@@ -3,9 +3,10 @@
 
 static const wchar_t *const welcome =
     L"Welcome to DarkChat.\n\n"
-    L"This is the offline preview build. Type a message below and press Enter; "
-    L"a canned reply appears so you can exercise the shell, the transcript and "
-    L"the composer. Real OpenRouter responses arrive in the next pass.";
+    L"Type a message below and press Enter; the whole conversation goes to "
+    L"the model selected in the toolbar over the OpenRouter chat-completions "
+    L"endpoint. Set OPENROUTER_API_KEY in the environment before launching; "
+    L"without it DarkChat explains what is missing instead of answering.";
 
 /* Bounded append that never overruns the destination. */
 static void append3(wchar_t *dst, size_t capacity, size_t *used,
@@ -77,8 +78,11 @@ int chat_remaining(const Chat *chat) {
     return remaining > 0 ? remaining : 0;
 }
 
-int chat_append(Chat *chat, ChatRole role, const wchar_t *text) {
-    ChatConversation *conversation = &chat->conversations[chat->active];
+int chat_append_at(Chat *chat, int conversation_index, ChatRole role,
+    const wchar_t *text) {
+    if (conversation_index < 0 ||
+        conversation_index >= chat->conversation_count) return -1;
+    ChatConversation *conversation = &chat->conversations[conversation_index];
     if (conversation->message_count >= CHAT_MAX_MESSAGES) return -1;
     ChatMessage *message = &conversation->messages[conversation->message_count];
     message->role = role;
@@ -103,6 +107,10 @@ int chat_append(Chat *chat, ChatRole role, const wchar_t *text) {
         }
     }
     return index;
+}
+
+int chat_append(Chat *chat, ChatRole role, const wchar_t *text) {
+    return chat_append_at(chat, chat->active, role, text);
 }
 
 void chat_fake_reply(Chat *chat, const wchar_t *prompt, wchar_t *out,

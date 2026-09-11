@@ -293,6 +293,10 @@ void rich_text_append_message(RichTextControl *control, ChatRole role,
     SendMessageW(window, WM_SETREDRAW, TRUE, 0);
     control->has_content = true;
     if (pinned) rich_text_scroll_to_end(control);
+    /* WM_SETREDRAW does not invalidate the control when drawing is restored.
+       Force one paint for the completed batch; otherwise newly inserted text
+       may remain invisible until selection or another input invalidates it. */
+    RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
 bool rich_text_handle_notify(RichTextControl *control, LPARAM lparam) {

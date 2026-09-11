@@ -82,6 +82,25 @@ int main(void) {
     chat->active = 99;
     check(chat_remaining(chat) == 0, "invalid active has no remaining");
 
+    /* Late replies land in the conversation they were asked for, even after
+       the user switched away. */
+    Chat *late = (Chat *)calloc(1, sizeof *late);
+    if (!late) return 2;
+    chat_init(late);
+    chat_append(late, CHAT_ROLE_USER, L"question");
+    int origin = late->active;
+    check(chat_new_conversation(late) >= 0, "switch to a second conversation");
+    check(chat_append_at(late, origin, CHAT_ROLE_ASSISTANT, L"late reply") >= 0,
+        "append targets the given conversation");
+    check(chat_active(late)->message_count == 0, "active conversation untouched");
+    check(late->conversations[origin].message_count == 3,
+        "origin conversation received the reply");
+    check(chat_append_at(late, -1, CHAT_ROLE_USER, L"no") < 0,
+        "invalid conversation rejected");
+    check(chat_append_at(late, late->conversation_count, CHAT_ROLE_USER, L"no")
+        < 0, "out-of-range conversation rejected");
+    free(late);
+
     free(chat);
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("\nall chat checks passed\n");

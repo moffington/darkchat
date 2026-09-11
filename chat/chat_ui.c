@@ -98,7 +98,7 @@ bool chat_ui_init(ChatUi *chat_ui, Ui *ui, Chat *chat) {
         fill_width(chat_ui, chat_ui->conversations[i]);
         ui_set_hidden(ui, chat_ui->conversations[i], true);
     }
-    label(chat_ui, sidebar, L"Offline preview \u2014 no network yet", UI_SMALL,
+    label(chat_ui, sidebar, L"Replies need OPENROUTER_API_KEY", UI_SMALL,
         UI_FAINT);
 
     UiId main = add(chat_ui, body, UI_COLUMN, L"");

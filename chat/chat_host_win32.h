@@ -16,6 +16,9 @@ typedef struct {
     const wchar_t *title;
     int width, height;             /* initial client size in DIPs */
     int min_width, min_height;     /* minimum client size in DIPs */
+    /* UTF-8 OPENROUTER_API_KEY borrowed from the caller's storage; the host
+       neither copies it into persistent state nor logs it. May be empty. */
+    const char *api_key_utf8;
 } ChatHostConfig;
 
 int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config);

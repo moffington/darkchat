@@ -1,6 +1,7 @@
 #include "chat_host_win32.h"
 #include "chat_ui.h"
 #include "rich_text_win32.h"
+#include "openrouter_winhttp.h"
 #include "../platform/renderer.h"
 #include "../platform/accessibility.h"
 #include <windowsx.h>
@@ -21,6 +22,10 @@ typedef struct {
     bool tracking, minimized;
     unsigned retries;
     UiId accessibility_focus;
+    /* Pass 2: one non-streaming OpenRouter request at a time. */
+    OpenRouterClient client;
+    int request_generation, request_conversation;
+    bool generating;
 } ChatHost;
 
 static void flush(ChatHost *host);
@@ -143,16 +148,28 @@ static void set_status(ChatHost *host, const wchar_t *text) {
     flush(host);
 }
 
+/* Shows a local error note in the transcript. Error-role messages are never
+   sent back to the model as conversation history. */
+static void append_note(ChatHost *host, const wchar_t *text) {
+    if (chat_append(host->config.chat, CHAT_ROLE_ERROR, text) >= 0)
+        rich_text_append_message(&host->transcript, CHAT_ROLE_ERROR, text);
+}
+
 static void perform_send(ChatHost *host) {
     Chat *chat = host->config.chat;
+    if (host->generating) {
+        set_status(host, L"Already generating \u2014 wait for the reply");
+        return;
+    }
     wchar_t prompt[CHAT_MESSAGE_TEXT];
     rich_text_get_text(&host->composer, prompt, CHAT_MESSAGE_TEXT);
     if (!prompt[0]) {
         set_status(host, L"Nothing to send");
         return;
     }
-    /* Every send stores a user message and a reply; refuse up front rather than
-       leaving the transcript with content the conversation cannot hold. */
+    /* Every send stores a user message and expects a reply; refuse up front
+       rather than leaving the transcript with content the conversation cannot
+       hold. */
     if (chat_remaining(chat) < 2) {
         set_status(host, L"Conversation is full \u2014 start a new one");
         return;
@@ -164,12 +181,88 @@ static void perform_send(ChatHost *host) {
     }
     rich_text_append_message(&host->transcript, CHAT_ROLE_USER, prompt);
     rich_text_set_text(&host->composer, L"");
-    wchar_t reply[CHAT_MESSAGE_TEXT];
-    chat_fake_reply(chat, prompt, reply, CHAT_MESSAGE_TEXT);
-    /* Only display the reply once it is actually part of the conversation. */
-    if (chat_append(chat, CHAT_ROLE_ASSISTANT, reply) >= 0)
-        rich_text_append_message(&host->transcript, CHAT_ROLE_ASSISTANT, reply);
+    if (!host->config.api_key_utf8 || !host->config.api_key_utf8[0]) {
+        append_note(host,
+            L"OPENROUTER_API_KEY is not set. Set it in the environment and "
+            L"restart DarkChat to get real replies.");
+        set_status(host, L"No API key \u2014 see the transcript");
+        chat_ui_sync(&host->chat_ui);
+        flush(host);
+        return;
+    }
+    const ChatConversation *conversation = chat_active(chat);
+    int count = conversation ? conversation->message_count : 0;
+    OpenRouterMessage *messages =
+        (OpenRouterMessage *)malloc((count ? count : 1) * sizeof *messages);
+    if (!messages) {
+        append_note(host, L"Not enough memory to start the request.");
+        set_status(host, L"Request failed");
+        chat_ui_sync(&host->chat_ui);
+        flush(host);
+        return;
+    }
+    int used = 0;
+    for (int i = 0; i < count; i++) {
+        if (conversation->messages[i].role == CHAT_ROLE_ERROR) continue;
+        messages[used].role = conversation->messages[i].role;
+        messages[used].text = conversation->messages[i].text;
+        ++used;
+    }
+    host->generating = true;
+    host->request_conversation = chat->active;
+    ui_set_disabled(host->config.ui, host->chat_ui.send, true);
+    wchar_t status[CHAT_STATUS_TEXT];
+    _snwprintf(status, CHAT_STATUS_TEXT, L"Contacting %s\u2026", chat->model);
+    status[CHAT_STATUS_TEXT - 1] = 0;
+    set_status(host, status);
+    host->request_generation = openrouter_request(&host->client,
+        host->config.api_key_utf8, chat->model, messages, used);
+    free(messages);
+    if (!host->request_generation) {
+        host->generating = false;
+        ui_set_disabled(host->config.ui, host->chat_ui.send, false);
+        append_note(host, L"Could not start the OpenRouter request.");
+        set_status(host, L"Request failed");
+    }
     chat_ui_sync(&host->chat_ui);
+    flush(host);
+}
+
+/* The worker posted a completed request. The result is heap-owned here. */
+static void handle_result(ChatHost *host, OpenRouterResult *result) {
+    Chat *chat = host->config.chat;
+    if (!result || result->generation != host->request_generation) {
+        openrouter_result_free(result);
+        return;
+    }
+    openrouter_complete(&host->client, result->generation);
+    host->generating = false;
+    ui_set_disabled(host->config.ui, host->chat_ui.send, false);
+    int index = host->request_conversation;
+    bool active = index >= 0 && index < chat->conversation_count &&
+        index == chat->active;
+    if (result->ok) {
+        int message = chat_append_at(chat, index, CHAT_ROLE_ASSISTANT,
+            result->text);
+        if (message >= 0) {
+            if (active) rich_text_append_message(&host->transcript,
+                CHAT_ROLE_ASSISTANT,
+                chat->conversations[index].messages[message].text);
+            set_status(host, L"Reply received");
+        } else {
+            set_status(host,
+                L"Conversation is full \u2014 the reply was discarded");
+        }
+    } else {
+        int message = chat_append_at(chat, index, CHAT_ROLE_ERROR,
+            result->text ? result->text : L"Unknown error.");
+        if (message >= 0 && active)
+            rich_text_append_message(&host->transcript, CHAT_ROLE_ERROR,
+                chat->conversations[index].messages[message].text);
+        set_status(host, L"Request failed \u2014 see the transcript");
+    }
+    chat_ui_sync(&host->chat_ui);
+    openrouter_result_free(result);
     flush(host);
 }
 
@@ -284,6 +377,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         host->field.user = host;
         host->transcript.on_key = surface_key;
         host->transcript.user = host;
+        openrouter_init(&host->client, window, CHAT_WM_OPENROUTER_RESULT);
         if (!ui_accessible_name(u, u->root)[0])
             ui_set_accessible_name(u, u->root, host->config.title);
         host->accessibility = ui_accessibility_create(window, u);
@@ -417,6 +511,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             flush(host);
         }
         return 0;
+    case CHAT_WM_OPENROUTER_RESULT:
+        handle_result(host, (OpenRouterResult *)l);
+        return 0;
     case WM_ACTIVATE:
         ui_set_active(u, LOWORD(w) != WA_INACTIVE);
         flush(host);
@@ -488,6 +585,8 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
     }
     UnregisterClassW(cls.lpszClassName, instance);
 cleanup:
+    /* Never exit under a running worker: it still owns its request snapshot. */
+    openrouter_shutdown(&host->client);
     ui_accessibility_destroy(host->accessibility);
     config->ui->measure = NULL;
     config->ui->measure_user = NULL;

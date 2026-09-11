@@ -45,6 +45,11 @@ int chat_new_conversation(Chat *chat);
 bool chat_select_conversation(Chat *chat, int index);
 /* Appends a message to the active conversation. Returns its index, or -1. */
 int chat_append(Chat *chat, ChatRole role, const wchar_t *text);
+/* Appends a message to a specific conversation, whichever is active or not;
+   late replies land in the conversation they were asked for. Returns the
+   message index, or -1 when the conversation is unknown or full. */
+int chat_append_at(Chat *chat, int conversation, ChatRole role,
+    const wchar_t *text);
 /* Further messages the active conversation can still store. */
 int chat_remaining(const Chat *chat);
 const ChatConversation *chat_active(const Chat *chat);
