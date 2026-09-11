@@ -49,9 +49,10 @@ The renderer exposes a callback painter instead of putting COM calls in controls
 ## Using the core
 
 Initialize a fresh `Ui`, create exactly one root, and append children to containers.
-Nodes are context-owned and IDs remain valid until `ui_init` resets that context.
-Use `ui_node` to configure style, `ui_set_text` for owned text, and the hidden and
-disabled setters to keep focus/capture state consistent. Check `ui_add` for
+Nodes are context-owned. IDs are opaque generation handles that remain valid until
+their node is removed or `ui_init` resets the context; use `ui_node` to access a
+node rather than indexing the arena with an ID. Use `ui_set_text` for owned text,
+and the hidden and disabled setters to keep focus/capture state consistent. Check `ui_add` for
 `UI_NONE`; `ui.overflow` latches invalid-parent/capacity errors.
 
 ```c
@@ -72,6 +73,13 @@ on the UI thread. Event callbacks run synchronously after control state changes;
 they may update properties, text and visibility, but must not reset the context
 or re-enter event dispatch. Direct style/value mutations require
 `ui_invalidate(ui, true)` for layout changes, or `false` for appearance changes.
+
+`ui_remove` recursively removes a subtree and invalidates every handle to it;
+freed arena slots are reused without making stale handles valid. `ui_reparent`
+appends a non-root node to another container and rejects cycles. Both operations
+repair focus and active gestures immediately. Event callbacks may remove or
+reparent their event target, but must still not reset the context or re-enter
+event dispatch.
 
 ### Layout contract
 
@@ -137,8 +145,8 @@ same painter through WIC for visual review without desktop capture.
 
 This is a foundation, not a complete widget library. It intentionally has a bounded
 255-node arena, 191-code-unit text buffers, vertical scrolling, single-line text,
-and one top-level host window per `ui_win32_run`. There is no node removal/reparenting,
-virtualized list, popup/menu system, multiline editor, rich-text layout or custom
+and one top-level host window per `ui_win32_run`. There is no virtualized list,
+popup/menu system, multiline editor, rich-text layout or custom
 UI Automation provider yet. Native text fields expose native accessibility while
 active; custom controls need a UIA provider before screen-reader-ready use.
 

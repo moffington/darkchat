@@ -25,9 +25,10 @@ Prioritize depth over widget count:
 1. **Accessibility:** add a Win32 UIA provider mapping stable IDs to names, roles,
    bounds, enabled/focused state, invoke/toggle/value patterns and change events.
    Add explicit labels/help text in the core; connect native editor accessibility.
-2. **Lifetime and invalidation:** add safe removal/reparenting with generation IDs,
-   repair focus/capture after changes, and test callback mutation rules. Keep the
-   current bounded arena until actual scale requirements justify allocation policy.
+2. **Lifetime and invalidation:** generation-safe removal/reparenting, focus/capture
+   repair and callback mutation rules are now implemented and covered in the core
+   tests. Keep the current bounded arena until actual scale requirements justify
+   allocation policy; add insertion/reordering only when a concrete consumer needs it.
 3. **Layout and content:** measured wrapping, baseline/cross-axis alignment, then a
    virtualized collection using the existing viewport contract. Preserve shared
    clip/hit geometry and scroll anchoring as content changes.

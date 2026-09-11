@@ -3,7 +3,8 @@
 
 /* Reusable UI core. No operating-system or graphics API dependencies.
    Geometry, typography and input coordinates are always 96-DPI DIPs.
-   Nodes and their text are owned by the context; IDs remain stable until reset.
+   Nodes and their text are owned by the context; IDs are opaque generation
+   handles and remain stable until their node is removed or the context is reset.
    All operations run on the owning UI thread. */
 #include <stdbool.h>
 #include <stddef.h>
@@ -12,7 +13,7 @@
 
 #define UI_CAPACITY 256
 #define UI_TEXT_CAPACITY 192
-typedef uint16_t UiId;
+typedef uint32_t UiId;
 #define UI_NONE ((UiId)0)
 
 typedef struct { float x, y, w, h; } UiRect;
@@ -63,6 +64,9 @@ typedef struct {
     float value; /* slider/progress: normalized [0,1] */
     float scroll, content_height;
     uintptr_t tag; /* application-owned identifier */
+    uint32_t generation;
+    uint8_t free_next;
+    bool alive;
 } UiNode;
 typedef enum { UI_ACTIVATE, UI_CHANGE } UiEventKind;
 typedef struct { UiId id; UiEventKind kind; } UiEvent;
@@ -76,7 +80,9 @@ typedef void (*UiEventFn)(void *user, Ui *ui, UiEvent event);
 typedef UiExtent (*UiMeasureFn)(void *user, const wchar_t *text, UiFont font);
 struct Ui {
     UiNode nodes[UI_CAPACITY];
-    UiId count, root, hot, focus, pressed, drag_scroll;
+    uint16_t count;
+    uint8_t next_slot, free_slot;
+    UiId root, hot, focus, pressed, drag_scroll;
     bool keyboard_focus, window_active, layout_dirty, paint_dirty, overflow;
     bool key_pressed, pointer_known;
     UiKey activation_key;
@@ -104,6 +110,10 @@ typedef struct {
 void ui_init(Ui *ui, UiMeasureFn measure, void *measure_user);
 /* Returns UI_NONE and latches overflow on exhaustion/invalid parent. */
 UiId ui_add(Ui *ui, UiId parent, UiKind kind, const wchar_t *text);
+/* Removes id and its descendants. All handles to them become invalid. */
+bool ui_remove(Ui *ui, UiId id);
+/* Moves a non-root node to the end of a container. Cycles are rejected. */
+bool ui_reparent(Ui *ui, UiId id, UiId parent);
 UiNode *ui_node(Ui *ui, UiId id);
 void ui_invalidate(Ui *ui, bool layout);
 void ui_set_text(Ui *ui, UiId id, const wchar_t *text);

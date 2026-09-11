@@ -6,7 +6,7 @@ static UiRect inset(UiRect r, float p) {
 static UiColor color(const Ui *u, UiColorRole role) { return u->theme.colors[role]; }
 static UiRect text_inset(UiRect r) { r.x+=8; r.w=r.w>16?r.w-16:0; return r; }
 static void draw(Ui *u, const UiPainter *p, UiId id) {
-    UiNode *n=&u->nodes[id];
+    UiNode *n=ui_node(u,id);
     UiRect r=n->rect;
     if (n->hidden || n->clip.w<=0 || n->clip.h<=0) return;
     bool enabled=ui_enabled(u,id), hot=u->hot==id && enabled;
@@ -71,7 +71,11 @@ static void draw(Ui *u, const UiPainter *p, UiId id) {
         p->fill(p->user,r,color(u,UI_BORDER),0); break;
     default: break;
     }
-    for (UiId c=n->first;c;c=u->nodes[c].next) draw(u,p,c);
+    for (UiId c=n->first;c;) {
+        UiNode *child=ui_node(u,c);
+        UiId next=child->next;
+        draw(u,p,c); c=next;
+    }
     if (n->kind==UI_SCROLL && ui_scroll_max(u,id)>0) {
         UiRect thumb=ui_scroll_thumb(u,id);
         thumb.x+=2; thumb.w=thumb.w>4?thumb.w-4:0;

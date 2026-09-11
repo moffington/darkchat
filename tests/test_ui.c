@@ -10,35 +10,41 @@ static unsigned assertions;
 #define CHECK(x) do { ++assertions; if (!(x)) { fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#x); exit(1); } } while (0)
 #define NEAR(a,b) CHECK(fabsf((a)-(b))<.05f)
 static Ui u;
+#define NODE(id) (*ui_node(&u,(id)))
 static unsigned activated, changed;
+static bool remove_on_event;
+static UiId reparent_on_event;
 static void event(void *user, Ui *ui, UiEvent e) {
     (void)user; (void)ui;
     if (e.kind==UI_ACTIVATE) activated++; else changed++;
+    if (remove_on_event) CHECK(ui_remove(ui,e.id));
+    else if (reparent_on_event) CHECK(ui_reparent(ui,e.id,reparent_on_event));
 }
 static UiId init(UiKind kind) {
     ui_init(&u,NULL,NULL); u.on_event=event; activated=changed=0;
+    remove_on_event=false; reparent_on_event=UI_NONE;
     return ui_add(&u,0,kind,L"");
 }
 static void click(UiId id) {
-    UiRect r=u.nodes[id].rect;
+    UiRect r=NODE(id).rect;
     ui_pointer_down(&u,r.x+r.w/2,r.y+r.h/2);
     ui_pointer_up(&u,r.x+r.w/2,r.y+r.h/2);
 }
 static void layout_test(void) {
-    UiId root=init(UI_ROW); u.nodes[root].style.padding=10; u.nodes[root].style.gap=10;
+    UiId root=init(UI_ROW); NODE(root).style.padding=10; NODE(root).style.gap=10;
     UiId a=ui_add(&u,root,UI_BUTTON,L"A"), b=ui_add(&u,root,UI_BUTTON,L"B"), c=ui_add(&u,root,UI_BUTTON,L"C");
-    u.nodes[a].style.width=ui_fixed(100);
-    u.nodes[b].style.width=ui_flex(1); u.nodes[b].style.max_w=80;
-    u.nodes[c].style.width=ui_flex(2);
+    NODE(a).style.width=ui_fixed(100);
+    NODE(b).style.width=ui_flex(1); NODE(b).style.max_w=80;
+    NODE(c).style.width=ui_flex(2);
     ui_layout(&u,500,80);
-    NEAR(u.nodes[a].rect.w,100); NEAR(u.nodes[b].rect.w,80); NEAR(u.nodes[c].rect.w,280);
-    NEAR(u.nodes[c].rect.x+u.nodes[c].rect.w,490);
-    u.nodes[b].style.min_w=70; u.nodes[c].style.min_w=60;
+    NEAR(NODE(a).rect.w,100); NEAR(NODE(b).rect.w,80); NEAR(NODE(c).rect.w,280);
+    NEAR(NODE(c).rect.x+NODE(c).rect.w,490);
+    NODE(b).style.min_w=70; NODE(c).style.min_w=60;
     ui_layout(&u,260,80);
-    NEAR(u.nodes[b].rect.w,70); NEAR(u.nodes[c].rect.w,60);
-    CHECK(u.nodes[c].clip.w<=u.nodes[c].rect.w);
+    NEAR(NODE(b).rect.w,70); NEAR(NODE(c).rect.w,60);
+    CHECK(NODE(c).clip.w<=NODE(c).rect.w);
     ui_set_hidden(&u,b,true); ui_layout(&u,500,80);
-    NEAR(u.nodes[c].rect.x,120); NEAR(u.nodes[c].rect.w,370);
+    NEAR(NODE(c).rect.x,120); NEAR(NODE(c).rect.w,370);
     CHECK(ui_hit_test(&u,125,20)==c);
     ui_layout(&u,0,0); CHECK(ui_hit_test(&u,0,0)==UI_NONE);
 }
@@ -51,7 +57,7 @@ static void input_test(void) {
     click(a); CHECK(activated==1);
     ui_pointer_down(&u,10,10); ui_pointer_up(&u,400,10); CHECK(activated==1);
     ui_pointer_down(&u,10,10); ui_cancel_input(&u); ui_pointer_up(&u,10,10); CHECK(activated==1);
-    click(b); CHECK(u.nodes[b].checked && changed==1);
+    click(b); CHECK(NODE(b).checked && changed==1);
     click(disabled); CHECK(activated==1);
     ui_focus(&u,0,true); ui_key(&u,UI_KEY_TAB,true,false,false); CHECK(u.focus==a);
     ui_key(&u,UI_KEY_TAB,true,false,false); CHECK(u.focus==b);
@@ -75,40 +81,40 @@ static void input_test(void) {
     ui_key(&u,UI_KEY_TAB,true,false,false); CHECK(u.focus==b);
 }
 static void scrolling_test(void) {
-    UiId outer=init(UI_SCROLL); u.nodes[outer].style.gap=0;
-    UiId inner=ui_add(&u,outer,UI_SCROLL,L"Inner"); u.nodes[inner].style.height=ui_fixed(100); u.nodes[inner].style.gap=0;
+    UiId outer=init(UI_SCROLL); NODE(outer).style.gap=0;
+    UiId inner=ui_add(&u,outer,UI_SCROLL,L"Inner"); NODE(inner).style.height=ui_fixed(100); NODE(inner).style.gap=0;
     UiId last=0;
     for (int i=0;i<10;i++) last=ui_add(&u,inner,UI_BUTTON,L"Item");
-    UiId bottom=ui_add(&u,outer,UI_BUTTON,L"Bottom"); u.nodes[bottom].style.height=ui_fixed(200);
+    UiId bottom=ui_add(&u,outer,UI_BUTTON,L"Bottom"); NODE(bottom).style.height=ui_fixed(200);
     ui_layout(&u,300,200);
     NEAR(ui_scroll_max(&u,inner),200); NEAR(ui_scroll_max(&u,outer),100);
     CHECK(ui_hit_test(&u,20,95)!=last); /* Offscreen children cannot receive clicks. */
     ui_scroll(&u,20,20,250);
-    NEAR(u.nodes[inner].scroll,200); NEAR(u.nodes[outer].scroll,50);
-    ui_scroll(&u,20,20,-250); NEAR(u.nodes[inner].scroll,0); NEAR(u.nodes[outer].scroll,0);
+    NEAR(NODE(inner).scroll,200); NEAR(NODE(outer).scroll,50);
+    ui_scroll(&u,20,20,-250); NEAR(NODE(inner).scroll,0); NEAR(NODE(outer).scroll,0);
     ui_focus(&u,last,true);
-    NEAR(u.nodes[inner].scroll,200); CHECK(u.nodes[last].clip.h==30);
+    NEAR(NODE(inner).scroll,200); CHECK(NODE(last).clip.h==30);
     UiRect thumb=ui_scroll_thumb(&u,inner);
     ui_pointer_down(&u,thumb.x+3,thumb.y+thumb.h/2); CHECK(u.drag_scroll==inner);
-    ui_pointer_move(&u,thumb.x+3,-100); NEAR(u.nodes[inner].scroll,0);
+    ui_pointer_move(&u,thumb.x+3,-100); NEAR(NODE(inner).scroll,0);
     ui_pointer_up(&u,thumb.x+3,-100); CHECK(!u.drag_scroll);
-    ui_focus(&u,inner,true); ui_key(&u,UI_KEY_END,true,false,false); NEAR(u.nodes[inner].scroll,200);
-    ui_key(&u,UI_KEY_HOME,true,false,false); NEAR(u.nodes[inner].scroll,0);
+    ui_focus(&u,inner,true); ui_key(&u,UI_KEY_END,true,false,false); NEAR(NODE(inner).scroll,200);
+    ui_key(&u,UI_KEY_HOME,true,false,false); NEAR(NODE(inner).scroll,0);
     /* Content shrink clamps old scroll offsets on the next layout. */
-    u.nodes[inner].scroll=200;
-    for (UiId c=u.nodes[inner].first;c;c=u.nodes[c].next) ui_set_hidden(&u,c,c!=last);
-    ui_layout(&u,300,200); NEAR(u.nodes[inner].scroll,0); NEAR(ui_scroll_thumb(&u,inner).h,0);
+    NODE(inner).scroll=200;
+    for (UiId c=NODE(inner).first;c;c=NODE(c).next) ui_set_hidden(&u,c,c!=last);
+    ui_layout(&u,300,200); NEAR(NODE(inner).scroll,0); NEAR(ui_scroll_thumb(&u,inner).h,0);
 }
 static void slider_test(void) {
     UiId root=init(UI_COLUMN), slider=ui_add(&u,root,UI_SLIDER,L"Value");
     ui_layout(&u,200,100);
-    ui_pointer_down(&u,100,15); NEAR(u.nodes[slider].value,.5f);
-    ui_pointer_move(&u,500,15); NEAR(u.nodes[slider].value,1);
-    ui_pointer_move(&u,-20,15); NEAR(u.nodes[slider].value,0);
+    ui_pointer_down(&u,100,15); NEAR(NODE(slider).value,.5f);
+    ui_pointer_move(&u,500,15); NEAR(NODE(slider).value,1);
+    ui_pointer_move(&u,-20,15); NEAR(NODE(slider).value,0);
     ui_pointer_up(&u,-20,15);
-    ui_focus(&u,slider,true); ui_key(&u,UI_KEY_PAGE_UP,true,false,false); NEAR(u.nodes[slider].value,.1f);
-    ui_key(&u,UI_KEY_END,true,false,false); NEAR(u.nodes[slider].value,1);
-    ui_key(&u,UI_KEY_RIGHT,true,false,false); NEAR(u.nodes[slider].value,1);
+    ui_focus(&u,slider,true); ui_key(&u,UI_KEY_PAGE_UP,true,false,false); NEAR(NODE(slider).value,.1f);
+    ui_key(&u,UI_KEY_END,true,false,false); NEAR(NODE(slider).value,1);
+    ui_key(&u,UI_KEY_RIGHT,true,false,false); NEAR(NODE(slider).value,1);
     CHECK(changed>=4);
 }
 static void text_and_capacity_test(void) {
@@ -117,11 +123,62 @@ static void text_and_capacity_test(void) {
     for (unsigned i=0;i<sizeof text/sizeof text[0]-1;i++) text[i]=L'x';
     text[sizeof text/sizeof text[0]-1]=0;
     text[UI_TEXT_CAPACITY-2]=0xd800; text[UI_TEXT_CAPACITY-1]=0xdc00;
-    ui_set_text(&u,field,text); CHECK(wcslen(u.nodes[field].text)==UI_TEXT_CAPACITY-2);
-    ui_set_text(&u,field,L""); CHECK(!u.nodes[field].text[0]);
+    ui_set_text(&u,field,text); CHECK(wcslen(NODE(field).text)==UI_TEXT_CAPACITY-2);
+    ui_set_text(&u,field,L""); CHECK(!NODE(field).text[0]);
     while (u.count<UI_CAPACITY-1) CHECK(ui_add(&u,root,UI_LABEL,L""));
     CHECK(!ui_add(&u,root,UI_LABEL,L"overflow") && u.overflow);
     CHECK(!ui_node(&u,UI_CAPACITY));
+}
+static void lifetime_test(void) {
+    UiId root=init(UI_COLUMN);
+    UiId left=ui_add(&u,root,UI_COLUMN,L"Left");
+    UiId right=ui_add(&u,root,UI_COLUMN,L"Right");
+    UiId group=ui_add(&u,left,UI_COLUMN,L"Group");
+    UiId button=ui_add(&u,group,UI_BUTTON,L"Move me");
+    UiId sibling=ui_add(&u,left,UI_BUTTON,L"Sibling");
+    CHECK(u.count==6);
+    CHECK(!ui_reparent(&u,root,right));
+    CHECK(!ui_reparent(&u,left,group));
+    CHECK(ui_reparent(&u,button,right));
+    CHECK(NODE(button).parent==right && NODE(right).first==button && NODE(right).last==button);
+    CHECK(NODE(group).first==UI_NONE && NODE(group).last==UI_NONE);
+    CHECK(NODE(left).first==group && NODE(left).last==sibling && NODE(group).next==sibling);
+
+    ui_layout(&u,300,300); ui_focus(&u,button,true);
+    ui_pointer_down(&u,NODE(button).rect.x+2,NODE(button).rect.y+2);
+    CHECK(u.focus==button && u.pressed==button);
+    ui_set_disabled(&u,left,true);
+    CHECK(ui_reparent(&u,button,left));
+    CHECK(!u.focus && !u.pressed && !u.drag_scroll);
+
+    UiNode *old_slot=ui_node(&u,group);
+    CHECK(ui_remove(&u,group));
+    CHECK(!ui_node(&u,group) && u.count==5);
+    UiId replacement=ui_add(&u,right,UI_BUTTON,L"Replacement");
+    CHECK(replacement && replacement!=group && ui_node(&u,replacement)==old_slot);
+    ui_set_text(&u,group,L"stale");
+    CHECK(!wcscmp(NODE(replacement).text,L"Replacement"));
+
+    ui_set_disabled(&u,left,false);
+    UiId parent=ui_add(&u,right,UI_COLUMN,L"Subtree");
+    UiId child=ui_add(&u,parent,UI_BUTTON,L"Captured child");
+    ui_layout(&u,300,300); ui_focus(&u,child,true);
+    u.hot=u.pressed=child;
+    CHECK(ui_remove(&u,parent));
+    CHECK(!ui_node(&u,parent) && !ui_node(&u,child));
+    CHECK(!u.focus && !u.hot && !u.pressed && !u.drag_scroll);
+
+    /* Event callbacks may remove or reparent their own target. */
+    UiId action=ui_add(&u,right,UI_BUTTON,L"One shot");
+    ui_layout(&u,300,300); remove_on_event=true; click(action);
+    CHECK(activated==1 && !ui_node(&u,action) && !u.focus);
+    remove_on_event=false;
+    UiId destination=ui_add(&u,root,UI_COLUMN,L"Destination");
+    action=ui_add(&u,right,UI_BUTTON,L"Relocate");
+    ui_layout(&u,300,300); reparent_on_event=destination; click(action);
+    CHECK(activated==2 && NODE(action).parent==destination && NODE(destination).last==action);
+    reparent_on_event=UI_NONE;
+    CHECK(!ui_remove(&u,action^(1u<<8))); /* The wrong generation is invalid. */
 }
 typedef struct { unsigned pushes,pops,depth,draws; } PaintCheck;
 static void fill(void *user, UiRect r, UiColor c, float radius) {
@@ -143,7 +200,7 @@ static void showcase_test(void) {
     const float widths[]={1280,1120,940,800,700,600};
     for (unsigned w=0;w<sizeof widths/sizeof widths[0];w++) {
         showcase_resize(&s,widths[w],420); ui_layout(&u,widths[w],420);
-        CHECK(u.nodes[s.viewport].rect.w>=400 || widths[w]<700);
+        CHECK(NODE(s.viewport).rect.w>=400 || widths[w]<700);
         for (int page=0;page<3;page++) {
             ui_focus(&u,s.navigation[page],true);
             ui_key(&u,UI_KEY_ENTER,true,false,false); ui_key(&u,UI_KEY_ENTER,false,false,false);
@@ -153,17 +210,17 @@ static void showcase_test(void) {
             for (int i=0;i<u.count;i++) {
                 ui_key(&u,UI_KEY_TAB,true,false,false);
                 CHECK(ui_enabled(&u,u.focus));
-                CHECK(u.nodes[u.focus].clip.w>0 && u.nodes[u.focus].clip.h>0);
+                CHECK(NODE(u.focus).clip.w>0 && NODE(u.focus).clip.h>0);
             }
         }
     }
     ui_set_text(&u,s.filter,L"slider"); u.on_event(u.event_user,&u,(UiEvent){s.filter,UI_CHANGE});
     int visible=0;
-    for (int i=0;i<8;i++) visible+=!u.nodes[s.catalog_rows[i]].hidden;
-    CHECK(visible==1 && !u.nodes[s.catalog_rows[4]].hidden);
+    for (int i=0;i<8;i++) visible+=!NODE(s.catalog_rows[i]).hidden;
+    CHECK(visible==1 && !NODE(s.catalog_rows[4]).hidden);
 }
 int main(void) {
-    layout_test(); input_test(); scrolling_test(); slider_test(); text_and_capacity_test(); showcase_test();
-    printf("PASS: %u assertions (layout, input, nested scroll, focus reveal, values, capacity, showcase breakpoints)\n",assertions);
+    layout_test(); input_test(); scrolling_test(); slider_test(); text_and_capacity_test(); lifetime_test(); showcase_test();
+    printf("PASS: %u assertions (layout, input, nested scroll, focus reveal, values, lifetime, capacity, showcase breakpoints)\n",assertions);
     return 0;
 }
