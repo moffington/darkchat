@@ -299,6 +299,40 @@ void rich_text_append_message(RichTextControl *control, ChatRole role,
     RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
+void rich_text_begin_stream(RichTextControl *control) {
+    if (!control || !control->window) return;
+    bool pinned = rich_text_pinned(control);
+    HWND window = control->window;
+    SendMessageW(window, EM_SETREADONLY, FALSE, 0);
+    caret_end(window);
+    if (control->has_content)
+        run(control, L"\n", false, false, control->theme.text, false);
+    run(control, L"Assistant", true, false,
+        control->theme.header_assistant, false);
+    run(control, L"\n", false, false, control->theme.text, false);
+    SendMessageW(window, EM_SETREADONLY, TRUE, 0);
+    control->has_content = true;
+    if (pinned) rich_text_scroll_to_end(control);
+    RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+}
+
+void rich_text_append_stream(RichTextControl *control, const wchar_t *text) {
+    if (!control || !control->window || !text || !text[0]) return;
+    bool pinned = rich_text_pinned(control);
+    HWND window = control->window;
+    SendMessageW(window, EM_SETREADONLY, FALSE, 0);
+    caret_end(window);
+    run(control, text, false, false, control->theme.text, false);
+    SendMessageW(window, EM_SETREADONLY, TRUE, 0);
+    if (pinned) rich_text_scroll_to_end(control);
+    RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+}
+
+void rich_text_end_stream(RichTextControl *control) {
+    if (!control || !control->window) return;
+    rich_text_append_stream(control, L"\n");
+}
+
 bool rich_text_handle_notify(RichTextControl *control, LPARAM lparam) {
     NMHDR *header = (NMHDR *)lparam;
     if (header->code == EN_LINK) {

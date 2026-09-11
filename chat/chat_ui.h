@@ -31,6 +31,9 @@ typedef struct {
 bool chat_ui_init(ChatUi *chat_ui, Ui *ui, Chat *chat);
 /* Reflects conversation count, selection, title and status into the tree. */
 void chat_ui_sync(ChatUi *chat_ui);
+/* Changes the primary action between Send, Stop, and the disabled stopping
+   state without rebuilding the retained tree. */
+void chat_ui_set_generation(ChatUi *chat_ui, bool generating, bool stopping);
 void chat_ui_resize(ChatUi *chat_ui, float width, float height);
 void chat_ui_event(void *user, Ui *ui, UiEvent event);
 /* Arranged rectangle for a laid-out node, or an empty rectangle. */

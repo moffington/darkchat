@@ -8,6 +8,7 @@
 #include <dwmapi.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
     ChatHostConfig config;
@@ -22,10 +23,13 @@ typedef struct {
     bool tracking, minimized;
     unsigned retries;
     UiId accessibility_focus;
-    /* Pass 2: one non-streaming OpenRouter request at a time. */
+    /* One streamed request at a time. The response is accumulated so the
+       completed message can be committed atomically to conversation state. */
     OpenRouterClient client;
     int request_generation, request_conversation;
-    bool generating;
+    wchar_t stream_text[CHAT_MESSAGE_TEXT];
+    size_t stream_length;
+    bool generating, stopping, accepting, stream_visible;
 } ChatHost;
 
 static void flush(ChatHost *host);
@@ -132,12 +136,19 @@ static void focus_surface(ChatHost *host, bool reverse) {
 }
 
 static void render_transcript(ChatHost *host) {
+    host->stream_visible = false;
     rich_text_clear(&host->transcript);
     const ChatConversation *conversation = chat_active(host->config.chat);
     if (!conversation) return;
     for (int i = 0; i < conversation->message_count; i++)
         rich_text_append_message(&host->transcript,
             conversation->messages[i].role, conversation->messages[i].text);
+    if (host->generating && host->accepting &&
+        host->request_conversation == host->config.chat->active) {
+        rich_text_begin_stream(&host->transcript);
+        rich_text_append_stream(&host->transcript, host->stream_text);
+        host->stream_visible = true;
+    }
     rich_text_scroll_to_end(&host->transcript);
 }
 
@@ -158,7 +169,13 @@ static void append_note(ChatHost *host, const wchar_t *text) {
 static void perform_send(ChatHost *host) {
     Chat *chat = host->config.chat;
     if (host->generating) {
-        set_status(host, L"Already generating \u2014 wait for the reply");
+        if (!host->stopping && openrouter_cancel(&host->client,
+            host->request_generation)) {
+            host->stopping = true;
+            host->accepting = false;
+            chat_ui_set_generation(&host->chat_ui, true, true);
+            set_status(host, L"Stopping generation\u2026");
+        }
         return;
     }
     wchar_t prompt[CHAT_MESSAGE_TEXT];
@@ -209,8 +226,14 @@ static void perform_send(ChatHost *host) {
         ++used;
     }
     host->generating = true;
+    host->stopping = false;
+    host->accepting = true;
+    host->stream_length = 0;
+    host->stream_text[0] = 0;
+    host->stream_visible = false;
     host->request_conversation = chat->active;
-    ui_set_disabled(host->config.ui, host->chat_ui.send, true);
+    chat_ui_set_generation(&host->chat_ui, true, false);
+    EnableWindow(host->field.window, FALSE);
     wchar_t status[CHAT_STATUS_TEXT];
     _snwprintf(status, CHAT_STATUS_TEXT, L"Contacting %s\u2026", chat->model);
     status[CHAT_STATUS_TEXT - 1] = 0;
@@ -220,50 +243,102 @@ static void perform_send(ChatHost *host) {
     free(messages);
     if (!host->request_generation) {
         host->generating = false;
-        ui_set_disabled(host->config.ui, host->chat_ui.send, false);
+        host->accepting = false;
+        chat_ui_set_generation(&host->chat_ui, false, false);
+        EnableWindow(host->field.window, TRUE);
         append_note(host, L"Could not start the OpenRouter request.");
         set_status(host, L"Request failed");
+    } else {
+        rich_text_begin_stream(&host->transcript);
+        host->stream_visible = true;
     }
     chat_ui_sync(&host->chat_ui);
     flush(host);
 }
 
-/* The worker posted a completed request. The result is heap-owned here. */
-static void handle_result(ChatHost *host, OpenRouterResult *result) {
-    Chat *chat = host->config.chat;
-    if (!result || result->generation != host->request_generation) {
-        openrouter_result_free(result);
-        return;
+static void append_stream_delta(ChatHost *host, wchar_t *text) {
+    if (!text || !text[0] || !host->accepting) return;
+    size_t total = wcslen(text);
+    size_t incoming = total;
+    size_t room = CHAT_MESSAGE_TEXT - 1 - host->stream_length;
+    if (incoming > room) incoming = room;
+    if (incoming && text[incoming - 1] >= 0xd800 &&
+        text[incoming - 1] <= 0xdbff) --incoming;
+    if (incoming) {
+        wmemcpy(host->stream_text + host->stream_length, text, incoming);
+        host->stream_length += incoming;
+        host->stream_text[host->stream_length] = 0;
+        if (host->stream_visible &&
+            host->request_conversation == host->config.chat->active) {
+            wchar_t saved = text[incoming];
+            text[incoming] = 0;
+            rich_text_append_stream(&host->transcript, text);
+            text[incoming] = saved;
+        }
     }
-    openrouter_complete(&host->client, result->generation);
+    if (incoming < total) {
+        host->accepting = false;
+        host->stopping = true;
+        openrouter_cancel(&host->client, host->request_generation);
+        chat_ui_set_generation(&host->chat_ui, true, true);
+        set_status(host, L"Stopping \u2014 response reached the message limit");
+    }
+}
+
+static void finish_request(ChatHost *host, OpenRouterEvent *event) {
+    Chat *chat = host->config.chat;
+    openrouter_complete(&host->client, event->generation);
+    bool was_stopping = host->stopping;
     host->generating = false;
-    ui_set_disabled(host->config.ui, host->chat_ui.send, false);
+    host->stopping = false;
+    host->accepting = false;
+    chat_ui_set_generation(&host->chat_ui, false, false);
+    EnableWindow(host->field.window, TRUE);
     int index = host->request_conversation;
     bool active = index >= 0 && index < chat->conversation_count &&
         index == chat->active;
-    if (result->ok) {
-        int message = chat_append_at(chat, index, CHAT_ROLE_ASSISTANT,
-            result->text);
-        if (message >= 0) {
-            if (active) rich_text_append_message(&host->transcript,
-                CHAT_ROLE_ASSISTANT,
-                chat->conversations[index].messages[message].text);
-            set_status(host, L"Reply received");
-        } else {
-            set_status(host,
-                L"Conversation is full \u2014 the reply was discarded");
-        }
-    } else {
+    int assistant = -1;
+    if (host->stream_length && event->type != OPENROUTER_ERROR)
+        assistant = chat_append_at(chat, index, CHAT_ROLE_ASSISTANT,
+            host->stream_text);
+    if (event->type == OPENROUTER_DONE) {
+        if (assistant >= 0) set_status(host, L"Reply received");
+        else if (!host->stream_length) {
+            chat_append_at(chat, index, CHAT_ROLE_ERROR,
+                L"OpenRouter completed without returning any text.");
+            set_status(host, L"Empty response \u2014 see the transcript");
+        } else set_status(host, L"Conversation is full \u2014 reply discarded");
+    } else if (event->type == OPENROUTER_ERROR) {
         int message = chat_append_at(chat, index, CHAT_ROLE_ERROR,
-            result->text ? result->text : L"Unknown error.");
-        if (message >= 0 && active)
-            rich_text_append_message(&host->transcript, CHAT_ROLE_ERROR,
-                chat->conversations[index].messages[message].text);
+            event->text ? event->text : L"Unknown streaming error.");
+        (void)message;
         set_status(host, L"Request failed \u2014 see the transcript");
+    } else {
+        set_status(host, was_stopping && host->stream_length >= CHAT_MESSAGE_TEXT - 1
+            ? L"Response stopped at the message limit"
+            : L"Generation stopped");
     }
+    host->stream_length = 0;
+    host->stream_text[0] = 0;
+    host->stream_visible = false;
+    if (active) render_transcript(host);
     chat_ui_sync(&host->chat_ui);
-    openrouter_result_free(result);
     flush(host);
+}
+
+/* The worker posts deltas and exactly one terminal event. */
+static void handle_event(ChatHost *host, OpenRouterEvent *event) {
+    if (!event) return;
+    if (event->generation != host->request_generation || !host->generating) {
+        openrouter_event_free(event);
+        return;
+    }
+    if (event->type == OPENROUTER_DELTA) {
+        append_stream_delta(host, event->text);
+    } else {
+        finish_request(host, event);
+    }
+    openrouter_event_free(event);
 }
 
 static void command(void *user, ChatCommand code, int index) {
@@ -377,7 +452,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         host->field.user = host;
         host->transcript.on_key = surface_key;
         host->transcript.user = host;
-        openrouter_init(&host->client, window, CHAT_WM_OPENROUTER_RESULT);
+        openrouter_init(&host->client, window, CHAT_WM_OPENROUTER_EVENT);
         if (!ui_accessible_name(u, u->root)[0])
             ui_set_accessible_name(u, u->root, host->config.title);
         host->accessibility = ui_accessibility_create(window, u);
@@ -511,8 +586,19 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             flush(host);
         }
         return 0;
-    case CHAT_WM_OPENROUTER_RESULT:
-        handle_result(host, (OpenRouterResult *)l);
+    case CHAT_WM_OPENROUTER_EVENT:
+        handle_event(host, (OpenRouterEvent *)l);
+        return 0;
+    case WM_CLOSE:
+        if (host->generating) {
+            openrouter_shutdown(&host->client);
+            host->generating = false;
+            MSG queued;
+            while (PeekMessageW(&queued, window, CHAT_WM_OPENROUTER_EVENT,
+                CHAT_WM_OPENROUTER_EVENT, PM_REMOVE))
+                openrouter_event_free((OpenRouterEvent *)queued.lParam);
+        }
+        DestroyWindow(window);
         return 0;
     case WM_ACTIVATE:
         ui_set_active(u, LOWORD(w) != WA_INACTIVE);

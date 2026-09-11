@@ -67,8 +67,14 @@ bool chat_ui_init(ChatUi *chat_ui, Ui *ui, Chat *chat) {
     chat_ui->heading = label(chat_ui, toolbar, L"", UI_BODY, UI_MUTED);
     fill_width(chat_ui, chat_ui->heading);
     height(chat_ui, chat_ui->heading, 30);
+    UiId model_label = label(chat_ui, toolbar, L"MODEL", UI_SMALL, UI_FAINT);
+    width(chat_ui, model_label, 48);
+    height(chat_ui, model_label, 30);
     chat_ui->model = surface(chat_ui, toolbar, L"Model", UI_TRACK);
-    width(chat_ui, chat_ui->model, 260);
+    width(chat_ui, chat_ui->model, 280);
+    height(chat_ui, chat_ui->model, 30);
+    ui_set_help_text(ui, chat_ui->model,
+        L"Type any OpenRouter model identifier, for example provider/model, then press Enter.");
 
     height(chat_ui, add(chat_ui, root, UI_SEPARATOR, L""), 1);
 
@@ -151,6 +157,16 @@ void chat_ui_sync(ChatUi *chat_ui) {
     ui_set_disabled(chat_ui->ui, chat_ui->new_conversation,
         chat->conversation_count >= CHAT_MAX_CONVERSATIONS);
     ui_invalidate(chat_ui->ui, true);
+}
+
+void chat_ui_set_generation(ChatUi *chat_ui, bool generating, bool stopping) {
+    ui_set_text(chat_ui->ui, chat_ui->send,
+        stopping ? L"Stopping\u2026" : generating ? L"Stop" : L"Send");
+    ui_set_accessible_name(chat_ui->ui, chat_ui->send,
+        stopping ? L"Stopping generation" :
+        generating ? L"Stop generation" : L"Send message");
+    ui_set_disabled(chat_ui->ui, chat_ui->send, stopping);
+    ui_invalidate(chat_ui->ui, false);
 }
 
 void chat_ui_resize(ChatUi *chat_ui, float width, float height) {

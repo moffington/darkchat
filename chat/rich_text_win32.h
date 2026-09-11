@@ -61,6 +61,11 @@ void rich_text_select_all(RichTextControl *control);
 void rich_text_clear(RichTextControl *control);
 void rich_text_append_message(RichTextControl *control, ChatRole role,
     const wchar_t *text);
+/* Lightweight live-response path. The completed transcript is re-rendered
+   through append_message so fenced-code formatting is applied at the end. */
+void rich_text_begin_stream(RichTextControl *control);
+void rich_text_append_stream(RichTextControl *control, const wchar_t *text);
+void rich_text_end_stream(RichTextControl *control);
 void rich_text_scroll_to_end(RichTextControl *control);
 bool rich_text_pinned(const RichTextControl *control);
 /* Handles EN_LINK (opens the target) and EN_VSCROLL. Returns true if consumed.
