@@ -123,17 +123,23 @@ bool showcase_init(Showcase *s, Ui *u) {
     s->toggle=add(s,selection,UI_SWITCH,L"Live preview"); node(s,s->toggle)->checked=true;
 
     UiId fields=panel(s,s->pages[0],L"Text & values");
-    label(s,fields,L"WORKSPACE NAME",UI_SECTION,UI_MUTED);
+    UiId workspace_label=label(s,fields,L"WORKSPACE NAME",UI_SECTION,UI_MUTED);
     s->edit=add(s,fields,UI_TEXTBOX,L"Untitled workspace");
+    ui_set_labelled_by(u,s->edit,workspace_label);
+    ui_set_help_text(u,s->edit,L"Enter a single-line workspace name.");
     label(s,fields,L"Native text selection, clipboard, undo and IME while editing.",UI_SMALL,UI_MUTED);
     s->value_label=label(s,fields,L"",UI_BODY,UI_TEXT);
     s->slider=add(s,fields,UI_SLIDER,L"Intensity"); node(s,s->slider)->value=.64f;
+    ui_set_accessible_name(u,s->slider,L"Intensity");
+    ui_set_help_text(u,s->slider,L"Use arrow keys for one percent or Page Up and Page Down for ten percent.");
     s->progress=add(s,fields,UI_PROGRESS,L"");
     label(s,fields,L"Drag the slider, or focus it and use arrows, Home and End.",UI_SMALL,UI_MUTED);
 
     UiId list=panel(s,s->pages[0],L"Control catalog");
     label(s,list,L"Filter this independently scrolling list.",UI_SMALL,UI_MUTED);
     s->filter=add(s,list,UI_TEXTBOX,L"");
+    ui_set_accessible_name(u,s->filter,L"Filter control catalog");
+    ui_set_help_text(u,s->filter,L"Type part of a control name to filter the list.");
     s->catalog=add(s,list,UI_SCROLL,L"Control catalog"); height(s,s->catalog,180);
     node(s,s->catalog)->style.padding=4; node(s,s->catalog)->style.gap=5;
     static const wchar_t *items[]={L"Button / actions",L"Checkbox / choices",L"Switch / settings",L"Text field / native editing",

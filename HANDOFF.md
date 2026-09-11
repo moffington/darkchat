@@ -7,11 +7,12 @@ The primary extension boundary is `ui/ui.h`; avoid adding showcase concepts to i
 **Run:** `build.bat test`, then `build\darkui.exe`. **Visual artifacts:** `render.bat`
 writes wide, compact, 150% DPI, token and input-page PNGs to `build/`.
 
-**Verified in this pass:** strict warning-free C17 build; 8,020 core/showcase
+**Verified in this pass:** strict warning-free C17 build; 8,049 core/showcase
 assertions; real Direct2D/DirectWrite tests at 96/144/192/240 DPI; forced target
-release/recreation; transactional font replacement and repeated teardown. Wide,
-compact, 150% DPI and input-page WIC renders were inspected. The native showcase
-launched and responded, and its accessibility tree was readable.
+release/recreation; transactional font replacement and repeated teardown; UIA
+fragment navigation, metadata, bounds, focus, Invoke and stale-provider checks.
+Wide, compact, 150% DPI and input-page WIC renders were inspected. The native
+showcase launched and responded, and its accessibility tree was readable.
 
 **Verification limit:** live Windows capture failed twice with
 `SetIsBorderRequired: No such interface supported (0x80004002)`. WIC artifacts test
@@ -22,9 +23,11 @@ path, not an actual GPU removal. No claim of screen-reader completeness.
 
 Prioritize depth over widget count:
 
-1. **Accessibility:** add a Win32 UIA provider mapping stable IDs to names, roles,
-   bounds, enabled/focused state, invoke/toggle/value patterns and change events.
-   Add explicit labels/help text in the core; connect native editor accessibility.
+1. **Accessibility:** the Win32 UIA fragment provider now maps generation-safe IDs
+   to names, roles, bounds, enabled/focused state and button Invoke, with focus and
+   invocation events. Core labels/help text and a hidden-HWND provider smoke test
+   are in place. Next add Toggle/RangeValue/Value patterns and property events,
+   then explicitly bridge the native editor into the retained fragment tree.
 2. **Lifetime and invalidation:** generation-safe removal/reparenting, focus/capture
    repair and callback mutation rules are now implemented and covered in the core
    tests. Keep the current bounded arena until actual scale requirements justify

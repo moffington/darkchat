@@ -180,6 +180,19 @@ static void lifetime_test(void) {
     reparent_on_event=UI_NONE;
     CHECK(!ui_remove(&u,action^(1u<<8))); /* The wrong generation is invalid. */
 }
+static void accessibility_metadata_test(void) {
+    UiId root=init(UI_COLUMN), label=ui_add(&u,root,UI_LABEL,L"WORKSPACE NAME");
+    UiId field=ui_add(&u,root,UI_TEXTBOX,L"draft");
+    CHECK(!wcscmp(ui_accessible_name(&u,field),L"draft"));
+    ui_set_labelled_by(&u,field,label);
+    CHECK(!wcscmp(ui_accessible_name(&u,field),L"WORKSPACE NAME"));
+    ui_set_accessible_name(&u,field,L"Workspace");
+    ui_set_help_text(&u,field,L"Enter a workspace name.");
+    CHECK(!wcscmp(ui_accessible_name(&u,field),L"Workspace"));
+    CHECK(!wcscmp(NODE(field).help_text,L"Enter a workspace name."));
+    ui_set_accessible_name(&u,field,L""); CHECK(!wcscmp(ui_accessible_name(&u,field),L"WORKSPACE NAME"));
+    CHECK(ui_remove(&u,label)); CHECK(!wcscmp(ui_accessible_name(&u,field),L"draft"));
+}
 typedef struct { unsigned pushes,pops,depth,draws; } PaintCheck;
 static void fill(void *user, UiRect r, UiColor c, float radius) {
     (void)c; (void)radius; PaintCheck *p=user;
@@ -220,7 +233,7 @@ static void showcase_test(void) {
     CHECK(visible==1 && !NODE(s.catalog_rows[4]).hidden);
 }
 int main(void) {
-    layout_test(); input_test(); scrolling_test(); slider_test(); text_and_capacity_test(); lifetime_test(); showcase_test();
+    layout_test(); input_test(); scrolling_test(); slider_test(); text_and_capacity_test(); lifetime_test(); accessibility_metadata_test(); showcase_test();
     printf("PASS: %u assertions (layout, input, nested scroll, focus reveal, values, lifetime, capacity, showcase breakpoints)\n",assertions);
     return 0;
 }

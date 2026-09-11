@@ -39,7 +39,7 @@ inspector disappears as space decreases.
 | Core | `ui/ui.h`, `ui/ui.c` | Stable IDs, owned text, tree, layout, input, focus and scrolling; no Win32 or graphics headers |
 | Design | `ui/theme.c`, `ui/paint.c` | Semantic colors, typography, spacing, control appearance, renderer-independent painter callbacks |
 | Rendering | `platform/renderer.*` | DirectWrite measurement/layout cache, Direct2D target and brush lifetime, target recovery; caller-owned targets supported for export |
-| Platform | `platform/win32.*` | HWND/message loop, COM, DPI conversion, capture, native text editor, GDI resources and invalidation |
+| Platform | `platform/win32.*`, `platform/accessibility.*` | HWND/message loop, UI Automation, DPI conversion, capture, native text editor, GDI resources and invalidation |
 | Application | `showcase/showcase.*`, `main.c` | Composition, responsive breakpoints, sample state and event handling |
 
 The platform knows nothing about the showcase. The showcase knows nothing about
@@ -52,8 +52,8 @@ Initialize a fresh `Ui`, create exactly one root, and append children to contain
 Nodes are context-owned. IDs are opaque generation handles that remain valid until
 their node is removed or `ui_init` resets the context; use `ui_node` to access a
 node rather than indexing the arena with an ID. Use `ui_set_text` for owned text,
-and the hidden and disabled setters to keep focus/capture state consistent. Check `ui_add` for
-`UI_NONE`; `ui.overflow` latches invalid-parent/capacity errors.
+and the hidden and disabled setters to keep focus/capture state consistent. Check
+`ui_add` for `UI_NONE`; `ui.overflow` latches invalid-parent/capacity errors.
 
 ```c
 ui_init(ui, NULL, NULL);
@@ -80,6 +80,13 @@ appends a non-root node to another container and rejects cycles. Both operations
 repair focus and active gestures immediately. Event callbacks may remove or
 reparent their event target, but must still not reset the context or re-enter
 event dispatch.
+
+Accessible names default to node text and can be overridden with
+`ui_set_accessible_name` or derived from another node with `ui_set_labelled_by`.
+Use `ui_set_help_text` for concise interaction guidance. The Win32 host exposes
+the visible retained tree through UI Automation with stable runtime IDs, roles,
+bounds, enabled/focused state and button Invoke support. Provider calls are
+generation-checked, so removed nodes report that the element is unavailable.
 
 ### Layout contract
 
@@ -140,14 +147,17 @@ activation/cancellation, nested wheel bubbling, focus reveal, scrollbar dragging
 slider bounds, text capacity and all three pages at six widths. The core tests
 need no Windows APIs. `tests/test_renderer.c` runs actual Direct2D/DirectWrite
 integration against a test-owned hidden HWND at 96/144/192/240 DPI, including forced
-target recreation, theme changes and repeated teardown. `render.bat` exercises the
-same painter through WIC for visual review without desktop capture.
+target recreation, theme changes and repeated teardown. `tests/test_accessibility.c`
+drives the UIA provider against a hidden HWND, including fragment navigation,
+properties, bounds, focus, Invoke and stale-provider behavior. `render.bat`
+exercises the same painter through WIC for visual review without desktop capture.
 
 This is a foundation, not a complete widget library. It intentionally has a bounded
 255-node arena, 191-code-unit text buffers, vertical scrolling, single-line text,
 and one top-level host window per `ui_win32_run`. There is no virtualized list,
-popup/menu system, multiline editor, rich-text layout or custom
-UI Automation provider yet. Native text fields expose native accessibility while
-active; custom controls need a UIA provider before screen-reader-ready use.
+popup/menu system or multiline/rich-text layout. UI Automation patterns for
+toggle, range and value controls are not implemented yet. Native text fields
+expose native accessibility while active, but their relationship to the retained
+provider still needs explicit bridging before screen-reader-ready use.
 
 See [HANDOFF.md](HANDOFF.md) for the next pass and the exact verification limits.

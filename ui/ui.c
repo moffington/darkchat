@@ -18,13 +18,13 @@ static bool focusable(UiKind k) {
     return k == UI_BUTTON || k == UI_CHECKBOX || k == UI_SWITCH ||
            k == UI_SLIDER || k == UI_TEXTBOX || k == UI_SCROLL;
 }
-static bool visible(const Ui *u, UiId id) {
+bool ui_visible(const Ui *u, UiId id) {
     if (!valid(u, id)) return false;
     for (; id; id = const_node(u,id)->parent) if (const_node(u,id)->hidden) return false;
     return true;
 }
 bool ui_enabled(const Ui *u, UiId id) {
-    if (!visible(u, id)) return false;
+    if (!ui_visible(u, id)) return false;
     for (; id; id = const_node(u,id)->parent) if (const_node(u,id)->disabled) return false;
     return true;
 }
@@ -81,6 +81,30 @@ UiId ui_add(Ui *u, UiId parent, UiKind kind, const wchar_t *text) {
     ui_set_text(u,id,text);
     ui_invalidate(u,true);
     return id;
+}
+static void copy_text(wchar_t *destination, const wchar_t *text) {
+    if (!text) text=L"";
+    size_t length=wcslen(text);
+    if (length>=UI_TEXT_CAPACITY) length=UI_TEXT_CAPACITY-1;
+    if (length && text[length-1]>=0xd800 && text[length-1]<=0xdbff) --length;
+    wmemmove(destination,text,length); destination[length]=0;
+}
+void ui_set_accessible_name(Ui *u, UiId id, const wchar_t *name) {
+    UiNode *n=ui_node(u,id); if (n) copy_text(n->accessible_name,name);
+}
+void ui_set_help_text(Ui *u, UiId id, const wchar_t *help_text) {
+    UiNode *n=ui_node(u,id); if (n) copy_text(n->help_text,help_text);
+}
+void ui_set_labelled_by(Ui *u, UiId id, UiId label) {
+    UiNode *n=ui_node(u,id);
+    if (n && (!label || ui_node(u,label))) n->labelled_by=label;
+}
+const wchar_t *ui_accessible_name(Ui *u, UiId id) {
+    UiNode *n=ui_node(u,id);
+    if (!n) return L"";
+    if (n->accessible_name[0]) return n->accessible_name;
+    UiNode *label=ui_node(u,n->labelled_by);
+    return label && label->text[0] ? label->text : n->text;
 }
 static void unlink(Ui *u, UiId id) {
     UiNode *n=node(u,id);
@@ -275,6 +299,11 @@ static void activate(Ui *u, UiId id) {
     UiNode *n=node(u,id);
     if (n->kind==UI_CHECKBOX || n->kind==UI_SWITCH) { n->checked=!n->checked; emit(u,id,UI_CHANGE); }
     else if (n->kind==UI_BUTTON) emit(u,id,UI_ACTIVATE);
+}
+bool ui_invoke(Ui *u, UiId id) {
+    UiNode *n=ui_node(u,id);
+    if (!n || n->kind!=UI_BUTTON || !ui_enabled(u,id)) return false;
+    activate(u,id); return true;
 }
 static void reveal(Ui *u, UiId id) {
     ensure_layout(u);

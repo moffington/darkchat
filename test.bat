@@ -9,4 +9,8 @@ if errorlevel 1 exit /b 1
 gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_renderer.c ui\ui.c ui\theme.c ui\paint.c showcase\showcase.c platform\renderer.c -o build\test_renderer.exe -ld2d1 -ldwrite -lole32 -lgdi32
 if errorlevel 1 exit /b 1
 build\test_renderer.exe
+if errorlevel 1 exit /b 1
+gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_accessibility.c ui\ui.c ui\theme.c platform\accessibility.c -o build\test_accessibility.exe -luiautomationcore -loleaut32 -lole32 -lgdi32
+if errorlevel 1 exit /b 1
+build\test_accessibility.exe
 exit /b %errorlevel%

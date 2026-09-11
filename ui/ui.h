@@ -60,6 +60,9 @@ typedef struct {
     UiRect rect, clip, viewport;
     UiExtent measured;
     wchar_t text[UI_TEXT_CAPACITY];
+    wchar_t accessible_name[UI_TEXT_CAPACITY];
+    wchar_t help_text[UI_TEXT_CAPACITY];
+    UiId labelled_by;
     bool hidden, disabled, checked, selected;
     float value; /* slider/progress: normalized [0,1] */
     float scroll, content_height;
@@ -117,9 +120,16 @@ bool ui_reparent(Ui *ui, UiId id, UiId parent);
 UiNode *ui_node(Ui *ui, UiId id);
 void ui_invalidate(Ui *ui, bool layout);
 void ui_set_text(Ui *ui, UiId id, const wchar_t *text);
+void ui_set_accessible_name(Ui *ui, UiId id, const wchar_t *name);
+void ui_set_help_text(Ui *ui, UiId id, const wchar_t *help_text);
+void ui_set_labelled_by(Ui *ui, UiId id, UiId label);
+const wchar_t *ui_accessible_name(Ui *ui, UiId id);
 void ui_set_hidden(Ui *ui, UiId id, bool hidden);
 void ui_set_disabled(Ui *ui, UiId id, bool disabled);
+bool ui_visible(const Ui *ui, UiId id);
 bool ui_enabled(const Ui *ui, UiId id);
+/* Performs the default action of an enabled button. */
+bool ui_invoke(Ui *ui, UiId id);
 void ui_layout(Ui *ui, float width, float height);
 void ui_paint(Ui *ui, const UiPainter *painter);
 UiId ui_hit_test(const Ui *ui, float x, float y);

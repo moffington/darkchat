@@ -1,4 +1,5 @@
 #include "win32.h"
+#include "accessibility.h"
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <math.h>
@@ -7,6 +8,7 @@
 typedef struct {
     UiWindowConfig config;
     UiRenderer renderer;
+    UiAccessibility *accessibility;
     HWND window, edit;
     WNDPROC edit_proc;
     UiId editing;
@@ -16,6 +18,7 @@ typedef struct {
     float dpi;
     bool tracking, syncing, edit_change, minimized;
     unsigned retries;
+    UiId accessibility_focus;
 } UiHost;
 
 static void flush(UiHost *host);
@@ -132,6 +135,10 @@ static void layout(UiHost *h) {
 }
 static void flush(UiHost *h) {
     layout(h); sync_edit(h);
+    if (h->accessibility && h->accessibility_focus!=h->config.ui->focus) {
+        h->accessibility_focus=h->config.ui->focus;
+        ui_accessibility_focus_changed(h->accessibility,h->accessibility_focus?h->accessibility_focus:h->config.ui->root);
+    }
     if (GetCapture()==h->window && !h->config.ui->pressed && !h->config.ui->drag_scroll) ReleaseCapture();
     if (h->config.ui->paint_dirty) InvalidateRect(h->window,NULL,FALSE);
 }
@@ -155,8 +162,18 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM 
         SendMessageW(h->edit,EM_SETLIMITTEXT,UI_TEXT_CAPACITY-1,0);
         SendMessageW(h->edit,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,0);
         if (!update_font(h,UI_BODY)) return -1;
+        if (!ui_accessible_name(u,u->root)[0]) ui_set_accessible_name(u,u->root,h->config.title);
+        h->accessibility=ui_accessibility_create(window,u);
+        if (!h->accessibility) return -1;
         return 0;
     }
+    case WM_GETOBJECT: {
+        LRESULT result=ui_accessibility_get_object(h->accessibility,w,l);
+        if (result) return result;
+        break;
+    }
+    case UI_WM_ACCESSIBILITY_INVOKE:
+        ui_accessibility_handle_message(h->accessibility,message,w); flush(h); return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT paint; BeginPaint(window,&paint);
@@ -300,6 +317,7 @@ int ui_win32_run(HINSTANCE instance, int show, const UiWindowConfig *config) {
     }
     UnregisterClassW(cls.lpszClassName,instance);
 cleanup:
+    ui_accessibility_destroy(h->accessibility);
     config->ui->measure=NULL; config->ui->measure_user=NULL;
     renderer_dispose(&h->renderer);
     if (h->edit_font) DeleteObject(h->edit_font);
