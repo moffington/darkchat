@@ -44,6 +44,11 @@ int main(void) {
     CHECK(!wcscmp(c->title,L"Manual title"));
     CHECK(chat_delete(chat));
     CHECK(chat_active(chat)->id!=id && chat->conversation_count==1);
+    CHECK(chat_new_conversation(chat)==1);
+    CHECK(chat_append(chat,CHAT_ROLE_USER,L"Remove every conversation")>=0);
+    CHECK(chat_delete_all(chat));
+    CHECK(chat->conversation_count==1 && chat->active==0);
+    CHECK(chat_active(chat)->message_count==0);
     for (int i=0;i<CHAT_MODEL_HISTORY+5;i++) { swprintf(chat->model,CHAT_MODEL_TEXT,L"model/%d",i); chat_remember_model(chat); }
     CHECK(chat->model_history_count==CHAT_MODEL_HISTORY);
     chat_remember_model(chat); CHECK(chat->model_history_count==CHAT_MODEL_HISTORY);

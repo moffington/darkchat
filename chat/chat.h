@@ -87,6 +87,8 @@ const wchar_t *chat_generation_name(ChatGenerationState state);
 void chat_remember_model(Chat *chat);
 bool chat_rename(Chat *chat, const wchar_t *title);
 bool chat_delete(Chat *chat);
+/* Removes every conversation and leaves one fresh empty conversation active. */
+bool chat_delete_all(Chat *chat);
 void chat_clear(Chat *chat);
 /* Replacement actions remove only the latest user turn's response, never
    duplicate its user message. Edit replaces that user text at send time. */

@@ -229,6 +229,14 @@ bool chat_delete(Chat *chat) {
     return true;
 }
 
+bool chat_delete_all(Chat *chat) {
+    if (!chat_active(chat)) return false;
+    memset(chat->conversations, 0, sizeof chat->conversations);
+    chat->conversation_count = 0;
+    chat->active = -1;
+    return chat_new_conversation(chat) >= 0;
+}
+
 void chat_clear(Chat *chat) {
     if (!chat_active(chat)) return;
     ChatConversation *c = &chat->conversations[chat->active];

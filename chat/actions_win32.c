@@ -85,6 +85,7 @@ HMENU chat_actions_menu(void) {
     AppendMenuW(conversation,MF_STRING,ACTION_NEW,L"&New conversation");
     AppendMenuW(conversation,MF_STRING,ACTION_RENAME,L"&Rename...");
     AppendMenuW(conversation,MF_STRING,ACTION_DELETE,L"&Delete...");
+    AppendMenuW(conversation,MF_STRING,ACTION_DELETE_ALL,L"Delete &all...");
     AppendMenuW(conversation,MF_STRING,ACTION_CLEAR,L"&Clear messages...");
     AppendMenuW(response,MF_STRING,ACTION_RETRY,L"&Retry unsuccessful response");
     AppendMenuW(response,MF_STRING,ACTION_REGENERATE,L"Re&generate last response");

@@ -890,10 +890,15 @@ static void action(ChatHost *host, int code) {
     } else if (code==ACTION_RENAME) {
         wchar_t title[CHAT_TITLE_TEXT]; wcscpy(title,c->title);
         if (chat_edit_dialog(host->window,L"Rename conversation",title,CHAT_TITLE_TEXT,false)) chat_rename(chat,title);
-    } else if (code==ACTION_DELETE || code==ACTION_CLEAR) {
-        if (MessageBoxW(host->window,code==ACTION_DELETE ? L"Delete this conversation?" : L"Clear all messages in this conversation?",
+    } else if (code==ACTION_DELETE || code==ACTION_DELETE_ALL || code==ACTION_CLEAR) {
+        const wchar_t *message=code==ACTION_DELETE ? L"Delete this conversation?" :
+            code==ACTION_DELETE_ALL ? L"Delete all conversations? This cannot be undone." :
+            L"Clear all messages in this conversation?";
+        if (MessageBoxW(host->window,message,
             L"DarkChat",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES) return;
-        if (code==ACTION_DELETE) chat_delete(chat); else chat_clear(chat);
+        if (code==ACTION_DELETE) chat_delete(chat);
+        else if (code==ACTION_DELETE_ALL) chat_delete_all(chat);
+        else chat_clear(chat);
         host->editing=false; rich_text_set_text(&host->composer,chat->conversations[chat->active].draft); render_transcript(host);
     } else if (code==ACTION_SYSTEM) {
         wchar_t prompt[CHAT_MESSAGE_TEXT]; wcscpy(prompt,chat->system_prompt);
