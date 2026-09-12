@@ -24,6 +24,13 @@ int main(void) {
     check(active && active->message_count == 1, "welcome message present");
     check(chat_remaining(chat) == CHAT_MAX_MESSAGES - 1, "remaining after welcome");
 
+    ChatGeneration generation;
+    chat_generation_init(&generation);
+    check(generation.reasoning_ms == -1,
+        "generation init marks reasoning duration unavailable");
+    check(!active->messages[0].reasoning[0], "new messages carry no reasoning");
+    check(!active->messages[0].reasoning_open, "new messages start collapsed");
+
     chat_append(chat, CHAT_ROLE_USER, L"Explain native text controls");
     active = chat_active(chat);
     check(active->message_count == 2, "user message appended");
@@ -77,6 +84,22 @@ int main(void) {
     last = &chat_active(spare)->messages[chat_active(spare)->message_count - 1];
     check(wcslen(last->text) == 4, "dangling high surrogate trimmed");
     free(spare);
+
+    /* A normal long response now fits: the old 4,096 bound cancelled it. */
+    Chat *long_chat = (Chat *)calloc(1, sizeof *long_chat);
+    if (!long_chat) return 2;
+    chat_init(long_chat);
+    wchar_t *mid = (wchar_t *)malloc(sizeof(wchar_t) * 12001);
+    if (!mid) return 2;
+    for (size_t i = 0; i < 12000; i++) mid[i] = L'y';
+    mid[12000] = 0;
+    chat_append(long_chat, CHAT_ROLE_USER, L"question");
+    int mid_index = chat_append(long_chat, CHAT_ROLE_ASSISTANT, mid);
+    check(mid_index >= 0 &&
+        wcslen(chat_active(long_chat)->messages[mid_index].text) == 12000,
+        "a 12,000-unit response is preserved past the old 4,096 limit");
+    free(mid);
+    free(long_chat);
 
     /* chat_remaining guards invalid state. */
     chat->active = 99;

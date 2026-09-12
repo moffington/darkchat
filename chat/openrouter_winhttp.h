@@ -2,7 +2,8 @@
 #define DARKCHAT_OPENROUTER_WINHTTP_H
 
 /* Worker-thread OpenRouter streaming client. Each posted event is heap-owned
-   by the UI thread. Generation IDs let the host ignore stale queued deltas. */
+   by the UI thread. Generation IDs let the host ignore stale queued deltas.
+   Answer content and model reasoning arrive as separate event types. */
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -13,7 +14,7 @@
 typedef struct { ChatRole role; const wchar_t *text; } OpenRouterMessage;
 
 typedef enum {
-    OPENROUTER_DELTA, OPENROUTER_DONE, OPENROUTER_ERROR,
+    OPENROUTER_DELTA, OPENROUTER_REASONING, OPENROUTER_DONE, OPENROUTER_ERROR,
     OPENROUTER_CANCELLED, OPENROUTER_INTERRUPTED
 } OpenRouterEventType;
 

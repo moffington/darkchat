@@ -187,7 +187,7 @@ int64_t chat_now(void) {
 void chat_generation_init(ChatGeneration *g) {
     memset(g, 0, sizeof *g);
     g->ttft_ms = g->latency_ms = g->prompt_tokens = g->completion_tokens =
-        g->total_tokens = g->cost = -1;
+        g->total_tokens = g->cost = g->reasoning_ms = -1;
 }
 
 const wchar_t *chat_generation_name(ChatGenerationState state) {

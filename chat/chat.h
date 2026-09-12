@@ -11,7 +11,13 @@
 
 #define CHAT_MAX_CONVERSATIONS 16
 #define CHAT_MAX_MESSAGES 64
-#define CHAT_MESSAGE_TEXT 4096
+/* Interim per-message bound for both the answer and its reasoning: 16K UTF-16
+   code units comfortably fits normal LLM replies while still capping one
+   message. At full capacity the in-memory Chat is ~69 MB. */
+#define CHAT_MESSAGE_TEXT 16384
+/* Separate bound for streamed model reasoning, which never overwrites the
+   answer text and is always optional. */
+#define CHAT_REASONING_TEXT CHAT_MESSAGE_TEXT
 #define CHAT_TITLE_TEXT 64
 #define CHAT_MODEL_TEXT 96
 #define CHAT_STATUS_TEXT 160
@@ -29,6 +35,9 @@ typedef struct {
     int64_t started_at, finished_at, first_token_at;
     /* -1 means unavailable, including usage/cost after cancellation. */
     double ttft_ms, latency_ms, prompt_tokens, completion_tokens, total_tokens, cost;
+    /* Duration of the visible reasoning for this turn in milliseconds, or -1
+       when the turn supplied no reasoning. Persisted with the message. */
+    double reasoning_ms;
 } ChatGeneration;
 
 typedef enum {
@@ -38,6 +47,12 @@ typedef enum {
 typedef struct {
     ChatRole role;
     wchar_t text[CHAT_MESSAGE_TEXT];
+    /* Optional streamed model reasoning for this turn; empty when the provider
+       supplied none. Never fabricated locally. */
+    wchar_t reasoning[CHAT_REASONING_TEXT];
+    /* View state: whether this turn's reasoning viewport is expanded. Owned by
+       the rendered turn; reset with the message, not persisted. */
+    bool reasoning_open;
     int64_t created_at, modified_at;
     ChatGeneration generation;
 } ChatMessage;

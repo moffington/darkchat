@@ -2,7 +2,7 @@
 #include "../chat/openrouter_winhttp.c"
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
-static int deltas, terminal;
+static int deltas, reasons, terminal;
 static OpenRouterEventType outcome;
 static ChatGeneration metadata;
 static int generation;
@@ -11,6 +11,7 @@ static LRESULT CALLBACK test_proc(HWND window,UINT msg,WPARAM w,LPARAM l) {
         OpenRouterEvent *e=(OpenRouterEvent *)l;
         if (e->generation==generation) {
             if (e->type==OPENROUTER_DELTA) { if (e->text && e->text[0]) ++deltas; }
+            else if (e->type==OPENROUTER_REASONING) { if (e->text && e->text[0]) ++reasons; }
             else { ++terminal; outcome=e->type; }
             metadata=e->metadata;
         }
@@ -50,11 +51,25 @@ int main(int argc,char **argv) {
     CHECK(!stream_event(&stream,chunk,strlen(chunk)) && stream.failed && stream.error);
     free(stream.error); stream.error=NULL; stream.failed=false;
     CHECK(!stream_event(&stream,"{bad}",5)); free(stream.error); pump();
+    /* Reasoning is parsed from structured details and compatibility fallbacks;
+       an entry with no displayable text never fabricates one. */
+    stream.error=NULL; stream.failed=false; reasons=0; deltas=0;
+    chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"step one \"}]}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==1);
+    chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.summary\",\"summary\":\"summary\"}]}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==2);
+    chunk="{\"choices\":[{\"delta\":{\"reasoning\":\"plain text\"}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==3);
+    chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"data\":\"opaque\"}]}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==3);
+    chunk="{\"choices\":[{\"delta\":{\"content\":\"answer only\"}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==3 && deltas==1);
     work.model=L"test/model";
     ChatRole roles[]={CHAT_ROLE_SYSTEM,CHAT_ROLE_USER,CHAT_ROLE_ERROR};
     wchar_t *texts[]={L"system",L"question \"quoted\"",L"local error"};
     work.roles=roles; work.texts=texts; work.count=3;
     JsonBuf body; CHECK(build_request(&work,&body)); CHECK(json_validate(body.data));
+    CHECK(strstr(body.data,"\"reasoning\":{\"enabled\":true}")!=NULL);
     char value[128]; CHECK(json_query_string(body.data,"messages[1].content",value,sizeof value));
     CHECK(!json_query_string(body.data,"messages[2].content",value,sizeof value));
     json_buf_free(&body);

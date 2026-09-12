@@ -38,6 +38,17 @@ int main(void) {
     CHECK(!wcscmp(loaded->system_prompt,chat->system_prompt));
     CHECK(loaded->sidebar_width==280 && loaded->model_history_count==1);
     CHECK(!wcscmp(loaded->conversations[0].draft,L"Unsent draft"));
+    /* A message line without the optional reasoning fields (an older version 1
+       snapshot) loads with empty reasoning and unavailable duration. */
+    CHECK(!loaded->conversations[0].messages[1].reasoning[0]);
+    CHECK(loaded->conversations[0].messages[1].generation.reasoning_ms==-1);
+    wcscpy(m->reasoning,L"Checked the options and chose this.");
+    m->generation.reasoning_ms=2500.0;
+    CHECK(storage_save(&store,chat));
+    CHECK(storage_load(&store,loaded)==1);
+    CHECK(!wcscmp(loaded->conversations[0].messages[1].reasoning,
+        L"Checked the options and chose this."));
+    CHECK(loaded->conversations[0].messages[1].generation.reasoning_ms==2500.0);
     m->generation.state=CHAT_GENERATION_COMPLETE;
     CHECK(storage_save(&store,chat));
     CHECK(storage_load(&store,loaded)==1);

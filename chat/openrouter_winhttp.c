@@ -3,6 +3,7 @@
 #include "sse.h"
 #include <winhttp.h>
 #include <process.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -110,7 +111,8 @@ static bool build_request(const OpenRouterWork *work, JsonBuf *body) {
             !json_buf_append_json_string(body, work->texts[i]) ||
             !json_buf_append_raw(body, "}", 1)) return false;
     }
-    return json_buf_append_raw(body, "],\"stream\":true}", 16);
+    return json_buf_append_raw(body,
+        "],\"stream\":true,\"reasoning\":{\"enabled\":true}}", 45);
 }
 
 static wchar_t *build_headers(const char *api_key) {
@@ -265,6 +267,34 @@ static bool stream_event(void *user, const char *data, size_t length) {
     USAGE(prompt_tokens); USAGE(completion_tokens); USAGE(total_tokens); USAGE(cost);
 #undef USAGE
 
+    /* OpenRouter exposes reasoning as structured reasoning_details; a plain
+       `reasoning` string is a compatibility fallback for providers and older
+       payloads. Only emit an event when reasoning text actually arrives. */
+    bool has_reasoning = false;
+    for (int i = 0; i < 3 && !has_reasoning; i++) {
+        char path[64];
+        snprintf(path, sizeof path,
+            "choices[0].delta.reasoning_details[%d].text", i);
+        has_reasoning = json_query_string(json, path, decoded, length + 1) &&
+            decoded[0];
+        if (!has_reasoning) {
+            snprintf(path, sizeof path,
+                "choices[0].delta.reasoning_details[%d].summary", i);
+            has_reasoning = json_query_string(json, path, decoded, length + 1) &&
+                decoded[0];
+        }
+    }
+    if (!has_reasoning)
+        has_reasoning = json_query_string(json, "choices[0].delta.reasoning",
+            decoded, length + 1) && decoded[0];
+    if (has_reasoning) {
+        wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
+        if (!wide || !post_event(stream->work, OPENROUTER_REASONING, wide)) {
+            if (!cancelled(stream->work))
+                stream->error = copy_wide(L"Could not deliver streamed reasoning.");
+            stream->failed = true;
+        }
+    }
     if (json_query_string(json, "choices[0].delta.content", decoded,
         length + 1)) {
         if (decoded[0] && !g->first_token_at) {

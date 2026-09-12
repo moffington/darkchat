@@ -14,6 +14,15 @@
 #ifndef SES_EXTENDBACKCOLOR
 #define SES_EXTENDBACKCOLOR 0x00400000
 #endif
+#ifndef EM_REQUESTRESIZE
+#define EM_REQUESTRESIZE (WM_USER + 81)
+#endif
+#ifndef EN_REQUESTRESIZE
+#define EN_REQUESTRESIZE 0x0701
+#endif
+#ifndef ENM_REQUESTRESIZE
+#define ENM_REQUESTRESIZE 0x00010000
+#endif
 
 static HMODULE rich_library;
 
@@ -40,14 +49,16 @@ void rich_text_theme(RichTextTheme *theme, const UiTheme *ui) {
     theme->code_text = color_of(ui->colors[UI_BRIGHT]);
     theme->link = color_of(ui->colors[UI_ACCENT]);
     theme->composer_background = color_of(ui->colors[UI_TRACK]);
+    theme->reasoning_background = color_of(ui->colors[UI_PANEL]);
     theme->ui_family = ui->font_family;
     theme->mono_family = L"Consolas";
     theme->ui_size = ui->font_size[UI_BODY];
     theme->mono_size = ui->font_size[UI_SMALL] + 1.0f;
+    theme->small_size = ui->font_size[UI_SMALL];
 }
 
 static void apply_format(RichTextControl *control, WPARAM scope, bool bold,
-    bool mono, COLORREF color, bool code) {
+    bool mono, COLORREF color, bool code, float size) {
     const RichTextTheme *theme = &control->theme;
     CHARFORMAT2W format;
     memset(&format, 0, sizeof format);
@@ -56,7 +67,6 @@ static void apply_format(RichTextControl *control, WPARAM scope, bool bold,
     format.dwEffects = bold ? CFE_BOLD : 0;
     format.wWeight = (WORD)(bold ? 700 : 400);
     format.crTextColor = color;
-    float size = mono ? theme->mono_size : theme->ui_size;
     /* yHeight is in twips (1/1440 inch), a physical unit the control already
        converts for the monitor DPI. Express the theme's DIP size as twips
        (1 DIP = 0.75 pt = 15 twips) so native text matches DarkUI at any DPI. */
@@ -75,11 +85,18 @@ static void caret_end(HWND window) {
     SendMessageW(window, EM_SETSEL, (WPARAM)length, (LPARAM)length);
 }
 
-/* Inserts text using the just-established insertion format. */
+/* Inserts text at the caret using an explicit point size. */
+static void run_at(RichTextControl *control, const wchar_t *text, bool bold,
+    bool mono, COLORREF color, bool code, float size) {
+    apply_format(control, SCF_SELECTION, bold, mono, color, code, size);
+    SendMessageW(control->window, EM_REPLACESEL, FALSE, (LPARAM)text);
+}
+
+/* Inserts text at the caret using the default face for its role. */
 static void run(RichTextControl *control, const wchar_t *text, bool bold,
     bool mono, COLORREF color, bool code) {
-    apply_format(control, SCF_SELECTION, bold, mono, color, code);
-    SendMessageW(control->window, EM_REPLACESEL, FALSE, (LPARAM)text);
+    run_at(control, text, bold, mono, color, code,
+        mono ? control->theme.mono_size : control->theme.ui_size);
 }
 
 static LRESULT CALLBACK rich_proc(HWND window, UINT message, WPARAM w,
@@ -88,6 +105,13 @@ static LRESULT CALLBACK rich_proc(HWND window, UINT message, WPARAM w,
         (RichTextControl *)GetWindowLongPtrW(window, GWLP_USERDATA);
     if (!control) return DefWindowProcW(window, message, w, l);
     if (message == WM_GETDLGCODE) return DLGC_WANTALLKEYS | DLGC_WANTCHARS;
+    /* Read-only transcript blocks never consume the wheel: the transcript
+       container decides whether to scroll a reasoning viewport or itself, so
+       the target no longer depends on which control holds focus. */
+    if (message == WM_MOUSEWHEEL && control->readonly) {
+        HWND parent = GetParent(window);
+        if (parent) { SendMessageW(parent, WM_MOUSEWHEEL, w, l); return 0; }
+    }
     if (message == WM_KEYDOWN || message == WM_KEYUP) {
         bool down = message == WM_KEYDOWN;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -105,6 +129,20 @@ static LRESULT CALLBACK rich_proc(HWND window, UINT message, WPARAM w,
         if (w == L'\r' && control->on_submit &&
             !(GetKeyState(VK_SHIFT) & 0x8000)) return 0;
     }
+    if ((message == WM_LBUTTONDOWN || message == WM_LBUTTONUP) &&
+        control->on_line_click && control->readonly) {
+        POINTL point;
+        point.x = (LONG)(short)LOWORD(l);
+        point.y = (LONG)(short)HIWORD(l);
+        LONG character = (LONG)SendMessageW(window, EM_CHARFROMPOS, 0,
+            (LPARAM)&point);
+        int line = 0;
+        if (character >= 0)
+            line = (int)SendMessageW(window, EM_EXLINEFROMCHAR, 0,
+                (LPARAM)character);
+        if (control->on_line_click(control->user, control, line,
+                message == WM_LBUTTONDOWN)) return 0;
+    }
     if (message == WM_KILLFOCUS && control->on_blur) control->on_blur(control->user);
     return CallWindowProcW(control->previous, window, message, w, l);
 }
@@ -118,15 +156,18 @@ static void set_margin(RichTextControl *control, int left, int right) {
 
 static bool create_control(RichTextControl *control, HWND parent, int id,
     const RichTextTheme *theme, float dpi, bool multiline, bool readonly,
-    long limit, const wchar_t *text) {
+    bool scrollable, long limit, COLORREF background, const wchar_t *text) {
     memset(control, 0, sizeof *control);
     control->theme = *theme;
     control->dpi = dpi;
     control->multiline = multiline;
     control->readonly = readonly;
+    control->scrollable = scrollable;
     DWORD style = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS;
-    if (multiline) style |= ES_MULTILINE | ES_WANTRETURN | WS_VSCROLL | ES_AUTOVSCROLL;
-    else style |= ES_AUTOHSCROLL;
+    if (multiline) {
+        style |= ES_MULTILINE | ES_WANTRETURN;
+        if (scrollable) style |= WS_VSCROLL | ES_AUTOVSCROLL;
+    } else style |= ES_AUTOHSCROLL;
     if (readonly) style |= ES_READONLY;
     control->window = CreateWindowExW(0, DARKCHAT_RICH_CLASS, text ? text : L"",
         style, 0, 0, 10, 10, parent, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL),
@@ -135,42 +176,54 @@ static bool create_control(RichTextControl *control, HWND parent, int id,
     SetWindowLongPtrW(control->window, GWLP_USERDATA, (LONG_PTR)control);
     control->previous = (WNDPROC)SetWindowLongPtrW(control->window,
         GWLP_WNDPROC, (LONG_PTR)rich_proc);
-    SendMessageW(control->window, EM_SETBKGNDCOLOR, 0,
-        (LPARAM)(readonly ? theme->background : theme->composer_background));
+    SendMessageW(control->window, EM_SETBKGNDCOLOR, 0, (LPARAM)background);
     SendMessageW(control->window, EM_EXLIMITTEXT, 0, (LPARAM)limit);
     SendMessageW(control->window, EM_AUTOURLDETECT, TRUE, 0);
-    SendMessageW(control->window, EM_SETEVENTMASK, 0, ENM_LINK | ENM_SCROLL);
+    /* Read-only blocks size themselves to their content, so they ask their
+       parent for the required height whenever their text or width changes. */
+    DWORD events = ENM_LINK | ENM_SCROLL;
+    if (readonly && !scrollable) events |= ENM_REQUESTRESIZE;
+    SendMessageW(control->window, EM_SETEVENTMASK, 0, events);
     SendMessageW(control->window, EM_SETEDITSTYLE, SES_EXTENDBACKCOLOR,
         SES_EXTENDBACKCOLOR);
     if (multiline) SendMessageW(control->window, EM_SETTARGETDEVICE, 0, 0);
-    apply_format(control, SCF_DEFAULT, false, false, theme->text, false);
+    apply_format(control, SCF_DEFAULT, false, false, theme->text, false,
+        theme->ui_size);
     set_margin(control, multiline ? 10 : 8, multiline ? 10 : 8);
     return true;
 }
 
-bool rich_text_create_transcript(RichTextControl *control, HWND parent, int id,
+bool rich_text_create_block(RichTextControl *control, HWND parent, int id,
     const RichTextTheme *theme, float dpi) {
-    return create_control(control, parent, id, theme, dpi, true, true,
-        0x7fffffffL, NULL);
+    /* Headroom beyond one message's text so stats/error notes still fit. */
+    return create_control(control, parent, id, theme, dpi, true, true, false,
+        (long)(CHAT_MESSAGE_TEXT + 2048), theme->background, NULL);
+}
+
+bool rich_text_create_viewport(RichTextControl *control, HWND parent, int id,
+    const RichTextTheme *theme, float dpi) {
+    return create_control(control, parent, id, theme, dpi, true, true, true,
+        (long)(CHAT_REASONING_TEXT - 1), theme->reasoning_background, NULL);
 }
 
 bool rich_text_create_composer(RichTextControl *control, HWND parent, int id,
     const RichTextTheme *theme, float dpi) {
     /* Bound input to what the host can read back, so nothing is silently lost. */
-    return create_control(control, parent, id, theme, dpi, true, false,
-        (long)(CHAT_MESSAGE_TEXT - 1), NULL);
+    return create_control(control, parent, id, theme, dpi, true, false, true,
+        (long)(CHAT_MESSAGE_TEXT - 1), theme->composer_background, NULL);
 }
 
 bool rich_text_create_field(RichTextControl *control, HWND parent, int id,
     const RichTextTheme *theme, float dpi, const wchar_t *text) {
-    return create_control(control, parent, id, theme, dpi, false, false,
-        (long)(CHAT_MODEL_TEXT - 1), text);
+    return create_control(control, parent, id, theme, dpi, false, false, false,
+        (long)(CHAT_MODEL_TEXT - 1), theme->composer_background, text);
 }
 
 void rich_text_set_dpi(RichTextControl *control, float dpi) {
     if (!control->window || dpi <= 0) return;
     control->dpi = dpi;
-    apply_format(control, SCF_DEFAULT, false, false, control->theme.text, false);
+    apply_format(control, SCF_DEFAULT, false, false, control->theme.text, false,
+        control->theme.ui_size);
     set_margin(control, control->multiline ? 10 : 8, control->multiline ? 10 : 8);
 }
 
@@ -184,10 +237,6 @@ void rich_text_get_text(const RichTextControl *control, wchar_t *out,
 
 void rich_text_set_text(RichTextControl *control, const wchar_t *text) {
     if (control->window) SetWindowTextW(control->window, text ? text : L"");
-}
-
-void rich_text_select_all(RichTextControl *control) {
-    if (control->window) SendMessageW(control->window, EM_SETSEL, 0, -1);
 }
 
 static void open_link(HWND window, const CHARRANGE *range) {
@@ -225,24 +274,49 @@ void rich_text_scroll_to_end(RichTextControl *control) {
     SendMessageW(control->window, WM_VSCROLL, SB_BOTTOM, 0);
 }
 
-void rich_text_clear(RichTextControl *control) {
-    if (!control->window) return;
-    SendMessageW(control->window, EM_SETREADONLY, FALSE, 0);
-    SetWindowTextW(control->window, L"");
-    SendMessageW(control->window, EM_SETREADONLY,
-        control->readonly ? TRUE : FALSE, 0);
-    control->has_content = false;
-    apply_format(control, SCF_DEFAULT, false, false, control->theme.text, false);
+static const wchar_t *role_label(ChatRole role) {
+    switch (role) {
+    case CHAT_ROLE_USER: return L"You";
+    case CHAT_ROLE_ASSISTANT: return L"Assistant";
+    case CHAT_ROLE_ERROR: return L"Error";
+    default: return L"System";
+    }
 }
 
-/* Appends body text one line at a time, switching monospace styling while a
-   ``` fence is open. Fence lines themselves are hidden. */
-static void append_body(RichTextControl *control, const wchar_t *text,
+static COLORREF role_color(const RichTextTheme *theme, ChatRole role) {
+    switch (role) {
+    case CHAT_ROLE_USER: return theme->header_user;
+    case CHAT_ROLE_ASSISTANT: return theme->header_assistant;
+    case CHAT_ROLE_ERROR: return theme->error;
+    default: return theme->header_system;
+    }
+}
+
+/* Clears the control and leaves it writable with the insertion point at the
+   start, ready for a batch of runs. */
+static void begin_write(RichTextControl *control) {
+    SendMessageW(control->window, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(control->window, EM_SETREADONLY, FALSE, 0);
+    SetWindowTextW(control->window, L"");
+    caret_end(control->window);
+}
+
+static void end_write(RichTextControl *control) {
+    SendMessageW(control->window, EM_SETREADONLY,
+        control->readonly ? TRUE : FALSE, 0);
+    control->has_content = GetWindowTextLengthW(control->window) > 0;
+    SendMessageW(control->window, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(control->window, NULL, NULL, RDW_INVALIDATE);
+}
+
+/* Writes body text one line at a time, switching monospace styling while a
+   ``` fence is open and hiding the fence lines themselves. */
+static void write_lines(RichTextControl *control, const wchar_t *text,
     ChatRole role) {
     const RichTextTheme *theme = &control->theme;
     COLORREF body = role == CHAT_ROLE_ERROR ? theme->error : theme->text;
-    bool code = false;
-    const wchar_t *line = text;
+    bool code = false, first = true;
+    const wchar_t *line = text ? text : L"";
     for (;;) {
         const wchar_t *end = line;
         while (*end && *end != L'\n') ++end;
@@ -252,85 +326,117 @@ static void append_body(RichTextControl *control, const wchar_t *text,
         if (fence) {
             code = !code;
         } else {
-            wchar_t *buffer = (wchar_t *)malloc((length + 2) * sizeof(wchar_t));
+            if (!first) run(control, L"\n", false, false, theme->text, false);
+            wchar_t *buffer = (wchar_t *)malloc((length + 1) * sizeof(wchar_t));
             if (buffer) {
                 if (length) wmemcpy(buffer, line, length);
-                buffer[length] = L'\n';
-                buffer[length + 1] = 0;
-                run(control, buffer, false, code, code ? theme->code_text : body,
-                    code);
+                buffer[length] = 0;
+                run(control, buffer, false, code,
+                    code ? theme->code_text : body, code);
                 free(buffer);
             }
+            first = false;
         }
         if (!*end) break;
         line = end + 1;
     }
 }
 
-void rich_text_append_message(RichTextControl *control, ChatRole role,
-    const wchar_t *text) {
-    if (!control->window) return;
-    HWND window = control->window;
-    bool pinned = rich_text_pinned(control);
+void rich_text_set_head(RichTextControl *control, ChatRole role,
+    const wchar_t *row) {
+    if (!control || !control->window) return;
     const RichTextTheme *theme = &control->theme;
-    const wchar_t *label;
-    COLORREF color;
-    switch (role) {
-    case CHAT_ROLE_USER: label = L"You"; color = theme->header_user; break;
-    case CHAT_ROLE_ASSISTANT: label = L"Assistant"; color = theme->header_assistant; break;
-    case CHAT_ROLE_ERROR: label = L"Error"; color = theme->error; break;
-    default: label = L"System"; color = theme->header_system; break;
+    begin_write(control);
+    run(control, role_label(role), true, false, role_color(theme, role), false);
+    if (row && row[0]) {
+        run(control, L"\n", false, false, theme->text, false);
+        run(control, row, false, false, theme->muted, false);
     }
+    end_write(control);
+}
+
+void rich_text_set_block(RichTextControl *control, ChatRole role,
+    const wchar_t *text) {
+    if (!control || !control->window) return;
+    const RichTextTheme *theme = &control->theme;
+    begin_write(control);
+    run(control, role_label(role), true, false, role_color(theme, role), false);
+    if (text && text[0]) {
+        run(control, L"\n", false, false, theme->text, false);
+        write_lines(control, text, role);
+    }
+    end_write(control);
+}
+
+void rich_text_set_body(RichTextControl *control, ChatRole role,
+    const wchar_t *text) {
+    if (!control || !control->window) return;
+    begin_write(control);
+    write_lines(control, text ? text : L"", role);
+    end_write(control);
+}
+
+void rich_text_append_body(RichTextControl *control, const wchar_t *text) {
+    if (!control || !control->window || !text || !text[0]) return;
+    HWND window = control->window;
+    CHARRANGE selection;
+    SendMessageW(window, EM_EXGETSEL, 0, (LPARAM)&selection);
     SendMessageW(window, WM_SETREDRAW, FALSE, 0);
     SendMessageW(window, EM_SETREADONLY, FALSE, 0);
     caret_end(window);
-    if (control->has_content) run(control, L"\n", false, false, theme->text, false);
-    run(control, label, true, false, color, false);
-    run(control, L"\n", false, false, theme->text, false);
-    append_body(control, text ? text : L"", role);
-    run(control, L"\n", false, false, theme->text, false);
-    SendMessageW(window, EM_SETREADONLY, TRUE, 0);
-    SendMessageW(window, WM_SETREDRAW, TRUE, 0);
+    run(control, text, false, false, control->theme.text, false);
+    SendMessageW(window, EM_SETREADONLY, control->readonly ? TRUE : FALSE, 0);
     control->has_content = true;
-    if (pinned) rich_text_scroll_to_end(control);
-    /* WM_SETREDRAW does not invalidate the control when drawing is restored.
-       Force one paint for the completed batch; otherwise newly inserted text
-       may remain invisible until selection or another input invalidates it. */
-    RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+    /* The transcript owns answer scrolling. Keep the block at its origin and
+       let the host finish sizing/positioning it before the next paint. */
+    SendMessageW(window, EM_EXSETSEL, 0, (LPARAM)&selection);
+    POINT origin = {0, 0};
+    SendMessageW(window, EM_SETSCROLLPOS, 0, (LPARAM)&origin);
+    SendMessageW(window, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(window, NULL, NULL, RDW_INVALIDATE);
 }
 
-void rich_text_begin_stream(RichTextControl *control) {
+void rich_text_set_meta(RichTextControl *control, const wchar_t *text,
+    const wchar_t *error) {
     if (!control || !control->window) return;
-    bool pinned = rich_text_pinned(control);
+    begin_write(control);
+    if (text && text[0])
+        run_at(control, text, false, false, control->theme.muted, false,
+            control->theme.small_size);
+    if (error && error[0]) {
+        if (text && text[0])
+            run_at(control, L"\n", false, false, control->theme.text, false,
+                control->theme.small_size);
+        run_at(control, error, false, false, control->theme.error, false,
+            control->theme.small_size);
+    }
+    end_write(control);
+}
+
+void rich_text_set_reasoning(RichTextControl *control, const wchar_t *text) {
+    if (!control || !control->window) return;
     HWND window = control->window;
     SendMessageW(window, EM_SETREADONLY, FALSE, 0);
+    SetWindowTextW(window, L"");
     caret_end(window);
-    if (control->has_content)
-        run(control, L"\n", false, false, control->theme.text, false);
-    run(control, L"Assistant", true, false,
-        control->theme.header_assistant, false);
-    run(control, L"\n", false, false, control->theme.text, false);
-    SendMessageW(window, EM_SETREADONLY, TRUE, 0);
-    control->has_content = true;
-    if (pinned) rich_text_scroll_to_end(control);
+    run(control, text ? text : L"", false, false, control->theme.muted, false);
+    SendMessageW(window, EM_SETREADONLY, control->readonly ? TRUE : FALSE, 0);
+    control->has_content = text && text[0];
+    rich_text_scroll_to_end(control);
     RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
-void rich_text_append_stream(RichTextControl *control, const wchar_t *text) {
+void rich_text_append_reasoning(RichTextControl *control, const wchar_t *text) {
     if (!control || !control->window || !text || !text[0]) return;
     bool pinned = rich_text_pinned(control);
     HWND window = control->window;
     SendMessageW(window, EM_SETREADONLY, FALSE, 0);
     caret_end(window);
-    run(control, text, false, false, control->theme.text, false);
-    SendMessageW(window, EM_SETREADONLY, TRUE, 0);
+    run(control, text, false, false, control->theme.muted, false);
+    SendMessageW(window, EM_SETREADONLY, control->readonly ? TRUE : FALSE, 0);
+    control->has_content = true;
     if (pinned) rich_text_scroll_to_end(control);
     RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-}
-
-void rich_text_end_stream(RichTextControl *control) {
-    if (!control || !control->window) return;
-    rich_text_append_stream(control, L"\n");
 }
 
 bool rich_text_handle_notify(RichTextControl *control, LPARAM lparam) {

@@ -5,7 +5,10 @@
 #include <string.h>
 #include <math.h>
 
-#define STORAGE_LIMIT (32u * 1024u * 1024u)
+/* Bounds the on-disk snapshot and the buffers used to read it. Sized for a full
+   state at 16K code units per message plus JSON-escaping headroom; the previous
+   32 MB cap would reject a legitimately full snapshot. */
+#define STORAGE_LIMIT (128u * 1024u * 1024u)
 #define FORMAT_VERSION 1
 
 static uint32_t checksum(const char *s, size_t n) {
@@ -94,6 +97,10 @@ static bool encode(const Chat *chat, JsonBuf *b) {
             STR(b, g, actual_model);
             STR(b, g, finish_reason);
             STR(b, g, error);
+            /* Optional, appended last so a turn without reasoning is byte-for-byte
+               the same shape as an older version 1 message line. */
+            if (m->reasoning[0]) string(b, "reasoning", m->reasoning);
+            if (g->reasoning_ms >= 0) number(b, "reasoning_ms", g->reasoning_ms);
             raw(b, "}\n");
         }
     }
@@ -177,6 +184,12 @@ static bool decode(char *data, Chat *chat) {
             READ_STR(g, actual_model);
             READ_STR(g, finish_reason);
             READ_STR(g, error);
+            /* Optional fields: absent in older version 1 snapshots. */
+            if (!get_string(line,"reasoning",m->reasoning,CHAT_REASONING_TEXT))
+                m->reasoning[0]=0;
+            g->reasoning_ms=-1;
+            if (json_query_number(line,"reasoning_ms",&v) && v>=-1)
+                g->reasoning_ms=v;
             if (g->state == CHAT_GENERATION_RUNNING) {
                 g->state = CHAT_GENERATION_INTERRUPTED;
                 /* End time is unknown after a crash; do not invent latency. */

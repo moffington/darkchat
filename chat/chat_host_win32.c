@@ -7,10 +7,24 @@
 #include "../platform/renderer.h"
 #include "../platform/accessibility.h"
 #include <windowsx.h>
+#include <richedit.h>
 #include <dwmapi.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* One rendered transcript turn. Every message owns its own head/body blocks and,
+   when its reasoning is expanded, its own scrolling viewport; no control is
+   shared between turns. The host lays the controls out in content coordinates
+   inside the transcript container and repositions them as the container
+   scrolls, so the whole conversation scrolls as one transcript while an
+   expanded reasoning viewport scrolls independently. */
+typedef struct {
+    RichTextControl head, body, reasoning, meta;
+    bool head_live, body_live, reason_live, meta_live;
+    int y, head_y, reason_y, body_y, meta_y, height;
+    int head_h, reason_h, body_h, meta_h;
+} TurnView;
 
 typedef struct {
     ChatHostConfig config;
@@ -18,7 +32,14 @@ typedef struct {
     UiAccessibility *accessibility;
     HWND window;
     ChatUi chat_ui;
-    RichTextControl transcript, composer, field;
+    RichTextControl composer, field;
+    HWND view;                          /* transcript container child window */
+    TurnView turns[CHAT_MAX_MESSAGES];
+    int turn_count;
+    int view_scroll, view_content, view_page, view_width, view_margin, view_gap;
+    int view_reason_gap, view_meta_gap, view_reason_inset;
+    RichTextControl *measuring;         /* control awaiting EN_REQUESTRESIZE */
+    int measured;
     RichTextTheme rich_theme;
     HBRUSH background;
     float dpi;
@@ -27,7 +48,9 @@ typedef struct {
     UiId accessibility_focus;
     OpenRouterClient client;
     int request_generation, request_conversation, request_message;
-    bool generating, stopping, accepting, stream_visible, dirty, editing;
+    bool generating, stopping, accepting, dirty, editing, content_started;
+    bool reasoning_streaming;
+    ULONGLONG reasoning_started_tick;
     ChatStorage storage;
     ULONGLONG started_tick;
     ChatGenerationState stop_state;
@@ -40,6 +63,15 @@ static void perform_send(ChatHost *host);
 static void action(ChatHost *host, int code);
 static bool save(ChatHost *host);
 static void capture_settings(ChatHost *host);
+static bool surface_key(void *user, WPARAM key, bool shift, bool control,
+    bool down);
+static int measure_control(ChatHost *host, RichTextControl *control, int width);
+static void refresh_turn(ChatHost *host, int index);
+static void layout_from(ChatHost *host, int start, bool follow);
+static void position_turns(ChatHost *host, bool follow);
+static bool view_pinned(ChatHost *host);
+static bool turn_row_click(void *user, RichTextControl *control, int line,
+    bool down);
 
 static int px(ChatHost *host, float dips) {
     return (int)lroundf(dips * host->dpi / 96.0f);
@@ -56,6 +88,10 @@ static void place(ChatHost *host, RichTextControl *control, UiId id,
     float inset) {
     UiNode *item = ui_node(host->config.ui, id);
     if (!item || !control->window) return;
+    if (!ui_visible(host->config.ui, id)) {
+        ShowWindow(control->window, SW_HIDE);
+        return;
+    }
     UiRect area = ui_intersect(item->rect, item->clip);
     area.x += inset;
     area.y += inset;
@@ -86,12 +122,32 @@ static void place_field(ChatHost *host) {
     ShowWindow(host->field.window, SW_SHOWNOACTIVATE);
 }
 
+/* Sizes the transcript container over its placeholder, inside the drawn border. */
+static void place_container(ChatHost *host) {
+    UiNode *item = ui_node(host->config.ui, host->chat_ui.transcript);
+    if (!item || !host->view) return;
+    if (!ui_visible(host->config.ui, host->chat_ui.transcript)) {
+        ShowWindow(host->view, SW_HIDE);
+        return;
+    }
+    UiRect area = ui_intersect(item->rect, item->clip);
+    area.x += 1;
+    area.y += 1;
+    area.w -= 2;
+    area.h -= 2;
+    if (area.w <= 2 || area.h <= 2) { ShowWindow(host->view, SW_HIDE); return; }
+    int x = px(host, area.x), y = px(host, area.y);
+    SetWindowPos(host->view, NULL, x, y, px(host, area.x + area.w) - x,
+        px(host, area.y + area.h) - y, SWP_NOZORDER | SWP_NOACTIVATE);
+    ShowWindow(host->view, SW_SHOWNOACTIVATE);
+}
+
 static void layout(ChatHost *host) {
     if (host->minimized) return;
     RECT client;
     GetClientRect(host->window, &client);
     chat_ui_resize(&host->chat_ui, dip(host, client.right), dip(host, client.bottom));
-    place(host, &host->transcript, host->chat_ui.transcript, 1.0f);
+    place_container(host);
     place(host, &host->composer, host->chat_ui.composer, 1.0f);
     place_field(host);
 }
@@ -132,53 +188,269 @@ static void field_blur(void *user) { sync_model((ChatHost *)user); }
 
 
 static void focus_surface(ChatHost *host, bool reverse) {
-    HWND order[3] = { host->field.window, host->composer.window,
-        host->transcript.window };
+    /* The composer and model field remain the two explicit Tab stops; Tab from
+       a transcript turn returns to the field. */
+    HWND order[2] = { host->field.window, host->composer.window };
     HWND focus = GetFocus();
     int current = -1;
-    for (int i = 0; i < 3; i++) if (order[i] == focus) current = i;
-    int next = current < 0 ? 0 : (current + (reverse ? -1 : 1) + 3) % 3;
+    for (int i = 0; i < 2; i++) if (order[i] == focus) current = i;
+    int next = current < 0 ? (reverse ? 1 : 0) : (current + (reverse ? -1 : 1) + 2) % 2;
     SetFocus(order[next]);
 }
 
-static void render_transcript(ChatHost *host) {
-    host->stream_visible = false;
-    rich_text_clear(&host->transcript);
-    const ChatConversation *c = chat_active(host->config.chat);
-    if (!c) return;
-    for (int i = 0; i < c->message_count; i++) {
-        const ChatMessage *m = &c->messages[i];
-        const ChatGeneration *g = &m->generation;
-        if (host->generating && i == host->request_message &&
-            host->config.chat->active == host->request_conversation) {
-            rich_text_begin_stream(&host->transcript);
-            rich_text_append_stream(&host->transcript, m->text);
-            host->stream_visible = true;
-        } else {
-            rich_text_append_message(&host->transcript, m->role, m->text);
-            if (m->role == CHAT_ROLE_ASSISTANT && g->state != CHAT_GENERATION_NONE) {
-                wchar_t info[768], usage[160], timing[120], cost[64], ttft[40], latency[40];
-                if (g->total_tokens >= 0)
-                    swprintf(usage,160,L"Tokens: %.0f input / %.0f output / %.0f total",
-                        g->prompt_tokens,g->completion_tokens,g->total_tokens);
-                else wcscpy(usage,L"Tokens: unavailable");
-                if (g->ttft_ms >= 0) swprintf(ttft,40,L"%.0f ms",g->ttft_ms);
-                else wcscpy(ttft,L"unavailable");
-                if (g->latency_ms >= 0) swprintf(latency,40,L"%.0f ms",g->latency_ms);
-                else wcscpy(latency,L"unavailable");
-                swprintf(timing,120,L"TTFT: %ls | Latency: %ls",ttft,latency);
-                if (g->cost >= 0) swprintf(cost,64,L"Cost: $%.8f",g->cost);
-                else wcscpy(cost,L"Cost: unavailable");
-                swprintf(info,768,L"%ls | Requested: %ls | Actual: %ls\n%ls | %ls | %ls\nFinish: %ls",
-                    chat_generation_name(g->state),g->requested_model,
-                    g->actual_model[0] ? g->actual_model : L"unavailable",timing,usage,cost,
-                    g->finish_reason[0] ? g->finish_reason : L"unavailable");
-                rich_text_append_message(&host->transcript,CHAT_ROLE_SYSTEM,info);
-                if (g->error[0]) rich_text_append_message(&host->transcript,CHAT_ROLE_ERROR,g->error);
-            }
+/* ---- Per-turn transcript views ----------------------------------------- */
+
+/* Writes a grouped integer (e.g. 1,365) into out. */
+static void group_integer(wchar_t *out, size_t cap, double value) {
+    wchar_t digits[32];
+    swprintf(digits, 32, L"%.0f", value);
+    size_t length = wcslen(digits);
+    size_t commas = length > 1 ? (length - 1) / 3 : 0;
+    size_t needed = length + commas;
+    if (needed + 1 > cap) {
+        wcsncpy(out, digits, cap - 1);
+        out[cap - 1] = 0;
+        return;
+    }
+    out[needed] = 0;
+    size_t write = needed;
+    int count = 0;
+    for (size_t read = length; read > 0; ) {
+        out[--write] = digits[--read];
+        if (++count == 3 && read > 0) { count = 0; out[--write] = L','; }
+    }
+}
+
+/* Appends a " · " separated segment, skipping empty ones. */
+static void stats_append(wchar_t *out, size_t cap, const wchar_t *part) {
+    if (!part || !part[0]) return;
+    size_t used = wcslen(out);
+    if (used) {
+        if (used + 3 >= cap) return;
+        wmemcpy(out + used, L" \u00b7 ", 3);
+        used += 3;
+        out[used] = 0;
+    }
+    size_t room = cap - 1 - used;
+    size_t length = wcslen(part);
+    if (length > room) length = room;
+    wmemcpy(out + used, part, length);
+    out[used + length] = 0;
+}
+
+/* Compact two-line footer: "Complete · TTFT 18.0s · 19.4s · 44 in / 1,365 out
+   · $0.00165" followed by the model, deduplicated when requested == actual.
+   Normal "stop" is omitted; unusual finish reasons are surfaced. */
+static void format_stats(const ChatGeneration *g, wchar_t *info, size_t cap) {
+    info[0] = 0;
+    wchar_t piece[192];
+    stats_append(info, cap, chat_generation_name(g->state));
+    if (g->ttft_ms >= 0) {
+        swprintf(piece, 192, L"TTFT %.1fs", g->ttft_ms / 1000.0);
+        stats_append(info, cap, piece);
+    }
+    if (g->latency_ms >= 0) {
+        swprintf(piece, 192, L"%.1fs", g->latency_ms / 1000.0);
+        stats_append(info, cap, piece);
+    }
+    if (g->total_tokens >= 0 && g->prompt_tokens >= 0 &&
+        g->completion_tokens >= 0) {
+        wchar_t in[32], out[32];
+        group_integer(in, 32, g->prompt_tokens);
+        group_integer(out, 32, g->completion_tokens);
+        swprintf(piece, 192, L"%ls in / %ls out", in, out);
+        stats_append(info, cap, piece);
+    }
+    if (g->cost >= 0) {
+        swprintf(piece, 192, L"$%.5f", g->cost);
+        stats_append(info, cap, piece);
+    }
+    if (g->finish_reason[0] && wcscmp(g->finish_reason, L"stop") != 0) {
+        swprintf(piece, 192, L"finish: %ls", g->finish_reason);
+        stats_append(info, cap, piece);
+    }
+    const wchar_t *requested = g->requested_model[0] ? g->requested_model : NULL;
+    const wchar_t *actual = g->actual_model[0] ? g->actual_model : NULL;
+    wchar_t model[224];
+    model[0] = 0;
+    if (requested && actual) {
+        if (!wcscmp(requested, actual)) wcsncpy(model, actual, 223);
+        else swprintf(model, 224, L"%ls \u2192 %ls", requested, actual);
+    } else if (actual) {
+        wcsncpy(model, actual, 223);
+    } else if (requested) {
+        wcsncpy(model, requested, 223);
+    }
+    model[223] = 0;
+    if (model[0]) {
+        size_t used = wcslen(info);
+        if (used + 2 < cap) {
+            info[used++] = L'\n';
+            info[used] = 0;
+            size_t room = cap - 1 - used;
+            size_t length = wcslen(model);
+            if (length > room) length = room;
+            wmemcpy(info + used, model, length);
+            info[used + length] = 0;
         }
     }
-    rich_text_scroll_to_end(&host->transcript);
+}
+
+/* Required client height of a block at the given width. The control sends
+   EN_REQUESTRESIZE to its parent (the transcript container), which records the
+   value in host->measured while host->measuring points at it. */
+static int measure_control(ChatHost *host, RichTextControl *control, int width) {
+    if (!control->window || width <= 0) return 0;
+    RECT bounds;
+    GetWindowRect(control->window, &bounds);
+    /* Keep the current height while measuring. Shrinking a live block to a
+       probe height on every token scrolls/clips its text before layout. */
+    if (bounds.right - bounds.left != width)
+        SetWindowPos(control->window, NULL, 0, 0, width,
+            bounds.bottom - bounds.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREDRAW);
+    host->measuring = control;
+    host->measured = 0;
+    SendMessageW(control->window, EM_REQUESTRESIZE, 0, 0);
+    host->measuring = NULL;
+    int height = host->measured;
+    if (height <= 0) {
+        int lines = (int)SendMessageW(control->window, EM_GETLINECOUNT, 0, 0);
+        if (lines < 1) lines = 1;
+        height = lines * px(host, host->rich_theme.ui_size * 1.45f);
+    }
+    int minimum = px(host, 8);
+    return height < minimum ? minimum : height;
+}
+
+static void ensure_control(ChatHost *host, RichTextControl *control, int id,
+    bool viewport) {
+    if (control->window || !host->view) return;
+    if (viewport)
+        rich_text_create_viewport(control, host->view, id, &host->rich_theme,
+            host->dpi);
+    else
+        rich_text_create_block(control, host->view, id, &host->rich_theme,
+            host->dpi);
+    if (!control->window) return;
+    control->on_key = surface_key;
+    control->user = host;
+}
+
+static void hide_turn(ChatHost *host, int index) {
+    TurnView *turn = &host->turns[index];
+    if (turn->head.window) ShowWindow(turn->head.window, SW_HIDE);
+    if (turn->body.window) ShowWindow(turn->body.window, SW_HIDE);
+    if (turn->reasoning.window) ShowWindow(turn->reasoning.window, SW_HIDE);
+    if (turn->meta.window) ShowWindow(turn->meta.window, SW_HIDE);
+    turn->head_live = turn->body_live = turn->reason_live = turn->meta_live = false;
+}
+
+static void reasoning_row_text(ChatHost *host, const ChatMessage *m,
+    bool running, wchar_t *out, size_t capacity) {
+    bool pending = running && !host->content_started;
+    if (pending) {
+        wcsncpy(out, L"Thinking\u2026 \u2304", capacity - 1);
+        out[capacity - 1] = 0;
+    } else {
+        double ms = m->generation.reasoning_ms;
+        if (ms < 0) ms = 0;
+        swprintf(out, capacity, L"\u2304 Thought for %.1fs", ms / 1000.0);
+    }
+}
+
+
+/* Builds the controls for one turn from its message. Doing this per turn is
+   what makes each turn own its reasoning affordance and viewport: no control
+   is shared, and none follows a "latest" message. */
+static void prepare_turn(ChatHost *host, int index, ChatMessage *m,
+    bool running) {
+    TurnView *turn = &host->turns[index];
+    bool assistant = m->role == CHAT_ROLE_ASSISTANT;
+    bool has_row = false;
+    if (assistant) {
+        ensure_control(host, &turn->head, 100 + index * 4, false);
+        if (turn->head.window) {
+            turn->head.on_line_click = turn_row_click;
+            turn->head_live = true;
+        }
+        bool pending = running && !host->content_started;
+        has_row = pending || m->reasoning[0];
+        wchar_t row[48];
+        row[0] = 0;
+        if (has_row) reasoning_row_text(host, m, running, row, 48);
+        rich_text_set_head(&turn->head, m->role, has_row ? row : NULL);
+
+        ensure_control(host, &turn->body, 100 + index * 4 + 1, false);
+        if (turn->body.window) turn->body_live = true;
+        rich_text_set_body(&turn->body, m->role, m->text);
+
+        /* Metadata is a terminal-state footer, so a running turn never mixes
+           stats into the streaming answer. */
+        bool terminal = m->generation.state != CHAT_GENERATION_NONE &&
+            m->generation.state != CHAT_GENERATION_RUNNING;
+        if (terminal) {
+            ensure_control(host, &turn->meta, 100 + index * 4 + 3, false);
+            if (turn->meta.window) {
+                wchar_t info[768];
+                format_stats(&m->generation, info, 768);
+                rich_text_set_meta(&turn->meta, info, m->generation.error);
+                turn->meta_live = true;
+            }
+        } else {
+            if (turn->meta.window) ShowWindow(turn->meta.window, SW_HIDE);
+            turn->meta_live = false;
+        }
+    } else {
+        if (turn->head.window) ShowWindow(turn->head.window, SW_HIDE);
+        turn->head_live = false;
+        ensure_control(host, &turn->body, 100 + index * 4 + 1, false);
+        if (turn->body.window) turn->body_live = true;
+        rich_text_set_block(&turn->body, m->role, m->text);
+        if (turn->meta.window) ShowWindow(turn->meta.window, SW_HIDE);
+        turn->meta_live = false;
+    }
+
+    bool open = assistant && has_row && m->reasoning_open;
+    if (open) {
+        bool created = turn->reasoning.window == NULL;
+        ensure_control(host, &turn->reasoning, 100 + index * 4 + 2, true);
+        if (turn->reasoning.window) {
+            turn->reason_live = true;
+            /* A live stream is appended to, never rebuilt, so its viewport
+               keeps its own scroll position. A freshly created viewport always
+               loads the reasoning accumulated so far. */
+            bool streaming = running &&
+                host->request_conversation == host->config.chat->active &&
+                host->reasoning_streaming;
+            if (created || !streaming)
+                rich_text_set_reasoning(&turn->reasoning, m->reasoning);
+        }
+    } else {
+        if (turn->reasoning.window) ShowWindow(turn->reasoning.window, SW_HIDE);
+        turn->reason_live = false;
+    }
+}
+
+/* Whole-row click on one turn's reasoning row: toggles only that turn, whose
+   expansion is stored on its own message. */
+static bool turn_row_click(void *user, RichTextControl *control, int line,
+    bool down) {
+    ChatHost *host = (ChatHost *)user;
+    Chat *chat = host->config.chat;
+    for (int i = 0; i < host->turn_count; i++) {
+        if (&host->turns[i].head != control) continue;
+        if (line != 1) return false;          /* only the reasoning row line */
+        if (!down &&
+            chat->active >= 0 && chat->active < chat->conversation_count &&
+            i < chat->conversations[chat->active].message_count) {
+            ChatMessage *m = &chat->conversations[chat->active].messages[i];
+            m->reasoning_open = !m->reasoning_open;
+            refresh_turn(host, i);
+        }
+        return true;
+    }
+    return false;
 }
 
 static void set_status(ChatHost *host, const wchar_t *text) {
@@ -197,6 +469,158 @@ static bool save(ChatHost *host) {
     if (storage_save(&host->storage,host->config.chat)) { host->dirty=false; return true; }
     set_status(host,L"Save failed: changes are in memory; check storage permissions or disk space.");
     return false;
+}
+
+/* Ends the visible-reasoning window and records its duration once. */
+static void end_reasoning(ChatHost *host) {
+    if (!host->reasoning_streaming) return;
+    ChatMessage *m = pending(host);
+    if (m->generation.reasoning_ms < 0)
+        m->generation.reasoning_ms =
+            (double)(GetTickCount64() - host->reasoning_started_tick);
+    host->reasoning_streaming = false;
+}
+
+static bool view_pinned(ChatHost *host) {
+    int maximum = host->view_content - host->view_page;
+    if (maximum < 0) maximum = 0;
+    return host->view_scroll >= maximum - 1;
+}
+
+static void place_turn_control(ChatHost *host, RichTextControl *control,
+    bool live, int y, int height, int scroll, int page, int inset) {
+    if (!control->window) return;
+    if (!live) { ShowWindow(control->window, SW_HIDE); return; }
+    int top = y - scroll;
+    if (top >= page || top + height <= 0) {
+        ShowWindow(control->window, SW_HIDE);
+        return;
+    }
+    SetWindowPos(control->window, NULL, host->view_margin + inset, top,
+        host->view_width - 2 * inset, height,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+    ShowWindow(control->window, SW_SHOWNOACTIVATE);
+}
+
+/* Re-clamps the scroll and moves every turn control to its scrolled position.
+   Only turns that intersect the viewport are shown, so a turn above or below
+   the visible transcript is clipped away rather than drawn over other UI. */
+static void position_turns(ChatHost *host, bool follow) {
+    if (!host->view) return;
+    RECT client;
+    GetClientRect(host->view, &client);
+    int page = client.bottom;
+    int maximum = host->view_content - page;
+    if (maximum < 0) maximum = 0;
+    if (follow) host->view_scroll = maximum;
+    else if (host->view_scroll > maximum) host->view_scroll = maximum;
+    else if (host->view_scroll < 0) host->view_scroll = 0;
+    host->view_page = page;
+    SCROLLINFO info;
+    memset(&info, 0, sizeof info);
+    info.cbSize = sizeof info;
+    info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
+    info.nMin = 0;
+    info.nMax = host->view_content > 0 ? host->view_content - 1 : 0;
+    info.nPage = (UINT)page;
+    info.nPos = host->view_scroll;
+    SetScrollInfo(host->view, SB_VERT, &info, TRUE);
+    for (int i = 0; i < host->turn_count; i++) {
+        TurnView *turn = &host->turns[i];
+        place_turn_control(host, &turn->head, turn->head_live, turn->head_y,
+            turn->head_h, host->view_scroll, page, 0);
+        place_turn_control(host, &turn->reasoning, turn->reason_live,
+            turn->reason_y, turn->reason_h, host->view_scroll, page,
+            host->view_reason_inset);
+        place_turn_control(host, &turn->body, turn->body_live, turn->body_y,
+            turn->body_h, host->view_scroll, page, 0);
+        place_turn_control(host, &turn->meta, turn->meta_live, turn->meta_y,
+            turn->meta_h, host->view_scroll, page, 0);
+    }
+    /* Moving children does not repaint the background they uncover; the
+       container paints every gap and margin itself. */
+    InvalidateRect(host->view, NULL, FALSE);
+}
+
+/* Measures and stacks turns from start onward, then repositions them. */
+static void layout_from(ChatHost *host, int start, bool follow) {
+    if (!host->view) return;
+    if (start < 0 || start >= host->turn_count) start = 0;
+    int y = start == 0 ? host->view_margin : host->turns[start].y;
+    for (int i = start; i < host->turn_count; i++) {
+        TurnView *turn = &host->turns[i];
+        turn->y = y;
+        int cursor = y;
+        if (turn->head_live) {
+            turn->head_h = measure_control(host, &turn->head, host->view_width);
+            turn->head_y = cursor;
+            cursor += turn->head_h;
+        }
+        if (turn->reason_live) {
+            cursor += host->view_reason_gap;
+            turn->reason_h = px(host, 150);
+            turn->reason_y = cursor;
+            cursor += turn->reason_h + host->view_reason_gap;
+        }
+        if (turn->body_live) {
+            turn->body_h = measure_control(host, &turn->body, host->view_width);
+            turn->body_y = cursor;
+            cursor += turn->body_h;
+        }
+        if (turn->meta_live) {
+            cursor += host->view_meta_gap;
+            turn->meta_h = measure_control(host, &turn->meta, host->view_width);
+            turn->meta_y = cursor;
+            cursor += turn->meta_h;
+        }
+        turn->height = cursor - y;
+        y = cursor + host->view_gap;
+    }
+    host->view_content = y;
+    position_turns(host, follow);
+}
+
+/* Rebuilds one turn only, so toggling a row never disturbs another turn's
+   viewport or the transcript scroll. */
+static void refresh_turn(ChatHost *host, int index) {
+    Chat *chat = host->config.chat;
+    if (chat->active < 0 || chat->active >= chat->conversation_count) return;
+    ChatConversation *conversation = &chat->conversations[chat->active];
+    if (index < 0 || index >= conversation->message_count) return;
+    bool pinned = view_pinned(host);
+    bool running = host->generating &&
+        host->request_conversation == chat->active &&
+        index == host->request_message;
+    prepare_turn(host, index, &conversation->messages[index], running);
+    layout_from(host, index, pinned);
+}
+
+static void render_transcript(ChatHost *host) {
+    if (!host->view) return;
+    Chat *chat = host->config.chat;
+    RECT client;
+    GetClientRect(host->view, &client);
+    host->view_margin = px(host, 12);
+    host->view_gap = px(host, 10);
+    host->view_reason_gap = px(host, 8);
+    host->view_meta_gap = px(host, 8);
+    host->view_reason_inset = px(host, 10);
+    host->view_width = client.right - 2 * host->view_margin;
+    int minimum = px(host, 40);
+    if (host->view_width < minimum) host->view_width = minimum;
+    bool pinned = view_pinned(host);
+    const ChatConversation *c = chat_active(chat);
+    int count = c ? c->message_count : 0;
+    for (int i = 0; i < count; i++) {
+        bool running = host->generating &&
+            host->request_conversation == chat->active &&
+            i == host->request_message;
+        prepare_turn(host, i, &chat->conversations[chat->active].messages[i],
+            running);
+    }
+    for (int i = count; i < CHAT_MAX_MESSAGES; i++) hide_turn(host, i);
+    host->turn_count = count;
+    layout_from(host, 0, pinned);
 }
 
 static void capture_settings(ChatHost *host) {
@@ -233,6 +657,9 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     if (index<0) { set_status(host,L"Action unavailable: check the latest turn and conversation capacity."); return; }
     host->request_conversation=chat->active; host->request_message=index;
     host->started_tick=GetTickCount64();
+    /* The running turn shows a temporary pending row; it is removed once answer
+       text begins if the provider never supplies reasoning. */
+    host->reasoning_streaming=false; host->content_started=false;
     ChatMessage *m=pending(host);
     if (mode==CHAT_SEND) { rich_text_set_text(&host->composer,L""); chat->conversations[chat->active].draft[0]=0; }
     if (host->editing && mode!=CHAT_SEND) {
@@ -289,7 +716,16 @@ static void perform_send(ChatHost *host) {
 static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
     if (!event->text || !event->text[0] || !host->accepting) return;
     ChatMessage *m=pending(host);
+    double keep_reasoning_ms=m->generation.reasoning_ms;
     m->generation=event->metadata; m->generation.state=CHAT_GENERATION_RUNNING;
+    m->generation.reasoning_ms=keep_reasoning_ms;
+    /* The first answer token ends any reasoning window. If no reasoning ever
+       arrived, the pending Thinking row is removed from that turn. */
+    bool first=!host->content_started;
+    if (first) {
+        host->content_started=true;
+        end_reasoning(host);
+    }
     size_t length=wcslen(m->text), total=wcslen(event->text), incoming=total;
     if (incoming>CHAT_MESSAGE_TEXT-1-length) incoming=CHAT_MESSAGE_TEXT-1-length;
     if (incoming && event->text[incoming-1]>=0xd800 && event->text[incoming-1]<=0xdbff) --incoming;
@@ -297,8 +733,18 @@ static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
     m->modified_at=chat_now();
     host->config.chat->conversations[host->request_conversation].modified_at=m->modified_at;
     host->dirty=true;
-    if (host->stream_visible && host->request_conversation==host->config.chat->active) {
-        event->text[incoming]=0; rich_text_append_stream(&host->transcript,event->text);
+    event->text[incoming]=0;
+    if (incoming>0 && host->request_conversation==host->config.chat->active) {
+        int index=host->request_message;
+        TurnView *turn=&host->turns[index];
+        if (first) {
+            /* Rebuilds this turn's body and refreshes/removes its row. */
+            refresh_turn(host,index);
+        } else if (turn->body_live && turn->body.window) {
+            bool pinned=view_pinned(host);
+            rich_text_append_body(&turn->body,event->text);
+            layout_from(host,index,pinned);
+        }
     }
     if (incoming<total) {
         host->stop_state=CHAT_GENERATION_INTERRUPTED;
@@ -309,10 +755,42 @@ static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
     }
 }
 
+static void append_reasoning_delta(ChatHost *host, OpenRouterEvent *event) {
+    if (!event->text || !event->text[0] || !host->accepting) return;
+    ChatMessage *m=pending(host);
+    m->generation=event->metadata; m->generation.state=CHAT_GENERATION_RUNNING;
+    size_t length=wcslen(m->reasoning), total=wcslen(event->text), incoming=total;
+    if (incoming>CHAT_REASONING_TEXT-1-length) incoming=CHAT_REASONING_TEXT-1-length;
+    if (incoming && event->text[incoming-1]>=0xd800 && event->text[incoming-1]<=0xdbff) --incoming;
+    if (incoming) {
+        wmemcpy(m->reasoning+length,event->text,incoming);
+        m->reasoning[length+incoming]=0;
+        event->text[incoming]=0;
+        if (host->request_conversation==host->config.chat->active) {
+            TurnView *turn=&host->turns[host->request_message];
+            if (m->reasoning_open && !turn->reason_live)
+                refresh_turn(host,host->request_message);
+            else if (m->reasoning_open && turn->reason_live &&
+                turn->reasoning.window)
+                rich_text_append_reasoning(&turn->reasoning,event->text);
+        }
+    }
+    m->modified_at=chat_now();
+    host->config.chat->conversations[host->request_conversation].modified_at=m->modified_at;
+    host->dirty=true;
+    if (!host->reasoning_streaming) {
+        host->reasoning_streaming=true;
+        host->reasoning_started_tick=GetTickCount64();
+    }
+}
+
 static void finish_request(ChatHost *host, OpenRouterEvent *event) {
+    end_reasoning(host);
+    double reasoning_ms=pending(host)->generation.reasoning_ms;
     openrouter_complete(&host->client,event->generation);
     ChatMessage *m=pending(host);
     m->generation=event->metadata;
+    m->generation.reasoning_ms=reasoning_ms;
     ChatGeneration *g=&m->generation;
     g->state=host->stopping ? host->stop_state : event->type==OPENROUTER_DONE ?
         CHAT_GENERATION_COMPLETE : event->type==OPENROUTER_CANCELLED ?
@@ -338,6 +816,7 @@ static void handle_event(ChatHost *host, OpenRouterEvent *event) {
     if (!event) return;
     if (event->generation==host->request_generation && host->generating) {
         if (event->type==OPENROUTER_DELTA) append_stream_delta(host,event);
+        else if (event->type==OPENROUTER_REASONING) append_reasoning_delta(host,event);
         else finish_request(host,event);
     }
     openrouter_event_free(event);
@@ -379,7 +858,23 @@ static void action(ChatHost *host, int code) {
         }
         return;
     }
-    if (code==ACTION_SELECTION) { SendMessageW(host->transcript.window,WM_COPY,0,0); return; }
+    if (code==ACTION_SELECTION) {
+        /* Copy whichever turn viewport/block currently holds a selection. */
+        for (int i=0;i<host->turn_count;i++) {
+            RichTextControl *controls[3]={&host->turns[i].head,&host->turns[i].body,&host->turns[i].reasoning};
+            for (int k=0;k<3;k++) {
+                if (!controls[k]->window) continue;
+                CHARRANGE selection; memset(&selection,0,sizeof selection);
+                SendMessageW(controls[k]->window,EM_EXGETSEL,0,(LPARAM)&selection);
+                if (selection.cpMax>selection.cpMin) {
+                    SendMessageW(controls[k]->window,WM_COPY,0,0);
+                    set_status(host,L"Transcript selection copied");
+                    return;
+                }
+            }
+        }
+        return;
+    }
     if (code==ACTION_NEW) { command(host,CHAT_COMMAND_NEW_CONVERSATION,-1); return; }
     if (host->generating) { set_status(host,L"Stop generation before changing history or settings."); return; }
     capture_settings(host);
@@ -471,6 +966,16 @@ static bool key_from_win32(WPARAM key, UiKey *out) {
 static void wheel(ChatHost *host, WPARAM w, LPARAM l) {
     Ui *u = host->config.ui;
     POINT point = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+    /* Route the wheel to the transcript container when the pointer is over it,
+       even if a different child (e.g. the composer) holds focus. */
+    if (host->view) {
+        RECT bounds;
+        GetWindowRect(host->view, &bounds);
+        if (PtInRect(&bounds, point)) {
+            SendMessageW(host->view, WM_MOUSEWHEEL, w, l);
+            return;
+        }
+    }
     ScreenToClient(host->window, &point);
     UINT lines = 3;
     SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
@@ -485,6 +990,133 @@ static void host_event(void *user, Ui *ui, UiEvent event) {
     (void)ui;
     ChatHost *host = (ChatHost *)user;
     chat_ui_event(&host->chat_ui, host->config.ui, event);
+}
+
+/* True for any child that keeps the window active while it holds focus. */
+static bool owns_child_window(ChatHost *host, HWND window) {
+    if (window == host->composer.window || window == host->field.window)
+        return true;
+    for (int i = 0; i < CHAT_MAX_MESSAGES; i++) {
+        TurnView *turn = &host->turns[i];
+        if (window == turn->head.window || window == turn->body.window ||
+            window == turn->reasoning.window || window == turn->meta.window)
+            return true;
+    }
+    return false;
+}
+
+/* Transcript container: owns the single outer scroll for the whole
+   conversation and repositions each turn's controls as it scrolls. Its
+   WS_CLIPCHILDREN style clips turns that scroll out of view so they never draw
+   over the composer or toolbar. */
+static LRESULT CALLBACK view_proc(HWND window, UINT message, WPARAM w,
+    LPARAM l) {
+    ChatHost *host = (ChatHost *)GetWindowLongPtrW(window, GWLP_USERDATA);
+    if (message == WM_NCCREATE) {
+        host = ((CREATESTRUCTW *)l)->lpCreateParams;
+        SetWindowLongPtrW(window, GWLP_USERDATA, (LONG_PTR)host);
+    }
+    if (!host) return DefWindowProcW(window, message, w, l);
+    switch (message) {
+    case WM_ERASEBKGND: {
+        RECT bounds;
+        GetClientRect(window, &bounds);
+        FillRect((HDC)w, &bounds, host->background);
+        return 1;
+    }
+    case WM_SIZE:
+        render_transcript(host);
+        return 0;
+    case WM_VSCROLL: {
+        SCROLLINFO info;
+        memset(&info, 0, sizeof info);
+        info.cbSize = sizeof info;
+        info.fMask = SIF_ALL;
+        GetScrollInfo(window, SB_VERT, &info);
+        int position = info.nPos;
+        switch (LOWORD(w)) {
+        case SB_LINEUP: position -= px(host, 28); break;
+        case SB_LINEDOWN: position += px(host, 28); break;
+        case SB_PAGEUP: position -= (int)info.nPage; break;
+        case SB_PAGEDOWN: position += (int)info.nPage; break;
+        case SB_THUMBTRACK: case SB_THUMBPOSITION: position = info.nTrackPos; break;
+        case SB_TOP: position = info.nMin; break;
+        case SB_BOTTOM: position = info.nMax; break;
+        default: return 0;
+        }
+        int maximum = host->view_content - host->view_page;
+        if (maximum < 0) maximum = 0;
+        if (position < 0) position = 0;
+        if (position > maximum) position = maximum;
+        host->view_scroll = position;
+        position_turns(host, false);
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        int delta = GET_WHEEL_DELTA_WPARAM(w);
+        /* An expanded reasoning viewport scrolls itself first; once it reaches
+           an end the transcript scrolls, so chaining feels natural and the
+           target no longer depends on which control holds focus. */
+        POINT point = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        ScreenToClient(window, &point);
+        HWND child = ChildWindowFromPointEx(window, point,
+            CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
+        if (child && child != window && delta) {
+            for (int i = 0; i < host->turn_count; i++) {
+                if (host->turns[i].reasoning.window != child) continue;
+                SCROLLINFO inner;
+                memset(&inner, 0, sizeof inner);
+                inner.cbSize = sizeof inner;
+                inner.fMask = SIF_ALL;
+                GetScrollInfo(child, SB_VERT, &inner);
+                int inner_max = inner.nMax - (int)inner.nPage + 1;
+                if (inner_max < 0) inner_max = 0;
+                bool can = delta > 0 ? inner.nPos > 0 : inner.nPos < inner_max;
+                if (can) {
+                    UINT lines = 3;
+                    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+                    int code = lines == WHEEL_PAGESCROLL
+                        ? (delta > 0 ? SB_PAGEUP : SB_PAGEDOWN)
+                        : (delta > 0 ? SB_LINEUP : SB_LINEDOWN);
+                    SendMessageW(child, WM_VSCROLL, MAKEWPARAM(code, 0), 0);
+                    return 0;
+                }
+                break;
+            }
+        }
+        UINT lines = 3;
+        SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+        int step = lines == WHEEL_PAGESCROLL ? host->view_page
+                                             : (int)lines * px(host, 28);
+        int position = host->view_scroll - delta / WHEEL_DELTA * step;
+        int maximum = host->view_content - host->view_page;
+        if (maximum < 0) maximum = 0;
+        if (position < 0) position = 0;
+        if (position > maximum) position = maximum;
+        host->view_scroll = position;
+        position_turns(host, false);
+        return 0;
+    }
+    case WM_NOTIFY: {
+        NMHDR *header = (NMHDR *)l;
+        if (header->code == EN_REQUESTRESIZE) {
+            RichTextControl *control = (RichTextControl *)GetWindowLongPtrW(
+                header->hwndFrom, GWLP_USERDATA);
+            if (control && control == host->measuring) {
+                const RECT *required = &((REQRESIZE *)l)->rc;
+                host->measured = required->bottom - required->top;
+            }
+            return 0;
+        }
+        RichTextControl *control = (RichTextControl *)GetWindowLongPtrW(
+            header->hwndFrom, GWLP_USERDATA);
+        if (control && rich_text_handle_notify(control, l)) return 0;
+        break;
+    }
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, w, l);
 }
 
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
@@ -504,12 +1136,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         host->renderer.dpi = host->dpi;
         if (!rich_text_library_open()) return -1;
         rich_text_theme(&host->rich_theme, &u->theme);
-        if (!rich_text_create_transcript(&host->transcript, window, 1,
-            &host->rich_theme, host->dpi)) return -1;
         if (!rich_text_create_composer(&host->composer, window, 2,
             &host->rich_theme, host->dpi)) return -1;
         if (!rich_text_create_field(&host->field, window, 3, &host->rich_theme,
             host->dpi, host->config.chat->model)) return -1;
+        host->view = CreateWindowExW(0, L"DarkChat.Transcript", L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
+            0, 0, 10, 10, window, NULL, GetModuleHandleW(NULL), host);
+        if (!host->view) return -1;
         host->composer.on_submit = composer_submit;
         host->composer.on_key = surface_key;
         host->composer.user = host;
@@ -517,8 +1151,6 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         host->field.on_key = surface_key;
         host->field.on_blur = field_blur;
         host->field.user = host;
-        host->transcript.on_key = surface_key;
-        host->transcript.user = host;
         openrouter_init(&host->client, window, CHAT_WM_OPENROUTER_EVENT);
         if (!ui_accessible_name(u, u->root)[0])
             ui_set_accessible_name(u, u->root, host->config.title);
@@ -594,13 +1226,6 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         }
         if (w == 1) { KillTimer(window, 1); InvalidateRect(window, NULL, FALSE); }
         return 0;
-    case WM_NOTIFY: {
-        NMHDR *header = (NMHDR *)l;
-        if (host->transcript.window &&
-            header->hwndFrom == host->transcript.window &&
-            rich_text_handle_notify(&host->transcript, l)) return 0;
-        break;
-    }
     case WM_SIZE:
         host->minimized = w == SIZE_MINIMIZED;
         if (!host->minimized) {
@@ -617,7 +1242,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         RECT *r = (RECT *)l;
         rich_text_set_dpi(&host->field, host->dpi);
         rich_text_set_dpi(&host->composer, host->dpi);
-        rich_text_set_dpi(&host->transcript, host->dpi);
+        for (int i = 0; i < CHAT_MAX_MESSAGES; i++) {
+            TurnView *turn = &host->turns[i];
+            if (turn->head.window) rich_text_set_dpi(&turn->head, host->dpi);
+            if (turn->body.window) rich_text_set_dpi(&turn->body, host->dpi);
+            if (turn->reasoning.window)
+                rich_text_set_dpi(&turn->reasoning, host->dpi);
+            if (turn->meta.window) rich_text_set_dpi(&turn->meta, host->dpi);
+        }
         renderer_resize(&host->renderer, 0, 0, host->dpi);
         ui_invalidate(u, true);
         SetWindowPos(window, NULL, r->left, r->top, r->right - r->left,
@@ -679,9 +1311,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
     case WM_CHAR: return 0;
     case WM_SETFOCUS: ui_set_active(u, true); flush(host); return 0;
     case WM_KILLFOCUS:
-        if ((HWND)w != host->field.window &&
-            (HWND)w != host->composer.window &&
-            (HWND)w != host->transcript.window) {
+        if (!owns_child_window(host, (HWND)w)) {
             ui_set_active(u, false);
             flush(host);
         }
@@ -771,6 +1401,13 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
     cls.hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512));
     cls.lpszClassName = L"DarkChat.Window";
     if (!RegisterClassExW(&cls)) goto cleanup;
+    WNDCLASSEXW view_cls = { 0 };
+    view_cls.cbSize = sizeof view_cls;
+    view_cls.lpfnWndProc = view_proc;
+    view_cls.hInstance = instance;
+    view_cls.hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512));
+    view_cls.lpszClassName = L"DarkChat.Transcript";
+    if (!RegisterClassExW(&view_cls)) goto cleanup;
     RECT bounds = { 0, 0, px(host, (float)config->chat->window_width),
         px(host, (float)config->chat->window_height) };
     AdjustWindowRectExForDpi(&bounds, WS_OVERLAPPEDWINDOW, FALSE, 0,
@@ -799,6 +1436,7 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
         if (IsWindow(window)) DestroyWindow(window);
     }
     UnregisterClassW(cls.lpszClassName, instance);
+    UnregisterClassW(view_cls.lpszClassName, instance);
 cleanup:
     /* Never exit under a running worker: it still owns its request snapshot. */
     openrouter_shutdown(&host->client);
