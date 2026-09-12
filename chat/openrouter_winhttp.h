@@ -14,13 +14,14 @@ typedef struct { ChatRole role; const wchar_t *text; } OpenRouterMessage;
 
 typedef enum {
     OPENROUTER_DELTA, OPENROUTER_DONE, OPENROUTER_ERROR,
-    OPENROUTER_CANCELLED
+    OPENROUTER_CANCELLED, OPENROUTER_INTERRUPTED
 } OpenRouterEventType;
 
 typedef struct {
     int generation;
     OpenRouterEventType type;
     wchar_t *text;
+    ChatGeneration metadata;
 } OpenRouterEvent;
 
 typedef struct OpenRouterClient {

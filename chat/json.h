@@ -38,4 +38,7 @@ bool json_query_string(const char *json, const char *path, char *out,
    UTF-16 string. Invalid bytes become U+FFFD. NULL on allocation failure. */
 wchar_t *json_utf8_to_utf16(const char *utf8, size_t length);
 
+bool json_validate(const char *json);
+bool json_query_number(const char *json, const char *path, double *out);
+
 #endif

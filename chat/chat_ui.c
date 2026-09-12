@@ -83,7 +83,8 @@ bool chat_ui_init(ChatUi *chat_ui, Ui *ui, Chat *chat) {
     node(chat_ui, body)->style.gap = 0;
 
     UiId sidebar = add(chat_ui, body, UI_COLUMN, L"");
-    width(chat_ui, sidebar, 232);
+    chat_ui->sidebar = sidebar;
+    width(chat_ui, sidebar, (float)chat->sidebar_width);
     node(chat_ui, sidebar)->style.height = ui_flex(1);
     node(chat_ui, sidebar)->style.padding = 14;
     node(chat_ui, sidebar)->style.gap = 8;
@@ -139,6 +140,7 @@ bool chat_ui_init(ChatUi *chat_ui, Ui *ui, Chat *chat) {
 
 void chat_ui_sync(ChatUi *chat_ui) {
     Chat *chat = chat_ui->chat;
+    width(chat_ui, chat_ui->sidebar, (float)chat->sidebar_width);
     const ChatConversation *active = chat_active(chat);
     ui_set_text(chat_ui->ui, chat_ui->heading,
         active ? active->title : L"DarkChat");

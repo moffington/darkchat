@@ -1,5 +1,6 @@
 #include "chat.h"
 #include <string.h>
+#include <time.h>
 
 static const wchar_t *const welcome =
     L"Welcome to DarkChat.\n\n"
@@ -41,6 +42,11 @@ void chat_init(Chat *chat) {
     memset(chat, 0, sizeof *chat);
     wcsncpy(chat->model, L"openai/gpt-4o-mini", CHAT_MODEL_TEXT - 1);
     chat->model[CHAT_MODEL_TEXT - 1] = 0;
+    chat->next_id = (uint64_t)chat_now();
+    chat->sidebar_width = 232;
+    chat->window_width = 1100;
+    chat->window_height = 720;
+    chat->window_x = chat->window_y = -32000;
     chat->active = 0;
     chat_new_conversation(chat);
     chat_append(chat, CHAT_ROLE_ASSISTANT, welcome);
@@ -52,6 +58,8 @@ int chat_new_conversation(Chat *chat) {
     ChatConversation *conversation = &chat->conversations[index];
     memset(conversation, 0, sizeof *conversation);
     swprintf(conversation->title, CHAT_TITLE_TEXT, L"Conversation %d", index + 1);
+    conversation->id = ++chat->next_id;
+    conversation->created_at = conversation->modified_at = chat_now();
     chat->active = index;
     wcsncpy(chat->status, L"New conversation", CHAT_STATUS_TEXT - 1);
     chat->status[CHAT_STATUS_TEXT - 1] = 0;
@@ -61,7 +69,7 @@ int chat_new_conversation(Chat *chat) {
 bool chat_select_conversation(Chat *chat, int index) {
     if (index < 0 || index >= chat->conversation_count) return false;
     chat->active = index;
-    swprintf(chat->status, CHAT_STATUS_TEXT, L"Opened %s",
+    swprintf(chat->status, CHAT_STATUS_TEXT, L"Opened %ls",
         chat->conversations[index].title);
     return true;
 }
@@ -85,6 +93,10 @@ int chat_append_at(Chat *chat, int conversation_index, ChatRole role,
     ChatConversation *conversation = &chat->conversations[conversation_index];
     if (conversation->message_count >= CHAT_MAX_MESSAGES) return -1;
     ChatMessage *message = &conversation->messages[conversation->message_count];
+    memset(message, 0, sizeof *message);
+    chat_generation_init(&message->generation);
+    message->created_at = message->modified_at = chat_now();
+    conversation->modified_at = message->modified_at;
     message->role = role;
     size_t length = text ? wcslen(text) : 0;
     if (length >= CHAT_MESSAGE_TEXT) length = CHAT_MESSAGE_TEXT - 1;
@@ -97,7 +109,7 @@ int chat_append_at(Chat *chat, int conversation_index, ChatRole role,
         bool first = true;
         for (int i = 0; i < index; i++)
             if (conversation->messages[i].role == CHAT_ROLE_USER) first = false;
-        if (first && message->text[0]) {
+        if (first && !conversation->renamed && message->text[0]) {
             wchar_t derived[CHAT_TITLE_TEXT];
             first_line(derived, CHAT_TITLE_TEXT, message->text, 40);
             if (derived[0]) {
@@ -165,5 +177,107 @@ void chat_fake_reply(Chat *chat, const wchar_t *prompt, wchar_t *out,
         break;
     }
     swprintf(chat->status, CHAT_STATUS_TEXT, L"Offline reply %u generated", reply);
+}
+
+
+int64_t chat_now(void) {
+    return (int64_t)time(NULL) * 1000;
+}
+
+void chat_generation_init(ChatGeneration *g) {
+    memset(g, 0, sizeof *g);
+    g->ttft_ms = g->latency_ms = g->prompt_tokens = g->completion_tokens =
+        g->total_tokens = g->cost = -1;
+}
+
+const wchar_t *chat_generation_name(ChatGenerationState state) {
+    static const wchar_t *names[] = {L"Local", L"Generating", L"Complete",
+        L"Cancelled", L"Interrupted", L"Failed"};
+    return state >= 0 && state <= CHAT_GENERATION_FAILED ? names[state] : L"Unknown";
+}
+
+void chat_remember_model(Chat *chat) {
+    int found = chat->model_history_count;
+    for (int i = 0; i < chat->model_history_count; i++)
+        if (!wcscmp(chat->model_history[i], chat->model)) { found = i; break; }
+    if (found == CHAT_MODEL_HISTORY) --found;
+    for (int i = found; i > 0; --i)
+        wcscpy(chat->model_history[i], chat->model_history[i - 1]);
+    wcscpy(chat->model_history[0], chat->model);
+    if (chat->model_history_count < CHAT_MODEL_HISTORY && found == chat->model_history_count)
+        ++chat->model_history_count;
+}
+
+bool chat_rename(Chat *chat, const wchar_t *title) {
+    if (!chat_active(chat) || !title || !title[0] || wcslen(title) >= CHAT_TITLE_TEXT) return false;
+    ChatConversation *c = &chat->conversations[chat->active];
+    wcscpy(c->title, title);
+    c->renamed = true;
+    c->modified_at = chat_now();
+    return true;
+}
+
+bool chat_delete(Chat *chat) {
+    if (!chat_active(chat)) return false;
+    int index = chat->active;
+    --chat->conversation_count;
+    memmove(&chat->conversations[index], &chat->conversations[index + 1],
+        (chat->conversation_count - index) * sizeof(ChatConversation));
+    memset(&chat->conversations[chat->conversation_count], 0, sizeof(ChatConversation));
+    if (!chat->conversation_count) chat_new_conversation(chat);
+    else if (index >= chat->conversation_count) chat->active = chat->conversation_count - 1;
+    return true;
+}
+
+void chat_clear(Chat *chat) {
+    if (!chat_active(chat)) return;
+    ChatConversation *c = &chat->conversations[chat->active];
+    memset(c->messages, 0, sizeof c->messages);
+    c->message_count = 0;
+    c->draft[0] = 0;
+    c->modified_at = chat_now();
+}
+
+int chat_latest_user(const ChatConversation *c) {
+    if (c) for (int i = c->message_count - 1; i >= 0; --i)
+        if (c->messages[i].role == CHAT_ROLE_USER) return i;
+    return -1;
+}
+
+bool chat_history_message(const ChatMessage *m) {
+    return m->role != CHAT_ROLE_ERROR &&
+        (m->role != CHAT_ROLE_ASSISTANT || m->generation.state == CHAT_GENERATION_COMPLETE);
+}
+
+int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt) {
+    if (!chat_active(chat)) return -1;
+    ChatConversation *c = &chat->conversations[chat->active];
+    for (int i = 0; i < c->message_count; i++)
+        if (c->messages[i].generation.state == CHAT_GENERATION_RUNNING) return -1;
+    int user = chat_latest_user(c);
+    if (mode == CHAT_SEND) {
+        if (!prompt || !prompt[0] || wcslen(prompt) >= CHAT_MESSAGE_TEXT || chat_remaining(chat) < 2) return -1;
+        user = chat_append(chat, CHAT_ROLE_USER, prompt);
+    } else {
+        if (user < 0 || user + 1 >= CHAT_MAX_MESSAGES) return -1;
+        if (mode == CHAT_RETRY && c->message_count > user + 1 &&
+            c->messages[user + 1].generation.state != CHAT_GENERATION_FAILED &&
+            c->messages[user + 1].generation.state != CHAT_GENERATION_CANCELLED &&
+            c->messages[user + 1].generation.state != CHAT_GENERATION_INTERRUPTED) return -1;
+        if (mode == CHAT_EDIT_RESEND) {
+            if (!prompt || !prompt[0] || wcslen(prompt) >= CHAT_MESSAGE_TEXT) return -1;
+            wcscpy(c->messages[user].text, prompt);
+            c->messages[user].modified_at = chat_now();
+        }
+        memset(&c->messages[user + 1], 0, (c->message_count - user - 1) * sizeof(ChatMessage));
+        c->message_count = user + 1;
+    }
+    int index = chat_append(chat, CHAT_ROLE_ASSISTANT, L"");
+    ChatGeneration *g = &c->messages[index].generation;
+    g->state = CHAT_GENERATION_RUNNING;
+    g->started_at = chat_now();
+    wcscpy(g->requested_model, chat->model);
+    chat_remember_model(chat);
+    return index;
 }
 

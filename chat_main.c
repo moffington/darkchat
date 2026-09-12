@@ -11,6 +11,11 @@ static void load_api_key(void) {
     wchar_t wide[4096];
     wide[0] = 0;
     DWORD length = GetEnvironmentVariableW(L"OPENROUTER_API_KEY", wide, 4096);
+    if (!length) {
+        DWORD bytes=sizeof wide;
+        if (RegGetValueW(HKEY_CURRENT_USER,L"Environment",L"OPENROUTER_API_KEY",
+            RRF_RT_REG_SZ,NULL,wide,&bytes)==ERROR_SUCCESS) length=(DWORD)wcslen(wide);
+    }
     if (length > 0 && length < 4096)
         WideCharToMultiByte(CP_UTF8, 0, wide, -1, api_key, (int)sizeof api_key,
             NULL, NULL);

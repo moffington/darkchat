@@ -23,7 +23,7 @@ typedef struct {
     UiId root, heading, model, new_conversation, list, transcript, composer, send,
         status;
     UiId conversations[CHAT_MAX_CONVERSATIONS];
-    UiId spacer;
+    UiId spacer, sidebar;
     ChatCommandFn command;
     void *command_user;
 } ChatUi;

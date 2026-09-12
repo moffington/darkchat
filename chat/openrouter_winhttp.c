@@ -21,6 +21,8 @@ typedef struct {
     ChatRole *roles;
     wchar_t **texts;
     int count;
+    ChatGeneration metadata;
+    ULONGLONG started_tick;
 } OpenRouterWork;
 
 typedef struct { char *data; size_t length, capacity; } Response;
@@ -35,7 +37,7 @@ typedef struct {
     bool done, failed;
     wchar_t *error;
 } Stream;
-typedef enum { REQUEST_DONE, REQUEST_ERROR, REQUEST_CANCELLED } RequestOutcome;
+typedef enum { REQUEST_DONE, REQUEST_ERROR, REQUEST_CANCELLED, REQUEST_INTERRUPTED } RequestOutcome;
 
 static wchar_t *copy_wide(const wchar_t *text) {
     if (!text) return NULL;
@@ -74,6 +76,7 @@ static bool post_event(OpenRouterWork *work, OpenRouterEventType type,
     event->generation = work->generation;
     event->type = type;
     event->text = owned_text;
+    event->metadata = work->metadata;
     if (!PostMessageW(work->notify, work->message, (WPARAM)work->generation,
         (LPARAM)event)) {
         openrouter_event_free(event);
@@ -215,7 +218,7 @@ static wchar_t *http_error(DWORD status, const char *body) {
     }
     wchar_t composed[512];
     if (detail) {
-        _snwprintf(composed, 512, L"OpenRouter returned HTTP %lu: %s",
+        _snwprintf(composed, 512, L"OpenRouter returned HTTP %lu: %ls",
             (unsigned long)status, detail);
         free(detail);
     } else {
@@ -242,15 +245,40 @@ static bool stream_event(void *user, const char *data, size_t length) {
         return false;
     }
     memcpy(json, data, length); json[length] = 0;
+    if (!json_validate(json)) {
+        free(json); free(decoded);
+        stream->error = copy_wide(L"Malformed JSON in stream.");
+        stream->failed = true;
+        return false;
+    }
+    ChatGeneration *g = &stream->work->metadata;
+    if (json_query_string(json, "model", decoded, length + 1)) {
+        wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
+        if (wide) { wcsncpy(g->actual_model, wide, CHAT_MODEL_TEXT - 1); free(wide); }
+    }
+    if (json_query_string(json, "choices[0].finish_reason", decoded, length + 1)) {
+        wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
+        if (wide) { wcsncpy(g->finish_reason, wide, 63); free(wide); }
+    }
+    double value;
+#define USAGE(field) if (json_query_number(json, "usage." #field, &value) && value >= 0) g->field = value
+    USAGE(prompt_tokens); USAGE(completion_tokens); USAGE(total_tokens); USAGE(cost);
+#undef USAGE
+
     if (json_query_string(json, "choices[0].delta.content", decoded,
         length + 1)) {
+        if (decoded[0] && !g->first_token_at) {
+            g->first_token_at = chat_now();
+            g->ttft_ms = (double)(GetTickCount64() - stream->work->started_tick);
+        }
         wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
         if (!wide || !post_event(stream->work, OPENROUTER_DELTA, wide)) {
             if (!cancelled(stream->work))
                 stream->error = copy_wide(L"Could not deliver streamed text.");
             stream->failed = true;
         }
-    } else if (json_query_string(json, "error.message", decoded, length + 1)) {
+    }
+    if (json_query_string(json, "error.message", decoded, length + 1)) {
         stream->error = json_utf8_to_utf16(decoded, strlen(decoded));
         stream->failed = true;
     }
@@ -380,6 +408,7 @@ static RequestOutcome perform(OpenRouterWork *work, wchar_t **error) {
         goto cleanup;
     }
     if (!stream.done) {
+        outcome = REQUEST_INTERRUPTED;
         *error = copy_wide(L"The stream ended before OpenRouter sent [DONE].");
         goto cleanup;
     }
@@ -390,6 +419,7 @@ network_or_cancel:
     goto network_error;
 network_error:
     if (cancelled(work)) goto was_cancelled;
+    if (work->metadata.first_token_at) outcome = REQUEST_INTERRUPTED;
     {
         wchar_t text[160];
         swprintf(text, 160, L"Network request failed (WinHTTP error %lu).",
@@ -422,7 +452,7 @@ static void free_work(OpenRouterWork *work) {
         free(work->api_key);
     }
     free(work->model);
-    for (int i = 0; i < work->count; i++) free(work->texts[i]);
+    if (work->texts) for (int i = 0; i < work->count; i++) free(work->texts[i]);
     free(work->texts); free(work->roles); free(work);
 }
 
@@ -431,7 +461,10 @@ static unsigned __stdcall worker(void *parameter) {
     wchar_t *error = NULL;
     RequestOutcome outcome = perform(work, &error);
     OpenRouterEventType type = outcome == REQUEST_DONE ? OPENROUTER_DONE :
-        outcome == REQUEST_CANCELLED ? OPENROUTER_CANCELLED : OPENROUTER_ERROR;
+        outcome == REQUEST_CANCELLED ? OPENROUTER_CANCELLED :
+        outcome == REQUEST_INTERRUPTED ? OPENROUTER_INTERRUPTED : OPENROUTER_ERROR;
+    work->metadata.finished_at = chat_now();
+    work->metadata.latency_ms = (double)(GetTickCount64() - work->started_tick);
     post_event(work, type, error);
     free_work(work);
     return 0;
@@ -446,13 +479,17 @@ int openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
     InterlockedExchange(&client->cancelled_generation, 0);
     OpenRouterWork *work = (OpenRouterWork *)calloc(1, sizeof *work);
     if (!work) return 0;
+    chat_generation_init(&work->metadata);
+    work->metadata.started_at = chat_now();
+    work->started_tick = GetTickCount64();
+    wcsncpy(work->metadata.requested_model, model, CHAT_MODEL_TEXT - 1);
     work->generation = (int)generation;
     work->notify = client->notify;
     work->message = client->message;
     work->client = client;
     work->count = count;
     size_t key_length = strlen(api_key_utf8);
-    work->api_key = (char *)malloc(key_length + 1);
+    work->api_key = (char *)calloc(key_length + 1, 1);
     work->model = copy_wide(model);
     work->roles = (ChatRole *)malloc((count ? count : 1) * sizeof *work->roles);
     work->texts = (wchar_t **)calloc(count ? count : 1, sizeof *work->texts);

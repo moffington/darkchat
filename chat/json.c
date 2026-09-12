@@ -1,5 +1,7 @@
 #include "json.h"
 #include <stdint.h>
+#include <math.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -251,14 +253,44 @@ const char *json_decode_string(const char *json, char *out, size_t capacity) {
 /* --- Structure skipping -------------------------------------------------- */
 
 static const char *skip_string(const char *p) {
-    ++p;  /* opening quote */
-    for (;;) {
-        char c = *p;
-        if (!c) return NULL;
-        if (c == '\\') { if (!p[1]) return NULL; p += 2; continue; }
-        if (c == '"') return p + 1;
+    ++p;
+    while (*p) {
+        if ((unsigned char)*p < 0x20) return NULL;
+        if (*p == '"') return p + 1;
+        if (*p == '\\') {
+            ++p;
+            if (!*p) return NULL;
+            if (*p == 'u') {
+                if (hex4(p + 1) < 0) return NULL;
+                p += 5;
+                continue;
+            }
+            if (!strchr("\"\\/bfnrt", *p)) return NULL;
+        }
         ++p;
     }
+    return NULL;
+}
+
+static const char *skip_number(const char *p) {
+    if (*p == '-') ++p;
+    if (*p == '0') ++p;
+    else {
+        if (*p < '1' || *p > '9') return NULL;
+        while (*p >= '0' && *p <= '9') ++p;
+    }
+    if (*p == '.') {
+        ++p;
+        if (*p < '0' || *p > '9') return NULL;
+        while (*p >= '0' && *p <= '9') ++p;
+    }
+    if (*p == 'e' || *p == 'E') {
+        ++p;
+        if (*p == '+' || *p == '-') ++p;
+        if (*p < '0' || *p > '9') return NULL;
+        while (*p >= '0' && *p <= '9') ++p;
+    }
+    return p;
 }
 
 static const char *skip_value(const char *p, int depth);
@@ -296,12 +328,7 @@ static const char *skip_value(const char *p, int depth) {
     case 'f': return strncmp(p, "false", 5) == 0 ? p + 5 : NULL;
     case 'n': return strncmp(p, "null", 4) == 0 ? p + 4 : NULL;
     default:
-        if (*p == '-' || (*p >= '0' && *p <= '9')) {
-            while (*p == '-' || *p == '+' || *p == '.' || *p == 'e' ||
-                *p == 'E' || (*p >= '0' && *p <= '9')) ++p;
-            return p;
-        }
-        return NULL;
+        return skip_number(p);
     }
 }
 
@@ -396,4 +423,30 @@ bool json_query_string(const char *json, const char *path, char *out,
         p = skip_ws(p);
     }
     return *p == '"' && json_decode_string(p, out, capacity) != NULL;
+}
+
+bool json_validate(const char *json) {
+    if (!json) return false;
+    const char *end = skip_value(json, 0);
+    return end && !*skip_ws(end);
+}
+
+bool json_query_number(const char *json, const char *path, double *out) {
+    if (!json || !path || !out) return false;
+    const char *p = skip_ws(json), *cursor = path;
+    while (*cursor) {
+        char name[128]; int index;
+        if (!next_segment(&cursor, name, sizeof name, &index)) return false;
+        p = navigate(p, name, index);
+        if (!p) return false;
+        p = skip_ws(p);
+    }
+    const char *end = skip_number(p);
+    if (!end || (*end && !strchr(",}] \t\r\n", *end))) return false;
+    char *parsed;
+    errno = 0;
+    double value = strtod(p, &parsed);
+    if (errno || parsed != end || !isfinite(value)) return false;
+    *out = value;
+    return true;
 }

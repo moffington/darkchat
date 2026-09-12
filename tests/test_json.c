@@ -162,6 +162,15 @@ static void test_utf16_conversion(void) {
 }
 
 int main(void) {
+    double value;
+    check(json_validate("{\"n\":-1.25e+2,\"s\":\"\\uD83D\\uDE80\"}"), "strict document validates");
+    check(!json_validate("{\"n\":01}") && !json_validate("{\"n\":1e}") &&
+        !json_validate("{\"n\":1,}") && !json_validate("{} trailing"), "malformed numbers and trailing data rejected");
+    check(!json_validate("{\"s\":\"\\q\"}") && !json_validate("{\"s\":\"a\nb\"}"), "invalid string escapes and controls rejected");
+    check(json_query_number("{\"usage\":{\"cost\":0.000012}}","usage.cost",&value) &&
+        value==0.000012, "nested fractional cost decoded");
+    check(!json_query_number("{\"n\":null}","n",&value) &&
+        !json_query_number("{\"n\":1e9999}","n",&value), "unknown and overflowing numbers rejected");
     test_round_trip();
     test_escapes();
     test_queries();
