@@ -320,7 +320,7 @@ static void write_lines(RichTextControl *control, const wchar_t *text,
     const wchar_t *line = text ? text : L"";
     for (;;) {
         const wchar_t *end = line;
-        while (*end && *end != L'\n') ++end;
+        while (*end && *end != L'\n' && *end != L'\r') ++end;
         size_t length = (size_t)(end - line);
         bool fence = length >= 3 && line[0] == L'`' && line[1] == L'`' &&
             line[2] == L'`';
@@ -339,7 +339,11 @@ static void write_lines(RichTextControl *control, const wchar_t *text,
             first = false;
         }
         if (!*end) break;
+        /* GetWindowTextW returns composer paragraphs as CRLF. Treat the pair
+           as one logical break; passing the retained CR and an inserted LF to
+           Rich Edit makes each character render as its own paragraph. */
         line = end + 1;
+        if (*end == L'\r' && *line == L'\n') ++line;
     }
 }
 

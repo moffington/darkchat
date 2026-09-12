@@ -226,6 +226,15 @@ int main(void) {
     CHECK(wcslen(chat_message_text(pending(h)))==40000);
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
+    /* Native composer text uses CRLF. The transcript must treat that pair as
+       one break instead of rendering CR and LF as separate paragraphs. */
+    { RichTextControl probe;
+      CHECK(rich_text_create_block(&probe,window,899,&h->rich_theme,96));
+      SetWindowPos(probe.window,NULL,0,0,600,200,
+          SWP_NOZORDER|SWP_NOACTIVATE);
+      rich_text_set_body(&probe,CHAT_ROLE_USER,L"one\r\n\r\ntwo");
+      CHECK(SendMessageW(probe.window,EM_GETLINECOUNT,0,0)==3);
+      DestroyWindow(probe.window); }
     /* Reasoning may legitimately be much longer than the final answer. It no
        longer disappears at the answer-sized 16K boundary. */
     begin_regenerate(h);
@@ -240,6 +249,14 @@ int main(void) {
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"Answer after long reasoning"));
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
+    /* Composer text comes back as CRLF; rendering must not count CR and LF as
+       separate paragraph breaks. */
+    { RichTextControl probe;
+      CHECK(rich_text_create_block(&probe,window,899,&h->rich_theme,96));
+      SetWindowPos(probe.window,NULL,0,0,500,200,SWP_NOZORDER|SWP_NOACTIVATE);
+      rich_text_set_body(&probe,CHAT_ROLE_USER,L"one\r\n\r\ntwo");
+      CHECK(SendMessageW(probe.window,EM_GETLINECOUNT,0,0)==3);
+      DestroyWindow(probe.window); }
     /* Reasoning-to-answer streaming keeps geometry stable across repeated
        layouts, follows only at the bottom, and never scrolls inside a body. */
     begin_regenerate(h);
