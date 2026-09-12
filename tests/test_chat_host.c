@@ -214,16 +214,30 @@ int main(void) {
     CHECK(h->turn_count==4);
     { wchar_t text[128]; reasoning_text(h,second,text,128);
       CHECK(!wcscmp(text,L"kept")); }
-    /* A response past the old 4,096 limit still streams to completion. */
+    /* An answer past the old fixed-size limit streams to completion. */
     begin_regenerate(h);
-    wchar_t *long_text=(wchar_t *)malloc(sizeof(wchar_t)*8001);
+    wchar_t *long_text=(wchar_t *)malloc(sizeof(wchar_t)*40001);
     CHECK(long_text);
-    for (int i=0;i<8000;i++) long_text[i]=L'z';
-    long_text[8000]=0;
+    for (int i=0;i<40000;i++) long_text[i]=L'z';
+    long_text[40000]=0;
     handle_event(h,fixture(h,OPENROUTER_DELTA,long_text));
     free(long_text);
     CHECK(h->accepting && pending(h)->generation.state==CHAT_GENERATION_RUNNING);
-    CHECK(wcslen(pending(h)->text)==8000);
+    CHECK(wcslen(chat_message_text(pending(h)))==40000);
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
+    /* Reasoning may legitimately be much longer than the final answer. It no
+       longer disappears at the answer-sized 16K boundary. */
+    begin_regenerate(h);
+    wchar_t *long_reasoning=(wchar_t *)malloc(sizeof(wchar_t)*70001);
+    CHECK(long_reasoning);
+    for (int i=0;i<70000;i++) long_reasoning[i]=L'r';
+    long_reasoning[70000]=0;
+    handle_event(h,fixture(h,OPENROUTER_REASONING,long_reasoning));
+    free(long_reasoning);
+    CHECK(h->accepting &&
+        wcslen(chat_message_reasoning(pending(h)))==70000);
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"Answer after long reasoning"));
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
     /* Reasoning-to-answer streaming keeps geometry stable across repeated
@@ -335,6 +349,7 @@ int main(void) {
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
     ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer);
     DeleteObject(h->background); rich_text_library_close();
+    chat_dispose(loaded); chat_dispose(chat);
     free(loaded); free(chat); free(ui); free(h); CoUninitialize();
     puts("Hidden host: failures, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, edit/draft and close/reopen passed");
     return 0;

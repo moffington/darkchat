@@ -267,27 +267,47 @@ static bool stream_event(void *user, const char *data, size_t length) {
     USAGE(prompt_tokens); USAGE(completion_tokens); USAGE(total_tokens); USAGE(cost);
 #undef USAGE
 
-    /* OpenRouter exposes reasoning as structured reasoning_details; a plain
-       `reasoning` string is a compatibility fallback for providers and older
-       payloads. Only emit an event when reasoning text actually arrives. */
+    /* A reasoning_details delta may contain several displayable objects. Emit
+       every fragment in array order; dropping all but the first makes the
+       reasoning pane appear frozen while the model is still generating. */
     bool has_reasoning = false;
-    for (int i = 0; i < 3 && !has_reasoning; i++) {
-        char path[64];
+    size_t detail_count = 0;
+    json_query_array_length(json,
+        "choices[0].delta.reasoning_details", &detail_count);
+    for (size_t i = 0; i < detail_count && !stream->failed; i++) {
+        char path[80];
         snprintf(path, sizeof path,
-            "choices[0].delta.reasoning_details[%d].text", i);
-        has_reasoning = json_query_string(json, path, decoded, length + 1) &&
-            decoded[0];
-        if (!has_reasoning) {
+            "choices[0].delta.reasoning_details[%zu].text", i);
+        bool has_fragment = json_query_string(json, path, decoded,
+            length + 1) && decoded[0];
+        if (!has_fragment) {
             snprintf(path, sizeof path,
-                "choices[0].delta.reasoning_details[%d].summary", i);
-            has_reasoning = json_query_string(json, path, decoded, length + 1) &&
-                decoded[0];
+                "choices[0].delta.reasoning_details[%zu].summary", i);
+            has_fragment = json_query_string(json, path, decoded,
+                length + 1) && decoded[0];
+        }
+        if (has_fragment) {
+            has_reasoning = true;
+            wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
+            if (!wide || !post_event(stream->work, OPENROUTER_REASONING, wide)) {
+                if (!cancelled(stream->work))
+                    stream->error = copy_wide(
+                        L"Could not deliver streamed reasoning.");
+                stream->failed = true;
+            }
         }
     }
-    if (!has_reasoning)
-        has_reasoning = json_query_string(json, "choices[0].delta.reasoning",
+    /* Plain fields are compatibility fallbacks used by some providers. */
+    bool has_plain_reasoning = false;
+    if (!has_reasoning && !stream->failed)
+        has_plain_reasoning = json_query_string(json,
+            "choices[0].delta.reasoning",
             decoded, length + 1) && decoded[0];
-    if (has_reasoning) {
+    if (!has_reasoning && !has_plain_reasoning && !stream->failed)
+        has_plain_reasoning = json_query_string(json,
+            "choices[0].delta.reasoning_content", decoded, length + 1) &&
+            decoded[0];
+    if (has_plain_reasoning && !stream->failed) {
         wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
         if (!wide || !post_event(stream->work, OPENROUTER_REASONING, wide)) {
             if (!cancelled(stream->work))
@@ -295,7 +315,8 @@ static bool stream_event(void *user, const char *data, size_t length) {
             stream->failed = true;
         }
     }
-    if (json_query_string(json, "choices[0].delta.content", decoded,
+    if (!stream->failed && json_query_string(json,
+        "choices[0].delta.content", decoded,
         length + 1)) {
         if (decoded[0] && !g->first_token_at) {
             g->first_token_at = chat_now();

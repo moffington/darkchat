@@ -3,6 +3,7 @@
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
 static int deltas, reasons, terminal;
+static wchar_t reasoning_text[256];
 static OpenRouterEventType outcome;
 static ChatGeneration metadata;
 static int generation;
@@ -11,7 +12,13 @@ static LRESULT CALLBACK test_proc(HWND window,UINT msg,WPARAM w,LPARAM l) {
         OpenRouterEvent *e=(OpenRouterEvent *)l;
         if (e->generation==generation) {
             if (e->type==OPENROUTER_DELTA) { if (e->text && e->text[0]) ++deltas; }
-            else if (e->type==OPENROUTER_REASONING) { if (e->text && e->text[0]) ++reasons; }
+            else if (e->type==OPENROUTER_REASONING) {
+                if (e->text && e->text[0]) {
+                    ++reasons;
+                    wcsncat(reasoning_text,e->text,
+                        255-wcslen(reasoning_text));
+                }
+            }
             else { ++terminal; outcome=e->type; }
             metadata=e->metadata;
         }
@@ -54,6 +61,7 @@ int main(int argc,char **argv) {
     /* Reasoning is parsed from structured details and compatibility fallbacks;
        an entry with no displayable text never fabricates one. */
     stream.error=NULL; stream.failed=false; reasons=0; deltas=0;
+    reasoning_text[0]=0;
     chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"step one \"}]}}]}";
     CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==1);
     chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.summary\",\"summary\":\"summary\"}]}}]}";
@@ -62,8 +70,14 @@ int main(int argc,char **argv) {
     CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==3);
     chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"data\":\"opaque\"}]}}]}";
     CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==3);
+    chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"multi one \"},{\"type\":\"reasoning.encrypted\",\"data\":\"opaque\"},{\"type\":\"reasoning.summary\",\"summary\":\"multi two\"}]}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump();
+    CHECK(reasons==5 && wcsstr(reasoning_text,L"multi one multi two"));
+    chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"data\":\"opaque\"}],\"reasoning_content\":\"alias text\"}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump();
+    CHECK(reasons==6 && wcsstr(reasoning_text,L"alias text"));
     chunk="{\"choices\":[{\"delta\":{\"content\":\"answer only\"}}]}";
-    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==3 && deltas==1);
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==6 && deltas==1);
     work.model=L"test/model";
     ChatRole roles[]={CHAT_ROLE_SYSTEM,CHAT_ROLE_USER,CHAT_ROLE_ERROR};
     wchar_t *texts[]={L"system",L"question \"quoted\"",L"local error"};

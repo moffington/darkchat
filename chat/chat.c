@@ -1,4 +1,5 @@
 #include "chat.h"
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -8,6 +9,103 @@ static const wchar_t *const welcome =
     L"the model selected in the toolbar over the OpenRouter chat-completions "
     L"endpoint. Set OPENROUTER_API_KEY in the environment before launching; "
     L"without it DarkChat explains what is missing instead of answering.";
+
+static const wchar_t *message_value(const wchar_t *inline_text,
+    const wchar_t *overflow) {
+    return overflow ? overflow : inline_text;
+}
+
+const wchar_t *chat_message_text(const ChatMessage *m) {
+    return m ? message_value(m->text,m->text_overflow) : L"";
+}
+
+const wchar_t *chat_message_reasoning(const ChatMessage *m) {
+    return m ? message_value(m->reasoning,m->reasoning_overflow) : L"";
+}
+
+static bool set_message_value(wchar_t *inline_text, size_t inline_capacity,
+    wchar_t **overflow, size_t *length, size_t *capacity,
+    const wchar_t *text) {
+    if (!text) text=L"";
+    size_t needed=wcslen(text);
+    if (needed && text[needed-1]>=0xd800 && text[needed-1]<=0xdbff) --needed;
+    if (needed<inline_capacity) {
+        free(*overflow); *overflow=NULL; *capacity=0;
+        if (needed) wmemcpy(inline_text,text,needed);
+        inline_text[needed]=0; *length=needed;
+        return true;
+    }
+    if (needed==SIZE_MAX/sizeof(wchar_t)) return false;
+    wchar_t *next=(wchar_t *)malloc((needed+1)*sizeof(wchar_t));
+    if (!next) return false;
+    if (needed) wmemcpy(next,text,needed);
+    next[needed]=0;
+    free(*overflow);
+    *overflow=next; *length=needed; *capacity=needed+1;
+    inline_text[0]=0;
+    return true;
+}
+
+static bool append_message_value(wchar_t *inline_text, size_t inline_capacity,
+    wchar_t **overflow, size_t *length, size_t *capacity,
+    const wchar_t *text) {
+    if (!text || !text[0]) return true;
+    const wchar_t *current=message_value(inline_text,*overflow);
+    if (!*length && current[0]) *length=wcslen(current);
+    size_t added=wcslen(text);
+    if (added>SIZE_MAX-1-*length) return false;
+    size_t needed=*length+added+1;
+    if (!*overflow && needed<=inline_capacity) {
+        wmemcpy(inline_text+*length,text,added+1);
+        *length+=added;
+        return true;
+    }
+    if (needed>*capacity) {
+        size_t next=*capacity ? *capacity : inline_capacity*2;
+        while (next<needed) {
+            if (next>SIZE_MAX/2) { next=needed; break; }
+            next*=2;
+        }
+        if (next>SIZE_MAX/sizeof(wchar_t)) return false;
+        wchar_t *grown=(wchar_t *)realloc(*overflow,
+            next*sizeof(wchar_t));
+        if (!grown) return false;
+        if (!*overflow) wmemcpy(grown,inline_text,(*length+1)*sizeof(wchar_t));
+        *overflow=grown; *capacity=next; inline_text[0]=0;
+    }
+    wmemcpy(*overflow+*length,text,added+1);
+    *length+=added;
+    return true;
+}
+
+bool chat_message_set_text(ChatMessage *m,const wchar_t *text) {
+    return m && set_message_value(m->text,CHAT_MESSAGE_TEXT,&m->text_overflow,
+        &m->text_length,&m->text_capacity,text);
+}
+bool chat_message_set_reasoning(ChatMessage *m,const wchar_t *text) {
+    return m && set_message_value(m->reasoning,CHAT_REASONING_TEXT,
+        &m->reasoning_overflow,&m->reasoning_length,&m->reasoning_capacity,text);
+}
+bool chat_message_append_text(ChatMessage *m,const wchar_t *text) {
+    return m && append_message_value(m->text,CHAT_MESSAGE_TEXT,&m->text_overflow,
+        &m->text_length,&m->text_capacity,text);
+}
+bool chat_message_append_reasoning(ChatMessage *m,const wchar_t *text) {
+    return m && append_message_value(m->reasoning,CHAT_REASONING_TEXT,
+        &m->reasoning_overflow,&m->reasoning_length,&m->reasoning_capacity,text);
+}
+void chat_message_dispose(ChatMessage *m) {
+    if (!m) return;
+    free(m->text_overflow); free(m->reasoning_overflow);
+    m->text_overflow=m->reasoning_overflow=NULL;
+    m->text_capacity=m->reasoning_capacity=0;
+}
+void chat_dispose(Chat *chat) {
+    if (!chat) return;
+    for (int i=0;i<chat->conversation_count;i++)
+        for (int j=0;j<chat->conversations[i].message_count;j++)
+            chat_message_dispose(&chat->conversations[i].messages[j]);
+}
 
 /* Bounded append that never overruns the destination. */
 static void append3(wchar_t *dst, size_t capacity, size_t *used,
@@ -98,20 +196,16 @@ int chat_append_at(Chat *chat, int conversation_index, ChatRole role,
     message->created_at = message->modified_at = chat_now();
     conversation->modified_at = message->modified_at;
     message->role = role;
-    size_t length = text ? wcslen(text) : 0;
-    if (length >= CHAT_MESSAGE_TEXT) length = CHAT_MESSAGE_TEXT - 1;
-    if (length && text[length - 1] >= 0xd800 && text[length - 1] <= 0xdbff) --length;
-    if (length) wmemcpy(message->text, text, length);
-    message->text[length] = 0;
+    if (!chat_message_set_text(message,text)) return -1;
     int index = conversation->message_count++;
     if (role == CHAT_ROLE_USER) {
         /* Name the conversation after its first user message. */
         bool first = true;
         for (int i = 0; i < index; i++)
             if (conversation->messages[i].role == CHAT_ROLE_USER) first = false;
-        if (first && !conversation->renamed && message->text[0]) {
+        if (first && !conversation->renamed && chat_message_text(message)[0]) {
             wchar_t derived[CHAT_TITLE_TEXT];
-            first_line(derived, CHAT_TITLE_TEXT, message->text, 40);
+            first_line(derived, CHAT_TITLE_TEXT, chat_message_text(message), 40);
             if (derived[0]) {
                 wcsncpy(conversation->title, derived, CHAT_TITLE_TEXT - 1);
                 conversation->title[CHAT_TITLE_TEXT - 1] = 0;
@@ -220,6 +314,9 @@ bool chat_rename(Chat *chat, const wchar_t *title) {
 bool chat_delete(Chat *chat) {
     if (!chat_active(chat)) return false;
     int index = chat->active;
+    ChatConversation *removed=&chat->conversations[index];
+    for (int i=0;i<removed->message_count;i++)
+        chat_message_dispose(&removed->messages[i]);
     --chat->conversation_count;
     memmove(&chat->conversations[index], &chat->conversations[index + 1],
         (chat->conversation_count - index) * sizeof(ChatConversation));
@@ -231,6 +328,7 @@ bool chat_delete(Chat *chat) {
 
 bool chat_delete_all(Chat *chat) {
     if (!chat_active(chat)) return false;
+    chat_dispose(chat);
     memset(chat->conversations, 0, sizeof chat->conversations);
     chat->conversation_count = 0;
     chat->active = -1;
@@ -240,6 +338,7 @@ bool chat_delete_all(Chat *chat) {
 void chat_clear(Chat *chat) {
     if (!chat_active(chat)) return;
     ChatConversation *c = &chat->conversations[chat->active];
+    for (int i=0;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
     memset(c->messages, 0, sizeof c->messages);
     c->message_count = 0;
     c->draft[0] = 0;
@@ -274,13 +373,17 @@ int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt) {
             c->messages[user + 1].generation.state != CHAT_GENERATION_INTERRUPTED) return -1;
         if (mode == CHAT_EDIT_RESEND) {
             if (!prompt || !prompt[0] || wcslen(prompt) >= CHAT_MESSAGE_TEXT) return -1;
-            wcscpy(c->messages[user].text, prompt);
+            if (!chat_message_set_text(&c->messages[user],prompt)) return -1;
             c->messages[user].modified_at = chat_now();
         }
-        memset(&c->messages[user + 1], 0, (c->message_count - user - 1) * sizeof(ChatMessage));
+        for (int i=user+1;i<c->message_count;i++)
+            chat_message_dispose(&c->messages[i]);
+        memset(&c->messages[user + 1], 0,
+            (c->message_count - user - 1) * sizeof(ChatMessage));
         c->message_count = user + 1;
     }
     int index = chat_append(chat, CHAT_ROLE_ASSISTANT, L"");
+    if (index<0) return -1;
     ChatGeneration *g = &c->messages[index].generation;
     g->state = CHAT_GENERATION_RUNNING;
     g->started_at = chat_now();

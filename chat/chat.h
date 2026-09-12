@@ -11,12 +11,9 @@
 
 #define CHAT_MAX_CONVERSATIONS 16
 #define CHAT_MAX_MESSAGES 64
-/* Interim per-message bound for both the answer and its reasoning: 16K UTF-16
-   code units comfortably fits normal LLM replies while still capping one
-   message. At full capacity the in-memory Chat is ~69 MB. */
+/* Fixed inline space covers prompts and ordinary replies without allocations.
+   Streamed model output grows onto the heap when it exceeds this size. */
 #define CHAT_MESSAGE_TEXT 16384
-/* Separate bound for streamed model reasoning, which never overwrites the
-   answer text and is always optional. */
 #define CHAT_REASONING_TEXT CHAT_MESSAGE_TEXT
 #define CHAT_TITLE_TEXT 64
 #define CHAT_MODEL_TEXT 96
@@ -50,6 +47,11 @@ typedef struct {
     /* Optional streamed model reasoning for this turn; empty when the provider
        supplied none. Never fabricated locally. */
     wchar_t reasoning[CHAT_REASONING_TEXT];
+    /* Oversized model output is stored here instead of reserving its worst-case
+       size in every message slot. Access through chat_message_* helpers. */
+    wchar_t *text_overflow, *reasoning_overflow;
+    size_t text_length, reasoning_length;
+    size_t text_capacity, reasoning_capacity;
     /* View state: whether this turn's reasoning viewport is expanded. Owned by
        the rendered turn; reset with the message, not persisted. */
     bool reasoning_open;
@@ -96,6 +98,14 @@ typedef enum { CHAT_SEND, CHAT_RETRY, CHAT_REGENERATE, CHAT_EDIT_RESEND } ChatSe
 int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt);
 int chat_latest_user(const ChatConversation *conversation);
 bool chat_history_message(const ChatMessage *message);
+const wchar_t *chat_message_text(const ChatMessage *message);
+const wchar_t *chat_message_reasoning(const ChatMessage *message);
+bool chat_message_set_text(ChatMessage *message, const wchar_t *text);
+bool chat_message_set_reasoning(ChatMessage *message, const wchar_t *text);
+bool chat_message_append_text(ChatMessage *message, const wchar_t *text);
+bool chat_message_append_reasoning(ChatMessage *message, const wchar_t *text);
+void chat_message_dispose(ChatMessage *message);
+void chat_dispose(Chat *chat);
 
 void chat_init(Chat *chat);
 /* Creates an empty conversation, selects it and returns its index, or -1. */

@@ -37,6 +37,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command,
     };
     int result = chat_host_run(instance, show, &config);
     SecureZeroMemory(api_key, sizeof api_key);
+    chat_dispose(chat);
     free(chat);
     free(ui);
     return result;

@@ -115,6 +115,15 @@ static void test_queries(void) {
         "{\"error\": { \"message\": \"Rate limited\", \"code\": 429 }}";
     check(json_query_string(error, "error.message", out, sizeof out) &&
         strcmp(out, "Rate limited") == 0, "API error message extracted");
+
+    size_t count = 99;
+    check(json_query_array_length(response, "choices", &count) && count == 1,
+        "array length extracted");
+    check(json_query_array_length("{\"items\":[]}", "items", &count) &&
+        count == 0, "empty array length extracted");
+    check(!json_query_array_length(response, "usage", &count) &&
+        !json_query_array_length(response, "missing", &count),
+        "non-array and missing array rejected");
 }
 
 static void test_buffers(void) {

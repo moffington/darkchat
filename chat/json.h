@@ -40,5 +40,7 @@ wchar_t *json_utf8_to_utf16(const char *utf8, size_t length);
 
 bool json_validate(const char *json);
 bool json_query_number(const char *json, const char *path, double *out);
+/* Returns the number of elements in the array named by path. */
+bool json_query_array_length(const char *json, const char *path, size_t *out);
 
 #endif

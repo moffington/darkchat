@@ -375,7 +375,7 @@ static void prepare_turn(ChatHost *host, int index, ChatMessage *m,
             turn->head_live = true;
         }
         bool pending = running && !host->content_started;
-        has_row = pending || m->reasoning[0];
+        has_row = pending || chat_message_reasoning(m)[0];
         wchar_t row[48];
         row[0] = 0;
         if (has_row) reasoning_row_text(host, m, running, row, 48);
@@ -383,7 +383,7 @@ static void prepare_turn(ChatHost *host, int index, ChatMessage *m,
 
         ensure_control(host, &turn->body, 100 + index * 4 + 1, false);
         if (turn->body.window) turn->body_live = true;
-        rich_text_set_body(&turn->body, m->role, m->text);
+        rich_text_set_body(&turn->body, m->role, chat_message_text(m));
 
         /* Metadata is a terminal-state footer, so a running turn never mixes
            stats into the streaming answer. */
@@ -406,7 +406,7 @@ static void prepare_turn(ChatHost *host, int index, ChatMessage *m,
         turn->head_live = false;
         ensure_control(host, &turn->body, 100 + index * 4 + 1, false);
         if (turn->body.window) turn->body_live = true;
-        rich_text_set_block(&turn->body, m->role, m->text);
+        rich_text_set_block(&turn->body, m->role, chat_message_text(m));
         if (turn->meta.window) ShowWindow(turn->meta.window, SW_HIDE);
         turn->meta_live = false;
     }
@@ -424,7 +424,8 @@ static void prepare_turn(ChatHost *host, int index, ChatMessage *m,
                 host->request_conversation == host->config.chat->active &&
                 host->reasoning_streaming;
             if (created || !streaming)
-                rich_text_set_reasoning(&turn->reasoning, m->reasoning);
+                rich_text_set_reasoning(&turn->reasoning,
+                    chat_message_reasoning(m));
         }
     } else {
         if (turn->reasoning.window) ShowWindow(turn->reasoning.window, SW_HIDE);
@@ -673,7 +674,8 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     if (chat->system_prompt[0]) messages[used++]=(OpenRouterMessage){CHAT_ROLE_SYSTEM,chat->system_prompt};
     ChatConversation *c=&chat->conversations[chat->active];
     for (int i=0;i<index;i++) if (chat_history_message(&c->messages[i]))
-        messages[used++]=(OpenRouterMessage){c->messages[i].role,c->messages[i].text};
+        messages[used++]=(OpenRouterMessage){c->messages[i].role,
+            chat_message_text(&c->messages[i])};
     host->request_generation=saved ? openrouter_request(&host->client,
         host->config.api_key_utf8,chat->model,messages,used) : 0;
     if (!host->request_generation) {
@@ -726,14 +728,18 @@ static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
         host->content_started=true;
         end_reasoning(host);
     }
-    size_t length=wcslen(m->text), total=wcslen(event->text), incoming=total;
-    if (incoming>CHAT_MESSAGE_TEXT-1-length) incoming=CHAT_MESSAGE_TEXT-1-length;
-    if (incoming && event->text[incoming-1]>=0xd800 && event->text[incoming-1]<=0xdbff) --incoming;
-    wmemcpy(m->text+length,event->text,incoming); m->text[length+incoming]=0;
+    size_t incoming=wcslen(event->text);
+    if (!chat_message_append_text(m,event->text)) {
+        host->stop_state=CHAT_GENERATION_INTERRUPTED;
+        host->accepting=false; host->stopping=true;
+        openrouter_cancel(&host->client,host->request_generation);
+        chat_ui_set_generation(&host->chat_ui,true,true);
+        set_status(host,L"Not enough memory to continue the response.");
+        return;
+    }
     m->modified_at=chat_now();
     host->config.chat->conversations[host->request_conversation].modified_at=m->modified_at;
     host->dirty=true;
-    event->text[incoming]=0;
     if (incoming>0 && host->request_conversation==host->config.chat->active) {
         int index=host->request_message;
         TurnView *turn=&host->turns[index];
@@ -746,26 +752,22 @@ static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
             layout_from(host,index,pinned);
         }
     }
-    if (incoming<total) {
-        host->stop_state=CHAT_GENERATION_INTERRUPTED;
-        host->accepting=false; host->stopping=true;
-        openrouter_cancel(&host->client,host->request_generation);
-        chat_ui_set_generation(&host->chat_ui,true,true);
-        set_status(host,L"Response reached the message limit; partial text preserved.");
-    }
 }
 
 static void append_reasoning_delta(ChatHost *host, OpenRouterEvent *event) {
     if (!event->text || !event->text[0] || !host->accepting) return;
     ChatMessage *m=pending(host);
     m->generation=event->metadata; m->generation.state=CHAT_GENERATION_RUNNING;
-    size_t length=wcslen(m->reasoning), total=wcslen(event->text), incoming=total;
-    if (incoming>CHAT_REASONING_TEXT-1-length) incoming=CHAT_REASONING_TEXT-1-length;
-    if (incoming && event->text[incoming-1]>=0xd800 && event->text[incoming-1]<=0xdbff) --incoming;
+    size_t incoming=wcslen(event->text);
     if (incoming) {
-        wmemcpy(m->reasoning+length,event->text,incoming);
-        m->reasoning[length+incoming]=0;
-        event->text[incoming]=0;
+        if (!chat_message_append_reasoning(m,event->text)) {
+            host->stop_state=CHAT_GENERATION_INTERRUPTED;
+            host->accepting=false; host->stopping=true;
+            openrouter_cancel(&host->client,host->request_generation);
+            chat_ui_set_generation(&host->chat_ui,true,true);
+            set_status(host,L"Not enough memory to continue the reasoning.");
+            return;
+        }
         if (host->request_conversation==host->config.chat->active) {
             TurnView *turn=&host->turns[host->request_message];
             if (m->reasoning_open && !turn->reason_live)
@@ -798,10 +800,9 @@ static void finish_request(ChatHost *host, OpenRouterEvent *event) {
         CHAT_GENERATION_INTERRUPTED : CHAT_GENERATION_FAILED;
     if (event->text) wcsncpy(g->error,event->text,511);
     if (g->state==CHAT_GENERATION_COMPLETE && !wcscmp(g->finish_reason,L"error")) g->state=CHAT_GENERATION_FAILED;
-    if (g->state==CHAT_GENERATION_COMPLETE && !m->text[0]) {
+    if (g->state==CHAT_GENERATION_COMPLETE && !chat_message_text(m)[0]) {
         g->state=CHAT_GENERATION_FAILED; wcscpy(g->error,L"OpenRouter completed without text.");
     }
-    if (host->stopping && host->stop_state==CHAT_GENERATION_INTERRUPTED) wcscpy(g->error,L"Response exceeded the local message limit.");
     m->modified_at=chat_now();
     host->config.chat->conversations[host->request_conversation].modified_at=m->modified_at;
     host->generating=false; host->stopping=false; host->accepting=false;
@@ -854,7 +855,9 @@ static void action(ChatHost *host, int code) {
     ChatConversation *c=&chat->conversations[chat->active];
     if (code==ACTION_COPY) {
         for (int i=c->message_count-1;i>=0;i--) if (c->messages[i].role==CHAT_ROLE_ASSISTANT) {
-            set_status(host,chat_copy_text(host->window,c->messages[i].text) ? L"Response copied" : L"Copy failed"); return;
+            set_status(host,chat_copy_text(host->window,
+                chat_message_text(&c->messages[i])) ? L"Response copied" :
+                L"Copy failed"); return;
         }
         return;
     }
@@ -885,7 +888,8 @@ static void action(ChatHost *host, int code) {
     } else if (code==ACTION_EDIT) {
         int user=chat_latest_user(c);
         if (user<0) { set_status(host,L"No user message to edit"); return; }
-        host->editing=true; rich_text_set_text(&host->composer,c->messages[user].text);
+        host->editing=true; rich_text_set_text(&host->composer,
+            chat_message_text(&c->messages[user]));
         SetFocus(host->composer.window); set_status(host,L"Editing latest user message. Send replaces its response; Response > Cancel edit restores the draft.");
     } else if (code==ACTION_RENAME) {
         wchar_t title[CHAT_TITLE_TEXT]; wcscpy(title,c->title);

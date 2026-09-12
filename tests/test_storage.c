@@ -49,6 +49,16 @@ int main(void) {
     CHECK(!wcscmp(loaded->conversations[0].messages[1].reasoning,
         L"Checked the options and chose this."));
     CHECK(loaded->conversations[0].messages[1].generation.reasoning_ms==2500.0);
+    wchar_t *large_reasoning=(wchar_t *)malloc(70001*sizeof(wchar_t));
+    CHECK(large_reasoning);
+    for (int i=0;i<70000;i++) large_reasoning[i]=L'r';
+    large_reasoning[70000]=0;
+    CHECK(chat_message_set_reasoning(m,large_reasoning));
+    free(large_reasoning);
+    CHECK(storage_save(&store,chat));
+    CHECK(storage_load(&store,loaded)==1);
+    CHECK(wcslen(chat_message_reasoning(
+        &loaded->conversations[0].messages[1]))==70000);
     m->generation.state=CHAT_GENERATION_COMPLETE;
     CHECK(storage_save(&store,chat));
     CHECK(storage_load(&store,loaded)==1);
@@ -89,6 +99,7 @@ int main(void) {
     storage_close(&store);
     DeleteFileW(store.path); DeleteFileW(store.backup); DeleteFileW(store.temporary);
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
+    chat_dispose(chat); chat_dispose(loaded);
     free(chat); free(loaded);
     puts("Storage roundtrip, locking, corruption, backup and interrupted-write recovery passed");
     return 0;

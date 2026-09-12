@@ -5,9 +5,8 @@
 #include <string.h>
 #include <math.h>
 
-/* Bounds the on-disk snapshot and the buffers used to read it. Sized for a full
-   state at 16K code units per message plus JSON-escaping headroom; the previous
-   32 MB cap would reject a legitimately full snapshot. */
+/* The persisted conversation still has a broad corruption/resource guard.
+   Individual model outputs have no smaller fixed-size truncation point. */
 #define STORAGE_LIMIT (128u * 1024u * 1024u)
 #define FORMAT_VERSION 1
 
@@ -34,6 +33,21 @@ static bool get_string(const char *s, const char *name, wchar_t *out, size_t cap
     ok = wide && wcslen(wide) < cap;
     if (ok) wcscpy(out, wide);
     free(wide); free(text);
+    return ok;
+}
+static bool get_message_string(const char *s, const char *name,
+    ChatMessage *message, bool reasoning, bool required) {
+    size_t size=strlen(s)+1;
+    char *text=(char *)malloc(size);
+    if (!text) return false;
+    bool found=json_query_string(s,name,text,size);
+    if (!found) { free(text); return !required; }
+    wchar_t *wide=json_utf8_to_utf16(text,strlen(text));
+    free(text);
+    if (!wide) return false;
+    bool ok=reasoning ? chat_message_set_reasoning(message,wide) :
+        chat_message_set_text(message,wide);
+    free(wide);
     return ok;
 }
 static bool integer(const char *s, const char *name, double min, double max, double *out) {
@@ -82,7 +96,7 @@ static bool encode(const Chat *chat, JsonBuf *b) {
             NUM(b, m, role);
             NUM(b, m, created_at);
             NUM(b, m, modified_at);
-            STR(b, m, text);
+            string(b, "text", chat_message_text(m));
             NUM(b, g, state);
             NUM(b, g, started_at);
             NUM(b, g, finished_at);
@@ -99,7 +113,8 @@ static bool encode(const Chat *chat, JsonBuf *b) {
             STR(b, g, error);
             /* Optional, appended last so a turn without reasoning is byte-for-byte
                the same shape as an older version 1 message line. */
-            if (m->reasoning[0]) string(b, "reasoning", m->reasoning);
+            if (chat_message_reasoning(m)[0])
+                string(b, "reasoning", chat_message_reasoning(m));
             if (g->reasoning_ms >= 0) number(b, "reasoning_ms", g->reasoning_ms);
             raw(b, "}\n");
         }
@@ -169,7 +184,7 @@ static bool decode(char *data, Chat *chat) {
             READ_INT(m, role, 0, CHAT_ROLE_ERROR);
             READ_INT(m, created_at, 1, 9007199254740991.0);
             READ_INT(m, modified_at, 1, 9007199254740991.0);
-            READ_STR(m, text);
+            if (!get_message_string(line,"text",m,false,true)) goto bad;
             READ_INT(g, state, 0, CHAT_GENERATION_FAILED);
             READ_INT(g, started_at, 0, 9007199254740991.0);
             READ_INT(g, finished_at, 0, 9007199254740991.0);
@@ -185,8 +200,7 @@ static bool decode(char *data, Chat *chat) {
             READ_STR(g, finish_reason);
             READ_STR(g, error);
             /* Optional fields: absent in older version 1 snapshots. */
-            if (!get_string(line,"reasoning",m->reasoning,CHAT_REASONING_TEXT))
-                m->reasoning[0]=0;
+            if (!get_message_string(line,"reasoning",m,true,false)) goto bad;
             g->reasoning_ms=-1;
             if (json_query_number(line,"reasoning_ms",&v) && v>=-1)
                 g->reasoning_ms=v;
@@ -197,8 +211,11 @@ static bool decode(char *data, Chat *chat) {
             }
         }
     }
-    return cursor == footer;
+    if (cursor != footer) goto bad;
+    return true;
 bad:
+    chat_dispose(chat);
+    memset(chat,0,sizeof *chat);
     return false;
 }
 static bool read_snapshot(const wchar_t *path, Chat *chat, bool *unsupported) {
@@ -253,7 +270,7 @@ bool storage_open(ChatStorage *store, const wchar_t *directory) {
 }
 int storage_load(ChatStorage *store, Chat *chat) {
     if (!store->writable) return -1;
-    Chat *loaded=malloc(sizeof *loaded);
+    Chat *loaded=calloc(1,sizeof *loaded);
     if (!loaded) { store->writable=false; return -1; }
     const wchar_t *paths[]={store->path,store->backup,store->temporary};
     bool exists=false;
@@ -261,19 +278,24 @@ int storage_load(ChatStorage *store, Chat *chat) {
         if (GetFileAttributesW(paths[i])!=INVALID_FILE_ATTRIBUTES) exists=true;
         bool unsupported=false;
         bool valid=read_snapshot(paths[i],loaded,&unsupported);
-        if (unsupported) { free(loaded); store->writable=false; return -1; }
+        if (unsupported) {
+            chat_dispose(loaded); free(loaded);
+            store->writable=false; return -1;
+        }
         if (valid) {
             /* A recovered temp may be the only valid copy. Preserve it before
                the next save reuses the temp filename. */
             if (i==2 && !durable_copy(store->temporary,store->backup)) {
-                free(loaded); store->writable=false; return -1;
+                chat_dispose(loaded); free(loaded);
+                store->writable=false; return -1;
             }
+            chat_dispose(chat);
             *chat=*loaded; free(loaded);
             store->primary_valid=i==0; store->recovered=i!=0;
             return 1;
         }
     }
-    free(loaded);
+    chat_dispose(loaded); free(loaded);
     if (exists) { store->writable=false; return -1; }
     return 0;
 }

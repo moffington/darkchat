@@ -450,3 +450,28 @@ bool json_query_number(const char *json, const char *path, double *out) {
     *out = value;
     return true;
 }
+
+bool json_query_array_length(const char *json, const char *path, size_t *out) {
+    if (!json || !path || !out) return false;
+    const char *p = skip_ws(json), *cursor = path;
+    while (*cursor) {
+        char name[128]; int index;
+        if (!next_segment(&cursor, name, sizeof name, &index)) return false;
+        p = navigate(p, name, index);
+        if (!p) return false;
+        p = skip_ws(p);
+    }
+    if (*p != '[') return false;
+    p = skip_ws(p + 1);
+    size_t count = 0;
+    if (*p == ']') { *out = 0; return true; }
+    for (;;) {
+        p = skip_value(p, 0);
+        if (!p) return false;
+        ++count;
+        p = skip_ws(p);
+        if (*p == ']') { *out = count; return true; }
+        if (*p != ',') return false;
+        p = skip_ws(p + 1);
+    }
+}

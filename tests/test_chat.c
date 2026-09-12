@@ -65,7 +65,7 @@ int main(void) {
     check(chat_append(chat, CHAT_ROLE_USER, L"overflow") < 0, "overflow rejected");
     check(chat_active(chat)->message_count == CHAT_MAX_MESSAGES, "count capped");
 
-    /* Oversized message is truncated safely. */
+    /* Oversized generated text grows beyond the inline buffer. */
     Chat *spare = (Chat *)calloc(1, sizeof *spare);
     if (!spare) return 2;
     chat_init(spare);
@@ -76,14 +76,16 @@ int main(void) {
     chat_append(spare, CHAT_ROLE_USER, big);
     const ChatMessage *last =
         &chat_active(spare)->messages[chat_active(spare)->message_count - 1];
-    check(wcslen(last->text) == CHAT_MESSAGE_TEXT - 1, "oversized message truncated");
+    check(wcslen(chat_message_text(last)) == CHAT_MESSAGE_TEXT * 2 - 1,
+        "oversized model text grows beyond inline storage");
     free(big);
 
     /* A trailing high surrogate is not left dangling. */
     chat_append(spare, CHAT_ROLE_USER, L"tail\xd83d");
     last = &chat_active(spare)->messages[chat_active(spare)->message_count - 1];
-    check(wcslen(last->text) == 4, "dangling high surrogate trimmed");
-    free(spare);
+    check(wcslen(chat_message_text(last)) == 4,
+        "dangling high surrogate trimmed");
+    chat_dispose(spare); free(spare);
 
     /* A normal long response now fits: the old 4,096 bound cancelled it. */
     Chat *long_chat = (Chat *)calloc(1, sizeof *long_chat);
@@ -96,10 +98,11 @@ int main(void) {
     chat_append(long_chat, CHAT_ROLE_USER, L"question");
     int mid_index = chat_append(long_chat, CHAT_ROLE_ASSISTANT, mid);
     check(mid_index >= 0 &&
-        wcslen(chat_active(long_chat)->messages[mid_index].text) == 12000,
+        wcslen(chat_message_text(
+            &chat_active(long_chat)->messages[mid_index])) == 12000,
         "a 12,000-unit response is preserved past the old 4,096 limit");
     free(mid);
-    free(long_chat);
+    chat_dispose(long_chat); free(long_chat);
 
     /* chat_remaining guards invalid state. */
     chat->active = 99;

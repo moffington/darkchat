@@ -195,15 +195,16 @@ static bool create_control(RichTextControl *control, HWND parent, int id,
 
 bool rich_text_create_block(RichTextControl *control, HWND parent, int id,
     const RichTextTheme *theme, float dpi) {
-    /* Headroom beyond one message's text so stats/error notes still fit. */
+    /* Model output grows on demand; the network/storage layers provide the
+       practical safety bounds instead of this display control. */
     return create_control(control, parent, id, theme, dpi, true, true, false,
-        (long)(CHAT_MESSAGE_TEXT + 2048), theme->background, NULL);
+        0x7ffffffeL, theme->background, NULL);
 }
 
 bool rich_text_create_viewport(RichTextControl *control, HWND parent, int id,
     const RichTextTheme *theme, float dpi) {
     return create_control(control, parent, id, theme, dpi, true, true, true,
-        (long)(CHAT_REASONING_TEXT - 1), theme->reasoning_background, NULL);
+        0x7ffffffeL, theme->reasoning_background, NULL);
 }
 
 bool rich_text_create_composer(RichTextControl *control, HWND parent, int id,
