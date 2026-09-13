@@ -13,6 +13,18 @@ static void check(int condition, const char *what) {
     else printf("ok: %s\n", what);
 }
 
+/* Allocation seam for the boundary-crossing test below: the chat test links
+   with -Wl,--wrap=realloc (chat.bat test does), so every allocation the
+   message growth path makes starts poisoned. The spare capacity beyond a
+   copied string is then known memory, which makes the crossing checks
+   deterministic instead of reading whatever malloc left there. */
+void *__real_realloc(void *pointer, size_t size);
+void *__wrap_realloc(void *pointer, size_t size) {
+    void *grown = __real_realloc(pointer, size);
+    if (grown) memset(grown, 0x5C, size);
+    return grown;
+}
+
 int main(void) {
     Chat *chat = (Chat *)calloc(1, sizeof *chat);
     if (!chat) return 2;
@@ -103,6 +115,100 @@ int main(void) {
         "a 12,000-unit response is preserved past the old 4,096 limit");
     free(mid);
     chat_dispose(long_chat); free(long_chat);
+
+    /* Streamed growth across the inline boundary must copy exactly the
+       inline characters onto the heap; a wrong copy count still leaves
+       the string NUL-terminated, so only memory checks can see the damage. */
+    Chat *grow = (Chat *)calloc(1, sizeof *grow);
+    if (!grow) return 2;
+    chat_init(grow);
+    wchar_t *fill = (wchar_t *)malloc(sizeof(wchar_t) * (CHAT_MESSAGE_TEXT + 1));
+    if (!fill) return 2;
+    for (size_t i = 0; i < CHAT_MESSAGE_TEXT - 1; i++) fill[i] = L'x';
+    fill[CHAT_MESSAGE_TEXT - 1] = 0;
+    int stream = chat_append(grow, CHAT_ROLE_ASSISTANT, L"");
+    check(stream >= 0, "empty assistant message appended");
+    ChatMessage *m = &grow->conversations[grow->active].messages[stream];
+    check(chat_message_append_text(m, fill) && !m->text_overflow,
+        "a boundary-minus-one answer stays inline");
+    check(chat_message_append_text(m, L"!"),
+        "appending past the boundary succeeds");
+    check(m->text_overflow != NULL, "the crossed answer moved to heap storage");
+    check(wcslen(chat_message_text(m)) == CHAT_MESSAGE_TEXT,
+        "the crossed answer keeps every character");
+    check(chat_message_text(m)[0] == L'x' &&
+        chat_message_text(m)[CHAT_MESSAGE_TEXT - 2] == L'x' &&
+        chat_message_text(m)[CHAT_MESSAGE_TEXT - 1] == L'!',
+        "the crossed answer preserves head, seam and tail");
+    /* Further growth reuses and doubles the heap buffer without touching the
+       inline source again; content must survive every hop, including a
+       subsequent heap-doubling reallocation. */
+    for (int i = 0; i < 3; i++) {
+        check(chat_message_append_text(m, fill) &&
+            wcslen(chat_message_text(m)) ==
+                CHAT_MESSAGE_TEXT + (size_t)(i + 1) * (CHAT_MESSAGE_TEXT - 1),
+            "repeated heap growth preserves the streamed answer");
+    }
+
+    /* The reasoning buffer has the same inline size and grows identically,
+       without disturbing the answer stored beside it. */
+    for (size_t i = 0; i < CHAT_MESSAGE_TEXT - 1; i++) fill[i] = L'r';
+    fill[CHAT_MESSAGE_TEXT - 1] = 0;
+    int think = chat_append(grow, CHAT_ROLE_ASSISTANT, L"");
+    check(think >= 0, "second assistant message appended");
+    ChatMessage *t = &grow->conversations[grow->active].messages[think];
+    check(chat_message_append_reasoning(t, fill) && !t->reasoning_overflow,
+        "a boundary-minus-one reasoning stays inline");
+    check(chat_message_append_reasoning(t, L"!"),
+        "reasoning appending past the boundary succeeds");
+    check(t->reasoning_overflow != NULL &&
+        wcslen(chat_message_reasoning(t)) == CHAT_MESSAGE_TEXT &&
+        chat_message_reasoning(t)[0] == L'r' &&
+        chat_message_reasoning(t)[CHAT_MESSAGE_TEXT - 2] == L'r' &&
+        chat_message_reasoning(t)[CHAT_MESSAGE_TEXT - 1] == L'!',
+        "the crossed reasoning preserves head, seam and tail");
+    check(!t->text[0] && !t->text_overflow,
+        "answer storage is untouched by reasoning growth");
+    free(fill);
+    chat_dispose(grow); free(grow);
+
+    /* A protected boundary catches overreads that content checks cannot: a
+       too-large copy count still produces a correct, NUL-terminated string
+       while dragging bytes of the sibling buffer past the terminator. The
+       reasoning storage carries a sentinel, and the overflow storage starts
+       poisoned by the realloc seam, so any overread shows up as sentinel
+       values displacing the poison in the spare capacity. */
+    {
+        ChatMessage *guarded = (ChatMessage *)calloc(1, sizeof *guarded);
+        check(guarded != NULL, "guarded message allocated");
+        if (guarded) {
+            memset(guarded->reasoning, 0xA5, sizeof guarded->reasoning);
+            guarded->role = CHAT_ROLE_ASSISTANT;
+            wchar_t *fill = (wchar_t *)malloc(sizeof(wchar_t) * CHAT_MESSAGE_TEXT);
+            if (!fill) return 2;
+            for (size_t i = 0; i < CHAT_MESSAGE_TEXT - 1; i++) fill[i] = L'w';
+            fill[CHAT_MESSAGE_TEXT - 1] = 0;
+            check(chat_message_append_text(guarded, fill),
+                "the guarded message fills its inline buffer");
+            check(chat_message_append_text(guarded, L"!"),
+                "the guarded boundary crossing succeeds");
+            check(guarded->text_overflow != NULL &&
+                wcslen(chat_message_text(guarded)) == CHAT_MESSAGE_TEXT &&
+                chat_message_text(guarded)[0] == L'w' &&
+                chat_message_text(guarded)[CHAT_MESSAGE_TEXT - 1] == L'!',
+                "the guarded crossing preserves the message");
+            int intact = 1;
+            /* Spare capacity begins one past the new terminator. */
+            for (size_t i = CHAT_MESSAGE_TEXT + 1;
+                i < CHAT_MESSAGE_TEXT + 257; i++)
+                if (guarded->text_overflow[i] != (wchar_t)0x5C5C) intact = 0;
+            check(intact,
+                "the crossing copied nothing beyond the inline terminator");
+            chat_message_dispose(guarded);
+            free(guarded);
+            free(fill);
+        }
+    }
 
     /* chat_remaining guards invalid state. */
     chat->active = 99;

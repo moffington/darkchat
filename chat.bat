@@ -19,7 +19,7 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_json.exe
     if errorlevel 1 exit /b 1
-    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat.c chat\chat.c -o build\test_chat.exe
+    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat.c chat\chat.c -o build\test_chat.exe -Wl,--wrap=realloc
     if errorlevel 1 exit /b 1
     build\test_chat.exe
     if errorlevel 1 exit /b 1

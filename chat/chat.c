@@ -70,7 +70,9 @@ static bool append_message_value(wchar_t *inline_text, size_t inline_capacity,
         wchar_t *grown=(wchar_t *)realloc(*overflow,
             next*sizeof(wchar_t));
         if (!grown) return false;
-        if (!*overflow) wmemcpy(grown,inline_text,(*length+1)*sizeof(wchar_t));
+        /* Byte-oriented copy: the count is explicitly in bytes, so the unit
+           of the length cannot be confused with elements again. */
+        if (!*overflow) memcpy(grown,inline_text,(*length+1)*sizeof *grown);
         *overflow=grown; *capacity=next; inline_text[0]=0;
     }
     wmemcpy(*overflow+*length,text,added+1);
