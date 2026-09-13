@@ -14,6 +14,7 @@ static void begin_mode(ChatHost *h,ChatSendMode mode) {
     h->request_conversation=h->config.chat->active;
     ++h->request_generation; h->generating=true; h->accepting=true; h->stopping=false;
     h->reasoning_streaming=false; h->content_started=false;
+    h->body_render_tick=0;
     h->started_tick=GetTickCount64(); render_transcript(h);
 }
 static void begin_fixture(ChatHost *h) { begin_mode(h,CHAT_RETRY); }
@@ -277,6 +278,13 @@ int main(void) {
           SendMessageW(turn->body.window,EM_GETSCROLLPOS,0,(LPARAM)&origin);
           CHECK(origin.y==0);
       }
+      /* The burst stayed within the throttle window, so nothing above was
+         reparsed per token; flushing renders the accumulated burst in one
+         step and the transcript still follows at the bottom. */
+      int before_flush=turn->body_h;
+      h->body_render_tick=0;
+      handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nFlushed rebuild."));
+      CHECK(turn->body_h>before_flush && view_pinned(h));
       h->view_scroll=px(h,30); position_turns(h,false);
       CHECK(!view_pinned(h));
       int scroll=h->view_scroll;
@@ -310,6 +318,55 @@ int main(void) {
       if (maximum<0) maximum=0;
       CHECK(info.nPos<=before+4 && info.nPos<maximum);
       free(big); DestroyWindow(probe.window); }
+    /* ---- Progressive Markdown streaming: the first delta renders
+       immediately, rapid deltas stay within the throttle window (no per-token
+       reparse), an elapsed window renders the accumulated text so markers
+       fragmented across deltas reassemble, incomplete syntax stays literal,
+       and the terminal event flushes the final render. Stored message text
+       keeps the raw markers throughout. */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    add_turn(chat,L"seed",L"seed answer",NULL,-1);
+    begin_regenerate(h);
+    int stream_turn=h->request_message;
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"# Tit"));
+    { wchar_t body[256]; body_text(h,stream_turn,body,256);
+      CHECK(!wcscmp(body,L"Tit")); }
+    h->body_render_tick=GetTickCount64();
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"le **bo"));
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"ld** an"));
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"d `co"));
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"de` an"));
+    CHECK(GetTickCount64()-h->body_render_tick<CHAT_BODY_RENDER_MS);
+    { wchar_t body[256]; body_text(h,stream_turn,body,256);
+      CHECK(!wcscmp(body,L"Tit")); }
+    Sleep(CHAT_BODY_RENDER_MS+20);
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"d\nnext **ope"));
+    { wchar_t body[256]; body_text(h,stream_turn,body,256);
+      CHECK(!wcscmp(body,L"Title bold and code and\r\nnext **ope"));
+      CHARFORMAT2W f;
+      memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* "bold" */
+      SendMessageW(h->turns[stream_turn].body.window,EM_SETSEL,6,7);
+      SendMessageW(h->turns[stream_turn].body.window,EM_GETCHARFORMAT,
+          SCF_SELECTION,(LPARAM)&f);
+      CHECK((f.dwEffects & CFE_BOLD) && !(f.dwEffects & CFE_ITALIC));
+      memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* "code" */
+      SendMessageW(h->turns[stream_turn].body.window,EM_SETSEL,15,16);
+      SendMessageW(h->turns[stream_turn].body.window,EM_GETCHARFORMAT,
+          SCF_SELECTION,(LPARAM)&f);
+      CHECK(!wcscmp(f.szFaceName,L"Consolas") &&
+          (f.dwMask & CFM_BACKCOLOR));
+      memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* plain tail */
+      SendMessageW(h->turns[stream_turn].body.window,EM_SETSEL,26,27);
+      SendMessageW(h->turns[stream_turn].body.window,EM_GETCHARFORMAT,
+          SCF_SELECTION,(LPARAM)&f);
+      CHECK(!(f.dwEffects & CFE_BOLD) && !wcscmp(f.szFaceName,L"Segoe UI")); }
+    CHECK(!wcscmp(pending(h)->text,
+        L"# Title **bold** and `code` and\nnext **ope"));
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
+    { wchar_t body[256]; body_text(h,stream_turn,body,256);
+      CHECK(!wcscmp(body,L"Title bold and code and\r\nnext **ope")); }
+    command(h,CHAT_COMMAND_SELECT,cv);
     /* Compact metadata footer: deduplicated model, grouped tokens, no "stop",
        and unusual finish reasons surfaced. */
     { ChatMessage *m=&chat->conversations[cv].messages[second];

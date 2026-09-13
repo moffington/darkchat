@@ -51,6 +51,10 @@ typedef struct {
     bool generating, stopping, accepting, dirty, editing, content_started;
     bool reasoning_streaming;
     ULONGLONG reasoning_started_tick;
+    /* Last time the streaming body was rebuilt as Markdown; token deltas
+       accumulate in the message while the visible body is re-rendered at
+       most once per CHAT_BODY_RENDER_MS. */
+    ULONGLONG body_render_tick;
     ChatStorage storage;
     ULONGLONG started_tick;
     ChatGenerationState stop_state;
@@ -67,6 +71,7 @@ static bool surface_key(void *user, WPARAM key, bool shift, bool control,
     bool down);
 static int measure_control(ChatHost *host, RichTextControl *control, int width);
 static void refresh_turn(ChatHost *host, int index);
+static void stream_body_markdown(ChatHost *host, int index);
 static void layout_from(ChatHost *host, int start, bool follow);
 static void position_turns(ChatHost *host, bool follow);
 static bool view_pinned(ChatHost *host);
@@ -383,18 +388,16 @@ static void prepare_turn(ChatHost *host, int index, ChatMessage *m,
 
         ensure_control(host, &turn->body, 100 + index * 4 + 1, false);
         if (turn->body.window) turn->body_live = true;
-        /* Terminal assistant output is Markdown-rendered; running output
-           stays verbatim while it streams. Rebuilds of completed turns may
-           reparse the message; no render cache is kept. */
-        bool terminal = m->generation.state != CHAT_GENERATION_NONE &&
-            m->generation.state != CHAT_GENERATION_RUNNING;
-        if (terminal)
-            rich_text_set_markdown(&turn->body, m->role, chat_message_text(m));
-        else
-            rich_text_set_body(&turn->body, m->role, chat_message_text(m));
+        /* Assistant output is Markdown-rendered at every rebuild; while a
+           stream runs, the host throttles these rebuilds (see
+           stream_body_markdown) and incomplete syntax renders literally.
+           Rebuilds may reparse the message; no render cache is kept. */
+        rich_text_set_markdown(&turn->body, m->role, chat_message_text(m));
 
         /* Metadata is a terminal-state footer, so a running turn never mixes
            stats into the streaming answer. */
+        bool terminal = m->generation.state != CHAT_GENERATION_NONE &&
+            m->generation.state != CHAT_GENERATION_RUNNING;
         if (terminal) {
             ensure_control(host, &turn->meta, 100 + index * 4 + 3, false);
             if (turn->meta.window) {
@@ -667,6 +670,7 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     /* The running turn shows a temporary pending row; it is removed once answer
        text begins if the provider never supplies reasoning. */
     host->reasoning_streaming=false; host->content_started=false;
+    host->body_render_tick=0;
     ChatMessage *m=pending(host);
     if (mode==CHAT_SEND) { rich_text_set_text(&host->composer,L""); chat->conversations[chat->active].draft[0]=0; }
     if (host->editing && mode!=CHAT_SEND) {
@@ -721,6 +725,25 @@ static void perform_send(ChatHost *host) {
     start_response(host,host->editing ? CHAT_EDIT_RESEND : CHAT_SEND,prompt);
 }
 
+/* Markdown streaming rebuilds the visible body at most this often; deltas
+   accumulate in the message between rebuilds. */
+#define CHAT_BODY_RENDER_MS 100
+
+/* Re-renders the streaming turn's body as Markdown from the accumulated
+   message text (incomplete syntax stays literal) and relayouts from that turn,
+   following the transcript scroll only while the reader is pinned to the
+   bottom. */
+static void stream_body_markdown(ChatHost *host, int index) {
+    if (index<0 || index>=CHAT_MAX_MESSAGES) return;
+    TurnView *turn=&host->turns[index];
+    if (!turn->body.window) return;
+    ChatMessage *m=&host->config.chat->conversations[
+        host->request_conversation].messages[index];
+    bool pinned=view_pinned(host);
+    rich_text_set_markdown(&turn->body,m->role,chat_message_text(m));
+    layout_from(host,index,pinned);
+}
+
 static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
     if (!event->text || !event->text[0] || !host->accepting) return;
     ChatMessage *m=pending(host);
@@ -752,10 +775,17 @@ static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
         if (first) {
             /* Rebuilds this turn's body and refreshes/removes its row. */
             refresh_turn(host,index);
+            host->body_render_tick=GetTickCount64();
         } else if (turn->body_live && turn->body.window) {
-            bool pinned=view_pinned(host);
-            rich_text_append_body(&turn->body,event->text);
-            layout_from(host,index,pinned);
+            /* Deltas accumulate in the message; the visible body is rebuilt
+               as Markdown at most once per interval, so a token storm never
+               reparses per token. The rebuild follows the transcript scroll
+               only while the reader stays pinned to the bottom. */
+            ULONGLONG now=GetTickCount64();
+            if (now-host->body_render_tick>=CHAT_BODY_RENDER_MS) {
+                host->body_render_tick=now;
+                stream_body_markdown(host,index);
+            }
         }
     }
 }
@@ -814,6 +844,8 @@ static void finish_request(ChatHost *host, OpenRouterEvent *event) {
     host->generating=false; host->stopping=false; host->accepting=false;
     chat_ui_set_generation(&host->chat_ui,false,false); EnableWindow(host->field.window,TRUE);
     set_status(host,chat_generation_name(g->state));
+    /* The full transcript render flushes any body rebuild the streaming
+       throttle had deferred, so the terminal Markdown is always visible. */
     host->dirty=true; save(host);
     if (host->request_conversation==host->config.chat->active) render_transcript(host);
     chat_ui_sync(&host->chat_ui); flush(host);

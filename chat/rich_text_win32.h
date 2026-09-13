@@ -83,8 +83,8 @@ void rich_text_set_head(RichTextControl *control, ChatRole role,
 /* Role header and body together, for messages that have no reasoning row. */
 void rich_text_set_block(RichTextControl *control, ChatRole role,
     const wchar_t *text);
-/* Body text only, written verbatim; running assistant output stays literal
-   while it streams (no markdown interpretation, fence markers visible). */
+/* Body text only, written verbatim (user, system and error turns, and
+   explicit clears); no markdown interpretation, fence markers visible. */
 void rich_text_set_body(RichTextControl *control, ChatRole role,
     const wchar_t *text);
 /* Live answer text appended verbatim; the completed body is re-rendered. */
