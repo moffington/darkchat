@@ -1,8 +1,10 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-rem DarkChat application executable. Leaves build\darkui.exe (the toolkit
-rem showcase) untouched. MinGW-w64 / w64devkit; no third-party dependencies.
+rem DarkChat application executable. Building the app leaves build\darkui.exe
+rem (the toolkit showcase) untouched; `chat.bat test` additionally runs the
+rem toolkit suite, which rebuilds the showcase, so close it first.
+rem MinGW-w64 / w64devkit; no third-party dependencies.
 if not exist build mkdir build
 windres app.rc -O coff -o build\chat_app.res
 if errorlevel 1 exit /b 1
@@ -51,6 +53,11 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_chat_host.exe
     if errorlevel 1 exit /b 1
-    echo Chat tests passed
+    rem One command covers both suites: the chat tests above and the DarkUI
+    rem toolkit suite (test_ui, test_renderer, test_accessibility). build.bat
+    rem test rebuilds build\darkui.exe, so close a running showcase first.
+    call build.bat test
+    if errorlevel 1 exit /b 1
+    echo Chat and toolkit suites passed
 )
 exit /b 0

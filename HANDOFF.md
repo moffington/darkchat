@@ -43,7 +43,3 @@ Design choices to retain: DIPs throughout the core; no Win32/COM in `ui/` or
 `showcase/`; synchronous small events; no per-frame application reconstruction;
 cached DirectWrite layouts; native editing rather than a partial Unicode editor;
 captured gestures canceled on focus/capture loss; on-demand painting.
-
-Pre-existing working-tree changes were left alone: deleted reference images and
-`serverconsole.exe`. The old untracked root `darkui.exe` is not the new build.
-No commit was made.

@@ -1,3 +1,4 @@
 /build/
-/docs/
+/docs/*
+!/docs/CHAT.md
 /darkui.exe

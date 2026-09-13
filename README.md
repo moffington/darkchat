@@ -1,8 +1,9 @@
 # Dark UI — native foundation
 
 The DarkChat application lives alongside the toolkit. Build with `chat.bat`,
-run `build\darkchat.exe`, and see [CHAT.md](CHAT.md) for daily-use actions,
-persistence/recovery, lifecycle semantics and verification.
+run `build\darkchat.exe`, and see [CHAT.md](docs/CHAT.md) for daily-use actions,
+persistence/recovery, lifecycle semantics and verification. `chat.bat test` is the
+single verification command: it runs the chat tests and the DarkUI toolkit suite.
 
 A small retained UI framework and runnable control showcase in **C17, Win32,
 Direct2D and DirectWrite**. The original charcoal surfaces, Segoe UI typography,
