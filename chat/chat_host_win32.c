@@ -383,12 +383,18 @@ static void prepare_turn(ChatHost *host, int index, ChatMessage *m,
 
         ensure_control(host, &turn->body, 100 + index * 4 + 1, false);
         if (turn->body.window) turn->body_live = true;
-        rich_text_set_body(&turn->body, m->role, chat_message_text(m));
+        /* Terminal assistant output is Markdown-rendered; running output
+           stays verbatim while it streams. Rebuilds of completed turns may
+           reparse the message; no render cache is kept. */
+        bool terminal = m->generation.state != CHAT_GENERATION_NONE &&
+            m->generation.state != CHAT_GENERATION_RUNNING;
+        if (terminal)
+            rich_text_set_markdown(&turn->body, m->role, chat_message_text(m));
+        else
+            rich_text_set_body(&turn->body, m->role, chat_message_text(m));
 
         /* Metadata is a terminal-state footer, so a running turn never mixes
            stats into the streaming answer. */
-        bool terminal = m->generation.state != CHAT_GENERATION_NONE &&
-            m->generation.state != CHAT_GENERATION_RUNNING;
         if (terminal) {
             ensure_control(host, &turn->meta, 100 + index * 4 + 3, false);
             if (turn->meta.window) {

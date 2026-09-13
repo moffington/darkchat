@@ -1,4 +1,5 @@
 #include "rich_text_win32.h"
+#include "markdown.h"
 #include <richedit.h>
 #include <shellapi.h>
 #include <stdlib.h>
@@ -58,13 +59,16 @@ void rich_text_theme(RichTextTheme *theme, const UiTheme *ui) {
 }
 
 static void apply_format(RichTextControl *control, WPARAM scope, bool bold,
-    bool mono, COLORREF color, bool code, float size) {
+    bool italic, bool mono, COLORREF color, bool code, float size) {
     const RichTextTheme *theme = &control->theme;
     CHARFORMAT2W format;
     memset(&format, 0, sizeof format);
     format.cbSize = sizeof format;
-    format.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE | CFM_BOLD | CFM_WEIGHT;
-    format.dwEffects = bold ? CFE_BOLD : 0;
+    /* Every field is set on every call: runs never inherit stale formatting,
+       so emphasis or the code tint cannot bleed into following text. */
+    format.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE | CFM_BOLD | CFM_WEIGHT |
+        CFM_ITALIC | CFM_BACKCOLOR;
+    format.dwEffects = (bold ? CFE_BOLD : 0) | (italic ? CFE_ITALIC : 0);
     format.wWeight = (WORD)(bold ? 700 : 400);
     format.crTextColor = color;
     /* yHeight is in twips (1/1440 inch), a physical unit the control already
@@ -76,7 +80,8 @@ static void apply_format(RichTextControl *control, WPARAM scope, bool bold,
     wcsncpy(format.szFaceName, face, LF_FACESIZE - 1);
     format.szFaceName[LF_FACESIZE - 1] = 0;
     format.bCharSet = DEFAULT_CHARSET;
-    if (code) { format.crBackColor = theme->code_background; format.dwMask |= CFM_BACKCOLOR; }
+    format.crBackColor = code ? theme->code_background :
+        control->surface_background;
     SendMessageW(control->window, EM_SETCHARFORMAT, scope, (LPARAM)&format);
 }
 
@@ -88,7 +93,7 @@ static void caret_end(HWND window) {
 /* Inserts text at the caret using an explicit point size. */
 static void run_at(RichTextControl *control, const wchar_t *text, bool bold,
     bool mono, COLORREF color, bool code, float size) {
-    apply_format(control, SCF_SELECTION, bold, mono, color, code, size);
+    apply_format(control, SCF_SELECTION, bold, false, mono, color, code, size);
     SendMessageW(control->window, EM_REPLACESEL, FALSE, (LPARAM)text);
 }
 
@@ -159,6 +164,7 @@ static bool create_control(RichTextControl *control, HWND parent, int id,
     bool scrollable, long limit, COLORREF background, const wchar_t *text) {
     memset(control, 0, sizeof *control);
     control->theme = *theme;
+    control->surface_background = background;
     control->dpi = dpi;
     control->multiline = multiline;
     control->readonly = readonly;
@@ -187,8 +193,8 @@ static bool create_control(RichTextControl *control, HWND parent, int id,
     SendMessageW(control->window, EM_SETEDITSTYLE, SES_EXTENDBACKCOLOR,
         SES_EXTENDBACKCOLOR);
     if (multiline) SendMessageW(control->window, EM_SETTARGETDEVICE, 0, 0);
-    apply_format(control, SCF_DEFAULT, false, false, theme->text, false,
-        theme->ui_size);
+    apply_format(control, SCF_DEFAULT, false, false, false, theme->text,
+        false, theme->ui_size);
     set_margin(control, multiline ? 10 : 8, multiline ? 10 : 8);
     return true;
 }
@@ -223,8 +229,8 @@ bool rich_text_create_field(RichTextControl *control, HWND parent, int id,
 void rich_text_set_dpi(RichTextControl *control, float dpi) {
     if (!control->window || dpi <= 0) return;
     control->dpi = dpi;
-    apply_format(control, SCF_DEFAULT, false, false, control->theme.text, false,
-        control->theme.ui_size);
+    apply_format(control, SCF_DEFAULT, false, false, false,
+        control->theme.text, false, control->theme.ui_size);
     set_margin(control, control->multiline ? 10 : 8, control->multiline ? 10 : 8);
 }
 
@@ -310,41 +316,79 @@ static void end_write(RichTextControl *control) {
     RedrawWindow(control->window, NULL, NULL, RDW_INVALIDATE);
 }
 
-/* Writes body text one line at a time, switching monospace styling while a
-   ``` fence is open and hiding the fence lines themselves. */
-static void write_lines(RichTextControl *control, const wchar_t *text,
-    ChatRole role) {
-    const RichTextTheme *theme = &control->theme;
-    COLORREF body = role == CHAT_ROLE_ERROR ? theme->error : theme->text;
-    bool code = false, first = true;
+/* Writes text verbatim, one line at a time; CR LF pairs become one paragraph
+   break. No markdown interpretation of any kind: user, system and error
+   messages and running assistant output stay exactly as stored, including
+   fence markers. */
+static void write_literal(RichTextControl *control, const wchar_t *text,
+    COLORREF color) {
+    bool first = true;
     const wchar_t *line = text ? text : L"";
     for (;;) {
         const wchar_t *end = line;
         while (*end && *end != L'\n' && *end != L'\r') ++end;
         size_t length = (size_t)(end - line);
-        bool fence = length >= 3 && line[0] == L'`' && line[1] == L'`' &&
-            line[2] == L'`';
-        if (fence) {
-            code = !code;
-        } else {
-            if (!first) run(control, L"\n", false, false, theme->text, false);
-            wchar_t *buffer = (wchar_t *)malloc((length + 1) * sizeof(wchar_t));
-            if (buffer) {
-                if (length) wmemcpy(buffer, line, length);
-                buffer[length] = 0;
-                run(control, buffer, false, code,
-                    code ? theme->code_text : body, code);
-                free(buffer);
-            }
-            first = false;
+        if (!first) run(control, L"\n", false, false, color, false);
+        wchar_t *buffer = (wchar_t *)malloc((length + 1) * sizeof(wchar_t));
+        if (buffer) {
+            if (length) wmemcpy(buffer, line, length);
+            buffer[length] = 0;
+            run(control, buffer, false, false, color, false);
+            free(buffer);
         }
+        first = false;
         if (!*end) break;
-        /* GetWindowTextW returns composer paragraphs as CRLF. Treat the pair
-           as one logical break; passing the retained CR and an inserted LF to
-           Rich Edit makes each character render as its own paragraph. */
         line = end + 1;
         if (*end == L'\r' && *line == L'\n') ++line;
     }
+}
+
+/* Terminal assistant body: parse once, insert the normalized document, then
+   style each run's exact range. Every character belongs to a run, so no
+   format survives past its run. */
+void rich_text_set_markdown(RichTextControl *control, ChatRole role,
+    const wchar_t *text) {
+    if (!control || !control->window) return;
+    const RichTextTheme *theme = &control->theme;
+    COLORREF body = role == CHAT_ROLE_ERROR ? theme->error : theme->text;
+    begin_write(control);
+    MdDocument document;
+    if (!markdown_render(text, &document)) {
+        /* Transactional failure: fall back to the verbatim body. */
+        write_literal(control, text, body);
+    } else {
+        SendMessageW(control->window, EM_REPLACESEL, FALSE,
+            (LPARAM)document.text);
+        for (int i = 0; i < document.run_count; i++) {
+            const MdRun *r = &document.runs[i];
+            if (!r->length) continue;
+            CHARRANGE range;
+            range.cpMin = (LONG)r->offset;
+            range.cpMax = (LONG)(r->offset + r->length);
+            SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&range);
+            COLORREF color = r->code ? theme->code_text :
+                r->muted ? theme->muted : body;
+            float size = r->mono ? theme->mono_size :
+                r->heading == 1 ? theme->ui_size + 3.0f :
+                r->heading == 2 ? theme->ui_size + 2.0f :
+                r->heading == 3 ? theme->ui_size + 1.0f : theme->ui_size;
+            apply_format(control, SCF_SELECTION, r->bold, r->italic, r->mono,
+                color, r->code, size);
+        }
+        markdown_dispose(&document);
+        caret_end(control->window);
+    }
+    end_write(control);
+}
+
+void rich_text_set_body(RichTextControl *control, ChatRole role,
+    const wchar_t *text) {
+    if (!control || !control->window) return;
+    const RichTextTheme *theme = &control->theme;
+    begin_write(control);
+    write_literal(control, text,
+        role == CHAT_ROLE_ERROR ? theme->error : theme->text);
+    end_write(control);
 }
 
 void rich_text_set_head(RichTextControl *control, ChatRole role,
@@ -368,16 +412,9 @@ void rich_text_set_block(RichTextControl *control, ChatRole role,
     run(control, role_label(role), true, false, role_color(theme, role), false);
     if (text && text[0]) {
         run(control, L"\n", false, false, theme->text, false);
-        write_lines(control, text, role);
+        write_literal(control, text,
+            role == CHAT_ROLE_ERROR ? theme->error : theme->text);
     }
-    end_write(control);
-}
-
-void rich_text_set_body(RichTextControl *control, ChatRole role,
-    const wchar_t *text) {
-    if (!control || !control->window) return;
-    begin_write(control);
-    write_lines(control, text ? text : L"", role);
     end_write(control);
 }
 

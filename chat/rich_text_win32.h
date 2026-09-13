@@ -4,7 +4,8 @@
 /* Native text surfaces for the chat host, all built on the Windows Rich Edit
    control (Msftedit.dll / RICHEDIT50W). Windows owns selection, caret movement,
    clipboard, undo and IME; this module owns dark styling, role formatting,
-   fenced-code blocks, automatic URL detection and per-viewport auto-follow.
+   Markdown rendering for terminal assistant output, automatic URL detection
+   and per-viewport auto-follow.
 
    Two read-only shapes exist so every transcript turn can own its own views
    instead of sharing one monolithic control: a block whose height tracks its
@@ -35,6 +36,9 @@ struct RichTextControl {
     HWND window;
     WNDPROC previous;
     RichTextTheme theme;
+    /* The surface's own background; Markdown code highlighting sets this
+       explicitly on plain runs so the code tint cannot bleed past its runs. */
+    COLORREF surface_background;
     float dpi;
     bool readonly, multiline, scrollable, has_content;
     /* Enter without Shift. Return true to consume the key. */
@@ -79,11 +83,17 @@ void rich_text_set_head(RichTextControl *control, ChatRole role,
 /* Role header and body together, for messages that have no reasoning row. */
 void rich_text_set_block(RichTextControl *control, ChatRole role,
     const wchar_t *text);
-/* Body text only, with fenced-code formatting (assistant answers). */
+/* Body text only, written verbatim; running assistant output stays literal
+   while it streams (no markdown interpretation, fence markers visible). */
 void rich_text_set_body(RichTextControl *control, ChatRole role,
     const wchar_t *text);
 /* Live answer text appended verbatim; the completed body is re-rendered. */
 void rich_text_append_body(RichTextControl *control, const wchar_t *text);
+/* Body text only, rendered as Markdown: headings 1-3, bold, italic, inline
+   and fenced code, flat lists, HTTP(S) links and blockquotes. Falls back to
+   verbatim text when parsing or allocation fails. */
+void rich_text_set_markdown(RichTextControl *control, ChatRole role,
+    const wchar_t *text);
 /* Compact terminal-state metadata footer (status, timings, tokens, cost,
    model), rendered in the small muted face. */
 void rich_text_set_meta(RichTextControl *control, const wchar_t *text,
