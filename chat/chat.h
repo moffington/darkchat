@@ -52,6 +52,12 @@ typedef struct {
     wchar_t *text_overflow, *reasoning_overflow;
     size_t text_length, reasoning_length;
     size_t text_capacity, reasoning_capacity;
+    /* View bookkeeping, never persisted: `id` is a process-local instance id
+       distinguishing a message from any other that later occupies the same
+       turn slot (retry/regenerate replacement), `revision` counts observable
+       content changes so a transcript control can skip rewriting a surface
+       whose message has not changed. */
+    uint64_t id, revision;
     /* View state: whether this turn's reasoning viewport is expanded. Owned by
        the rendered turn; reset with the message, not persisted. */
     bool reasoning_open;
@@ -104,6 +110,10 @@ bool chat_message_set_text(ChatMessage *message, const wchar_t *text);
 bool chat_message_set_reasoning(ChatMessage *message, const wchar_t *text);
 bool chat_message_append_text(ChatMessage *message, const wchar_t *text);
 bool chat_message_append_reasoning(ChatMessage *message, const wchar_t *text);
+/* Marks a message as observably changed for view bookkeeping after a direct
+   mutation the setters do not cover (generation metadata written in place).
+   Bumping must be limited to real changes; never call it speculatively. */
+void chat_message_touch(ChatMessage *message);
 void chat_message_dispose(ChatMessage *message);
 void chat_dispose(Chat *chat);
 

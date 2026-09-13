@@ -81,21 +81,47 @@ static bool append_message_value(wchar_t *inline_text, size_t inline_capacity,
 }
 
 bool chat_message_set_text(ChatMessage *m,const wchar_t *text) {
-    return m && set_message_value(m->text,CHAT_MESSAGE_TEXT,&m->text_overflow,
-        &m->text_length,&m->text_capacity,text);
+    if (!m) return false;
+    if (!text) text=L"";
+    const wchar_t *previous=message_value(m->text,m->text_overflow);
+    bool unchanged=!wcscmp(previous,text);
+    if (!set_message_value(m->text,CHAT_MESSAGE_TEXT,&m->text_overflow,
+        &m->text_length,&m->text_capacity,text)) return false;
+    /* Bump only when the stored value actually changes. */
+    if (!unchanged) ++m->revision;
+    return true;
 }
 bool chat_message_set_reasoning(ChatMessage *m,const wchar_t *text) {
-    return m && set_message_value(m->reasoning,CHAT_REASONING_TEXT,
-        &m->reasoning_overflow,&m->reasoning_length,&m->reasoning_capacity,text);
+    if (!m) return false;
+    if (!text) text=L"";
+    const wchar_t *previous=message_value(m->reasoning,m->reasoning_overflow);
+    bool unchanged=!wcscmp(previous,text);
+    if (!set_message_value(m->reasoning,CHAT_REASONING_TEXT,
+        &m->reasoning_overflow,&m->reasoning_length,&m->reasoning_capacity,
+        text)) return false;
+    if (!unchanged) ++m->revision;
+    return true;
 }
 bool chat_message_append_text(ChatMessage *m,const wchar_t *text) {
-    return m && append_message_value(m->text,CHAT_MESSAGE_TEXT,&m->text_overflow,
-        &m->text_length,&m->text_capacity,text);
+    if (!m) return false;
+    if (!append_message_value(m->text,CHAT_MESSAGE_TEXT,&m->text_overflow,
+        &m->text_length,&m->text_capacity,text)) return false;
+    if (text && text[0]) ++m->revision;
+    return true;
 }
 bool chat_message_append_reasoning(ChatMessage *m,const wchar_t *text) {
-    return m && append_message_value(m->reasoning,CHAT_REASONING_TEXT,
-        &m->reasoning_overflow,&m->reasoning_length,&m->reasoning_capacity,text);
+    if (!m) return false;
+    if (!append_message_value(m->reasoning,CHAT_REASONING_TEXT,
+        &m->reasoning_overflow,&m->reasoning_length,&m->reasoning_capacity,
+        text)) return false;
+    if (text && text[0]) ++m->revision;
+    return true;
 }
+/* Direct generation mutations that the setters cannot see go through here. */
+void chat_message_touch(ChatMessage *message) {
+    if (message) ++message->revision;
+}
+
 void chat_message_dispose(ChatMessage *m) {
     if (!m) return;
     free(m->text_overflow); free(m->reasoning_overflow);
@@ -196,6 +222,8 @@ int chat_append_at(Chat *chat, int conversation_index, ChatRole role,
     memset(message, 0, sizeof *message);
     chat_generation_init(&message->generation);
     message->created_at = message->modified_at = chat_now();
+    /* Process-local instance id: view bookkeeping, never persisted. */
+    message->id = ++chat->next_id;
     conversation->modified_at = message->modified_at;
     message->role = role;
     if (!chat_message_set_text(message,text)) return -1;

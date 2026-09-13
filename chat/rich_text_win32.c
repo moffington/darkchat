@@ -24,6 +24,9 @@
 #ifndef ENM_REQUESTRESIZE
 #define ENM_REQUESTRESIZE 0x00010000
 #endif
+#ifndef ENM_SELCHANGE
+#define ENM_SELCHANGE 0x00080000
+#endif
 
 static HMODULE rich_library;
 
@@ -186,8 +189,11 @@ static bool create_control(RichTextControl *control, HWND parent, int id,
     SendMessageW(control->window, EM_EXLIMITTEXT, 0, (LPARAM)limit);
     SendMessageW(control->window, EM_AUTOURLDETECT, TRUE, 0);
     /* Read-only blocks size themselves to their content, so they ask their
-       parent for the required height whenever their text or width changes. */
+       parent for the required height whenever their text or width changes.
+       They also report selection changes so the transcript can defer
+       destructive rebuilds while a selection is held. */
     DWORD events = ENM_LINK | ENM_SCROLL;
+    if (readonly) events |= ENM_SELCHANGE;
     if (readonly && !scrollable) events |= ENM_REQUESTRESIZE;
     SendMessageW(control->window, EM_SETEVENTMASK, 0, events);
     SendMessageW(control->window, EM_SETEDITSTYLE, SES_EXTENDBACKCOLOR,
@@ -270,6 +276,13 @@ bool rich_text_pinned(const RichTextControl *control) {
     if (info.nMax <= (int)info.nPage) return true;
     int maximum = info.nMax - (int)info.nPage + 1;
     return info.nPos >= maximum - 1;
+}
+
+bool rich_text_has_selection(const RichTextControl *control) {
+    if (!control || !control->window) return false;
+    CHARRANGE selection;
+    SendMessageW(control->window, EM_EXGETSEL, 0, (LPARAM)&selection);
+    return selection.cpMax > selection.cpMin;
 }
 
 void rich_text_scroll_to_end(RichTextControl *control) {
@@ -470,17 +483,21 @@ void rich_text_set_reasoning(RichTextControl *control, const wchar_t *text) {
 
 void rich_text_append_reasoning(RichTextControl *control, const wchar_t *text) {
     if (!control || !control->window || !text || !text[0]) return;
-    bool pinned = rich_text_pinned(control);
     HWND window = control->window;
+    CHARRANGE selection;
+    SendMessageW(window, EM_EXGETSEL, 0, (LPARAM)&selection);
+    bool pinned = rich_text_pinned(control);
     SendMessageW(window, EM_SETREADONLY, FALSE, 0);
     caret_end(window);
     run(control, text, false, false, control->theme.muted, false);
     SendMessageW(window, EM_SETREADONLY, control->readonly ? TRUE : FALSE, 0);
     control->has_content = true;
+    /* Follow the stream only while the reader stays pinned to the bottom;
+       restore the reader's selection after scrolling so it survives appends. */
     if (pinned) rich_text_scroll_to_end(control);
+    SendMessageW(window, EM_EXSETSEL, 0, (LPARAM)&selection);
     RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
 }
-
 bool rich_text_handle_notify(RichTextControl *control, LPARAM lparam) {
     NMHDR *header = (NMHDR *)lparam;
     if (header->code == EN_LINK) {

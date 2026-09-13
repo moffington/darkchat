@@ -14,7 +14,7 @@ static void begin_mode(ChatHost *h,ChatSendMode mode) {
     h->request_conversation=h->config.chat->active;
     ++h->request_generation; h->generating=true; h->accepting=true; h->stopping=false;
     h->reasoning_streaming=false; h->content_started=false;
-    h->body_render_tick=0;
+    h->transcript.body_render_tick=0;
     h->started_tick=GetTickCount64(); render_transcript(h);
 }
 static void begin_fixture(ChatHost *h) { begin_mode(h,CHAT_RETRY); }
@@ -22,20 +22,20 @@ static void begin_regenerate(ChatHost *h) { begin_mode(h,CHAT_REGENERATE); }
 /* Reads a turn's rendered controls back to prove per-turn ownership. */
 static void head_text(ChatHost *h,int i,wchar_t *out,size_t cap) {
     out[0]=0;
-    if (h->turns[i].head.window) rich_text_get_text(&h->turns[i].head,out,cap);
+    if (h->transcript.turns[i].head.window) rich_text_get_text(&h->transcript.turns[i].head,out,cap);
 }
 static void reasoning_text(ChatHost *h,int i,wchar_t *out,size_t cap) {
     out[0]=0;
-    if (h->turns[i].reasoning.window)
-        rich_text_get_text(&h->turns[i].reasoning,out,cap);
+    if (h->transcript.turns[i].reasoning.window)
+        rich_text_get_text(&h->transcript.turns[i].reasoning,out,cap);
 }
 static void body_text(ChatHost *h,int i,wchar_t *out,size_t cap) {
     out[0]=0;
-    if (h->turns[i].body.window) rich_text_get_text(&h->turns[i].body,out,cap);
+    if (h->transcript.turns[i].body.window) rich_text_get_text(&h->transcript.turns[i].body,out,cap);
 }
 static void meta_text(ChatHost *h,int i,wchar_t *out,size_t cap) {
     out[0]=0;
-    if (h->turns[i].meta.window) rich_text_get_text(&h->turns[i].meta,out,cap);
+    if (h->transcript.turns[i].meta.window) rich_text_get_text(&h->transcript.turns[i].meta,out,cap);
 }
 static bool row_present(ChatHost *h,int i) {
     wchar_t text[96]; head_text(h,i,text,96);
@@ -43,7 +43,7 @@ static bool row_present(ChatHost *h,int i) {
 }
 /* Drives the real whole-row click path for one turn. */
 static void click_row(ChatHost *h,int i) {
-    if (h->turns[i].head.window) turn_row_click(h,&h->turns[i].head,1,false);
+    if (h->transcript.turns[i].head.window) turn_row_click(h,&h->transcript.turns[i].head,1,false);
 }
 /* Appends a completed user/assistant turn with optional reasoning. */
 static int add_turn(Chat *chat,const wchar_t *prompt,const wchar_t *answer,
@@ -54,6 +54,7 @@ static int add_turn(Chat *chat,const wchar_t *prompt,const wchar_t *answer,
     m->generation.state=CHAT_GENERATION_COMPLETE;
     if (reasoning) wcscpy(m->reasoning,reasoning);
     m->generation.reasoning_ms=reasoning?reasoning_ms:-1;
+    chat_message_touch(m);
     return index;
 }
 int main(void) {
@@ -108,59 +109,59 @@ int main(void) {
     int second=add_turn(chat,L"second",L"Second answer",L"Beta reasoning",2500);
     wchar_t text[128];
     render_transcript(h);
-    CHECK(h->turn_count==4);
+    CHECK(h->transcript.turn_count==4);
     CHECK(row_present(h,first) && row_present(h,second));
-    CHECK(!h->turns[first].reason_live && !h->turns[second].reason_live);
+    CHECK(!h->transcript.turns[first].reason_live && !h->transcript.turns[second].reason_live);
     head_text(h,first,text,128);
     CHECK(wcsstr(text,L"1.5s")!=NULL);
     /* Expanding one turn never touches another. */
     click_row(h,first);
-    CHECK(h->turns[first].reason_live && !h->turns[second].reason_live);
+    CHECK(h->transcript.turns[first].reason_live && !h->transcript.turns[second].reason_live);
     reasoning_text(h,first,text,128);
     CHECK(!wcscmp(text,L"Alpha reasoning"));
     /* Measuring text must not include its position in the transcript. */
-    { TurnView *turn=&h->turns[first];
+    { TranscriptTurn *turn=&h->transcript.turns[first];
       int height=turn->head_h;
       CHECK(height<px(h,50));
       CHECK(turn->reason_y-turn->head_y-height==px(h,8));
-      layout_from(h,0,false);
+      transcript_layout_from(&h->transcript,0,false);
       CHECK(turn->head_h==height);
-      layout_from(h,0,false);
+      transcript_layout_from(&h->transcript,0,false);
       CHECK(turn->head_h==height); }
     click_row(h,second);
-    CHECK(h->turns[first].reason_live && h->turns[second].reason_live);
+    CHECK(h->transcript.turns[first].reason_live && h->transcript.turns[second].reason_live);
     reasoning_text(h,second,text,128);
     CHECK(!wcscmp(text,L"Beta reasoning"));
     reasoning_text(h,first,text,128);
     CHECK(!wcscmp(text,L"Alpha reasoning"));
     click_row(h,first);
-    CHECK(!h->turns[first].reason_live && h->turns[second].reason_live);
+    CHECK(!h->transcript.turns[first].reason_live && h->transcript.turns[second].reason_live);
     /* Collapsed by default while waiting; explicit expansion streams live into
        that turn only and is not collapsed when the answer begins. */
     begin_regenerate(h);
     CHECK(pending(h)->generation.state==CHAT_GENERATION_RUNNING);
     head_text(h,second,text,128);
     CHECK(wcsstr(text,L"Thinking")!=NULL);
-    CHECK(!h->turns[second].reason_live);
+    CHECK(!h->transcript.turns[second].reason_live);
     click_row(h,second);
-    CHECK(h->turns[second].reason_live &&
+    CHECK(h->transcript.turns[second].reason_live &&
         chat->conversations[cv].messages[second].reasoning_open);
     handle_event(h,fixture(h,OPENROUTER_REASONING,L"stream rea"));
     handle_event(h,fixture(h,OPENROUTER_REASONING,L"soning"));
     reasoning_text(h,second,text,128);
     CHECK(!wcscmp(text,L"stream reasoning"));
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"Streamed answer"));
-    CHECK(h->turns[second].reason_live &&
+    CHECK(h->transcript.turns[second].reason_live &&
         chat->conversations[cv].messages[second].reasoning_open);
     CHECK(pending(h)->generation.reasoning_ms>=0);
     /* The running answer is never mixed with metadata, and no footer exists
        until the turn is terminal. */
     { wchar_t body[256]; body_text(h,second,body,256);
       CHECK(!wcscmp(body,L"Streamed answer")); }
-    CHECK(!h->turns[second].meta_live);
+    CHECK(!h->transcript.turns[second].meta_live);
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
-    CHECK(h->turns[second].meta_live);
+    CHECK(h->transcript.turns[second].meta_live);
     { wchar_t meta[256]; meta_text(h,second,meta,256);
       CHECK(wcsstr(meta,L"Complete")!=NULL); }
     /* Reasoning and duration persist per message. */
@@ -183,12 +184,13 @@ int main(void) {
        expansion state. */
     wcscpy(chat->conversations[cv].messages[second].reasoning,L"leak?");
     chat->conversations[cv].messages[second].reasoning_open=true;
+    chat_message_touch(&chat->conversations[cv].messages[second]);
     render_transcript(h);
-    CHECK(h->turns[second].reason_live);
+    CHECK(h->transcript.turns[second].reason_live);
     begin_regenerate(h);
     CHECK(chat->conversations[cv].messages[second].reasoning[0]==0);
     CHECK(!chat->conversations[cv].messages[second].reasoning_open);
-    CHECK(!h->turns[second].reason_live);
+    CHECK(!h->transcript.turns[second].reason_live);
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED);
     /* Cancellation/error keeps that turn coherent: reasoning retained, row and
@@ -196,7 +198,7 @@ int main(void) {
     begin_regenerate(h);
     handle_event(h,fixture(h,OPENROUTER_REASONING,L"kept"));
     click_row(h,second);
-    CHECK(h->turns[second].reason_live);
+    CHECK(h->transcript.turns[second].reason_live);
     handle_event(h,fixture(h,OPENROUTER_ERROR,L"boom"));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED);
     CHECK(!wcscmp(chat->conversations[cv].messages[second].reasoning,L"kept"));
@@ -205,14 +207,15 @@ int main(void) {
     /* Switching conversations restores each message's own reasoning. */
     wcscpy(chat->conversations[0].messages[1].reasoning,L"Conv zero");
     chat->conversations[0].messages[1].reasoning_open=false;
+    chat_message_touch(&chat->conversations[0].messages[1]);
     command(h,CHAT_COMMAND_SELECT,0);
-    CHECK(h->turn_count==2);
+    CHECK(h->transcript.turn_count==2);
     CHECK(row_present(h,1));
     click_row(h,1);
     { wchar_t text[128]; reasoning_text(h,1,text,128);
       CHECK(!wcscmp(text,L"Conv zero")); }
     command(h,CHAT_COMMAND_SELECT,cv);
-    CHECK(h->turn_count==4);
+    CHECK(h->transcript.turn_count==4);
     { wchar_t text[128]; reasoning_text(h,second,text,128);
       CHECK(!wcscmp(text,L"kept")); }
     /* An answer past the old fixed-size limit streams to completion. */
@@ -264,16 +267,16 @@ int main(void) {
     click_row(h,second);
     handle_event(h,fixture(h,OPENROUTER_REASONING,L"Working through it"));
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"Answer"));
-    { TurnView *turn=&h->turns[second];
+    { TranscriptTurn *turn=&h->transcript.turns[second];
       int head_height=turn->head_h;
       int reason_y=turn->reason_y;
       position_turns(h,true);
       for (int i=0;i<80;i++) {
-          int height=turn->body_h, scroll=h->view_scroll;
+          int height=turn->body_h, scroll=h->transcript.view_scroll;
           handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nAnother line of the streamed answer."));
           CHECK(turn->head_h==head_height && turn->reason_y==reason_y);
           CHECK(turn->body_h>=height && turn->body_h-height<px(h,40));
-          CHECK(h->view_scroll>=scroll && view_pinned(h));
+          CHECK(h->transcript.view_scroll>=scroll && transcript_pinned(&h->transcript));
           POINT origin={0,0};
           SendMessageW(turn->body.window,EM_GETSCROLLPOS,0,(LPARAM)&origin);
           CHECK(origin.y==0);
@@ -282,15 +285,15 @@ int main(void) {
          reparsed per token; flushing renders the accumulated burst in one
          step and the transcript still follows at the bottom. */
       int before_flush=turn->body_h;
-      h->body_render_tick=0;
+      h->transcript.body_render_tick=0;
       handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nFlushed rebuild."));
-      CHECK(turn->body_h>before_flush && view_pinned(h));
-      h->view_scroll=px(h,30); position_turns(h,false);
-      CHECK(!view_pinned(h));
-      int scroll=h->view_scroll;
+      CHECK(turn->body_h>before_flush && transcript_pinned(&h->transcript));
+      h->transcript.view_scroll=px(h,30); position_turns(h,false);
+      CHECK(!transcript_pinned(&h->transcript));
+      int scroll=h->transcript.view_scroll;
       for (int i=0;i<8;i++) {
           handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nMore text while reading above."));
-          CHECK(h->view_scroll==scroll);
+          CHECK(h->transcript.view_scroll==scroll);
       }
     }
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
@@ -331,12 +334,12 @@ int main(void) {
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"# Tit"));
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
       CHECK(!wcscmp(body,L"Tit")); }
-    h->body_render_tick=GetTickCount64();
+    h->transcript.body_render_tick=GetTickCount64();
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"le **bo"));
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"ld** an"));
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"d `co"));
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"de` an"));
-    CHECK(GetTickCount64()-h->body_render_tick<CHAT_BODY_RENDER_MS);
+    CHECK(GetTickCount64()-h->transcript.body_render_tick<CHAT_BODY_RENDER_MS);
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
       CHECK(!wcscmp(body,L"Tit")); }
     Sleep(CHAT_BODY_RENDER_MS+20);
@@ -345,19 +348,19 @@ int main(void) {
       CHECK(!wcscmp(body,L"Title bold and code and\r\nnext **ope"));
       CHARFORMAT2W f;
       memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* "bold" */
-      SendMessageW(h->turns[stream_turn].body.window,EM_SETSEL,6,7);
-      SendMessageW(h->turns[stream_turn].body.window,EM_GETCHARFORMAT,
+      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_SETSEL,6,7);
+      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_GETCHARFORMAT,
           SCF_SELECTION,(LPARAM)&f);
       CHECK((f.dwEffects & CFE_BOLD) && !(f.dwEffects & CFE_ITALIC));
       memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* "code" */
-      SendMessageW(h->turns[stream_turn].body.window,EM_SETSEL,15,16);
-      SendMessageW(h->turns[stream_turn].body.window,EM_GETCHARFORMAT,
+      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_SETSEL,15,16);
+      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_GETCHARFORMAT,
           SCF_SELECTION,(LPARAM)&f);
       CHECK(!wcscmp(f.szFaceName,L"Consolas") &&
           (f.dwMask & CFM_BACKCOLOR));
       memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* plain tail */
-      SendMessageW(h->turns[stream_turn].body.window,EM_SETSEL,26,27);
-      SendMessageW(h->turns[stream_turn].body.window,EM_GETCHARFORMAT,
+      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_SETSEL,26,27);
+      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_GETCHARFORMAT,
           SCF_SELECTION,(LPARAM)&f);
       CHECK(!(f.dwEffects & CFE_BOLD) && !wcscmp(f.szFaceName,L"Segoe UI")); }
     CHECK(!wcscmp(pending(h)->text,
@@ -378,8 +381,9 @@ int main(void) {
       wcscpy(m->generation.finish_reason,L"stop");
       wcscpy(m->generation.requested_model,L"deepseek/deepseek-v4.1-flash");
       wcscpy(m->generation.actual_model,L"deepseek/deepseek-v4.1-flash");
+      chat_message_touch(m);
       render_transcript(h);
-      CHECK(h->turns[second].meta_live);
+      CHECK(h->transcript.turns[second].meta_live);
       meta_text(h,second,meta,256);
       CHECK(wcsstr(meta,L"Complete")!=NULL);
       CHECK(wcsstr(meta,L"TTFT 18.0s")!=NULL);
@@ -390,17 +394,133 @@ int main(void) {
       CHECK(wcsstr(meta,L"deepseek/deepseek-v4.1-flash")!=NULL);
       CHECK(wcsstr(meta,L"\u2192")==NULL);   /* requested == actual: shown once */
       wcscpy(m->generation.actual_model,L"deepseek/other");
+      chat_message_touch(m);
       render_transcript(h);
       meta_text(h,second,meta,256);
       CHECK(wcsstr(meta,L"deepseek/deepseek-v4.1-flash \u2192 deepseek/other")!=NULL);
       wcscpy(m->generation.actual_model,m->generation.requested_model);
       wcscpy(m->generation.finish_reason,L"length");
+      chat_message_touch(m);
       render_transcript(h);
       meta_text(h,second,meta,256);
       CHECK(wcsstr(meta,L"finish: length")!=NULL);
       CHECK(wcsstr(meta,L"stop")==NULL);
       wcscpy(m->generation.finish_reason,L"stop");
+      chat_message_touch(m);
     }
+    /* ---- Revision-tracked updates and selection preservation ---- */
+    /* An active selection in an unchanged historical turn survives transcript
+       rebuilds and a sibling turn's replacement untouched. */
+    { HWND body=h->transcript.turns[first].body.window;
+      CHECK(body);
+      SendMessageW(body,EM_SETSEL,2,6);
+      render_transcript(h);
+      CHARRANGE sel; memset(&sel,0,sizeof sel);
+      SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
+      CHECK(sel.cpMin==2 && sel.cpMax==6);
+      begin_regenerate(h);
+      handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+      CHECK(!h->generating);
+      SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
+      CHECK(sel.cpMin==2 && sel.cpMax==6);
+      wchar_t kept[128]; body_text(h,first,kept,128);
+      CHECK(wcsstr(kept,L"First answer")!=NULL); }
+    /* Streaming: a selection inside the live answer defers the throttled
+       Markdown rebuild; clearing the selection applies the deferred render and
+       relayouts from the affected turn, so geometry, the scrollbar range and
+       bottom-following stay correct even with no further stream event. */
+    begin_regenerate(h);
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"**raw *stream"));
+    { HWND body=h->transcript.turns[second].body.window;
+      TranscriptTurn *turn=&h->transcript.turns[second];
+      CHECK(body);
+      SendMessageW(body,EM_SETSEL,3,7);
+      h->transcript.body_render_tick=0;   /* force the throttled rebuild */
+      handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nmore"));
+      CHARRANGE sel; memset(&sel,0,sizeof sel);
+      SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
+      CHECK(sel.cpMin==3 && sel.cpMax==7);   /* selection survived the flush */
+      wchar_t shown[256]; body_text(h,second,shown,256);
+      CHECK(wcsstr(shown,L"**raw *stream")!=NULL);   /* not rebuilt */
+      CHECK(wcsstr(shown,L"more")==NULL);            /* rebuild deferred */
+      /* Clearing the selection applies the deferred Markdown rebuild and
+         remeasures: the turn grows, the following surface and the scrollbar
+         range move, and a pinned transcript still follows the bottom. */
+      h->transcript.view_scroll=0x7fffffff;
+      transcript_position(&h->transcript,false);   /* pin to the bottom */
+      int body_before=turn->body_h, height_before=turn->height;
+      int content_before=h->transcript.view_content;
+      SendMessageW(body,EM_SETSEL,0,0);
+      CHECK(turn->body_h>body_before);
+      CHECK(turn->height>height_before);
+      CHECK(h->transcript.view_content>content_before);
+      CHECK(transcript_pinned(&h->transcript));
+      body_text(h,second,shown,256);
+      CHECK(wcsstr(shown,L"more")!=NULL); }
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    /* The same deferral persists through generation completion: the terminal
+       Markdown render waits for the selection, and clearing afterwards still
+       relayouts so the following metadata footer and scrollbar follow. */
+    begin_regenerate(h);
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"**raw *stream"));
+    { HWND body=h->transcript.turns[second].body.window;
+      TranscriptTurn *turn=&h->transcript.turns[second];
+      CHECK(body);
+      SendMessageW(body,EM_SETSEL,3,7);
+      h->transcript.body_render_tick=0;
+      handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nmore"));
+      handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+      CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
+      CHECK(h->transcript.turns[second].meta_live);
+      wchar_t shown[256]; body_text(h,second,shown,256);
+      CHECK(wcsstr(shown,L"more")==NULL);   /* terminal render still deferred */
+      h->transcript.view_scroll=0x7fffffff;
+      transcript_position(&h->transcript,false);
+      int body_before=turn->body_h, meta_before=turn->meta_y;
+      int content_before=h->transcript.view_content;
+      SendMessageW(body,EM_SETSEL,0,0);
+      CHECK(turn->body_h>body_before);
+      CHECK(turn->meta_y>meta_before);     /* following footer moved down */
+      CHECK(h->transcript.view_content>content_before);
+      CHECK(transcript_pinned(&h->transcript));
+      body_text(h,second,shown,256);
+      CHECK(wcsstr(shown,L"more")!=NULL); }
+    /* Streaming reasoning appends preserve an in-progress selection. */
+    begin_regenerate(h);
+    click_row(h,second);
+    CHECK(h->transcript.turns[second].reason_live);
+    handle_event(h,fixture(h,OPENROUTER_REASONING,L"alpha beta"));
+    { HWND vp=h->transcript.turns[second].reasoning.window;
+      CHECK(vp);
+      SendMessageW(vp,EM_SETSEL,2,5);
+      handle_event(h,fixture(h,OPENROUTER_REASONING,L" gamma"));
+      CHARRANGE sel; memset(&sel,0,sizeof sel);
+      SendMessageW(vp,EM_EXGETSEL,0,(LPARAM)&sel);
+      CHECK(sel.cpMin==2 && sel.cpMax==5);
+      wchar_t shown[128]; reasoning_text(h,second,shown,128);
+      CHECK(!wcscmp(shown,L"alpha beta gamma")); }
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    /* A selection must never carry across conversations: switching while text
+       is selected forces immediate replacement with the other conversation's
+       own content. */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    int cvb=chat->active;
+    add_turn(chat,L"prompt",L"Distinct answer",NULL,-1);
+    render_transcript(h);
+    CHECK(h->transcript.turn_count==2);
+    SendMessageW(h->transcript.turns[1].body.window,EM_SETSEL,0,4);
+    command(h,CHAT_COMMAND_SELECT,0);
+    CHECK(h->transcript.turn_count==2);
+    { CHARRANGE sel; memset(&sel,0,sizeof sel);
+      HWND body=h->transcript.turns[1].body.window;
+      CHECK(body);
+      SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
+      CHECK(sel.cpMin==0 && sel.cpMax==0);   /* nothing carried over */
+      wchar_t shown[256]; body_text(h,1,shown,256);
+      CHECK(wcsstr(shown,L"Distinct answer")==NULL); }
+    command(h,CHAT_COMMAND_SELECT,cvb);
+    { wchar_t shown[256]; body_text(h,1,shown,256);
+      CHECK(wcsstr(shown,L"Distinct answer")!=NULL); }
     command(h,CHAT_COMMAND_SELECT,0);
     rich_text_set_text(&h->composer,L"Unsent draft");
     action(h,ACTION_EDIT);
@@ -425,6 +545,6 @@ int main(void) {
     DeleteObject(h->background); rich_text_library_close();
     chat_dispose(loaded); chat_dispose(chat);
     free(loaded); free(chat); free(ui); free(h); CoUninitialize();
-    puts("Hidden host: failures, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, edit/draft and close/reopen passed");
+    puts("Hidden host: failures, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, reasoning-append selections, cross-conversation selection isolation, edit/draft and close/reopen passed");
     return 0;
 }

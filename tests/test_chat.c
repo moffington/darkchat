@@ -210,6 +210,49 @@ int main(void) {
         }
     }
 
+    /* Revision bookkeeping: bumped only when observable content changes,
+       never speculatively. View state only; never persisted. */
+    {
+        Chat *rev = (Chat *)calloc(1, sizeof *rev);
+        if (!rev) return 2;
+        chat_init(rev);
+        chat_clear(rev);
+        int rev_index = chat_append(rev, CHAT_ROLE_USER, L"revision probe");
+        check(rev_index == 0, "revision probe appended");
+        ChatMessage *rm = &rev->conversations[rev->active].messages[rev_index];
+        uint64_t before = rm->revision;
+        check(chat_message_set_text(rm, L"revision probe") &&
+            rm->revision == before,
+            "setting identical text leaves the revision alone");
+        check(chat_message_set_text(rm, L"changed") &&
+            rm->revision == before + 1,
+            "changed text bumps the revision");
+        before = rm->revision;
+        check(chat_message_append_text(rm, L" more") &&
+            rm->revision == before + 1, "appended text bumps the revision");
+        check(chat_message_append_text(rm, L"") &&
+            rm->revision == before + 1,
+            "an empty append is not a change");
+        before = rm->revision;
+        check(chat_message_set_reasoning(rm, L"thinking") &&
+            rm->revision == before + 1,
+            "reasoning set bumps the revision");
+        check(chat_message_set_reasoning(rm, L"thinking") &&
+            rm->revision == before + 1,
+            "identical reasoning leaves the revision alone");
+        before = rm->revision;
+        check(chat_message_append_reasoning(rm, L"!") &&
+            rm->revision == before + 1,
+            "appended reasoning bumps the revision");
+        before = rm->revision;
+        chat_message_touch(rm);
+        check(rm->revision == before + 1,
+            "chat_message_touch marks a direct mutation");
+        check(rm->id != 0, "appended messages carry an instance id");
+        chat_dispose(rev);
+        free(rev);
+    }
+
     /* chat_remaining guards invalid state. */
     chat->active = 99;
     check(chat_remaining(chat) == 0, "invalid active has no remaining");

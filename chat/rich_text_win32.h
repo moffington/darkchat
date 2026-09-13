@@ -105,6 +105,8 @@ void rich_text_append_reasoning(RichTextControl *control, const wchar_t *text);
 
 void rich_text_scroll_to_end(RichTextControl *control);
 bool rich_text_pinned(const RichTextControl *control);
+/* True when the surface currently holds a non-empty selection. */
+bool rich_text_has_selection(const RichTextControl *control);
 /* Handles EN_LINK (opens the target) and EN_VSCROLL. Returns true if consumed.
    lparam is the WM_NOTIFY lParam; the caller checks the source handle. */
 bool rich_text_handle_notify(RichTextControl *control, LPARAM lparam);
