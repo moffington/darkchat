@@ -421,6 +421,13 @@ static void prepare_turn(Transcript *t, const TranscriptFeed *feed,
     bool fresh = rendered_current(turn, c->id, m->id, m->revision, m->role,
         m->generation.state, running, feed->content_started, m->reasoning_open,
         has_row, row);
+    /* Does the surface still represent this exact message instance? A
+       conversation switch invalidates every slot and a reused slot may hold a
+       different message, so streaming may skip a destructive rebuild only
+       while this identity is unchanged. Captured before the identity update
+       below overwrites it. */
+    bool same_message = turn->rendered_valid &&
+        turn->conversation == c->id && turn->message == m->id;
     if (!fresh) {
         turn->conversation = c->id;
         turn->message = m->id;
@@ -472,13 +479,19 @@ static void prepare_turn(Transcript *t, const TranscriptFeed *feed,
         bool created = turn->reasoning.window == NULL;
         ensure_control(t, &turn->reasoning, 100 + index * 4 + 2, true);
         if (turn->reasoning.window) {
+            /* Reopened on this pass: the viewport kept its window while
+               collapsed and so missed the appends that arrived in the
+               meantime. It must reload the accumulated reasoning before the
+               stream resumes appending into it. */
+            bool resumed = !turn->reason_live;
             turn->reason_live = true;
             /* A live stream is appended to, never rebuilt, so its viewport
                keeps its own scroll position. A freshly created viewport always
                loads the reasoning accumulated so far. */
             bool streaming = running && feed->reasoning_streaming;
-            if (created || !streaming) {
-                if (!fresh || turn->reason_pending || created)
+            if (created || !streaming || resumed || !same_message) {
+                if (!fresh || turn->reason_pending || created || resumed ||
+                    !same_message)
                     write_reasoning(t, turn, chat_message_reasoning(m));
             }
         }

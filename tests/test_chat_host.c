@@ -15,6 +15,10 @@ static void begin_mode(ChatHost *h,ChatSendMode mode) {
     ++h->request_generation; h->generating=true; h->accepting=true; h->stopping=false;
     h->reasoning_streaming=false; h->content_started=false;
     h->transcript.body_render_tick=0;
+    cancel_body_flush(h);
+    /* Matches start_response: reused turn slots drop stale identity, pending
+       updates and selections before the replacement is rendered. */
+    transcript_invalidate_from(&h->transcript,h->request_message);
     h->started_tick=GetTickCount64(); render_transcript(h);
 }
 static void begin_fixture(ChatHost *h) { begin_mode(h,CHAT_RETRY); }
@@ -56,6 +60,48 @@ static int add_turn(Chat *chat,const wchar_t *prompt,const wchar_t *answer,
     m->generation.reasoning_ms=reasoning?reasoning_ms:-1;
     chat_message_touch(m);
     return index;
+}
+/* Render timing uses the performance counter, not the host's tick clock. */
+static double now_ms(void) {
+    LARGE_INTEGER frequency,counter;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart*1000.0/(double)frequency.QuadPart;
+}
+/* Pumps real messages, letting the host's scheduled flush timer fire the way
+   it does in the running app. */
+static void pump_messages(DWORD ms) {
+    ULONGLONG deadline=GetTickCount64()+ms;
+    do {
+        MSG message;
+        if (PeekMessageW(&message,NULL,0,0,PM_REMOVE)) {
+            TranslateMessage(&message); DispatchMessageW(&message);
+        } else {
+            MsgWaitForMultipleObjects(0,NULL,FALSE,10,QS_ALLINPUT);
+        }
+    } while (GetTickCount64()<deadline);
+}
+/* Pumps until a turn's body contains needle; false on timeout. */
+static bool pump_until_body(ChatHost *h,int index,const wchar_t *needle,
+    DWORD timeout_ms) {
+    ULONGLONG deadline=GetTickCount64()+timeout_ms;
+    for (;;) {
+        wchar_t body[2048]; body_text(h,index,body,2048);
+        if (wcsstr(body,needle)) return true;
+        if (GetTickCount64()>=deadline) return false;
+        pump_messages(5);
+    }
+}
+/* Transcript child controls the container currently owns (realized or shown).
+   WS_VISIBLE is read directly: the host's own top-level window is never shown
+   in this headless test, so IsWindowVisible would report every child hidden. */
+static int child_controls(HWND parent,bool visible_only) {
+    int count=0;
+    for (HWND child=GetWindow(parent,GW_CHILD); child;
+         child=GetWindow(child,GW_HWNDNEXT))
+        if (!visible_only ||
+            (GetWindowLongPtrW(child,GWL_STYLE) & WS_VISIBLE)) count++;
+    return count;
 }
 int main(void) {
     CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
@@ -500,6 +546,191 @@ int main(void) {
       wchar_t shown[128]; reasoning_text(h,second,shown,128);
       CHECK(!wcscmp(shown,L"alpha beta gamma")); }
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    /* ---- Scheduled streaming flush ---- */
+    /* A burst inside the throttle window marks the body dirty and arms a
+       one-shot flush; with no further delta, the accumulated text still
+       reaches the body once the timer fires. */
+    begin_regenerate(h);
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"first token"));
+    { wchar_t body[256]; body_text(h,second,body,256);
+      CHECK(!wcscmp(body,L"first token")); }
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L" second"));
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L" part"));
+    CHECK(h->body_flush_pending);
+    { wchar_t body[256]; body_text(h,second,body,256);
+      CHECK(wcsstr(body,L"second")==NULL); }        /* not rebuilt yet */
+    CHECK(pump_until_body(h,second,L"first token second part",1000));
+    CHECK(!h->body_flush_pending);
+    { wchar_t body[256]; body_text(h,second,body,256);
+      CHECK(!wcscmp(body,L"first token second part")); }
+    CHECK(transcript_pinned(&h->transcript));
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    /* Scheduling cannot strand dirty text: when no flush can be armed
+       (SetTimer failure) the body renders at once and the pending flag clears
+       so later deltas can arm again. */
+    begin_regenerate(h);
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"first token"));
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L" second"));
+    CHECK(h->body_flush_pending);
+    { wchar_t body[256]; body_text(h,second,body,256);
+      CHECK(wcsstr(body,L"second")==NULL); }
+    { HWND window=h->window; h->window=(HWND)1;   /* invalid: SetTimer fails */
+      schedule_body_flush(h);
+      h->window=window; }
+    CHECK(!h->body_flush_pending);
+    { wchar_t body[256]; body_text(h,second,body,256);
+      CHECK(wcsstr(body,L"second")!=NULL); }      /* rendered immediately */
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    /* A scheduled flush must not destroy a selection in the live body: the
+       rebuild is deferred, then applied and relaid out when the range clears. */
+    begin_regenerate(h);
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"streamed so far"));
+    { HWND body=h->transcript.turns[second].body.window;
+      TranscriptTurn *turn=&h->transcript.turns[second];
+      CHECK(body);
+      SendMessageW(body,EM_SETSEL,3,7);
+      int body_before=turn->body_h;
+      handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nplus more"));
+      CHECK(h->body_flush_pending);
+      pump_messages(500);                    /* let the scheduled flush fire */
+      CHECK(!h->body_flush_pending);
+      CHECK(turn->body_pending);             /* deferred, not rewritten */
+      CHARRANGE sel; memset(&sel,0,sizeof sel);
+      SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
+      CHECK(sel.cpMin==3 && sel.cpMax==7);
+      wchar_t shown[256]; body_text(h,second,shown,256);
+      CHECK(wcsstr(shown,L"plus more")==NULL);
+      h->transcript.view_scroll=0x7fffffff;
+      transcript_position(&h->transcript,false);   /* pin to the bottom */
+      int content_before=h->transcript.view_content;
+      SendMessageW(body,EM_SETSEL,0,0);
+      CHECK(turn->body_h>body_before);
+      CHECK(h->transcript.view_content>content_before);
+      CHECK(transcript_pinned(&h->transcript));
+      body_text(h,second,shown,256);
+      CHECK(wcsstr(shown,L"plus more")!=NULL); }
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    /* Live reasoning survives collapse and reopen mid-stream: the collapsed
+       viewport stops appending, reopening loads the accumulation, and the
+       stream then resumes appending into that turn's own viewport. */
+    begin_regenerate(h);
+    click_row(h,second);
+    CHECK(h->transcript.turns[second].reason_live);
+    handle_event(h,fixture(h,OPENROUTER_REASONING,L"first"));
+    handle_event(h,fixture(h,OPENROUTER_REASONING,L" second"));
+    { wchar_t shown[128]; reasoning_text(h,second,shown,128);
+      CHECK(!wcscmp(shown,L"first second")); }
+    click_row(h,second);                     /* collapse mid-stream */
+    CHECK(!h->transcript.turns[second].reason_live);
+    handle_event(h,fixture(h,OPENROUTER_REASONING,L" hidden"));
+    click_row(h,second);                     /* reopen */
+    CHECK(h->transcript.turns[second].reason_live);
+    { wchar_t shown[128]; reasoning_text(h,second,shown,128);
+      CHECK(!wcscmp(shown,L"first second hidden")); }
+    handle_event(h,fixture(h,OPENROUTER_REASONING,L" live"));
+    { wchar_t shown[128]; reasoning_text(h,second,shown,128);
+      CHECK(!wcscmp(shown,L"first second hidden live")); }
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"answer after reasoning"));
+    CHECK(h->transcript.turns[second].reason_live);  /* answer start keeps it */
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    /* ---- Long transcript: bounded renders and reader state ---- */
+    /* A maximum-length transcript must not realize additional controls when it
+       is rendered again or when one turn streams, and streaming that turn must
+       not destructively rewrite an unchanged historical turn. Render cost is
+       recorded, not asserted as a wall-clock threshold. */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    { wchar_t answer[1024];
+      for (int t=0;t<32;t++) {
+          size_t n=0;
+          for (int line=0;line<12;line++)
+              n+=swprintf(answer+n,1024-n,L"Line %d of answer %d.\n",line,t);
+          add_turn(chat,L"question",answer,NULL,-1);
+      }
+    }
+    CHECK(chat->conversations[chat->active].message_count==CHAT_MAX_MESSAGES);
+    double render_started=now_ms();
+    render_transcript(h);
+    double render_ms=now_ms()-render_started;
+    int realized=child_controls(h->view,false);
+    int visible=child_controls(h->view,true);
+    CHECK(realized>0 && visible>0 && visible<realized);
+    CHECK(realized<=CHAT_MAX_MESSAGES*4);
+    render_transcript(h);
+    CHECK(child_controls(h->view,false)==realized);  /* rerender adds none */
+    int older=1;                                     /* unchanged historical turn */
+    { HWND body=h->transcript.turns[older].body.window;
+      CHECK(body);
+      SendMessageW(body,EM_SETSEL,1,5); }
+    begin_regenerate(h);
+    int long_turn=h->request_message;
+    CHECK(child_controls(h->view,false)==realized);  /* streaming adds none */
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"long"));
+    for (int i=0;i<40;i++)
+        handle_event(h,fixture(h,OPENROUTER_DELTA,L" burst line"));
+    CHECK(h->body_flush_pending);
+    CHECK(h->transcript.view_content>h->transcript.view_page);
+    h->transcript.view_scroll=0;
+    transcript_position(&h->transcript,false);       /* reading an older turn */
+    CHECK(!transcript_pinned(&h->transcript));
+    int scroll=h->transcript.view_scroll;
+    double flush_started=now_ms();
+    CHECK(pump_until_body(h,long_turn,L"burst line burst line",1000));
+    double flush_ms=now_ms()-flush_started;
+    CHECK(!h->body_flush_pending);
+    CHECK(h->transcript.view_scroll==scroll);        /* flush did not follow */
+    CHECK(child_controls(h->view,false)==realized);
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L" tail"));
+    CHECK(h->transcript.view_scroll==scroll);
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
+    CHECK(h->transcript.view_scroll==scroll);        /* completion did not follow */
+    /* The historical turn was neither rewritten nor deselected by the stream,
+       the flush or the terminal render. */
+    { HWND body=h->transcript.turns[older].body.window;
+      CHARRANGE sel; memset(&sel,0,sizeof sel);
+      SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
+      CHECK(sel.cpMin==1 && sel.cpMax==5);
+      wchar_t kept[512]; body_text(h,older,kept,512);
+      CHECK(wcsstr(kept,L"Line 0 of answer 0")!=NULL); }
+    printf("long transcript: %d controls (%d visible), full render %.1f ms, "
+        "scheduled flush to visible %.1f ms\n",
+        realized,visible,render_ms,flush_ms);
+    /* ---- Reasoning never carries across conversations ---- */
+    /* Switching A -> B -> A while both corresponding reasoning viewports are
+       expanded, with A still streaming while hidden, must reload A's own
+       reasoning: the reused control must not keep showing B's content or
+       accumulate A's deltas on top of it. */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    int conv_a=chat->active;
+    add_turn(chat,L"a question",L"A answer",L"A reasoning",1000);
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    int conv_b=chat->active;
+    add_turn(chat,L"b question",L"B answer",L"B reasoning",1000);
+    chat->conversations[conv_a].messages[1].reasoning_open=true;
+    chat->conversations[conv_b].messages[1].reasoning_open=true;
+    chat_message_touch(&chat->conversations[conv_a].messages[1]);
+    chat_message_touch(&chat->conversations[conv_b].messages[1]);
+    command(h,CHAT_COMMAND_SELECT,conv_a);
+    begin_regenerate(h);
+    click_row(h,1);
+    CHECK(h->transcript.turns[1].reason_live);
+    handle_event(h,fixture(h,OPENROUTER_REASONING,L"A live"));
+    command(h,CHAT_COMMAND_SELECT,conv_b);
+    CHECK(chat->active==conv_b);
+    { wchar_t shown[128]; reasoning_text(h,1,shown,128);
+      CHECK(!wcscmp(shown,L"B reasoning")); }
+    /* A keeps streaming while hidden; the reply stays with its origin. */
+    handle_event(h,fixture(h,OPENROUTER_REASONING,L" more"));
+    CHECK(!wcscmp(chat_message_reasoning(
+        &chat->conversations[conv_a].messages[1]),L"A live more"));
+    command(h,CHAT_COMMAND_SELECT,conv_a);
+    CHECK(h->generating && h->request_conversation==conv_a);
+    { wchar_t shown[128]; reasoning_text(h,1,shown,128);
+      CHECK(!wcscmp(shown,L"A live more")); }
+    handle_event(h,fixture(h,OPENROUTER_REASONING,L" end"));
+    { wchar_t shown[128]; reasoning_text(h,1,shown,128);
+      CHECK(!wcscmp(shown,L"A live more end")); }
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
     /* A selection must never carry across conversations: switching while text
        is selected forces immediate replacement with the other conversation's
        own content. */
@@ -545,6 +776,6 @@ int main(void) {
     DeleteObject(h->background); rich_text_library_close();
     chat_dispose(loaded); chat_dispose(chat);
     free(loaded); free(chat); free(ui); free(h); CoUninitialize();
-    puts("Hidden host: failures, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, reasoning-append selections, cross-conversation selection isolation, edit/draft and close/reopen passed");
+    puts("Hidden host: failures, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen passed");
     return 0;
 }

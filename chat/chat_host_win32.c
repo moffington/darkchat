@@ -14,7 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-
+/* One-shot flush for dirty streaming content; the status sweep and the
+   paint-retry timers use ids 2 and 1. */
+#define CHAT_TIMER_BODY_FLUSH 3
 
 typedef struct {
     ChatHostConfig config;
@@ -35,6 +37,9 @@ typedef struct {
     int request_generation, request_conversation, request_message;
     bool generating, stopping, accepting, dirty, editing, content_started;
     bool reasoning_streaming;
+    /* Appended text not yet written to the live body; a scheduled flush
+       guarantees it renders even when the stream pauses. */
+    bool body_flush_pending;
     ULONGLONG reasoning_started_tick;
     ChatStorage storage;
     ULONGLONG started_tick;
@@ -53,6 +58,9 @@ static bool surface_key(void *user, WPARAM key, bool shift, bool control,
 static void refresh_turn(ChatHost *host, int index);
 static void stream_body_markdown(ChatHost *host, int index);
 static void position_turns(ChatHost *host, bool follow);
+static void schedule_body_flush(ChatHost *host);
+static void cancel_body_flush(ChatHost *host);
+static void flush_stream_body(ChatHost *host);
 static bool turn_row_click(void *user, RichTextControl *control, int line,
     bool down);
 
@@ -93,6 +101,42 @@ static void stream_body_markdown(ChatHost *host, int index) {
 }
 static void position_turns(ChatHost *host, bool follow) {
     transcript_position(&host->transcript, follow);
+}
+/* Arms a one-shot flush so deltas appended inside the throttle window reach
+   the body even if the stream then pauses with no further delta to cross it.
+   body_flush_pending always reflects whether text is still unrendered: it stays
+   set only while a flush is actually armed, so a failed arm can never block
+   later deltas from trying again. */
+static void schedule_body_flush(ChatHost *host) {
+    if (!host->window) {
+        host->body_flush_pending = false;
+        return;
+    }
+    ULONGLONG elapsed = GetTickCount64() - host->transcript.body_render_tick;
+    UINT delay = elapsed >= CHAT_BODY_RENDER_MS ? 1
+        : (UINT)(CHAT_BODY_RENDER_MS - elapsed);
+    if (SetTimer(host->window, CHAT_TIMER_BODY_FLUSH, delay, NULL)) return;
+    /* Timer creation can fail under resource pressure. Render immediately
+       instead of stranding the dirty text until another delta or completion;
+       one unthrottled render is the accepted cost. */
+    flush_stream_body(host);
+}
+/* Drops any scheduled or pending body flush; used when content is rendered
+   whole (first token, terminal render) or the target turn is no longer live. */
+static void cancel_body_flush(ChatHost *host) {
+    host->body_flush_pending = false;
+    if (host->window) KillTimer(host->window, CHAT_TIMER_BODY_FLUSH);
+}
+/* Applies the scheduled rebuild. A body holding a selection is not rewritten:
+   transcript_stream_body records the debt as a pending write and returns, so
+   the reader's range survives and the deferred render lands when it clears. */
+static void flush_stream_body(ChatHost *host) {
+    if (host->window) KillTimer(host->window, CHAT_TIMER_BODY_FLUSH);
+    if (!host->body_flush_pending || !host->generating) return;
+    if (host->request_conversation != host->config.chat->active) return;
+    host->body_flush_pending = false;
+    host->transcript.body_render_tick = GetTickCount64();
+    stream_body_markdown(host, host->request_message);
 }
 /* Whole-row click on one turn's reasoning row: toggles only that turn, whose
    expansion is stored on its own message. */
@@ -298,6 +342,7 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
        text begins if the provider never supplies reasoning. */
     host->reasoning_streaming=false; host->content_started=false;
     host->transcript.body_render_tick=0;
+    cancel_body_flush(host);
     ChatMessage *m=pending(host);
     if (mode==CHAT_SEND) { rich_text_set_text(&host->composer,L""); chat->conversations[chat->active].draft[0]=0; }
     if (host->editing && mode!=CHAT_SEND) {
@@ -386,15 +431,23 @@ static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
             /* Rebuilds this turn's body and refreshes/removes its row. */
             refresh_turn(host,index);
             host->transcript.body_render_tick=GetTickCount64();
+            cancel_body_flush(host);
         } else if (turn->body_live && turn->body.window) {
             /* Deltas accumulate in the message; the visible body is rebuilt
                as Markdown at most once per interval, so a token storm never
-               reparses per token. The rebuild follows the transcript scroll
-               only while the reader stays pinned to the bottom. */
+               reparses per token. A delta inside the window only marks the
+               body dirty and arms a one-shot flush, so a burst that then
+               pauses still renders without waiting for another delta. The
+               rebuild follows the transcript scroll only while the reader
+               stays pinned to the bottom. */
             ULONGLONG now=GetTickCount64();
             if (now-host->transcript.body_render_tick>=CHAT_BODY_RENDER_MS) {
                 host->transcript.body_render_tick=now;
+                cancel_body_flush(host);
                 stream_body_markdown(host,index);
+            } else if (!host->body_flush_pending) {
+                host->body_flush_pending=true;
+                schedule_body_flush(host);
             }
         }
     }
@@ -458,6 +511,7 @@ static void finish_request(ChatHost *host, OpenRouterEvent *event) {
     set_status(host,chat_generation_name(g->state));
     /* The full transcript render flushes any body rebuild the streaming
        throttle had deferred, so the terminal Markdown is always visible. */
+    cancel_body_flush(host);
     host->dirty=true; save(host);
     if (host->request_conversation==host->config.chat->active) render_transcript(host);
     chat_ui_sync(&host->chat_ui); flush(host);
@@ -484,6 +538,7 @@ static void command(void *user, ChatCommand code, int index) {
         perform_send(host);
     } else if (code == CHAT_COMMAND_NEW_CONVERSATION) {
         if (chat_new_conversation(chat) >= 0) {
+            cancel_body_flush(host);
             transcript_invalidate(&host->transcript);
             render_transcript(host);
             rich_text_set_text(&host->composer, L"");
@@ -491,6 +546,7 @@ static void command(void *user, ChatCommand code, int index) {
         }
     } else if (code == CHAT_COMMAND_SELECT) {
         if (chat_select_conversation(chat, index)) {
+            cancel_body_flush(host);
             transcript_invalidate(&host->transcript);
             render_transcript(host);
             rich_text_set_text(&host->composer,chat->conversations[chat->active].draft);
@@ -868,6 +924,11 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         if (!l) { action(host,LOWORD(w)); return 0; }
         break;
     case WM_TIMER:
+        if (w == CHAT_TIMER_BODY_FLUSH) {
+            /* The stream went quiet with text still dirty: render it now. */
+            flush_stream_body(host);
+            return 0;
+        }
         if (w == 2) {
             /* If allocation/PostMessage failed for the terminal event, the
                worker can finish without notifying us. Drain queued events
@@ -987,6 +1048,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         return 0;
     case WM_CLOSE:
         capture_settings(host);
+        cancel_body_flush(host);
         if (host->generating) {
             ChatGeneration *g=&pending(host)->generation;
             g->state=host->stopping ? host->stop_state : CHAT_GENERATION_INTERRUPTED;
@@ -1017,6 +1079,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
     case WM_DESTROY:
         KillTimer(window, 1);
         KillTimer(window, 2);
+        KillTimer(window, CHAT_TIMER_BODY_FLUSH);
         renderer_drop_target(&host->renderer);
         PostQuitMessage(0);
         return 0;
