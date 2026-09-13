@@ -32,9 +32,10 @@ typedef struct {
     bool head_live, body_live, reason_live, meta_live;
     int y, head_y, reason_y, body_y, meta_y, height;
     int head_h, reason_h, body_h, meta_h;
-    /* Rendered identity: the message state these surfaces were built from. */
+    /* Rendered identity: the message state these surfaces were built from.
+       `body_revision` isolates the answer body from metadata-only bumps. */
     bool rendered_valid;
-    uint64_t conversation, message, revision;
+    uint64_t conversation, message, revision, body_revision;
     ChatRole role;
     ChatGenerationState state;
     bool running, content_started, reasoning_open;

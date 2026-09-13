@@ -471,6 +471,42 @@ int main(void) {
       CHECK(sel.cpMin==2 && sel.cpMax==6);
       wchar_t kept[128]; body_text(h,first,kept,128);
       CHECK(wcsstr(kept,L"First answer")!=NULL); }
+    /* Narrow updates: a metadata-only bump (completion writes the footer, not
+       the answer) leaves the body current, so the body write is skipped, not
+       deferred, and a selection placed in it stays put. */
+    { ChatMessage *m=&chat->conversations[cv].messages[first];
+      HWND body=h->transcript.turns[first].body.window;
+      TranscriptTurn *turn=&h->transcript.turns[first];
+      CHECK(body && turn->body_live);
+      SendMessageW(body,EM_SETSEL,0,0);        /* apply any prior deferral */
+      render_transcript(h);
+      CHECK(!turn->body_pending);
+      SendMessageW(body,EM_SETSEL,1,4);
+      int body_before=turn->body_h;
+      m->generation.prompt_tokens=11;          /* metadata only; text unchanged */
+      chat_message_touch(m);
+      render_transcript(h);
+      CHECK(!turn->body_pending);              /* skipped, not deferred */
+      CHECK(turn->body_h==body_before);
+      CHARRANGE sel; memset(&sel,0,sizeof sel);
+      SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
+      CHECK(sel.cpMin==1 && sel.cpMax==4); }
+    /* Starting another response resets the host-global content_started, which
+       only shapes the row of the turn that is actually streaming: a completed
+       historical turn stays current, so head and body are not rewritten. */
+    { HWND body=h->transcript.turns[first].body.window;
+      TranscriptTurn *turn=&h->transcript.turns[first];
+      SendMessageW(body,EM_SETSEL,0,0);
+      render_transcript(h);
+      CHECK(!turn->body_pending && !turn->head_pending);
+      SendMessageW(body,EM_SETSEL,1,4);
+      begin_regenerate(h);
+      CHECK(!h->content_started);
+      CHECK(!turn->body_pending && !turn->head_pending);
+      wchar_t kept[128]; body_text(h,first,kept,128);
+      CHECK(wcsstr(kept,L"First answer")!=NULL);
+      handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+      SendMessageW(body,EM_SETSEL,0,0); }
     /* Streaming: a selection inside the live answer defers the throttled
        Markdown rebuild; clearing the selection applies the deferred render and
        relayouts from the affected turn, so geometry, the scrollbar range and
@@ -595,6 +631,9 @@ int main(void) {
       pump_messages(500);                    /* let the scheduled flush fire */
       CHECK(!h->body_flush_pending);
       CHECK(turn->body_pending);             /* deferred, not rewritten */
+      /* The deferred write must not claim text it has not shown yet. */
+      CHECK(turn->body_revision!=
+          chat->conversations[cv].messages[second].body_revision);
       CHARRANGE sel; memset(&sel,0,sizeof sel);
       SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
       CHECK(sel.cpMin==3 && sel.cpMax==7);
@@ -608,8 +647,35 @@ int main(void) {
       CHECK(h->transcript.view_content>content_before);
       CHECK(transcript_pinned(&h->transcript));
       body_text(h,second,shown,256);
-      CHECK(wcsstr(shown,L"plus more")!=NULL); }
+      CHECK(wcsstr(shown,L"plus more")!=NULL);
+      /* The deferred apply must leave the recorded revision describing the
+         text now in the control. */
+      CHECK(turn->body_revision==
+          chat->conversations[cv].messages[second].body_revision); }
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    /* A scheduled flush writes the body outside prepare_turn(), so the
+       recorded revision must advance with it. Completion then refreshes only
+       the footer, leaving a selection in the live body untouched. */
+    begin_regenerate(h);
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"first token"));
+    { TranscriptTurn *turn=&h->transcript.turns[second];
+      ChatMessage *m=&chat->conversations[cv].messages[second];
+      HWND body=turn->body.window; CHECK(body);
+      CHECK(turn->body_revision==m->body_revision);
+      handle_event(h,fixture(h,OPENROUTER_DELTA,L" second"));
+      handle_event(h,fixture(h,OPENROUTER_DELTA,L" part"));
+      CHECK(h->body_flush_pending);
+      CHECK(pump_until_body(h,second,L"first token second part",1000));
+      CHECK(!h->body_flush_pending);
+      CHECK(turn->body_revision==m->body_revision);
+      SendMessageW(body,EM_SETSEL,1,4);
+      handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+      CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
+      CHECK(!turn->body_pending);                  /* footer only */
+      CHARRANGE sel; memset(&sel,0,sizeof sel);
+      SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
+      CHECK(sel.cpMin==1 && sel.cpMax==4);
+      SendMessageW(body,EM_SETSEL,0,0); }
     /* Live reasoning survives collapse and reopen mid-stream: the collapsed
        viewport stops appending, reopening loads the accumulation, and the
        stream then resumes appending into that turn's own viewport. */

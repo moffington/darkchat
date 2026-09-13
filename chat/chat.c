@@ -87,8 +87,10 @@ bool chat_message_set_text(ChatMessage *m,const wchar_t *text) {
     bool unchanged=!wcscmp(previous,text);
     if (!set_message_value(m->text,CHAT_MESSAGE_TEXT,&m->text_overflow,
         &m->text_length,&m->text_capacity,text)) return false;
-    /* Bump only when the stored value actually changes. */
-    if (!unchanged) ++m->revision;
+    /* Bump only when the stored value actually changes. The text-only
+       revision lets the transcript keep the rendered body when only metadata
+       or reasoning changed. */
+    if (!unchanged) { ++m->revision; ++m->body_revision; }
     return true;
 }
 bool chat_message_set_reasoning(ChatMessage *m,const wchar_t *text) {
@@ -106,7 +108,7 @@ bool chat_message_append_text(ChatMessage *m,const wchar_t *text) {
     if (!m) return false;
     if (!append_message_value(m->text,CHAT_MESSAGE_TEXT,&m->text_overflow,
         &m->text_length,&m->text_capacity,text)) return false;
-    if (text && text[0]) ++m->revision;
+    if (text && text[0]) { ++m->revision; ++m->body_revision; }
     return true;
 }
 bool chat_message_append_reasoning(ChatMessage *m,const wchar_t *text) {

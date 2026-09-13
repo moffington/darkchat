@@ -54,10 +54,10 @@ typedef struct {
     size_t text_capacity, reasoning_capacity;
     /* View bookkeeping, never persisted: `id` is a process-local instance id
        distinguishing a message from any other that later occupies the same
-       turn slot (retry/regenerate replacement), `revision` counts observable
-       content changes so a transcript control can skip rewriting a surface
-       whose message has not changed. */
-    uint64_t id, revision;
+       turn slot (retry/regenerate replacement). `revision` counts every
+       observable change; `body_revision` counts answer-text changes only, so a
+       metadata-only generation update does not invalidate the rendered body. */
+    uint64_t id, revision, body_revision;
     /* View state: whether this turn's reasoning viewport is expanded. Owned by
        the rendered turn; reset with the message, not persisted. */
     bool reasoning_open;

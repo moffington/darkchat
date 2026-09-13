@@ -297,9 +297,22 @@ static bool rendered_current(const TranscriptTurn *turn, uint64_t conversation,
     if (turn->conversation != conversation || turn->message != message ||
         turn->revision != revision || turn->role != role ||
         turn->state != state || turn->running != running ||
-        turn->content_started != content_started ||
         turn->reasoning_open != reasoning_open) return false;
+    /* content_started only shapes the row of the turn that is currently
+       streaming; a completed historical turn's rendered row does not depend on
+       it, so starting another response must not stale that turn. */
+    if (running && turn->content_started != content_started) return false;
     return has_row ? !wcscmp(turn->row, row) : !turn->row[0];
+}
+
+/* True when the turn's body already holds exactly this message's answer text.
+   Keyed on the text-only revision so a metadata-only generation update (or a
+   reasoning append) does not rewrite the body. */
+static bool body_current(const TranscriptTurn *turn, uint64_t conversation,
+    uint64_t message, uint64_t body_revision, ChatRole role) {
+    return turn->rendered_valid && turn->conversation == conversation &&
+        turn->message == message && turn->body_revision == body_revision &&
+        turn->role == role;
 }
 
 /* Writes one surface, deferring the destructive write while it holds a
@@ -380,7 +393,10 @@ static bool catch_up(Transcript *t, const TranscriptFeed *feed, int index) {
         if (write_head(t, turn, m->role, row, has_row)) changed = true;
     }
     if (turn->body_pending) {
-        if (write_body(t, turn, m->role, chat_message_text(m))) changed = true;
+        if (write_body(t, turn, m->role, chat_message_text(m))) {
+            turn->body_revision = m->body_revision;
+            changed = true;
+        }
     }
     bool terminal = m->generation.state != CHAT_GENERATION_NONE &&
         m->generation.state != CHAT_GENERATION_RUNNING;
@@ -421,6 +437,10 @@ static void prepare_turn(Transcript *t, const TranscriptFeed *feed,
     bool fresh = rendered_current(turn, c->id, m->id, m->revision, m->role,
         m->generation.state, running, feed->content_started, m->reasoning_open,
         has_row, row);
+    /* The answer body is keyed on its text alone, so a terminal metadata
+       update refreshes the footer without rebuilding the body. */
+    bool body_fresh = body_current(turn, c->id, m->id, m->body_revision,
+        m->role);
     /* Does the surface still represent this exact message instance? A
        conversation switch invalidates every slot and a reused slot may hold a
        different message, so streaming may skip a destructive rebuild only
@@ -455,8 +475,12 @@ static void prepare_turn(Transcript *t, const TranscriptFeed *feed,
     }
     ensure_control(t, &turn->body, 100 + index * 4 + 1, false);
     if (turn->body.window) turn->body_live = true;
-    if (!fresh || turn->body_pending)
-        write_body(t, turn, m->role, chat_message_text(m));
+    /* Record the revision only once the write actually lands, so the field
+       always names the answer text present in the control. A write deferred by
+       a selection leaves body_pending set and the revision untouched. */
+    if ((!body_fresh || turn->body_pending) &&
+        write_body(t, turn, m->role, chat_message_text(m)))
+        turn->body_revision = m->body_revision;
     if (assistant && terminal) {
         bool created = turn->meta.window == NULL;
         ensure_control(t, &turn->meta, 100 + index * 4 + 3, false);
@@ -555,6 +579,8 @@ void transcript_stream_body(Transcript *t, const TranscriptFeed *feed,
     rich_text_set_markdown(&turn->body, m->role, chat_message_text(m));
     t->applying = false;
     turn->body_pending = false;
+    /* This path bypasses prepare_turn(); keep the recorded revision in step. */
+    turn->body_revision = m->body_revision;
     transcript_layout_from(t, index, pinned);
 }
 
