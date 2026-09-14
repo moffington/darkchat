@@ -367,6 +367,66 @@ void chat_fake_reply(Chat *chat, const wchar_t *prompt, wchar_t *out,
 }
 
 
+Chat *chat_snapshot(const Chat *chat) {
+    if (!chat) return NULL;
+    Chat *copy=(Chat *)malloc(sizeof *copy);
+    if (!copy) return NULL;
+    *copy=*chat;
+    /* Detach every conversation's dynamic fields before any fallible step:
+       from here the copy owns nothing, so a failure disposes only what this
+       function allocated and can never reach the source's pointers. */
+    for (int i=0;i<chat->conversation_count;i++) {
+        copy->conversations[i].messages=NULL;
+        copy->conversations[i].message_count=0;
+        copy->conversations[i].message_capacity=0;
+    }
+    for (int i=0;i<chat->conversation_count;i++) {
+        const ChatConversation *source=&chat->conversations[i];
+        ChatConversation *destination=&copy->conversations[i];
+        /* The snapshot carries exactly the live messages: allocate the exact
+           count rather than reusing the growth policy, so a snapshot never
+           reserves spare slots for a state that is already frozen. */
+        if (source->message_count) {
+            destination->messages=(ChatMessage *)malloc(
+                source->message_count*sizeof *destination->messages);
+            if (!destination->messages) {
+                chat_dispose(copy); free(copy); return NULL;
+            }
+            destination->message_capacity=source->message_count;
+        }
+        for (size_t j=0;j<source->message_count;j++) {
+            const ChatMessage *from=&source->messages[j];
+            ChatMessage *to=&destination->messages[j];
+            /* The struct copy would alias the source's overflow pointers;
+               detach them before the slot becomes live, so a failed overflow
+               copy disposes exactly the state this copy built. */
+            *to=*from;
+            to->text_overflow=to->reasoning_overflow=NULL;
+            to->text_capacity=to->reasoning_capacity=0;
+            destination->message_count=j+1;
+            if (from->text_overflow) {
+                size_t bytes=(from->text_length+1)*sizeof(wchar_t);
+                to->text_overflow=(wchar_t *)malloc(bytes);
+                if (!to->text_overflow) {
+                    chat_dispose(copy); free(copy); return NULL;
+                }
+                memcpy(to->text_overflow,from->text_overflow,bytes);
+                to->text_capacity=from->text_length+1;
+            }
+            if (from->reasoning_overflow) {
+                size_t bytes=(from->reasoning_length+1)*sizeof(wchar_t);
+                to->reasoning_overflow=(wchar_t *)malloc(bytes);
+                if (!to->reasoning_overflow) {
+                    chat_dispose(copy); free(copy); return NULL;
+                }
+                memcpy(to->reasoning_overflow,from->reasoning_overflow,bytes);
+                to->reasoning_capacity=from->reasoning_length+1;
+            }
+        }
+    }
+    return copy;
+}
+
 int64_t chat_now(void) {
     return (int64_t)time(NULL) * 1000;
 }

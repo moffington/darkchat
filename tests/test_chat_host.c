@@ -26,6 +26,31 @@ int __wrap_openrouter_request(OpenRouterClient *client, const char *api_key_utf8
     if (openrouter_request_fake_generation) return openrouter_request_fake_generation;
     return __real_openrouter_request(client,api_key_utf8,model,messages,count);
 }
+/* Writer seam (linked with -Wl,--wrap=storage_save): counts every
+   storage_save call and can pause the writer while it holds an in-flight
+   snapshot, which makes coalescing, isolation and shutdown-drain
+   deterministic. Arming pauses exactly one call; a paused save falls through
+   when the test releases it or when teardown begins (so saver_shutdown can
+   always join). */
+static volatile LONG pause_next_save, storage_save_calls;
+static HANDLE save_paused_event, save_resume_event, save_teardown_event;
+bool __real_storage_save(ChatStorage *store, const Chat *chat);
+bool __wrap_storage_save(ChatStorage *store, const Chat *chat) {
+    InterlockedIncrement(&storage_save_calls);
+    if (InterlockedExchange(&pause_next_save,0)) {
+        SetEvent(save_paused_event);
+        for (;;) {
+            if (WaitForSingleObject(save_resume_event,50)==WAIT_OBJECT_0) break;
+            if (WaitForSingleObject(save_teardown_event,0)==WAIT_OBJECT_0) break;
+        }
+    }
+    return __real_storage_save(store,chat);
+}
+/* Arms exactly one paused storage_save on the writer. */
+static void arm_save_pause(void) {
+    ResetEvent(save_resume_event);
+    pause_next_save=1;
+}
 static OpenRouterEvent *fixture(ChatHost *h,OpenRouterEventType type,const wchar_t *text) {
     OpenRouterEvent *e=calloc(1,sizeof *e);
     e->generation=h->request_generation; e->type=type;
@@ -105,6 +130,12 @@ static void pump_messages(DWORD ms) {
         }
     } while (GetTickCount64()<deadline);
 }
+/* Pumps until the host has interpreted the completion of `attempt`. */
+static void wait_attempt_handled(ChatHost *h,uint64_t attempt) {
+    ULONGLONG deadline=GetTickCount64()+5000;
+    while (h->handled_attempt<attempt && GetTickCount64()<deadline)
+        pump_messages(5);
+}
 /* Pumps until a turn's body contains needle; false on timeout. */
 static bool pump_until_body(ChatHost *h,int index,const wchar_t *needle,
     DWORD timeout_ms) {
@@ -114,6 +145,25 @@ static bool pump_until_body(ChatHost *h,int index,const wchar_t *needle,
         if (wcsstr(body,needle)) return true;
         if (GetTickCount64()>=deadline) return false;
         pump_messages(5);
+    }
+}
+/* Pumps until posted saver completions report every handed-off change
+   durable (dirty cleared, failure latch clear); false on timeout. */
+static bool wait_save_settled(ChatHost *h,DWORD timeout_ms) {
+    ULONGLONG deadline=GetTickCount64()+timeout_ms;
+    for (;;) {
+        pump_messages(5);
+        if (!h->dirty && !h->save_failed) return true;
+        if (GetTickCount64()>=deadline) return false;
+    }
+}
+/* Pumps until a save completion reports failure; false on timeout. */
+static bool wait_save_failed(ChatHost *h,DWORD timeout_ms) {
+    ULONGLONG deadline=GetTickCount64()+timeout_ms;
+    for (;;) {
+        pump_messages(5);
+        if (h->save_failed) return true;
+        if (GetTickCount64()>=deadline) return false;
     }
 }
 /* Transcript child controls the container currently owns (realized or shown).
@@ -144,6 +194,15 @@ int main(void) {
     CHECK(RegisterClassW(&view_cls));
     HWND window=CreateWindowW(cls.lpszClassName,L"Host integration",WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
     CHECK(window); KillTimer(window,2);
+    /* The real background writer runs for the whole suite, exactly as in the
+       app: every save below is a handoff, and flush-and-wait sites (the
+       pre-request gate, close, and the explicit save_sync calls) block until
+       their own attempt is durable. */
+    save_paused_event=CreateEventW(NULL,FALSE,FALSE,NULL);
+    save_resume_event=CreateEventW(NULL,TRUE,FALSE,NULL);
+    save_teardown_event=CreateEventW(NULL,TRUE,FALSE,NULL);
+    CHECK(save_paused_event && save_resume_event && save_teardown_event);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
     rich_text_set_text(&h->composer,L"Question"); perform_send(h);
     CHECK(chat->conversations[0].message_count==2);
     CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED); /* no key */
@@ -264,7 +323,7 @@ int main(void) {
     OpenRouterEvent *e=fixture(h,OPENROUTER_DELTA,L"Partial answer");
     e->metadata.ttft_ms=12; e->metadata.first_token_at=chat_now();
     handle_event(h,e); CHECK(!wcscmp(pending(h)->text,L"Partial answer"));
-    h->dirty=true; CHECK(save(h));
+    mark_dirty(h); CHECK(save_sync(h));   /* durable before the stale event lands */
     e=fixture(h,OPENROUTER_DELTA,L"STALE"); --e->generation; handle_event(h,e);
     CHECK(!wcscmp(pending(h)->text,L"Partial answer"));
     command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
@@ -347,7 +406,7 @@ int main(void) {
     { wchar_t meta[256]; meta_text(h,second,meta,256);
       CHECK(wcsstr(meta,L"Complete")!=NULL); }
     /* Reasoning and duration persist per message. */
-    h->dirty=true; CHECK(save(h));
+    mark_dirty(h); CHECK(save_sync(h));
     Chat *reloaded=calloc(1,sizeof *reloaded); CHECK(reloaded);
     CHECK(storage_load(&h->storage,reloaded)==1);
     CHECK(!wcscmp(reloaded->conversations[cv].messages[first].reasoning,L"Alpha reasoning"));
@@ -963,6 +1022,166 @@ int main(void) {
     CHECK(chat->conversations[0].message_count==2);
     wchar_t composer[CHAT_MESSAGE_TEXT]; rich_text_get_text(&h->composer,composer,CHAT_MESSAGE_TEXT);
     CHECK(!wcscmp(composer,L"Unsent draft"));
+    /* ---- Background snapshot writer ---- */
+    /* The saver hands off immutable deep snapshots; the live Chat may keep
+       mutating while a write is in flight without affecting what the writer
+       serializes; latest-wins coalescing displaces unstarted snapshots and
+       bounds the writer's passes; and every posted result carries its own
+       attempt id plus the mutation counter captured at that handoff, so
+       stale completions can neither mark newer mutations durable nor
+       re-latch a failure that a newer attempt already resolved. */
+    {
+        Chat *loaded=calloc(1,sizeof *loaded); CHECK(loaded);
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int saver_conv=chat->active;
+        add_turn(chat,L"saver question",L"saver answer",NULL,-1);
+        /* Snapshot isolation across a paused in-flight write: the writer
+           holds the pre-mutation snapshot while the live Chat moves on, and
+           the file lands in the pre-mutation shape. The store is only read
+           after the writer is idle again, so the single-thread confinement
+           of ChatStorage is preserved. */
+        uint64_t attempt_a=h->saver.next_attempt+1;
+        arm_save_pause();
+        mark_dirty(h);
+        CHECK(save(h));
+        CHECK(WaitForSingleObject(save_paused_event,5000)==WAIT_OBJECT_0);
+        chat_append(chat,CHAT_ROLE_USER,L"mutation after handoff");
+        mark_dirty(h);
+        SetEvent(save_resume_event);
+        wait_attempt_handled(h,attempt_a);
+        CHECK(h->handled_attempt>=attempt_a);
+        CHECK(storage_load(&h->storage,loaded)==1);
+        CHECK(loaded->conversation_count==saver_conv+1);
+        CHECK(loaded->conversations[saver_conv].message_count==2 &&
+            !wcscmp(loaded->conversations[saver_conv].messages[0].text,
+                L"saver question"));
+        /* The mutation is newer state: flushing it makes it durable. The
+           first attempt's completion cannot clear dirty, because a newer
+           mutation already arrived after its own captured counter. */
+        mark_dirty(h); save(h);
+        CHECK(wait_save_settled(h,5000));
+        CHECK(storage_load(&h->storage,loaded)==1);
+        CHECK(loaded->conversations[saver_conv].message_count==3 &&
+            !wcscmp(loaded->conversations[saver_conv].messages[2].text,
+                L"mutation after handoff"));
+        /* Result ordering, per attempt: an older attempt's success never
+           marks newer mutations durable, a stale result never re-interprets,
+           and a failure older than the newest submitted attempt is
+           superseded — it must not latch failure, because that newer attempt
+           is guaranteed to complete and report authoritatively. The
+           synthetic attempt ids stay above the real ones while the sequence
+           plays out and both real counters are restored afterwards. */
+        uint64_t real_handled=h->handled_attempt;
+        uint64_t real_submitted=h->last_submitted_attempt;
+        mark_dirty(h);
+        uint64_t counter_a=h->mutations;
+        uint64_t attempt_u=real_submitted+10;
+        h->last_submitted_attempt=attempt_u;   /* attempt_u is the newest submission */
+        saver_completed(h,true,attempt_u,counter_a);
+        CHECK(!h->dirty);                    /* nothing newer: durable */
+        mark_dirty(h);                       /* a newer mutation */
+        CHECK(h->dirty);
+        saver_completed(h,true,attempt_u,counter_a);   /* same attempt again */
+        CHECK(h->dirty);                     /* must not claim durability */
+        saver_completed(h,false,attempt_u-1,h->mutations); /* late stale failure */
+        CHECK(!h->save_failed);              /* must not re-latch failure */
+        CHECK(h->dirty);
+        /* Superseded failure: a newer attempt is already submitted, so this
+           failure reports nothing. */
+        h->last_submitted_attempt=attempt_u+2;
+        saver_completed(h,false,attempt_u+1,counter_a);
+        CHECK(!h->save_failed);
+        /* Once that failure is the newest submission it is authoritative. */
+        h->last_submitted_attempt=attempt_u+1;
+        saver_completed(h,false,attempt_u+1,counter_a);
+        CHECK(h->save_failed && h->dirty);
+        /* The next handoff's success resolves everything. */
+        h->last_submitted_attempt=attempt_u+2;
+        saver_completed(h,true,attempt_u+2,h->mutations);
+        CHECK(!h->dirty && !h->save_failed);
+        h->handled_attempt=real_handled;     /* real writer sequence resumes */
+        h->last_submitted_attempt=real_submitted;
+        /* Failure propagation through the writer: a blocked temporary file
+           fails the save, latches the failure and explicitly keeps dirty set
+           for the next autosave retry, then recovers. */
+        HANDLE block=CreateFileW(h->storage.temporary,GENERIC_WRITE,0,NULL,
+            OPEN_ALWAYS,0,NULL);
+        CHECK(block!=INVALID_HANDLE_VALUE);
+        mark_dirty(h); save(h);
+        CHECK(wait_save_failed(h,5000));
+        CHECK(wcsstr(chat->status,L"Save failed")!=NULL);
+        CHECK(h->dirty);
+        CloseHandle(block);
+        save(h);
+        CHECK(wait_save_settled(h,5000));
+        /* The pre-request durability gate holds through the background
+           writer: a failed flush still refuses to send the request. */
+        block=CreateFileW(h->storage.temporary,GENERIC_WRITE,0,NULL,
+            OPEN_ALWAYS,0,NULL);
+        CHECK(block!=INVALID_HANDLE_VALUE);
+        int calls=openrouter_request_calls;
+        rich_text_set_text(&h->composer,L"gate question");
+        perform_send(h);
+        CHECK(openrouter_request_calls==calls);          /* request not sent */
+        CHECK(!h->generating);
+        { ChatConversation *c=&chat->conversations[chat->active];
+          CHECK(c->message_count>=2);
+          size_t last=c->message_count-1;
+          CHECK(c->messages[last].generation.state==CHAT_GENERATION_FAILED);
+          CHECK(wcsstr(c->messages[last].generation.error,
+              L"Could not save pending response")!=NULL); }
+        CloseHandle(block);
+        save(h);                             /* retry now that the file is writable */
+        CHECK(wait_save_settled(h,5000));
+        /* Latest-wins coalescing, deterministically: while the writer is
+           paused inside the first save, two more handoffs are submitted; the
+           middle snapshot is displaced before it is ever serialized, so the
+           writer passes exactly twice and only the newest state persists. */
+        storage_save_calls=0;
+        arm_save_pause();
+        wcscpy(chat->conversations[chat->active].draft,L"coalesce one");
+        mark_dirty(h); CHECK(save(h));
+        CHECK(WaitForSingleObject(save_paused_event,5000)==WAIT_OBJECT_0);
+        wcscpy(chat->conversations[chat->active].draft,L"coalesce two");
+        mark_dirty(h); save(h);              /* pending only */
+        wcscpy(chat->conversations[chat->active].draft,L"coalesce three");
+        mark_dirty(h); save(h);              /* displaces "coalesce two" */
+        SetEvent(save_resume_event);
+        CHECK(wait_save_settled(h,5000));
+        CHECK(storage_save_calls==2);        /* the middle snapshot never saved */
+        CHECK(storage_load(&h->storage,loaded)==1);
+        CHECK(!wcscmp(loaded->conversations[saver_conv].draft,L"coalesce three"));
+        /* Shutdown with a guaranteed pending job: a second saver is paused
+           inside its in-flight save, so the second handoff is certainly
+           still pending when saver_shutdown is called; teardown must release
+           the pause, drain the pending job and join before returning. */
+        {
+            ChatSaver drain_saver;
+            arm_save_pause();
+            wcscpy(chat->conversations[chat->active].draft,L"drain in flight");
+            mark_dirty(h);
+            Chat *in_flight=chat_snapshot(chat); CHECK(in_flight);
+            CHECK(saver_init(&drain_saver,window,CHAT_WM_SAVER_RESULT,
+                &h->storage));                   /* the main writer is parked */
+            saver_submit(&drain_saver,in_flight,h->mutations);
+            CHECK(WaitForSingleObject(save_paused_event,5000)==WAIT_OBJECT_0);
+            wcscpy(chat->conversations[chat->active].draft,L"drain pending");
+            mark_dirty(h);
+            Chat *pending_snap=chat_snapshot(chat); CHECK(pending_snap);
+            saver_submit(&drain_saver,pending_snap,h->mutations);
+            SetEvent(save_teardown_event);
+            saver_shutdown(&drain_saver);
+            CHECK(storage_load(&h->storage,loaded)==1);
+            CHECK(!wcscmp(loaded->conversations[saver_conv].draft,
+                L"drain pending"));
+        }
+        /* Return to the state the close/reopen test below expects. */
+        pump_messages(50);                    /* drain queued completions */
+        h->save_failed=false; h->dirty=false;
+        command(h,CHAT_COMMAND_SELECT,0);
+        rich_text_set_text(&h->composer,L"Unsent draft");
+        chat_dispose(loaded); free(loaded);
+    }
     begin_fixture(h); handle_event(h,fixture(h,OPENROUTER_DELTA,L"Closing partial"));
     SendMessageW(window,WM_CLOSE,0,0);
     CHECK(!IsWindow(window) && !h->generating);
@@ -971,6 +1190,10 @@ int main(void) {
     CHECK(loaded->conversations[0].messages[1].generation.state==CHAT_GENERATION_INTERRUPTED);
     CHECK(!wcscmp(loaded->conversations[0].messages[1].text,L"Closing partial"));
     CHECK(!wcscmp(loaded->conversations[0].draft,L"Unsent draft"));
+    /* Join the writer before the storage lock is released, as the app does. */
+    saver_shutdown(&h->saver);
+    CloseHandle(save_paused_event); CloseHandle(save_resume_event);
+    CloseHandle(save_teardown_event);
     storage_close(&h->storage);
     DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
@@ -978,6 +1201,6 @@ int main(void) {
     DeleteObject(h->background); rich_text_library_close();
     chat_dispose(loaded); chat_dispose(chat);
     free(loaded); free(chat); free(ui); free(h); CoUninitialize();
-    puts("Hidden host: failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen passed");
+    puts("Hidden host: failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen, background snapshot writer (snapshot isolation across an in-flight write, per-handoff completion accounting, failure latch and retry, pre-request flush gate refusing to send, latest-wins coalescing, shutdown drain) passed");
     return 0;
 }

@@ -143,6 +143,13 @@ typedef struct {
 } Chat;
 
 int64_t chat_now(void);
+/* Deep, transactional copy for asynchronous persistence: the result is fully
+   owned by the caller, shares no allocation with `chat`, and is safe to hand
+   to a background writer while the UI thread keeps mutating the original.
+   Overflow storage is reallocated per message (never aliased), so the copy
+   can be disposed independently. On any allocation failure the partial copy
+   is disposed and NULL is returned; the source is never modified. */
+Chat *chat_snapshot(const Chat *chat);
 void chat_generation_init(ChatGeneration *generation);
 const wchar_t *chat_generation_name(ChatGenerationState state);
 void chat_remember_model(Chat *chat);

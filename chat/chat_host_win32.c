@@ -5,6 +5,7 @@
 #include "openrouter_winhttp.h"
 #include "context.h"
 #include "storage.h"
+#include "saver.h"
 #include "actions_win32.h"
 #include "../platform/renderer.h"
 #include "../platform/accessibility.h"
@@ -46,6 +47,14 @@ typedef struct {
     bool body_flush_pending;
     ULONGLONG reasoning_started_tick;
     ChatStorage storage;
+    /* Background snapshot writer. Mutations is the counter every save handoff
+       captures; last_submitted_attempt is the newest accepted handoff and
+       handled_attempt the newest attempt whose result has been interpreted,
+       so a superseded failure can never report and a stale result can never
+       re-interpret older completions. */
+    ChatSaver saver;
+    uint64_t mutations, last_submitted_attempt, handled_attempt;
+    bool save_failed;
     ULONGLONG started_tick;
     ChatGenerationState stop_state;
 
@@ -174,11 +183,99 @@ static ChatMessage *pending(ChatHost *host) {
     return &host->config.chat->conversations[host->request_conversation].messages[host->request_message];
 }
 
+#define CHAT_SAVE_FAILED L"Save failed: changes are in memory; check storage permissions or disk space."
+
+/* Interprets one completed save. Results arrive with the attempt id and the
+   captured mutation counter of that specific handoff. Two guards keep the
+   report truthful:
+   - attempt <= handled_attempt: stale — the result was already interpreted
+     (synchronously by a flush, or as an earlier dispatch of itself).
+   - a failure whose attempt is older than the newest submitted attempt is
+     superseded: that newer attempt's snapshot contains all of this one's
+     state and is guaranteed to complete and post its own authoritative
+     result, so the older failure must not latch the failure latch, write the
+     failure status or suppress the status sweep.
+   A success clears the failure latch and clears dirty only when no mutation
+   happened after that snapshot was taken; a processed failure latches and
+   explicitly keeps dirty set so the one-second autosave retries. */
+static void saver_completed(ChatHost *host, bool ok, uint64_t attempt,
+    uint64_t captured) {
+    if (attempt<=host->handled_attempt) return;
+    if (!ok && attempt<host->last_submitted_attempt) return;
+    host->handled_attempt=attempt;
+    if (ok) {
+        host->save_failed=false;
+        if (host->mutations==captured) host->dirty=false;
+    } else {
+        host->save_failed=true;
+        host->dirty=true;
+        set_status(host,CHAT_SAVE_FAILED);
+    }
+}
+
+/* Builds the immutable snapshot a save hands off. NULL on allocation failure:
+   dirty stays set so the one-second autosave retries, and the failure is
+   reported exactly like a storage failure. `captured` receives the mutation
+   counter at handoff time, which travels with the job. */
+static Chat *save_snapshot(ChatHost *host, uint64_t *captured) {
+    *captured=host->mutations;
+    Chat *snapshot=chat_snapshot(host->config.chat);
+    if (!snapshot) {
+        host->save_failed=true;
+        set_status(host,CHAT_SAVE_FAILED);
+    }
+    return snapshot;
+}
+
+/* Asynchronous autosave: hands the snapshot to the background writer and
+   returns. The writer alone calls the storage module; with no writer there is
+   nothing honest to report except failure. */
 static bool save(ChatHost *host) {
     if (!host->dirty) return true;
-    if (storage_save(&host->storage,host->config.chat)) { host->dirty=false; return true; }
-    set_status(host,L"Save failed: changes are in memory; check storage permissions or disk space.");
-    return false;
+    uint64_t captured;
+    Chat *snapshot=save_snapshot(host,&captured);
+    if (!snapshot) return false;
+    if (!saver_ready(&host->saver)) {
+        chat_dispose(snapshot); free(snapshot);
+        host->save_failed=true; host->dirty=true;
+        set_status(host,CHAT_SAVE_FAILED);
+        return false;
+    }
+    uint64_t attempt=saver_submit(&host->saver,snapshot,captured);
+    host->last_submitted_attempt=attempt;
+    return true;
+}
+
+/* Flush-and-wait durability gate: hands the current state to the writer and
+   blocks until its own attempt is durable or failed. Used where the
+   synchronous contract must hold: before a network request and on close. */
+static bool save_sync(ChatHost *host) {
+    if (!host->dirty) return true;
+    uint64_t captured;
+    Chat *snapshot=save_snapshot(host,&captured);
+    if (!snapshot) return false;
+    if (!saver_ready(&host->saver)) {
+        chat_dispose(snapshot); free(snapshot);
+        host->save_failed=true; host->dirty=true;
+        set_status(host,CHAT_SAVE_FAILED);
+        return false;
+    }
+    uint64_t attempt;
+    bool ok=saver_flush(&host->saver,snapshot,captured,&attempt);
+    /* The flush's attempt is the newest submission while it completes; the
+       result is interpreted here, immediately, and its later queued
+       duplicate is ignored as stale. */
+    host->last_submitted_attempt=attempt;
+    saver_completed(host,ok,attempt,captured);
+    return ok;
+}
+
+/* Every observable change that makes state newer than the last handed-off
+   snapshot goes through here; the counter it bumps is what save handoffs
+   capture and completions are judged against. */
+static void mark_dirty(ChatHost *host) {
+    host->dirty = true;
+    ++host->mutations;
 }
 
 /* Ends the visible-reasoning window and records its duration once. */
@@ -288,7 +385,7 @@ static void sync_model(ChatHost *host) {
     /* Never let the visible field and the stored model disagree: an empty field
        falls back to the last valid model, which is written back into the field. */
     rich_text_set_text(&host->field, host->config.chat->model);
-    host->dirty = true;
+    mark_dirty(host);
 }
 
 static void field_blur(void *user) { sync_model((ChatHost *)user); }
@@ -310,11 +407,11 @@ static void capture_settings(ChatHost *host) {
     rich_text_get_text(&host->composer,draft,CHAT_MESSAGE_TEXT);
     ChatConversation *c=&chat->conversations[chat->active];
     if (!host->editing && wcscmp(draft,c->draft)) {
-        wcscpy(c->draft,draft); c->modified_at=chat_now(); host->dirty=true;
+        wcscpy(c->draft,draft); c->modified_at=chat_now(); mark_dirty(host);
     }
     wchar_t model[CHAT_MODEL_TEXT];
     rich_text_get_text(&host->field,model,CHAT_MODEL_TEXT);
-    if (model[0] && wcscmp(model,chat->model)) { wcscpy(chat->model,model); host->dirty=true; }
+    if (model[0] && wcscmp(model,chat->model)) { wcscpy(chat->model,model); mark_dirty(host); }
     WINDOWPLACEMENT placement={0}; placement.length=sizeof placement;
     if (GetWindowPlacement(host->window,&placement)) {
         RECT r=placement.rcNormalPosition;
@@ -325,7 +422,7 @@ static void capture_settings(ChatHost *host) {
             chat->window_x=r.left; chat->window_y=r.top;
             chat->window_width=width<720 ? 720 : width;
             chat->window_height=height<480 ? 480 : height;
-            chat->maximized=maximized; host->dirty=true;
+            chat->maximized=maximized; mark_dirty(host);
         }
     }
 }
@@ -356,9 +453,12 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
         host->editing=false;
         rich_text_set_text(&host->composer,chat->conversations[chat->active].draft);
     }
-    host->dirty=true;
-    /* Persist the user turn and pending response before starting network work. */
-    bool saved=save(host);
+    mark_dirty(host);
+    /* Durability gate: the user turn and pending response are durable before
+       network work starts. This flushes through the background writer and
+       keeps today's synchronous guarantee; a save failure outranks every
+       context diagnostic and the request is not sent. */
+    bool saved=save_sync(host);
     /* The request context is a bounded projection of the conversation: the
        system prompt, the triggering user message and the newest eligible
        history that fits CHAT_CONTEXT_BUDGET_BYTES. Persisted history is never
@@ -400,7 +500,7 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
             L"OPENROUTER_API_KEY is unavailable. Set the Windows User environment variable and restart." :
             L"Could not start OpenRouter request.");
         chat_message_touch(m);
-        host->dirty=true; save(host); set_status(host,L"Request failed; use Response > Retry.");
+        mark_dirty(host); save(host); set_status(host,L"Request failed; use Response > Retry.");
     } else {
         host->generating=true; host->stopping=false; host->accepting=true;
         host->stop_state=CHAT_GENERATION_CANCELLED;
@@ -424,7 +524,7 @@ static void perform_send(ChatHost *host) {
             pending(host)->generation.finished_at=chat_now();
             pending(host)->generation.latency_ms=(double)(GetTickCount64()-host->started_tick);
             chat_message_touch(pending(host));
-            host->dirty=true; save(host);
+            mark_dirty(host); save(host);
             chat_ui_set_generation(&host->chat_ui,true,true);
             set_status(host,L"Stopping generation...");
         }
@@ -459,7 +559,7 @@ static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
     }
     m->modified_at=chat_now();
     host->config.chat->conversations[host->request_conversation].modified_at=m->modified_at;
-    host->dirty=true;
+    mark_dirty(host);
     if (incoming>0 && host->request_conversation==host->config.chat->active) {
         int index=host->request_message;
         TranscriptTurn *turn=&host->transcript.turns[index];
@@ -514,7 +614,7 @@ static void append_reasoning_delta(ChatHost *host, OpenRouterEvent *event) {
     }
     m->modified_at=chat_now();
     host->config.chat->conversations[host->request_conversation].modified_at=m->modified_at;
-    host->dirty=true;
+    mark_dirty(host);
     if (!host->reasoning_streaming) {
         host->reasoning_streaming=true;
         host->reasoning_started_tick=GetTickCount64();
@@ -549,7 +649,7 @@ static void finish_request(ChatHost *host, OpenRouterEvent *event) {
     /* The full transcript render flushes any body rebuild the streaming
        throttle had deferred, so the terminal Markdown is always visible. */
     cancel_body_flush(host);
-    host->dirty=true; save(host);
+    mark_dirty(host); save(host);
     if (host->request_conversation==host->config.chat->active) render_transcript(host);
     chat_ui_sync(&host->chat_ui); flush(host);
 }
@@ -590,7 +690,7 @@ static void command(void *user, ChatCommand code, int index) {
             chat_ui_sync(&host->chat_ui);
         }
     }
-    host->dirty=true; save(host);
+    mark_dirty(host); save(host);
     ui_invalidate(host->config.ui, false);
     flush(host);
 }
@@ -676,7 +776,7 @@ static void action(ChatHost *host, int code) {
             wcscpy(chat->model,chat->model_history[selected-1000]); rich_text_set_text(&host->field,chat->model);
         }
     }
-    host->dirty=true; save(host); chat_ui_sync(&host->chat_ui); flush(host);
+    mark_dirty(host); save(host); chat_ui_sync(&host->chat_ui); flush(host);
 }
 
 static bool surface_key(void *user, WPARAM key, bool shift, bool control,
@@ -987,7 +1087,12 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             capture_settings(host);
             { TranscriptFeed feed = transcript_feed(host);
               transcript_apply_pending(&host->transcript, &feed); }
-            if (save(host) && host->generating) {
+            /* One-second autosave: hand a snapshot to the background writer.
+               While a save failure is latched the sweep stays silent so the
+               failure report remains visible, exactly like the synchronous
+               save's failure return did. */
+            save(host);
+            if (!host->save_failed && host->generating) {
                 wchar_t status[CHAT_STATUS_TEXT];
                 if (host->context_dropped)
                     swprintf(status,CHAT_STATUS_TEXT,
@@ -1093,6 +1198,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
     case CHAT_WM_OPENROUTER_EVENT:
         handle_event(host, (OpenRouterEvent *)l);
         return 0;
+    case CHAT_WM_SAVER_RESULT:
+        /* wParam carries the result bit and this job's attempt id; lParam
+           the mutation counter captured at that handoff. The completion is
+           interpreted against its own attempt and counter, never against the
+           latest handoff, and results at or below the newest
+           already-interpreted attempt are stale and ignored. */
+        saver_completed(host,(w&1)!=0,(uint64_t)w>>1,(uint64_t)l);
+        return 0;
     case WM_CLOSE:
         capture_settings(host);
         cancel_body_flush(host);
@@ -1103,8 +1216,8 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             g->latency_ms=(double)(GetTickCount64()-host->started_tick);
             wcscpy(g->error,L"Window closed before generation finished.");
             chat_message_touch(pending(host));
-            host->dirty=true;
-            save(host);
+            mark_dirty(host);
+            save_sync(host);
             openrouter_shutdown(&host->client);
             host->generating = false;
             host->context_dropped = 0;
@@ -1113,7 +1226,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
                 CHAT_WM_OPENROUTER_EVENT, PM_REMOVE))
                 openrouter_event_free((OpenRouterEvent *)queued.lParam);
         }
-        if (!save(host) && MessageBoxW(window,L"Changes could not be saved. Close anyway and lose unsaved changes?",
+        /* Final flush-and-wait: the close prompt must describe real
+           durability, not a handoff still in flight. */
+        if (!save_sync(host) && MessageBoxW(window,L"Changes could not be saved. Close anyway and lose unsaved changes?",
             L"DarkChat",MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)!=IDYES) {
             chat_ui_set_generation(&host->chat_ui,false,false); EnableWindow(host->field.window,TRUE);
             render_transcript(host); return 0;
@@ -1158,7 +1273,7 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
         MessageBoxW(NULL,L"No valid supported DarkChat snapshot was found. Storage files have been preserved. Restore a valid state.jsonl before restarting.",L"DarkChat",MB_OK|MB_ICONERROR);
         goto cleanup;
     }
-    host->dirty=true;
+    mark_dirty(host);
     if (host->storage.recovered) wcscpy(config->chat->status,L"Recovered the last valid snapshot from backup.");
     host->dpi = (float)GetDpiForSystem();
     if (!chat_ui_init(&host->chat_ui, config->ui, config->chat)) goto cleanup;
@@ -1199,6 +1314,17 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
         loaded ? px(host,(float)config->chat->window_height) : bounds.bottom - bounds.top, NULL, NULL,
         instance, host);
     if (window) {
+        /* The writer alone calls the storage module after startup, so a
+           failed saver_init fails startup cleanly rather than degrading to
+           UI-thread storage access. */
+        if (!saver_init(&host->saver,window,CHAT_WM_SAVER_RESULT,
+                &host->storage)) {
+            MessageBoxW(window,
+                L"DarkChat could not start the background snapshot writer.",
+                L"DarkChat",MB_OK|MB_ICONERROR);
+            DestroyWindow(window);
+            result=1;
+        } else {
         BOOL dark = TRUE;
         DwmSetWindowAttribute(window, 20, &dark, sizeof dark);
         ShowWindow(window, config->chat->maximized ? SW_SHOWMAXIMIZED : show);
@@ -1212,12 +1338,17 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
         }
         result = got < 0 ? 1 : (int)message.wParam;
         if (IsWindow(window)) DestroyWindow(window);
+        }
     }
     UnregisterClassW(cls.lpszClassName, instance);
     UnregisterClassW(view_cls.lpszClassName, instance);
 cleanup:
     /* Never exit under a running worker: it still owns its request snapshot. */
     openrouter_shutdown(&host->client);
+    /* Join the snapshot writer before the storage lock is released: it alone
+       uses the ChatStorage after startup, and pending jobs must be drained
+       (or disposed) while the store is still valid. */
+    saver_shutdown(&host->saver);
     ui_accessibility_destroy(host->accessibility);
     config->ui->measure = NULL;
     config->ui->measure_user = NULL;

@@ -24,7 +24,20 @@ static void check(int condition, const char *what) {
 void *__real_realloc(void *pointer, size_t size);
 void *__real_malloc(size_t size);
 static long fail_next_reallocs, fail_next_mallocs;
+/* One combined allocation sequence across BOTH wrappers: when armed, the
+   allocation in position N (counting mallocs and reallocs together) fails
+   exactly once. This is what models "the Nth allocation of an operation". */
+static long alloc_number, fail_allocation;
+static bool allocation_position(void) {
+    long position=++alloc_number;
+    if (position==fail_allocation) {
+        fail_allocation=0; alloc_number=0;
+        return true;
+    }
+    return false;
+}
 void *__wrap_realloc(void *pointer, size_t size) {
+    if (fail_allocation > 0 && allocation_position()) return NULL;
     if (fail_next_reallocs > 0) { --fail_next_reallocs; return NULL; }
     void *grown = __real_realloc(pointer, size);
     /* Poison only fresh allocations. Growing an existing buffer must keep
@@ -34,6 +47,7 @@ void *__wrap_realloc(void *pointer, size_t size) {
     return grown;
 }
 void *__wrap_malloc(size_t size) {
+    if (fail_allocation > 0 && allocation_position()) return NULL;
     if (fail_next_mallocs > 0) { --fail_next_mallocs; return NULL; }
     return __real_malloc(size);
 }
@@ -717,6 +731,120 @@ int main(void) {
             "the last id below the ceiling is still allocatable");
         check_invariants(exhausted);
         chat_dispose(exhausted); free(exhausted);
+    }
+
+    /* Deep snapshot for asynchronous persistence: the copy is fully owned by
+       the caller, aliases no source allocation, is transactional under
+       allocation failure, and never follows later source mutations. */
+    {
+        Chat *own = (Chat *)calloc(1, sizeof *own);
+        if (!own) return 2;
+        chat_init(own); chat_clear(own);
+        wchar_t *big = (wchar_t *)malloc(sizeof(wchar_t) * (CHAT_MESSAGE_TEXT * 2));
+        wchar_t *thought = (wchar_t *)malloc(sizeof(wchar_t) * (CHAT_REASONING_TEXT + 8));
+        if (!big || !thought) return 2;
+        for (size_t i = 0; i < CHAT_MESSAGE_TEXT * 2 - 1; i++) big[i] = L'x';
+        big[CHAT_MESSAGE_TEXT * 2 - 1] = 0;
+        for (size_t i = 0; i < CHAT_REASONING_TEXT + 7; i++) thought[i] = L'y';
+        thought[CHAT_REASONING_TEXT + 7] = 0;
+        check(chat_append(own, CHAT_ROLE_USER, L"question one") == 0,
+            "snapshot fixture user turn appended");
+        int answer = chat_append(own, CHAT_ROLE_ASSISTANT, big);
+        check(answer == 1, "snapshot fixture overflow answer appended");
+        check(own->conversations[0].messages[1].text_overflow != NULL,
+            "snapshot fixture answer really is on overflow storage");
+        check(chat_message_set_reasoning(&own->conversations[0].messages[1], thought),
+            "snapshot fixture reasoning appended");
+        check(own->conversations[0].messages[1].reasoning_overflow != NULL,
+            "snapshot fixture reasoning really is on overflow storage");
+        uint64_t answer_id = own->conversations[0].messages[1].id;
+        check_invariants(own);
+
+        Chat *copy = chat_snapshot(own);
+        check(copy != NULL, "snapshot of a populated chat succeeds");
+        if (copy) {
+            check(copy != own &&
+                copy->conversations[0].messages[1].text_overflow !=
+                    own->conversations[0].messages[1].text_overflow &&
+                copy->conversations[0].messages[1].reasoning_overflow !=
+                    own->conversations[0].messages[1].reasoning_overflow,
+                "snapshot overflow storage is freshly allocated, never aliased");
+            check(!wcscmp(chat_message_text(&copy->conversations[0].messages[0]),
+                    L"question one") &&
+                !wcscmp(chat_message_text(&copy->conversations[0].messages[1]), big) &&
+                !wcscmp(chat_message_reasoning(&copy->conversations[0].messages[1]),
+                    thought),
+                "snapshot carries inline and overflow content verbatim");
+            check(copy->conversations[0].messages[1].id == answer_id,
+                "snapshot keeps stable message identity");
+            check(copy->conversations[0].message_capacity ==
+                copy->conversations[0].message_count,
+                "snapshot arrays carry exactly the live message count");
+            check_invariants(copy);
+
+            /* Snapshot isolation: the source keeps mutating; the copy never
+               follows, and disposing the copy cannot disturb the source. */
+            check(chat_message_append_text(
+                    &own->conversations[0].messages[1], L" more"),
+                "source mutates after the snapshot was taken");
+            check(!wcscmp(chat_message_text(&copy->conversations[0].messages[1]), big),
+                "an earlier snapshot does not follow later source mutations");
+            chat_dispose(copy);
+            free(copy);
+            check(own->conversations[0].messages[1].text_overflow != NULL &&
+                wcslen(chat_message_text(&own->conversations[0].messages[1])) ==
+                    CHAT_MESSAGE_TEXT * 2 - 1 + 5,
+                "disposing the snapshot leaves the source's storage intact");
+        }
+        size_t answer_len = wcslen(chat_message_text(&own->conversations[0].messages[1]));
+        size_t reasoning_len = wcslen(chat_message_reasoning(&own->conversations[0].messages[1]));
+        /* Transactional failure sweep: failing each position of the one
+           combined allocation sequence in turn (the snapshot makes exactly
+           four allocations: the Chat struct, one exact live-count message
+           array per conversation, and one overflow copy per heap-backed
+           text) either fails the whole snapshot with the source untouched
+           and nothing leaked, or completes. */
+        {
+            bool saw_failure = false, saw_success = false;
+            bool source_damaged = false, snapshot_bad = false;
+            for (long i = 1; i <= 5; i++) {
+                alloc_number = 0; fail_allocation = i;
+                Chat *snap = chat_snapshot(own);
+                alloc_number = 0; fail_allocation = 0;
+                if (!snap) {
+                    saw_failure = true;
+                    if (wcslen(chat_message_text(&own->conversations[0].messages[1]))
+                            != answer_len ||
+                        wcslen(chat_message_reasoning(
+                            &own->conversations[0].messages[1])) != reasoning_len ||
+                        wcscmp(chat_message_text(&own->conversations[0].messages[0]),
+                            L"question one"))
+                        source_damaged = true;
+                    continue;
+                }
+                saw_success = true;
+                if (wcslen(chat_message_text(&snap->conversations[0].messages[1]))
+                        != answer_len ||
+                    wcslen(chat_message_reasoning(&snap->conversations[0].messages[1]))
+                        != reasoning_len ||
+                    wcscmp(chat_message_text(&snap->conversations[0].messages[0]),
+                        L"question one") ||
+                    snap->conversations[0].messages[1].text_overflow ==
+                        own->conversations[0].messages[1].text_overflow ||
+                    snap->conversations[0].messages[1].reasoning_overflow ==
+                        own->conversations[0].messages[1].reasoning_overflow)
+                    snapshot_bad = true;
+                check_invariants(snap);
+                chat_dispose(snap); free(snap);
+            }
+            check(saw_failure, "snapshot allocation-failure path is reachable");
+            check(saw_success, "snapshot succeeds once failures are exhausted");
+            check(!source_damaged, "a failed snapshot leaves the source untouched");
+            check(!snapshot_bad, "every completed snapshot is complete and unaliased");
+        }
+        check_invariants(own);
+        free(big); free(thought);
+        chat_dispose(own); free(own);
     }
 
     chat_dispose(chat);

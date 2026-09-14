@@ -142,7 +142,9 @@ The key is never part of conversation state or persistence.
 
 One request runs at a time. The UI thread owns Chat; the worker receives an owned
 request snapshot and posts generation-ID-tagged events. A user turn and empty
-running assistant response are saved **before** sending the network request.
+running assistant response are saved **before** sending the network request —
+a flush-and-wait through the background snapshot writer, so the guarantee
+stays synchronous and a failed save still refuses to send.
 Deltas update that assistant response in place. Late events are discarded.
 
 | State | Meaning |
@@ -183,7 +185,9 @@ conversation plus index or stable message ID (the transcript already stores
 rendered identity by value). Deleting a conversation bytewise-moves the
 surviving ones, transferring ownership of their arrays and overflow pointers,
 and the vacated slot is zeroed so nothing is freed twice. Chat and its message
-arrays remain UI-thread-owned; worker threads never borrow them.
+arrays remain UI-thread-owned; worker threads never borrow them, and
+asynchronous persistence uses `chat_snapshot` — a deep, transactional copy
+handed to one background writer thread.
 
 Request history includes user/system messages and completed generated assistant
 responses. Local welcome/error notes, running responses and all unsuccessful
@@ -263,10 +267,45 @@ Writes serialize explicit fields, flush `state.tmp.jsonl`, then atomically repla
 `state.jsonl` on the same volume using `MoveFileExW` with write-through. Before
 replacement, the last validated primary is copied and flushed to
 `state.bak.jsonl`. A failed write/rename leaves the primary intact and reports a
-save error. Autosave runs once per second while state/drafts/settings are dirty,
-and immediately on history actions, request start, Stop, completion and close.
-At most roughly one second of recent streamed text or ordinary draft typing can
-be lost on abrupt termination (long UI/disk stalls can increase that interval).
+save error.
+
+Saves run on a background snapshot writer (`chat/saver.c`): the UI thread builds
+a deep, immutable copy of the whole Chat (`chat_snapshot` — exact live-count
+message arrays, overflow storage reallocated per message so nothing is
+aliased) and hands ownership to one writer thread, which alone calls the
+storage module — the writer lock, backup rotation and recovery semantics are
+unchanged and stay single-threaded. The pending handoff slot is latest-wins: a
+snapshot that has not started writing is displaced by the next handoff and
+disposed, so a burst of handoffs can never queue work. Every accepted handoff
+receives a monotonically increasing submission (attempt) id, separate from the
+mutation counter, because two handoffs can share one counter and the counter
+alone cannot identify an attempt; the pending and in-flight jobs each retain
+their own attempt id and captured counter, and every posted result repeats
+them. A flush-and-wait is released only by its own attempt or a genuinely
+later covering one — never by an older in-flight attempt that merely shares
+the same counter. Results are interpreted in attempt order: any result at or
+below the newest already-interpreted attempt is stale and ignored, and a
+failure older than the newest *submitted* attempt is superseded and
+suppressed — that newer attempt's snapshot contains all of the failed one's
+state and is guaranteed to complete and post its own authoritative result
+(every accepted submission either completes with one posted result or is
+displaced before starting, in which case the displacement's own result
+reports), so a superseded failure can neither latch the failure state, write
+the failure status nor suppress the status sweep, and an older success can
+neither mark newer unsaved mutations durable nor hide a newer failure.
+`dirty` clears only when the newest handoff's completion succeeds; a
+processed failure latches, reports through the status line, explicitly keeps
+dirty set, and the one-second autosave retries.
+
+Autosave hands a snapshot off once per second while state/drafts/settings are
+dirty, and immediately on history actions, Stop and completion. Two sites keep
+the synchronous durability contract through a flush-and-wait: the save before
+sending a network request (a failed flush still refuses to send, and save
+failure still outranks every context diagnostic) and the final save on close
+(the "lose unsaved changes?" prompt reflects real durability, not a handoff in
+flight). At most roughly one second of recent streamed text or ordinary draft
+typing can be lost on abrupt termination (long UI/disk stalls can increase that
+interval). On close the writer joins before the storage lock is released.
 
 Load validates JSON, version, ranges, counts, identities and checksum into a
 separate Chat before adopting it. Message identity is validated strictly: a
@@ -344,6 +383,19 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   exclusive writer lock, corrupt/torn snapshots, backup/temp recovery, denied
   temp writes and failed atomic replacement, and protection against unknown
   versions.
+- Background snapshot saving (`chat_snapshot` unit tests and the hidden-HWND
+  host): deep copies of inline and overflow storage that never alias the
+  source and carry exactly the live message count, transactional failure at
+  every position of one combined allocation sequence with the source
+  untouched, snapshot isolation across a paused in-flight write (the file
+  lands in the pre-mutation shape, and the store is read only while the
+  writer is idle), per-attempt result ordering (a stale duplicate never
+  claims durability, a late older failure never re-latches behind a newer
+  success), failure latch with dirty preserved and retry through the writer,
+  deterministic latest-wins coalescing with the writer's storage passes
+  bounded by count, shutdown draining a provably pending handoff, and the
+  pre-request flush gate still refusing to send when the writer reports
+  failure.
 - Real request encoder/SSE callback fixtures for model, usage, cost, TTFT,
   finish reason and provider errors after partial content, now also the enabled
   reasoning request parameter and reasoning_details/text-summary/plain fallback
