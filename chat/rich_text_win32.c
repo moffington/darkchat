@@ -228,8 +228,15 @@ bool rich_text_create_composer(RichTextControl *control, HWND parent, int id,
 
 bool rich_text_create_field(RichTextControl *control, HWND parent, int id,
     const RichTextTheme *theme, float dpi, const wchar_t *text) {
+    return rich_text_create_field_limit(control, parent, id, theme, dpi,
+        (long)(CHAT_MODEL_TEXT - 1), text);
+}
+
+bool rich_text_create_field_limit(RichTextControl *control, HWND parent, int id,
+    const RichTextTheme *theme, float dpi, long limit, const wchar_t *text) {
+    if (limit < 1) return false;
     return create_control(control, parent, id, theme, dpi, false, false, false,
-        (long)(CHAT_MODEL_TEXT - 1), theme->composer_background, text);
+        limit, theme->composer_background, text);
 }
 
 void rich_text_set_dpi(RichTextControl *control, float dpi) {

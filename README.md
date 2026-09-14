@@ -84,6 +84,8 @@ Enter any valid OpenRouter model identifier in the model field. DarkChat current
 - `Enter` sends a message.
 - `Shift+Enter` inserts a newline.
 - `Ctrl+Space` opens recently used model identifiers.
+- `Ctrl+F` focuses conversation search. Enter refreshes the search and jumps to
+  its first result; `F3` / `Shift+F3` move through message and reasoning hits.
 - The Send button becomes Stop during generation.
 - Conversation actions provide New, Rename, Delete, and Clear messages.
 - Response actions provide Retry, Regenerate, Edit latest user message, Cancel edit, Copy response, and Copy transcript selection.
@@ -198,7 +200,8 @@ The automated suite does not require an API key or make live OpenRouter requests
 - No full model-catalog browser
 - No provider-routing UI
 - No response branches or retained variants
-- No global conversation search
+- Conversation search scans current in-memory messages on demand; there is no
+  persisted or background index
 - Markdown tables, images, nested lists, and other unsupported syntax remain literal
 
 Responses that reach the local text limit are retained and marked Interrupted rather than incorrectly reported as complete.

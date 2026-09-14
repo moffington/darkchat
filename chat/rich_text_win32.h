@@ -71,6 +71,8 @@ bool rich_text_create_composer(RichTextControl *control, HWND parent, int id,
     const RichTextTheme *theme, float dpi);
 bool rich_text_create_field(RichTextControl *control, HWND parent, int id,
     const RichTextTheme *theme, float dpi, const wchar_t *text);
+bool rich_text_create_field_limit(RichTextControl *control, HWND parent, int id,
+    const RichTextTheme *theme, float dpi, long limit, const wchar_t *text);
 
 void rich_text_set_dpi(RichTextControl *control, float dpi);
 void rich_text_get_text(const RichTextControl *control, wchar_t *out,

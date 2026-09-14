@@ -246,6 +246,21 @@ void transcript_position(Transcript *t, bool follow) {
     InvalidateRect(t->view, NULL, FALSE);
 }
 
+bool transcript_reveal_turn(Transcript *t, int index) {
+    if (!t || !t->view || index < 0 || index >= t->turn_count) return false;
+    TranscriptTurn *turn = &t->turns[index];
+    int top = turn->y;
+    int bottom = turn->y + turn->height;
+    if (top < t->view_scroll) {
+        t->view_scroll = top;
+    } else if (bottom > t->view_scroll + t->view_page) {
+        t->view_scroll = turn->height > t->view_page
+            ? top : bottom - t->view_page;
+    }
+    transcript_position(t, false);
+    return true;
+}
+
 /* Measures and stacks turns from start onward, then repositions them. */
 void transcript_layout_from(Transcript *t, int start, bool follow) {
     if (!t->view) return;

@@ -20,8 +20,8 @@ typedef void (*ChatCommandFn)(void *user, ChatCommand command, int index);
 typedef struct {
     Ui *ui;
     Chat *chat;
-    UiId root, heading, model, new_conversation, list, transcript, composer, send,
-        status;
+    UiId root, heading, model, search, search_status, new_conversation, list,
+        transcript, composer, send, status;
     UiId conversations[CHAT_MAX_CONVERSATIONS];
     UiId spacer, sidebar;
     ChatCommandFn command;
@@ -34,6 +34,7 @@ void chat_ui_sync(ChatUi *chat_ui);
 /* Changes the primary action between Send, Stop, and the disabled stopping
    state without rebuilding the retained tree. */
 void chat_ui_set_generation(ChatUi *chat_ui, bool generating, bool stopping);
+void chat_ui_set_search_status(ChatUi *chat_ui, const wchar_t *text);
 void chat_ui_resize(ChatUi *chat_ui, float width, float height);
 void chat_ui_event(void *user, Ui *ui, UiEvent event);
 /* Arranged rectangle for a laid-out node, or an empty rectangle. */

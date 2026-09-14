@@ -29,6 +29,14 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
 - Ctrl+Space opens model history, filtered by the field's prefix. If no entry
   matches, it shows all history. History retains the 16 most recently requested
   models; it does not fetch OpenRouter's full catalog.
+- Ctrl+F focuses the sidebar search field. Enter performs a fresh on-demand
+  search over every live message body and reasoning field; F3 and Shift+F3 move
+  between retained results. Matching is locale-independent ordinal Unicode
+  case-insensitive comparison without normalization or length-changing folds.
+  Results retain persisted conversation/message IDs rather than array indices;
+  stale edited, deleted, or replaced messages do not resolve. A reasoning hit
+  opens that turn's reasoning viewport before the transcript minimally reveals
+  it. Search queries, snippets, and results are transient and are never saved.
 - Each completed response displays a compact metadata footer: completion state,
   TTFT and latency in seconds, grouped input/output token counts, USD cost and
   the model (shown once when requested and actual match, otherwise
@@ -456,7 +464,9 @@ and viewport per assistant turn, live streaming, follow/pin behavior, no-reasoni
 removal, and version 1 persistence compatibility) and the compact metadata footer
 are covered by focused hidden-HWND tests. Live OpenRouter behavior is not asserted
 by any repo command; it is the manual, key-gated check shown above. Tests use
-isolated directories under `build`, not the user's conversation store.
+isolated directories under `build`, not the user's conversation store. Search
+matching, snippets, invalidation, stable-ID resolution and hidden-host jumps are
+also covered.
 
 Remaining limits: 16 conversations, 64 messages each, and a 128 MB on-disk
 snapshot bound. The composer and the system prompt are bounded at 16,383 UTF-16
@@ -465,8 +475,8 @@ so its ceiling is memory and the snapshot bound rather than a fixed count. A
 request sends at most the 64 KiB context budget and drops the oldest eligible
 history beyond it; the budget is a local proxy for prompt size, not a model's
 context window. Responses past the local limit stop as Interrupted without
-silently claiming success. Full
-model-catalog autocomplete, response variants, and global search remain outside
-this pass. Interactive clipboard/IME behavior,
+silently claiming success. Conversation search is an on-demand scan with no
+persisted or background index. Full model-catalog autocomplete and response
+variants remain outside this pass. Interactive clipboard/IME behavior,
 modal-dialog appearance and physical multi-monitor DPI transitions still need a
 manual desktop check; hidden-HWND tests do not substitute for that visual review.

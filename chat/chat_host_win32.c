@@ -4,6 +4,7 @@
 #include "transcript_win32.h"
 #include "openrouter_winhttp.h"
 #include "context.h"
+#include "search.h"
 #include "storage.h"
 #include "saver.h"
 #include "actions_win32.h"
@@ -19,6 +20,7 @@
 /* One-shot flush for dirty streaming content; the status sweep and the
    paint-retry timers use ids 2 and 1. */
 #define CHAT_TIMER_BODY_FLUSH 3
+#define CHAT_SEARCH_QUERY_TEXT 256
 
 typedef struct {
     ChatHostConfig config;
@@ -26,7 +28,7 @@ typedef struct {
     UiAccessibility *accessibility;
     HWND window;
     ChatUi chat_ui;
-    RichTextControl composer, field;
+    RichTextControl composer, field, search;
     HWND view;                          /* transcript container child window */
     Transcript transcript;              /* per-turn update bookkeeping */
     RichTextTheme rich_theme;
@@ -55,6 +57,9 @@ typedef struct {
     ChatSaver saver;
     uint64_t mutations, last_submitted_attempt, handled_attempt;
     bool save_failed;
+    ChatSearchResults search_results;
+    size_t search_selected;
+    bool search_has_selection;
     ULONGLONG started_tick;
     ChatGenerationState stop_state;
 
@@ -76,6 +81,9 @@ static void cancel_body_flush(ChatHost *host);
 static void flush_stream_body(ChatHost *host);
 static bool turn_row_click(void *user, RichTextControl *control, int line,
     bool down);
+static bool search_submit(void *user);
+static bool search_refresh(ChatHost *host, bool reverse);
+static bool search_step(ChatHost *host, bool reverse);
 
 static int px(ChatHost *host, float dips) {
     return (int)lroundf(dips * host->dpi / 96.0f);
@@ -308,10 +316,10 @@ static void place(ChatHost *host, RichTextControl *control, UiId id,
     ShowWindow(control->window, SW_SHOWNOACTIVATE);
 }
 
-/* The single-line field is vertically centered inside its placeholder. */
-static void place_field(ChatHost *host) {
-    UiNode *item = ui_node(host->config.ui, host->chat_ui.model);
-    if (!item || !host->field.window) return;
+/* A single-line field is vertically centered inside its placeholder. */
+static void place_field(ChatHost *host, RichTextControl *control, UiId id) {
+    UiNode *item = ui_node(host->config.ui, id);
+    if (!item || !control->window) return;
     UiRect area = ui_intersect(item->rect, item->clip);
     area.x += 1;
     area.w -= 2;
@@ -319,11 +327,11 @@ static void place_field(ChatHost *host) {
     float top = area.y + (area.h - line) / 2;
     if (top < area.y) top = area.y;
     float height = line < area.h ? line : area.h;
-    if (area.w <= 2 || height <= 2) { ShowWindow(host->field.window, SW_HIDE); return; }
+    if (area.w <= 2 || height <= 2) { ShowWindow(control->window, SW_HIDE); return; }
     int x = px(host, area.x), y = px(host, top);
-    SetWindowPos(host->field.window, NULL, x, y, px(host, area.x + area.w) - x,
+    SetWindowPos(control->window, NULL, x, y, px(host, area.x + area.w) - x,
         px(host, top + height) - y, SWP_NOZORDER | SWP_NOACTIVATE);
-    ShowWindow(host->field.window, SW_SHOWNOACTIVATE);
+    ShowWindow(control->window, SW_SHOWNOACTIVATE);
 }
 
 /* Sizes the transcript container over its placeholder, inside the drawn border. */
@@ -353,7 +361,8 @@ static void layout(ChatHost *host) {
     chat_ui_resize(&host->chat_ui, dip(host, client.right), dip(host, client.bottom));
     place_container(host);
     place(host, &host->composer, host->chat_ui.composer, 1.0f);
-    place_field(host);
+    place_field(host, &host->field, host->chat_ui.model);
+    place_field(host, &host->search, host->chat_ui.search);
 }
 
 static void flush(ChatHost *host) {
@@ -392,13 +401,15 @@ static void field_blur(void *user) { sync_model((ChatHost *)user); }
 
 
 static void focus_surface(ChatHost *host, bool reverse) {
-    /* The composer and model field remain the two explicit Tab stops; Tab from
-       a transcript turn returns to the field. */
-    HWND order[2] = { host->field.window, host->composer.window };
+    /* Native fields are the explicit Tab stops; Tab from a transcript turn
+       returns to the model field. */
+    HWND order[3] = { host->field.window, host->search.window,
+        host->composer.window };
     HWND focus = GetFocus();
     int current = -1;
-    for (int i = 0; i < 2; i++) if (order[i] == focus) current = i;
-    int next = current < 0 ? (reverse ? 1 : 0) : (current + (reverse ? -1 : 1) + 2) % 2;
+    for (int i = 0; i < 3; i++) if (order[i] == focus) current = i;
+    int next = current < 0 ? (reverse ? 2 : 0) :
+        (current + (reverse ? -1 : 1) + 3) % 3;
     SetFocus(order[next]);
 }
 static void capture_settings(ChatHost *host) {
@@ -695,9 +706,113 @@ static void command(void *user, ChatCommand code, int index) {
     flush(host);
 }
 
+static const wchar_t *search_role_name(ChatRole role) {
+    switch (role) {
+    case CHAT_ROLE_USER: return L"User";
+    case CHAT_ROLE_ASSISTANT: return L"Assistant";
+    case CHAT_ROLE_SYSTEM: return L"System";
+    case CHAT_ROLE_ERROR: return L"Error";
+    }
+    return L"Message";
+}
+
+/* Resolves ids immediately before navigation; retained array indices are never
+   trusted across conversation deletion, message replacement, or growth. */
+static bool jump_search_result(ChatHost *host, size_t index) {
+    ChatSearchTarget target;
+    if (!chat_search_resolve(host->config.chat, &host->search_results, index,
+            &target)) return false;
+    Chat *chat = host->config.chat;
+    bool different_conversation = target.conversation != chat->active;
+    ChatMessage *message =
+        &chat->conversations[target.conversation].messages[target.message];
+    bool open_reasoning = target.field == CHAT_SEARCH_REASONING &&
+        !message->reasoning_open;
+    if (open_reasoning) message->reasoning_open = true;
+    if (different_conversation) {
+        /* Selection invalidates and renders once. Set per-turn view state first
+           so a reasoning result is realized by that render. */
+        command(host, CHAT_COMMAND_SELECT, target.conversation);
+    } else if (open_reasoning) {
+        /* Only the newly opened reasoning turn needs synchronization. Body
+           results and already-open reasoning results need no render at all. */
+        refresh_turn(host, target.message);
+    }
+    if (target.conversation != chat->active || target.message < 0 ||
+        (size_t)target.message >= chat->conversations[chat->active].message_count)
+        return false;
+    if (!transcript_reveal_turn(&host->transcript, target.message)) return false;
+
+    host->search_selected = index;
+    host->search_has_selection = true;
+    const ChatSearchResult *result = &host->search_results.items[index];
+    wchar_t status[UI_TEXT_CAPACITY];
+    swprintf(status, UI_TEXT_CAPACITY, L"%llu/%llu %ls %ls: %ls",
+        (unsigned long long)(index + 1),
+        (unsigned long long)host->search_results.count,
+        search_role_name(result->role),
+        result->field == CHAT_SEARCH_REASONING ? L"reasoning" : L"message",
+        result->snippet);
+    status[UI_TEXT_CAPACITY - 1] = 0;
+    chat_ui_set_search_status(&host->chat_ui, status);
+    flush(host);
+    return true;
+}
+
+static bool search_step(ChatHost *host, bool reverse) {
+    size_t count = host->search_results.count;
+    if (!count) {
+        chat_ui_set_search_status(&host->chat_ui, L"No results");
+        flush(host);
+        return false;
+    }
+    size_t candidate = host->search_has_selection ? host->search_selected :
+        (reverse ? 0 : count - 1);
+    for (size_t checked = 0; checked < count; checked++) {
+        candidate = reverse ? (candidate ? candidate - 1 : count - 1) :
+            (candidate + 1) % count;
+        if (jump_search_result(host, candidate)) return true;
+    }
+    host->search_has_selection = false;
+    chat_ui_set_search_status(&host->chat_ui,
+        L"Results changed; press Enter to refresh");
+    flush(host);
+    return false;
+}
+
+static bool search_refresh(ChatHost *host, bool reverse) {
+    wchar_t query[CHAT_SEARCH_QUERY_TEXT];
+    rich_text_get_text(&host->search, query, CHAT_SEARCH_QUERY_TEXT);
+    ChatSearchOptions options = { true };
+    if (!chat_search_build(host->config.chat, query, options,
+            &host->search_results)) {
+        chat_ui_set_search_status(&host->chat_ui, L"Search could not allocate results");
+        flush(host);
+        return true;
+    }
+    host->search_has_selection = false;
+    if (!query[0]) {
+        chat_ui_set_search_status(&host->chat_ui,
+            L"Enter to search messages and reasoning");
+        flush(host);
+        return true;
+    }
+    search_step(host, reverse);
+    return true;
+}
+
+static bool search_submit(void *user) {
+    return search_refresh((ChatHost *)user, false);
+}
+
 static void action(ChatHost *host, int code) {
     Chat *chat=host->config.chat;
     ChatConversation *c=&chat->conversations[chat->active];
+    if (code==ACTION_SEARCH) {
+        SetFocus(host->search.window);
+        SendMessageW(host->search.window,EM_SETSEL,0,-1);
+        return;
+    }
     if (code==ACTION_COPY) {
         for (size_t i=c->message_count;i>0;i--) if (c->messages[i-1].role==CHAT_ROLE_ASSISTANT) {
             set_status(host,chat_copy_text(host->window,
@@ -782,6 +897,19 @@ static void action(ChatHost *host, int code) {
 static bool surface_key(void *user, WPARAM key, bool shift, bool control,
     bool down) {
     ChatHost *host = (ChatHost *)user;
+    if (control && (key == L'F' || key == L'f') && down) {
+        action(host, ACTION_SEARCH);
+        return true;
+    }
+    if (key == VK_F3 && down) {
+        wchar_t query[CHAT_SEARCH_QUERY_TEXT];
+        rich_text_get_text(&host->search, query, CHAT_SEARCH_QUERY_TEXT);
+        const wchar_t *searched = host->search_results.query
+            ? host->search_results.query : L"";
+        if (wcscmp(query, searched)) return search_refresh(host, shift);
+        search_step(host, shift);
+        return true;
+    }
     if (control && key == VK_SPACE && down) { action(host,ACTION_MODELS); return true; }
     if (key == VK_TAB && down) { focus_surface(host, shift); return true; }
     return false;
@@ -849,7 +977,8 @@ static void host_event(void *user, Ui *ui, UiEvent event) {
 
 /* True for any child that keeps the window active while it holds focus. */
 static bool owns_child_window(ChatHost *host, HWND window) {
-    if (window == host->composer.window || window == host->field.window)
+    if (window == host->composer.window || window == host->field.window ||
+        window == host->search.window)
         return true;
     for (int i = 0; i < CHAT_MAX_MESSAGES; i++) {
         TranscriptTurn *turn = &host->transcript.turns[i];
@@ -999,6 +1128,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             &host->rich_theme, host->dpi)) return -1;
         if (!rich_text_create_field(&host->field, window, 3, &host->rich_theme,
             host->dpi, host->config.chat->model)) return -1;
+        if (!rich_text_create_field_limit(&host->search, window, 4,
+            &host->rich_theme, host->dpi, CHAT_SEARCH_QUERY_TEXT - 1, L""))
+            return -1;
         host->view = CreateWindowExW(0, L"DarkChat.Transcript", L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
             0, 0, 10, 10, window, NULL, GetModuleHandleW(NULL), host);
@@ -1015,6 +1147,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         host->field.on_key = surface_key;
         host->field.on_blur = field_blur;
         host->field.user = host;
+        host->search.on_submit = search_submit;
+        host->search.on_key = surface_key;
+        host->search.user = host;
         openrouter_init(&host->client, window, CHAT_WM_OPENROUTER_EVENT);
         if (!ui_accessible_name(u, u->root)[0])
             ui_set_accessible_name(u, u->root, host->config.title);
@@ -1127,6 +1262,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         host->dpi = (float)HIWORD(w);
         RECT *r = (RECT *)l;
         rich_text_set_dpi(&host->field, host->dpi);
+        rich_text_set_dpi(&host->search, host->dpi);
         rich_text_set_dpi(&host->composer, host->dpi);
         transcript_set_dpi(&host->transcript, host->dpi);
         renderer_resize(&host->renderer, 0, 0, host->dpi);
@@ -1178,6 +1314,13 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
     case WM_MOUSEWHEEL: wheel(host, w, l); return 0;
     case WM_KEYDOWN:
     case WM_KEYUP: {
+        bool down = message == WM_KEYDOWN;
+        bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (down && ((control && (w == L'F' || w == L'f')) || w == VK_F3)) {
+            surface_key(host, w, (GetKeyState(VK_SHIFT) & 0x8000) != 0,
+                control, true);
+            return 0;
+        }
         UiKey key;
         if (key_from_win32(w, &key)) {
             ui_key(u, key, message == WM_KEYDOWN,
@@ -1243,6 +1386,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         KillTimer(window, 1);
         KillTimer(window, 2);
         KillTimer(window, CHAT_TIMER_BODY_FLUSH);
+        chat_search_results_dispose(&host->search_results);
         renderer_drop_target(&host->renderer);
         PostQuitMessage(0);
         return 0;

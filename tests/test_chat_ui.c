@@ -24,6 +24,13 @@ int main(void) {
     chat_ui_resize(chat_ui, 720, 480);
     check(model && model->rect.w >= 279 && model->rect.h >= 29,
         "model editor remains visible at the minimum window size");
+    UiNode *search = ui_node(ui, chat_ui->search);
+    check(search && search->rect.w > 100 && search->rect.h >= 29,
+        "conversation search placeholder remains visible at minimum size");
+    chat_ui_set_search_status(chat_ui, L"2/4 Assistant message: result");
+    UiNode *search_status = ui_node(ui, chat_ui->search_status);
+    check(search_status && wcsstr(search_status->text, L"2/4") != NULL,
+        "search result status updates without rebuilding the UI");
     chat_ui_set_generation(chat_ui, true, false);
     UiNode *send = ui_node(ui, chat_ui->send);
     check(send && wcscmp(send->text, L"Stop") == 0 && !send->disabled,

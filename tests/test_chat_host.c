@@ -956,6 +956,97 @@ int main(void) {
     printf("long transcript: %d controls (%d visible), full render %.1f ms, "
         "scheduled flush to visible %.1f ms\n",
         realized,visible,render_ms,flush_ms);
+    /* ---- Stable conversation search and jump ---- */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    int search_a=chat->active;
+    for (int i=0;i<8;i++) add_turn(chat,L"search filler",L"filler answer",NULL,-1);
+    int search_body=add_turn(chat,L"search target question",
+        L"First host-search-token body",NULL,-1);
+    uint64_t search_a_id=chat->conversations[search_a].id;
+    uint64_t search_body_id=chat->conversations[search_a].messages[search_body].id;
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    int search_b=chat->active;
+    for (int i=0;i<6;i++) add_turn(chat,L"other filler",L"other answer",NULL,-1);
+    int search_reason=add_turn(chat,L"reason target question",L"plain answer",
+        L"Second host-search-token reasoning",900);
+    uint64_t search_b_id=chat->conversations[search_b].id;
+    uint64_t search_reason_id=chat->conversations[search_b].messages[search_reason].id;
+    render_transcript(h);
+    h->transcript.view_scroll=0;
+    transcript_position(&h->transcript,false);
+    CHECK(h->search.window &&
+        (GetWindowLongPtrW(h->search.window,GWL_STYLE)&WS_VISIBLE));
+    rich_text_set_text(&h->search,L"HOST-search-token");
+    CHECK(search_submit(h));
+    CHECK(h->search_results.count==2 && h->search_has_selection &&
+        h->search_selected==0);
+    CHECK(chat->conversations[chat->active].id==search_a_id &&
+        h->transcript.turns[search_body].message==search_body_id);
+    { TranscriptTurn *turn=&h->transcript.turns[search_body];
+      int expected=turn->height>h->transcript.view_page ? turn->y :
+          turn->y+turn->height-h->transcript.view_page;
+      if (expected<0) expected=0;
+      CHECK(h->transcript.view_scroll==expected);
+      CHECK(turn->y+turn->height>h->transcript.view_scroll &&
+          turn->y<h->transcript.view_scroll+h->transcript.view_page);
+      int revealed=h->transcript.view_scroll;
+      CHECK(transcript_reveal_turn(&h->transcript,search_body) &&
+          h->transcript.view_scroll==revealed); }
+    /* Jumping again to an active body only reveals it. A deliberately stale
+       unrelated rendered identity proves no full transcript pass occurred. */
+    { bool valid=h->transcript.turns[0].rendered_valid;
+      h->transcript.turns[0].rendered_valid=false;
+      CHECK(jump_search_result(h,0));
+      CHECK(!h->transcript.turns[0].rendered_valid);
+      h->transcript.turns[0].rendered_valid=valid; }
+    CHECK(wcsstr(ui_node(ui,h->chat_ui.search_status)->text,
+        L"Assistant message")!=NULL);
+    /* F3 resolves the next result by stable ids, switches conversations, opens
+       a matched reasoning viewport, and minimally reveals the target turn. */
+    CHECK(surface_key(h,VK_F3,false,false,true));
+    CHECK(h->search_selected==1 &&
+        chat->conversations[chat->active].id==search_b_id &&
+        h->transcript.turns[search_reason].message==search_reason_id &&
+        chat->conversations[chat->active].messages[search_reason].reasoning_open &&
+        h->transcript.turns[search_reason].reason_live);
+    { TranscriptTurn *turn=&h->transcript.turns[search_reason];
+      CHECK(turn->y+turn->height>h->transcript.view_scroll &&
+          turn->y<h->transcript.view_scroll+h->transcript.view_page); }
+    /* Opening reasoning in the active conversation refreshes only its turn. */
+    chat->conversations[search_b].messages[search_reason].reasoning_open=false;
+    refresh_turn(h,search_reason);
+    { bool valid=h->transcript.turns[0].rendered_valid;
+      h->transcript.turns[0].rendered_valid=false;
+      CHECK(jump_search_result(h,1));
+      CHECK(h->transcript.turns[search_reason].reason_live &&
+          !h->transcript.turns[0].rendered_valid);
+      h->transcript.turns[0].rendered_valid=valid; }
+    CHECK(surface_key(h,VK_F3,true,false,true));
+    CHECK(h->search_selected==0 &&
+        chat->conversations[chat->active].id==search_a_id);
+    CHECK(surface_key(h,VK_F3,false,false,true));
+    CHECK(h->search_selected==1 &&
+        chat->conversations[chat->active].id==search_b_id);
+    /* A changed query honors Shift+F3's direction on its fresh result set. */
+    rich_text_set_text(&h->search,L"host-search-token");
+    CHECK(surface_key(h,VK_F3,true,false,true));
+    CHECK(h->search_selected==1 &&
+        chat->conversations[chat->active].id==search_b_id);
+    /* An edited matched field invalidates the retained result instead of
+       letting the old offset or reused turn resolve to new content. */
+    CHECK(chat_message_set_reasoning(
+        &chat->conversations[chat->active].messages[search_reason],
+        L"reasoning changed after search"));
+    CHECK(!jump_search_result(h,1));
+    CHECK(surface_key(h,VK_F3,false,false,true));
+    CHECK(h->search_selected==0 &&
+        chat->conversations[chat->active].id==search_a_id);
+    SetFocus(h->composer.window);
+    CHECK(surface_key(h,L'F',false,true,true) && GetFocus()==h->search.window);
+    int before_empty=chat->active;
+    rich_text_set_text(&h->search,L"");
+    CHECK(search_submit(h) && !h->search_results.count &&
+        chat->active==before_empty);
     /* ---- Reasoning never carries across conversations ---- */
     /* Switching A -> B -> A while both corresponding reasoning viewports are
        expanded, with A still streaming while hidden, must reload A's own
@@ -1201,6 +1292,6 @@ int main(void) {
     DeleteObject(h->background); rich_text_library_close();
     chat_dispose(loaded); chat_dispose(chat);
     free(loaded); free(chat); free(ui); free(h); CoUninitialize();
-    puts("Hidden host: failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen, background snapshot writer (snapshot isolation across an in-flight write, per-handoff completion accounting, failure latch and retry, pre-request flush gate refusing to send, latest-wins coalescing, shutdown drain) passed");
+    puts("Hidden host: failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, stable-id conversation search with body/reasoning jumps and stale-result rejection, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen, background snapshot writer (snapshot isolation across an in-flight write, per-handoff completion accounting, failure latch and retry, pre-request flush gate refusing to send, latest-wins coalescing, shutdown drain) passed");
     return 0;
 }

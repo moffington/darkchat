@@ -87,6 +87,8 @@ HMENU chat_actions_menu(void) {
     AppendMenuW(conversation,MF_STRING,ACTION_DELETE,L"&Delete...");
     AppendMenuW(conversation,MF_STRING,ACTION_DELETE_ALL,L"Delete &all...");
     AppendMenuW(conversation,MF_STRING,ACTION_CLEAR,L"&Clear messages...");
+    AppendMenuW(conversation,MF_SEPARATOR,0,NULL);
+    AppendMenuW(conversation,MF_STRING,ACTION_SEARCH,L"&Search conversations (Ctrl+F)");
     AppendMenuW(response,MF_STRING,ACTION_RETRY,L"&Retry unsuccessful response");
     AppendMenuW(response,MF_STRING,ACTION_REGENERATE,L"Re&generate last response");
     AppendMenuW(response,MF_STRING,ACTION_EDIT,L"&Edit latest user message...");

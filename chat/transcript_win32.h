@@ -97,6 +97,9 @@ void transcript_refresh_turn(Transcript *t, const TranscriptFeed *feed,
 void transcript_stream_body(Transcript *t, const TranscriptFeed *feed,
     int index);
 void transcript_position(Transcript *t, bool follow);
+/* Scrolls only enough to reveal one already-rendered turn. A turn taller than
+   the viewport is aligned at its top. No content or selection is rewritten. */
+bool transcript_reveal_turn(Transcript *t, int index);
 void transcript_layout_from(Transcript *t, int start, bool follow);
 bool transcript_pinned(const Transcript *t);
 /* EN_SELCHANGE from any turn surface: applies that turn's deferred writes when

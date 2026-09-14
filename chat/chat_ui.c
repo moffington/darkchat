@@ -91,6 +91,15 @@ bool chat_ui_init(ChatUi *chat_ui, Ui *ui, Chat *chat) {
     node(chat_ui, sidebar)->style.background = UI_PANEL;
     height(chat_ui, label(chat_ui, sidebar, L"CONVERSATIONS", UI_SECTION,
         UI_ACCENT), 26);
+    chat_ui->search = surface(chat_ui, sidebar, L"Search conversations",
+        UI_TRACK);
+    height(chat_ui, chat_ui->search, 30);
+    ui_set_help_text(ui, chat_ui->search,
+        L"Enter searches message text and reasoning. F3 moves to the next result.");
+    chat_ui->search_status = label(chat_ui, sidebar,
+        L"Enter to search messages and reasoning", UI_SMALL, UI_FAINT);
+    fill_width(chat_ui, chat_ui->search_status);
+    height(chat_ui, chat_ui->search_status, 34);
     chat_ui->new_conversation = add(chat_ui, sidebar, UI_BUTTON,
         L"New conversation");
     fill_width(chat_ui, chat_ui->new_conversation);
@@ -168,6 +177,11 @@ void chat_ui_set_generation(ChatUi *chat_ui, bool generating, bool stopping) {
         stopping ? L"Stopping generation" :
         generating ? L"Stop generation" : L"Send message");
     ui_set_disabled(chat_ui->ui, chat_ui->send, stopping);
+    ui_invalidate(chat_ui->ui, false);
+}
+
+void chat_ui_set_search_status(ChatUi *chat_ui, const wchar_t *text) {
+    ui_set_text(chat_ui->ui, chat_ui->search_status, text ? text : L"");
     ui_invalidate(chat_ui->ui, false);
 }
 
