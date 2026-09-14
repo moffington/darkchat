@@ -378,7 +378,7 @@ static bool catch_up(Transcript *t, const TranscriptFeed *feed, int index) {
     const Chat *chat = feed->chat;
     if (chat->active < 0 || chat->active >= chat->conversation_count) return false;
     const ChatConversation *c = &chat->conversations[chat->active];
-    if (index < 0 || index >= c->message_count) return false;
+    if (index < 0 || (size_t)index >= c->message_count) return false;
     const ChatMessage *m = &c->messages[index];
     TranscriptTurn *turn = &t->turns[index];
     bool assistant = m->role == CHAT_ROLE_ASSISTANT;
@@ -540,7 +540,7 @@ void transcript_render(Transcript *t, const TranscriptFeed *feed) {
     if (t->view_width < minimum) t->view_width = minimum;
     bool pinned = transcript_pinned(t);
     const ChatConversation *c = chat_active(chat);
-    int count = c ? c->message_count : 0;
+    int count = c ? (int)c->message_count : 0;
     t->turn_count = count;
     for (int i = 0; i < count; i++) prepare_turn(t, feed, i);
     for (int i = count; i < CHAT_MAX_MESSAGES; i++) hide_turn(t, i);
@@ -553,7 +553,7 @@ void transcript_refresh_turn(Transcript *t, const TranscriptFeed *feed,
     int index) {
     const Chat *chat = feed->chat;
     if (chat->active < 0 || chat->active >= chat->conversation_count) return;
-    if (index < 0 || index >= chat->conversations[chat->active].message_count)
+    if (index < 0 || (size_t)index >= chat->conversations[chat->active].message_count)
         return;
     bool pinned = transcript_pinned(t);
     prepare_turn(t, feed, index);

@@ -149,7 +149,7 @@ static bool turn_row_click(void *user, RichTextControl *control, int line,
         if (line != 1) return false;          /* only the reasoning row line */
         if (!down &&
             chat->active >= 0 && chat->active < chat->conversation_count &&
-            i < chat->conversations[chat->active].message_count) {
+            (size_t)i < chat->conversations[chat->active].message_count) {
             ChatMessage *m = &chat->conversations[chat->active].messages[i];
             m->reasoning_open = !m->reasoning_open;
             refresh_turn(host, i);
@@ -562,9 +562,9 @@ static void action(ChatHost *host, int code) {
     Chat *chat=host->config.chat;
     ChatConversation *c=&chat->conversations[chat->active];
     if (code==ACTION_COPY) {
-        for (int i=c->message_count-1;i>=0;i--) if (c->messages[i].role==CHAT_ROLE_ASSISTANT) {
+        for (size_t i=c->message_count;i>0;i--) if (c->messages[i-1].role==CHAT_ROLE_ASSISTANT) {
             set_status(host,chat_copy_text(host->window,
-                chat_message_text(&c->messages[i])) ? L"Response copied" :
+                chat_message_text(&c->messages[i-1])) ? L"Response copied" :
                 L"Copy failed"); return;
         }
         return;

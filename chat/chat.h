@@ -71,8 +71,48 @@ typedef struct {
     int64_t created_at, modified_at;
     bool renamed;
     wchar_t draft[CHAT_MESSAGE_TEXT];
-    ChatMessage messages[CHAT_MAX_MESSAGES];
-    int message_count;
+    /* Dynamic message storage. `messages` points to `message_capacity`
+       slots and is NULL exactly when `message_capacity` is 0; the invariants
+
+           0 <= message_count <= message_capacity <= CHAT_MAX_MESSAGES
+           message_count > 0  =>  messages != NULL
+
+       hold at all times. Only [0, message_count) holds live messages; slots in
+       [message_count, message_capacity) are private backing storage that
+       callers must never inspect as meaningful state, cache, serialize or
+       dispose independently. A never-used conversation has messages == NULL,
+       message_count == 0 and message_capacity == 0; an empty conversation may
+       still retain allocated capacity for reuse (trimming never reallocs
+       merely because message_count decreased; chat_clear releases the storage
+       entirely, matching its contract to wipe message content). Growth
+       doubles the capacity up to the CHAT_MAX_MESSAGES hard cap and is
+       transactional: a failed growth leaves the original allocation valid.
+
+       Ownership and pointer-lifetime rules:
+       - Element pointers (&messages[i]) are not stable across operations that
+         can grow the array: any growth realloc invalidates every element
+         pointer of that conversation. Re-derive messages from a conversation
+         pointer plus index or stable ID after every mutating call; never
+         cache a ChatMessage * across chat_append*, chat_begin_response or a
+         load. The transcript stores rendered identity by value and never
+         owns live ChatMessage pointers; preserve that property.
+       - A bytewise move of a whole ChatConversation (conversation deletion)
+         transfers ownership of the messages allocation and every live
+         message's overflow allocations; the vacated slot must be zeroed so
+         the same pointers cannot be freed twice.
+       - Never byte-copy a live ChatMessage that owns overflow pointers into
+         another independently owned slot; the copies would alias the same
+         allocations and free them twice.
+       - Before a conversation's message storage is discarded or overwritten,
+         dispose every live message in [0, message_count), then free the
+         messages allocation and reset pointer/count/capacity (chat_dispose
+         and the storage decode quarantine do this).
+       - Chat and its message arrays are UI-thread-owned. Worker threads never
+         borrow the array or pointers into it; asynchronous persistence work
+         must use an immutable/deep snapshot instead. */
+    ChatMessage *messages;
+    size_t message_count;
+    size_t message_capacity;
 } ChatConversation;
 
 typedef struct {
@@ -125,9 +165,17 @@ bool chat_select_conversation(Chat *chat, int index);
 int chat_append(Chat *chat, ChatRole role, const wchar_t *text);
 /* Appends a message to a specific conversation, whichever is active or not;
    late replies land in the conversation they were asked for. Returns the
-   message index, or -1 when the conversation is unknown or full. */
+   message index, or -1 when the conversation is unknown or full. The append
+   is transactional: an allocation or construction failure leaves the
+   conversation semantically unchanged, consumes no id and bumps no
+   timestamp. */
 int chat_append_at(Chat *chat, int conversation, ChatRole role,
     const wchar_t *text);
+/* Reserves backing storage for `count` live messages without changing any
+   live message or message_count. Returns false when the request exceeds the
+   CHAT_MAX_MESSAGES hard limit or the transactional growth failed. Storage
+   decode uses this before populating a decoded conversation. */
+bool chat_reserve_messages(ChatConversation *conversation, size_t count);
 /* Further messages the active conversation can still store. */
 int chat_remaining(const Chat *chat);
 const ChatConversation *chat_active(const Chat *chat);

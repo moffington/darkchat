@@ -89,7 +89,7 @@ static bool encode(const Chat *chat, JsonBuf *b) {
         STR(b, c, title);
         STR(b, c, draft);
         raw(b, "}\n");
-        for (int j = 0; j < c->message_count; j++) {
+        for (size_t j = 0; j < c->message_count; j++) {
             const ChatMessage *m = &c->messages[j];
             const ChatGeneration *g = &m->generation;
             raw(b, "{\"type\":\"message\"");
@@ -142,6 +142,7 @@ static bool decode(char *data, Chat *chat) {
     char *footer = data + length - 1;
     while (footer > data && footer[-1] != '\n') --footer;
     double v;
+    size_t declared;
     if (!json_validate(footer) || !type_is(footer,"commit") ||
         !integer(footer,"checksum",0,4294967295.0,&v) ||
         (uint32_t)v != checksum(data,(size_t)(footer-data))) return false;
@@ -174,11 +175,23 @@ static bool decode(char *data, Chat *chat) {
         READ_INT(c, modified_at, 1, 9007199254740991.0);
         READ_INT(c, renamed, 0, 1);
         READ_INT(c, message_count, 0, CHAT_MAX_MESSAGES);
+        /* A declared count is not a live count. Reserve backing storage for
+           the declared messages, but let message_count track only slots that
+           were actually constructed: each scratch slot is zeroed (fresh
+           realloc memory is uninitialized) and marked live before any
+           fallible decoding, so the quarantine dispose below can never free a
+           garbage overflow pointer and a failed message decode disposes
+           exactly the valid partial state. */
+        declared = c->message_count;
+        c->message_count = 0;
+        if (!chat_reserve_messages(c, declared)) goto bad;
         READ_STR(c, title);
         READ_STR(c, draft);
         for (int k=0; k<i; k++) if (chat->conversations[k].id == c->id) goto bad;
-        for (int j=0; j<c->message_count; j++) {
+        for (size_t j=0; j<declared; j++) {
             ChatMessage *m=&c->messages[j]; ChatGeneration *g=&m->generation;
+            memset(m, 0, sizeof *m);
+            c->message_count = j + 1;   /* live before any fallible decoding */
             line=next_line(&cursor);
             if (!type_is(line,"message")) goto bad;
             READ_INT(m, role, 0, CHAT_ROLE_ERROR);

@@ -158,6 +158,32 @@ Edit-and-resend changes the latest user text and replaces its response. These
 operations use the current model/system prompt and reset generation metadata.
 Prior response variants are deliberately not retained; there are no branches.
 
+### Message storage model
+
+Each conversation holds its messages in one dynamic array, not a fixed inline
+array: `messages`, `message_count` and `message_capacity` with the invariants
+`0 <= message_count <= message_capacity <= CHAT_MAX_MESSAGES` (still 64) and
+`messages == NULL` exactly when capacity is zero. A never-used conversation
+allocates nothing; the first message reserves a small initial budget and
+growth doubles up to the hard cap transactionally (a failed growth leaves the
+original allocation valid). Only `[0, message_count)` is live; the rest of the
+array is private backing storage that no caller inspects or serializes. Trims
+(retry, regenerate, edit-and-resend) reduce the live count and keep the
+allocation for reuse; Clear releases it entirely. Appends are transactional:
+the message is built in the still-unused scratch slot and committed (id,
+timestamps, count, title) only after every fallible step succeeded, so a
+failed append consumes no ID and changes nothing observable. Replacement
+operations preflight the **final post-operation message shape** and reserve
+capacity for it before trimming or editing, so replacing the tail works even
+at the 64-message cap and an allocation failure can never leave a partially
+applied send/retry/regenerate/edit. Because growth reallocs, element pointers
+are not stable across appending operations: identity is re-derived from the
+conversation plus index or stable message ID (the transcript already stores
+rendered identity by value). Deleting a conversation bytewise-moves the
+surviving ones, transferring ownership of their arrays and overflow pointers,
+and the vacated slot is zeroed so nothing is freed twice. Chat and its message
+arrays remain UI-thread-owned; worker threads never borrow them.
+
 Request history includes user/system messages and completed generated assistant
 responses. Local welcome/error notes, running responses and all unsuccessful
 assistant responses are excluded. Persisted metadata and error descriptions are
@@ -199,7 +225,11 @@ At most roughly one second of recent streamed text or ordinary draft typing can
 be lost on abrupt termination (long UI/disk stalls can increase that interval).
 
 Load validates JSON, version, ranges, counts, identities and checksum into a
-separate Chat before adopting it. It prefers the valid primary, then backup,
+separate Chat before adopting it. Decoding reserves backing storage for each
+conversation's declared message count, but a slot counts as live only once it
+has been zeroed and construction has begun, so the quarantine disposes exactly
+the messages it built and a decode failure can never leave partially decoded
+or uninitialized state. It prefers the valid primary, then backup,
 then a complete temporary snapshot; a recovered temporary file is preserved as
 a backup before reuse. A corrupt primary is never rotated over a valid recovery
 backup. Unsupported versions, or no valid snapshot when files exist, prevent
@@ -215,6 +245,16 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
 
 - Lifecycle state transitions, retry/regenerate/edit replacement, full-capacity
   retries, stable IDs after rename/clear/delete, and bounded model history.
+- Dynamic message storage: transactional doubling growth bounded by the
+  64-message cap, allocation invariants after every operation, append and
+  send/retry/regenerate/edit-resend transactional failure semantics under
+  injected allocation failures, retained-capacity trims, a version 1 fixture
+  from the previous build loading (and re-encoding) byte-identically, and
+  decode allocation failures (including the conversation-array reservation and
+  a mid-message failure under a poisoned, non-zero-filled allocator) recovered
+  through the fallback or leaving the destination's previous content and the
+  store untouched, plus ownership transfer across mid-list conversation
+  deletion.
 - JSON number/structure validation, optional usage values and fractional cost.
 - Storage round trips, Unicode/drafts/settings/metadata, exclusive writer lock,
   corrupt/torn snapshots, backup/temp recovery, denied temp writes and failed

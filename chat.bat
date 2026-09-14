@@ -21,7 +21,7 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_json.exe
     if errorlevel 1 exit /b 1
-    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat.c chat\chat.c -o build\test_chat.exe -Wl,--wrap=realloc
+    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat.c chat\chat.c -o build\test_chat.exe -Wl,--wrap=realloc -Wl,--wrap=malloc
     if errorlevel 1 exit /b 1
     build\test_chat.exe
     if errorlevel 1 exit /b 1
@@ -41,7 +41,7 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_lifecycle.exe
     if errorlevel 1 exit /b 1
-    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_storage.c chat\storage.c chat\chat.c chat\json.c -o build\test_storage.exe
+    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_storage.c chat\storage.c chat\chat.c chat\json.c -o build\test_storage.exe -Wl,--wrap=malloc -Wl,--wrap=realloc
     if errorlevel 1 exit /b 1
     build\test_storage.exe
     if errorlevel 1 exit /b 1

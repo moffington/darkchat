@@ -130,11 +130,49 @@ void chat_message_dispose(ChatMessage *m) {
     m->text_overflow=m->reasoning_overflow=NULL;
     m->text_capacity=m->reasoning_capacity=0;
 }
+
+/* Initial reservation for a conversation that starts receiving messages:
+   small enough to reserve little memory, large enough that ordinary
+   prompt/answer pairs rarely regrow. Growth doubles up to the hard cap. */
+#define CHAT_MESSAGES_INITIAL 8
+
+/* Grows the message array to hold at least `needed` live messages.
+   Transactional: on failure the original allocation stays valid and the
+   conversation is untouched. Never shrinks and never exceeds the cap. */
+static bool chat_ensure_capacity(ChatConversation *c, size_t needed) {
+    if (needed <= c->message_capacity) return true;
+    if (needed > CHAT_MAX_MESSAGES) return false;
+    size_t capacity = c->message_capacity ? c->message_capacity
+        : CHAT_MESSAGES_INITIAL;
+    while (capacity < needed) {
+        if (capacity > CHAT_MAX_MESSAGES / 2) { capacity = CHAT_MAX_MESSAGES; break; }
+        capacity *= 2;
+    }
+    ChatMessage *grown = realloc(c->messages, capacity * sizeof *grown);
+    if (!grown) return false;
+    c->messages = grown;
+    c->message_capacity = capacity;
+    return true;
+}
+
+bool chat_reserve_messages(ChatConversation *c, size_t count) {
+    return c && chat_ensure_capacity(c, count);
+}
+
+/* Releases everything a Chat owns: every live message's overflow allocations,
+   then each conversation's message array itself, leaving all three dynamic
+   fields reset so a later overwrite cannot double-free. */
 void chat_dispose(Chat *chat) {
     if (!chat) return;
-    for (int i=0;i<chat->conversation_count;i++)
-        for (int j=0;j<chat->conversations[i].message_count;j++)
-            chat_message_dispose(&chat->conversations[i].messages[j]);
+    for (int i=0;i<chat->conversation_count;i++) {
+        ChatConversation *c=&chat->conversations[i];
+        for (size_t j=0;j<c->message_count;j++)
+            chat_message_dispose(&c->messages[j]);
+        free(c->messages);
+        c->messages=NULL;
+        c->message_count=0;
+        c->message_capacity=0;
+    }
 }
 
 /* Bounded append that never overruns the destination. */
@@ -209,27 +247,44 @@ const ChatConversation *chat_active(const Chat *chat) {
 
 int chat_remaining(const Chat *chat) {
     const ChatConversation *conversation = chat_active(chat);
-    if (!conversation) return 0;
-    int remaining = CHAT_MAX_MESSAGES - conversation->message_count;
-    return remaining > 0 ? remaining : 0;
+    if (!conversation || conversation->message_count >= CHAT_MAX_MESSAGES)
+        return 0;
+    return CHAT_MAX_MESSAGES - (int)conversation->message_count;
 }
 
+/* Transactional append. Phase 1 reserves capacity for one more live message;
+   Phase 2 builds the message entirely inside the still-scratch slot at
+   message_count; Phase 3 commits id, timestamps, count, title. A failure at
+   any point returns -1 with the conversation semantically unchanged: no live
+   message, message_count, next_id, modified_at or title is touched. If a
+   capacity growth succeeded but construction then failed, the retained
+   (larger) capacity is harmless: the conversation simply holds unused backing
+   storage, and every allocation invariant still holds. */
 int chat_append_at(Chat *chat, int conversation_index, ChatRole role,
     const wchar_t *text) {
     if (conversation_index < 0 ||
         conversation_index >= chat->conversation_count) return -1;
     ChatConversation *conversation = &chat->conversations[conversation_index];
     if (conversation->message_count >= CHAT_MAX_MESSAGES) return -1;
+    /* Phase 1: ensure capacity before any observable mutation. */
+    if (!chat_ensure_capacity(conversation, conversation->message_count + 1))
+        return -1;
+    /* Phase 2: build in the scratch slot; no observable state changes yet. */
     ChatMessage *message = &conversation->messages[conversation->message_count];
     memset(message, 0, sizeof *message);
     chat_generation_init(&message->generation);
+    message->role = role;
+    if (!chat_message_set_text(message, text)) {
+        chat_message_dispose(message);
+        memset(message, 0, sizeof *message);
+        return -1;
+    }
+    /* Phase 3: commit — only non-failing operations from here on. */
     message->created_at = message->modified_at = chat_now();
     /* Process-local instance id: view bookkeeping, never persisted. */
     message->id = ++chat->next_id;
+    int index = (int)conversation->message_count++;
     conversation->modified_at = message->modified_at;
-    message->role = role;
-    if (!chat_message_set_text(message,text)) return -1;
-    int index = conversation->message_count++;
     if (role == CHAT_ROLE_USER) {
         /* Name the conversation after its first user message. */
         bool first = true;
@@ -347,8 +402,16 @@ bool chat_delete(Chat *chat) {
     if (!chat_active(chat)) return false;
     int index = chat->active;
     ChatConversation *removed=&chat->conversations[index];
-    for (int i=0;i<removed->message_count;i++)
+    /* Release the removed conversation's storage before the move: the
+       memmove transfers ownership of the surviving conversations' allocations
+       over this slot, and the vacated tail slot is zeroed so the moved
+       pointers can never be freed twice. */
+    for (size_t i=0;i<removed->message_count;i++)
         chat_message_dispose(&removed->messages[i]);
+    free(removed->messages);
+    removed->messages=NULL;
+    removed->message_count=0;
+    removed->message_capacity=0;
     --chat->conversation_count;
     memmove(&chat->conversations[index], &chat->conversations[index + 1],
         (chat->conversation_count - index) * sizeof(ChatConversation));
@@ -367,19 +430,24 @@ bool chat_delete_all(Chat *chat) {
     return chat_new_conversation(chat) >= 0;
 }
 
+/* Clear wipes the conversation's message content, so it releases the dynamic
+   message storage entirely, restoring the never-allocated NULL/0/0 shape
+   rather than opportunistically shrinking mid-use allocations. */
 void chat_clear(Chat *chat) {
     if (!chat_active(chat)) return;
     ChatConversation *c = &chat->conversations[chat->active];
-    for (int i=0;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
-    memset(c->messages, 0, sizeof c->messages);
+    for (size_t i=0;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+    free(c->messages);
+    c->messages = NULL;
     c->message_count = 0;
+    c->message_capacity = 0;
     c->draft[0] = 0;
     c->modified_at = chat_now();
 }
 
 int chat_latest_user(const ChatConversation *c) {
-    if (c) for (int i = c->message_count - 1; i >= 0; --i)
-        if (c->messages[i].role == CHAT_ROLE_USER) return i;
+    if (c) for (size_t i = c->message_count; i-- > 0;)
+        if (c->messages[i].role == CHAT_ROLE_USER) return (int)i;
     return -1;
 }
 
@@ -388,32 +456,55 @@ bool chat_history_message(const ChatMessage *m) {
         (m->role != CHAT_ROLE_ASSISTANT || m->generation.state == CHAT_GENERATION_COMPLETE);
 }
 
+/* Replacement/send preflight: validates the requested mode, then computes the
+   final post-operation live message count — counting only messages the
+   completed operation keeps or adds, never messages it will trim or replace —
+   and reserves capacity for that shape before any destructive mutation. A
+   conversation at the 64-message cap can still replace its tail (final count
+   unchanged), and an operation that would genuinely need 65 live messages
+   fails before anything is modified. After the reservation succeeds, no
+   remaining step can fail on array growth, so a -1 return from this function
+   always leaves the conversation exactly as it was. */
 int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt) {
     if (!chat_active(chat)) return -1;
+    if (mode != CHAT_SEND && mode != CHAT_RETRY &&
+        mode != CHAT_REGENERATE && mode != CHAT_EDIT_RESEND) return -1;
     ChatConversation *c = &chat->conversations[chat->active];
-    for (int i = 0; i < c->message_count; i++)
+    for (size_t i = 0; i < c->message_count; i++)
         if (c->messages[i].generation.state == CHAT_GENERATION_RUNNING) return -1;
     int user = chat_latest_user(c);
+    size_t final_count;
     if (mode == CHAT_SEND) {
-        if (!prompt || !prompt[0] || wcslen(prompt) >= CHAT_MESSAGE_TEXT || chat_remaining(chat) < 2) return -1;
-        user = chat_append(chat, CHAT_ROLE_USER, prompt);
+        if (!prompt || !prompt[0] || wcslen(prompt) >= CHAT_MESSAGE_TEXT ||
+            c->message_count + 2 > CHAT_MAX_MESSAGES) return -1;
+        final_count = c->message_count + 2; /* user turn + fresh response */
     } else {
-        if (user < 0 || user + 1 >= CHAT_MAX_MESSAGES) return -1;
-        if (mode == CHAT_RETRY && c->message_count > user + 1 &&
+        if (user < 0 || (size_t)user + 2 > CHAT_MAX_MESSAGES) return -1;
+        if (mode == CHAT_RETRY && c->message_count > (size_t)user + 1 &&
             c->messages[user + 1].generation.state != CHAT_GENERATION_FAILED &&
             c->messages[user + 1].generation.state != CHAT_GENERATION_CANCELLED &&
             c->messages[user + 1].generation.state != CHAT_GENERATION_INTERRUPTED) return -1;
         if (mode == CHAT_EDIT_RESEND) {
             if (!prompt || !prompt[0] || wcslen(prompt) >= CHAT_MESSAGE_TEXT) return -1;
+        }
+        /* Kept messages [0..user] plus the fresh response. */
+        final_count = (size_t)user + 2;
+    }
+    /* Capacity reservation happens before the edit, trim or append: from here
+       the appends cannot fail on growth. */
+    if (!chat_ensure_capacity(c, final_count)) return -1;
+    if (mode != CHAT_SEND) {
+        if (mode == CHAT_EDIT_RESEND) {
             if (!chat_message_set_text(&c->messages[user],prompt)) return -1;
             c->messages[user].modified_at = chat_now();
         }
-        for (int i=user+1;i<c->message_count;i++)
+        for (size_t i=(size_t)user+1;i<c->message_count;i++)
             chat_message_dispose(&c->messages[i]);
-        memset(&c->messages[user + 1], 0,
-            (c->message_count - user - 1) * sizeof(ChatMessage));
-        c->message_count = user + 1;
+        c->message_count = (size_t)user + 1;
     }
+    int user_index = mode == CHAT_SEND
+        ? chat_append(chat, CHAT_ROLE_USER, prompt) : user;
+    if (user_index < 0) return -1;
     int index = chat_append(chat, CHAT_ROLE_ASSISTANT, L"");
     if (index<0) return -1;
     ChatGeneration *g = &c->messages[index].generation;
