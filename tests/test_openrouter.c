@@ -1,5 +1,6 @@
 /* Includes the client to test its actual request encoder and SSE event decoder. */
 #include "../chat/openrouter_winhttp.c"
+#include "../chat/context.h"
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
 static int deltas, reasons, terminal;
@@ -87,6 +88,48 @@ int main(int argc,char **argv) {
     char value[128]; CHECK(json_query_string(body.data,"messages[1].content",value,sizeof value));
     CHECK(!json_query_string(body.data,"messages[2].content",value,sizeof value));
     json_buf_free(&body);
+    /* The request context's measured size must equal the body the real encoder
+       produces. This is the invariant the budget policy depends on: the
+       context decides what to drop by measuring exactly what will be sent. */
+    Chat *context_chat=(Chat *)calloc(1,sizeof *context_chat); CHECK(context_chat);
+    chat_init(context_chat); chat_clear(context_chat);
+    wcscpy(context_chat->system_prompt,L"Answer in one short sentence.");
+    for (int turn=0;turn<3;turn++) {
+        wchar_t question[64];
+        swprintf(question,64,L"question %d \u2014 unicode \u00e9",turn);
+        chat_append(context_chat,CHAT_ROLE_USER,question);
+        int index=chat_append(context_chat,CHAT_ROLE_ASSISTANT,
+            L"answer with \"quotes\", a\ttab and a newline\nsecond line");
+        context_chat->conversations[0].messages[index].generation.state=CHAT_GENERATION_COMPLETE;
+    }
+    int failed=chat_append(context_chat,CHAT_ROLE_ASSISTANT,L"partial");
+    context_chat->conversations[0].messages[failed].generation.state=CHAT_GENERATION_FAILED;
+    chat_append(context_chat,CHAT_ROLE_USER,L"final \U0001f600 question");
+    int trigger=(int)context_chat->conversations[0].message_count-1;
+    ChatRequestContext context;
+    CHECK(chat_context_build(context_chat,&context_chat->conversations[0],trigger,
+        CHAT_CONTEXT_BUDGET_BYTES,&context)==CHAT_CONTEXT_OK);
+    CHECK(context.count==8 && context.dropped_messages==0);
+    OpenRouterWork sized={0};
+    ChatRole sized_roles[CHAT_CONTEXT_MAX_ENTRIES];
+    wchar_t *sized_texts[CHAT_CONTEXT_MAX_ENTRIES];
+    for (int i=0;i<context.count;i++) {
+        sized_roles[i]=context.messages[i].role;
+        sized_texts[i]=(wchar_t *)context.messages[i].text;
+    }
+    sized.model=context_chat->model; sized.roles=sized_roles; sized.texts=sized_texts;
+    sized.count=context.count;
+    JsonBuf measured; CHECK(build_request(&sized,&measured));
+    CHECK(json_validate(measured.data));
+    CHECK(measured.length==context.bytes);
+    size_t messages_in_body=0;
+    CHECK(json_query_array_length(measured.data,"messages",&messages_in_body) &&
+        messages_in_body==(size_t)context.count);
+    CHECK(json_query_string(measured.data,"messages[0].content",value,sizeof value) &&
+        !strcmp(value,"Answer in one short sentence."));
+    json_buf_free(&measured);
+    chat_dispose(context_chat); free(context_chat);
+    puts("The bounded request context measures exactly what the encoder writes");
     puts("Actual request encoder and SSE metadata/error decoding passed");
     if (argc>1 && !strcmp(argv[1],"--live")) {
         char key[8192]={0};

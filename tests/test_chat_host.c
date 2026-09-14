@@ -2,6 +2,30 @@
 #include "../chat/chat_host_win32.c"
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
+/* Client seam: chat.bat test links this suite with -Wl,--wrap=openrouter_request,
+   so every request the host starts passes through __wrap_openrouter_request.
+   That shows exactly which context (if any) would reach the network client
+   without touching the network: the wrapper records the messages the host was
+   about to send, and can fake a started generation so a real successful send
+   with omitted history is driven end to end. */
+static int openrouter_request_calls;
+static int openrouter_request_last_count;
+static ChatRole openrouter_request_last_roles[CHAT_CONTEXT_MAX_ENTRIES];
+static const wchar_t *openrouter_request_last_texts[CHAT_CONTEXT_MAX_ENTRIES];
+static int openrouter_request_fake_generation;   /* 0: delegate to the real client */
+int __real_openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
+    const wchar_t *model, const OpenRouterMessage *messages, int count);
+int __wrap_openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
+    const wchar_t *model, const OpenRouterMessage *messages, int count) {
+    ++openrouter_request_calls;
+    openrouter_request_last_count=count;
+    for (int i=0;i<count && i<CHAT_CONTEXT_MAX_ENTRIES;i++) {
+        openrouter_request_last_roles[i]=messages[i].role;
+        openrouter_request_last_texts[i]=messages[i].text;
+    }
+    if (openrouter_request_fake_generation) return openrouter_request_fake_generation;
+    return __real_openrouter_request(client,api_key_utf8,model,messages,count);
+}
 static OpenRouterEvent *fixture(ChatHost *h,OpenRouterEventType type,const wchar_t *text) {
     OpenRouterEvent *e=calloc(1,sizeof *e);
     e->generation=h->request_generation; e->type=type;
@@ -124,6 +148,118 @@ int main(void) {
     CHECK(chat->conversations[0].message_count==2);
     CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED); /* no key */
     CHECK(!h->generating);
+    /* The seam is live: the missing-key send above did reach the client (which
+       refused it), so "the client was never called" below means something. */
+    CHECK(openrouter_request_calls==1);
+    /* An oversized indispensable context must fail explicitly instead of being
+       truncated: here the system prompt and the message each fit the budget
+       alone, but not together. The pending turn stays retryable, neither the
+       system prompt nor the message is shortened, and the client is never
+       asked to send the unusable context. */
+    {
+        wchar_t *wide=(wchar_t *)malloc(16384*sizeof *wide);
+        CHECK(wide);
+        int calls=openrouter_request_calls;
+        for (int i=0;i<16383;i++) wide[i]=0x2014;   /* three encoded bytes each */
+        wide[16383]=0;
+        wcscpy(chat->system_prompt,wide);
+        rich_text_set_text(&h->composer,wide);
+        perform_send(h);
+        ChatConversation *c=&chat->conversations[0];
+        CHECK(c->message_count==4);
+        CHECK(c->messages[3].generation.state==CHAT_GENERATION_FAILED);
+        CHECK(!h->generating && h->request_generation==0 && h->context_dropped==0);
+        CHECK(openrouter_request_calls==calls);           /* nothing was sent */
+        CHECK(wcsstr(c->messages[3].generation.error,L"too large together")!=NULL);
+        CHECK(wcsstr(c->messages[3].generation.error,L"65536")!=NULL);
+        CHECK(wcslen(chat_message_text(&c->messages[2]))==16383);  /* never truncated */
+        CHECK(wcslen(chat->system_prompt)==16383);
+        CHECK(wcsstr(chat->status,L"Request failed")!=NULL);
+        { wchar_t meta[512]; meta_text(h,3,meta,512);
+          CHECK(wcsstr(meta,L"too large together")!=NULL); }
+        /* Retry goes through the real send path, fails identically, and still
+           never reaches the client. */
+        start_response(h,CHAT_RETRY,NULL);
+        c=&chat->conversations[0];
+        CHECK(c->message_count==4);
+        CHECK(c->messages[3].generation.state==CHAT_GENERATION_FAILED);
+        CHECK(wcsstr(c->messages[3].generation.error,L"too large together")!=NULL);
+        CHECK(!h->generating && h->request_generation==0);
+        CHECK(openrouter_request_calls==calls);
+        /* Restore the state the following checks expect. */
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0;
+        render_transcript(h);
+        free(wide);
+    }
+    /* A real successful send that omitted history: the seam fakes the started
+       generation, so the whole send path runs and the client sees exactly the
+       bounded context, with the omission count carried as request-scoped host
+       state through the one-second status sweep. */
+    {
+        wchar_t *huge=(wchar_t *)malloc(200001*sizeof *huge);
+        CHECK(huge);
+        for (int i=0;i<200000;i++) huge[i]=L'x';
+        huge[200000]=0;
+        ChatConversation *c=&chat->conversations[0];
+        wcscpy(chat->system_prompt,L"Be brief.");
+        chat_append(chat,CHAT_ROLE_USER,L"old question");                  /* 2 */
+        int old=chat_append(chat,CHAT_ROLE_ASSISTANT,huge);                /* 3 dropped */
+        c->messages[old].generation.state=CHAT_GENERATION_COMPLETE;
+        chat_append(chat,CHAT_ROLE_USER,L"middle question");               /* 4 kept */
+        int middle=chat_append(chat,CHAT_ROLE_ASSISTANT,L"middle answer"); /* 5 kept */
+        c->messages[middle].generation.state=CHAT_GENERATION_COMPLETE;
+        int calls=openrouter_request_calls;
+        rich_text_set_text(&h->composer,L"final question");
+        openrouter_request_fake_generation=4242;
+        perform_send(h);
+        openrouter_request_fake_generation=0;
+        CHECK(openrouter_request_calls==calls+1);          /* exactly one send */
+        CHECK(h->generating && h->request_generation==4242);
+        /* What the client was handed: the system prompt, the newest eligible
+           history that fits, and the trigger -- never the dropped text. */
+        CHECK(openrouter_request_last_count==4);
+        CHECK(openrouter_request_last_roles[0]==CHAT_ROLE_SYSTEM &&
+              !wcscmp(openrouter_request_last_texts[0],L"Be brief."));
+        CHECK(openrouter_request_last_roles[1]==CHAT_ROLE_USER &&
+              !wcscmp(openrouter_request_last_texts[1],L"middle question"));
+        CHECK(openrouter_request_last_roles[2]==CHAT_ROLE_ASSISTANT &&
+              !wcscmp(openrouter_request_last_texts[2],L"middle answer"));
+        CHECK(openrouter_request_last_roles[3]==CHAT_ROLE_USER &&
+              !wcscmp(openrouter_request_last_texts[3],L"final question"));
+        int sent_huge=0;
+        for (int i=0;i<openrouter_request_last_count;i++)
+            if (openrouter_request_last_texts[i]==chat_message_text(&c->messages[old]))
+                sent_huge=1;
+        CHECK(!sent_huge);                                 /* the huge message stayed home */
+        CHECK(h->context_dropped==3);                      /* "Question", "old question", huge */
+        CHECK(wcsstr(chat->status,L"3 older messages omitted")!=NULL);
+        /* The status sweep keeps showing it for the life of the request. */
+        SendMessageW(window,WM_TIMER,2,0);
+        CHECK(wcsstr(chat->status,L"elapsed")!=NULL &&
+              wcsstr(chat->status,L"3 older messages omitted")!=NULL);
+        /* Finish the faked request through the real event path. */
+        handle_event(h,fixture(h,OPENROUTER_DELTA,L"streamed answer"));
+        handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+        c=&chat->conversations[0];
+        CHECK(!h->generating && !h->context_dropped);
+        CHECK(c->message_count==8 && c->messages[6].role==CHAT_ROLE_USER);
+        CHECK(c->messages[7].generation.state==CHAT_GENERATION_COMPLETE);
+        CHECK(!wcscmp(chat_message_text(&c->messages[7]),L"streamed answer"));
+        /* Restore the state the following checks expect. */
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+        free(huge);
+    }
     begin_fixture(h); CHECK(h->request_message==1);
     OpenRouterEvent *e=fixture(h,OPENROUTER_DELTA,L"Partial answer");
     e->metadata.ttft_ms=12; e->metadata.first_token_at=chat_now();
@@ -842,6 +978,6 @@ int main(void) {
     DeleteObject(h->background); rich_text_library_close();
     chat_dispose(loaded); chat_dispose(chat);
     free(loaded); free(chat); free(ui); free(h); CoUninitialize();
-    puts("Hidden host: failures, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen passed");
+    puts("Hidden host: failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen passed");
     return 0;
 }

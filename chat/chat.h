@@ -41,6 +41,11 @@ typedef enum {
     CHAT_ROLE_USER, CHAT_ROLE_ASSISTANT, CHAT_ROLE_SYSTEM, CHAT_ROLE_ERROR
 } ChatRole;
 
+/* A borrowed role/text view of one message for a request payload: the shape a
+   provider client consumes. It points into live Chat state and is never owned,
+   copied into persistent state or persisted. */
+typedef struct { ChatRole role; const wchar_t *text; } ChatRequestMessage;
+
 typedef struct {
     ChatRole role;
     wchar_t text[CHAT_MESSAGE_TEXT];

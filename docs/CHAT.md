@@ -2,8 +2,9 @@
 
 Build with `chat.bat`; run `build\darkchat.exe`. `chat.bat test` is the single
 reproducible verification command: it builds the app, runs all chat tests
-(including the transcript-isolation, scheduled-flush and message-growth-boundary
-regressions), then runs the unchanged DarkUI toolkit suite via `build.bat test`.
+(including the transcript-isolation, scheduled-flush, message-growth-boundary and
+request-context regressions), then runs the unchanged DarkUI toolkit suite via
+`build.bat test`.
 No third-party dependencies are required (C17, MinGW-w64, Win32).
 
 ## Daily use
@@ -189,6 +190,44 @@ responses. Local welcome/error notes, running responses and all unsuccessful
 assistant responses are excluded. Persisted metadata and error descriptions are
 never sent as conversation text.
 
+### Request context budget
+
+Persisted history and the payload sent to OpenRouter are separate things. A
+request carries a **bounded projection** of the conversation (`chat/context.c`, a
+pure, allocation-free module): the system prompt when set, the triggering user
+message, and the newest eligible history messages that fit
+`CHAT_CONTEXT_BUDGET_BYTES` (64 KiB). That constant is a deliberately
+conservative product policy, not a token-window guarantee: DarkChat never fetches
+a model's real context length or counts tokens, so a provider can still reject a
+request that fits the budget. Persisted history is never changed by a request:
+nothing is deleted, summarised or rewritten, and an omission is never fabricated
+into the transcript or the payload.
+
+- Eligibility is exactly `chat_history_message`: no error notes, no local welcome
+  text and no assistant message that did not finish successfully. Eligible
+  messages are sent whole, including empty ones, and are never truncated.
+- The system prompt and the triggering user message are indispensable. Eligible
+  history is scanned newest first and kept while it fits; the first message that
+  does not fit stops the scan, so only the oldest messages are dropped, the kept
+  ones always stay contiguous, and messages older than that point are counted
+  rather than measured. Message text is not globally capped (long replies live in
+  overflow storage), so a very large dropped history costs a walk of roles and
+  generation states, not of its text.
+- The budget counts the **encoded request body in bytes**, measured with the
+  encoder's own escape rules (`json_encoded_string_size`, shared with
+  `json_buf_append_json_string`), so the size the drop decision is made on is the
+  size actually sent; a test proves equality against the real request encoder.
+- If the indispensable messages cannot fit, the request is not sent at all: the
+  pending turn is marked Failed with the cause (system prompt, this message, or
+  the two together) and the complete body size they would have needed
+  (`required_bytes`), and Retry fails identically until the text or the system
+  prompt is shortened. Nothing is silently truncated. A save failure outranks
+  every context diagnostic.
+- When a request starts with history omitted, the count appears in the status
+  line (`Generating | model | 3.1 s elapsed | 5 older messages omitted`) and
+  keeps appearing for the life of the request: it is request-scoped host state,
+  not a message.
+
 ## Persistence format and recovery
 
 `%LOCALAPPDATA%\DarkChat\state.jsonl` is a UTF-8, version-1 JSONL snapshot:
@@ -256,6 +295,20 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   store untouched, plus ownership transfer across mid-list conversation
   deletion.
 - JSON number/structure validation, optional usage values and fractional cost.
+- Bounded request context (pure module): the newest-fit suffix rule at exact byte
+  boundaries, oldest-first dropping with exact message counts, eligibility of
+  welcome/error/unfinished/empty messages, system-prompt preservation, explicit
+  system/message/combined oversize failures with truthful complete-body
+  diagnostics, invalid arguments (each rejecting call zeroes its output), a
+  read-only proof over overflow storage, a budget sweep asserting the suffix,
+  monotonicity and size invariants, and equality between the measured size and
+  the real encoded request body. A hidden-HWND suite links the real host with a
+  wrapped `openrouter_request` seam: it proves an oversized send fails
+  explicitly, keeps its user message whole, retries through the real send path
+  with the same failure, and never invokes the client, then drives a real
+  successful send with omitted history and checks exactly which messages the
+  client received, that the dropped text was not among them, and that the
+  omission count stays in the generating status sweep.
 - Storage round trips, Unicode/drafts/settings/metadata, exclusive writer lock,
   corrupt/torn snapshots, backup/temp recovery, denied temp writes and failed
   atomic replacement, and protection against unknown versions.
@@ -320,9 +373,14 @@ are covered by focused hidden-HWND tests. Live OpenRouter behavior is not assert
 by any repo command; it is the manual, key-gated check shown above. Tests use
 isolated directories under `build`, not the user's conversation store.
 
-Remaining limits: 16 conversations, 64 messages each, 16,383 UTF-16 code units per
-message (answer and reasoning each), and a 128 MB on-disk snapshot bound. Responses
-past the local limit stop as Interrupted without silently claiming success. Full
+Remaining limits: 16 conversations, 64 messages each, and a 128 MB on-disk
+snapshot bound. The composer and the system prompt are bounded at 16,383 UTF-16
+code units; message text past that (streamed replies) lives in overflow storage,
+so its ceiling is memory and the snapshot bound rather than a fixed count. A
+request sends at most the 64 KiB context budget and drops the oldest eligible
+history beyond it; the budget is a local proxy for prompt size, not a model's
+context window. Responses past the local limit stop as Interrupted without
+silently claiming success. Full
 model-catalog autocomplete, response variants, and global search remain outside
 this pass. Interactive clipboard/IME behavior,
 modal-dialog appearance and physical multi-monitor DPI transitions still need a

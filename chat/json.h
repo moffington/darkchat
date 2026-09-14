@@ -22,6 +22,12 @@ bool json_buf_append_raw(JsonBuf *buf, const char *data, size_t length);
    unpaired surrogates become U+FFFD. */
 bool json_buf_append_json_string(JsonBuf *buf, const wchar_t *text);
 
+/* Exact number of bytes json_buf_append_json_string writes for `text`,
+   including both quotes. Shares the encoder's single traversal and size table,
+   so a measured size and an encoded size cannot diverge; a size that cannot be
+   represented saturates at SIZE_MAX rather than wrapping. */
+size_t json_encoded_string_size(const wchar_t *text);
+
 /* Decodes a quoted JSON string starting at json into out (UTF-8,
    NUL-terminated). Handles \uXXXX escapes and UTF-16 surrogate pairs; a lone
    surrogate becomes U+FFFD. Returns one past the closing quote, or NULL on

@@ -32,6 +32,8 @@ static void test_round_trip(void) {
     check(json_buf_append_json_string(&buf, text), "append json string");
     check(json_buf_ok(&buf) && buf.data && buf.length > 0,
         "json buffer holds the string");
+    check(json_encoded_string_size(text) == buf.length,
+        "the measured size equals the encoded size");
 
     char decoded[512];
     check(json_decode_string(buf.data, decoded, sizeof decoded) != NULL,
@@ -126,6 +128,46 @@ static void test_queries(void) {
         "non-array and missing array rejected");
 }
 
+static void test_encoded_size(void) {
+    JsonBuf buf;
+    json_buf_init(&buf, 0);
+    /* Escaping rules: \r\n and \r fold to \n (2 bytes), \b\t\n\f are 2 bytes,
+       other controls are \u00xx (6), quote and backslash are 2, and text is
+       UTF-8 (1-4 bytes). The measured size must track every one of those. */
+    struct { const wchar_t *text; size_t expected; const char *what; } cases[] = {
+        { L"", 2, "an empty string is two quotes" },
+        { L"abc", 5, "ascii is one byte per unit" },
+        { L"\n\t\b\f", 10, "named escapes are two bytes each" },
+        { L"\r\n", 4, "crlf folds to one newline" },
+        { L"\r", 4, "a lone carriage return folds to one newline" },
+        { L"\x0001", 8, "other controls use a six-byte escape" },
+        { L"\"\\", 6, "quote and backslash are escaped" },
+        { L"\u00e9", 4, "two-byte utf8" },
+        { L"\u2014", 5, "three-byte utf8" },
+        { L"\U0001f600", 6, "a surrogate pair is four-byte utf8" },
+        { L"\xd83d", 5, "a lone surrogate becomes U+FFFD" }
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        json_buf_free(&buf);
+        json_buf_init(&buf, 0);
+        bool written = json_buf_append_json_string(&buf, cases[i].text);
+        check(written && json_encoded_string_size(cases[i].text) == buf.length,
+            cases[i].what);
+        check(json_encoded_string_size(cases[i].text) == cases[i].expected,
+            "the size matches the documented escape cost");
+    }
+    /* A mixed string over the growth boundary keeps the two in step. */
+    json_buf_free(&buf);
+    json_buf_init(&buf, 16);
+    wchar_t mixed[600];
+    for (int i = 0; i < 599; i++) mixed[i] = (wchar_t)(i % 7 == 0 ? L'\t' : L'a' + i % 26);
+    mixed[599] = 0;
+    check(json_buf_append_json_string(&buf, mixed) &&
+        json_encoded_string_size(mixed) == buf.length,
+        "a long mixed string measures what it encodes");
+    json_buf_free(&buf);
+}
+
 static void test_buffers(void) {
     JsonBuf buf;
     json_buf_init(&buf, 0);
@@ -183,6 +225,7 @@ int main(void) {
     test_round_trip();
     test_escapes();
     test_queries();
+    test_encoded_size();
     test_buffers();
     test_utf16_conversion();
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }

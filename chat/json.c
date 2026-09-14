@@ -124,9 +124,24 @@ bool json_buf_append_raw(JsonBuf *buf, const char *data, size_t length) {
     return true;
 }
 
-/* Writes one escaped chunk of a JSON string body; the caller emits quotes. */
-static bool append_escaped_codepoint(JsonBuf *buf, uint32_t cp) {
+/* Escape sink: writes into a buffer, or only counts bytes when `buf` is NULL.
+   The encoder and the size query therefore share one traversal and one set of
+   size rules, so an encoded size and a measured size cannot diverge. */
+typedef struct { JsonBuf *buf; size_t bytes; } EscapeSink;
+
+static bool escape_emit(EscapeSink *sink, const char *data, size_t length) {
+    /* Saturate instead of wrapping: an encoded size that cannot be represented
+       is reported as SIZE_MAX, never as a small value. */
+    sink->bytes = sink->bytes > SIZE_MAX - length ? SIZE_MAX : sink->bytes + length;
+    return !sink->buf || json_buf_append_raw(sink->buf, data, length);
+}
+
+/* Writes one escaped code point and reports its length; the caller emits the
+   surrounding quotes. */
+static bool append_escaped_codepoint(EscapeSink *sink, uint32_t cp) {
     char scratch[8];
+    const char *chunk = scratch;
+    size_t length;
     if (cp < 0x20) {
         const char *named = NULL;
         switch (cp) {
@@ -136,25 +151,28 @@ static bool append_escaped_codepoint(JsonBuf *buf, uint32_t cp) {
         case 0x0c: named = "\\f"; break;
         default: break;
         }
-        if (named) return json_buf_append_raw(buf, named, 2);
-        static const char hex[] = "0123456789abcdef";
-        scratch[0] = '\\'; scratch[1] = 'u'; scratch[2] = '0'; scratch[3] = '0';
-        scratch[4] = hex[(cp >> 4) & 0xf];
-        scratch[5] = hex[cp & 0xf];
-        return json_buf_append_raw(buf, scratch, 6);
-    }
-    if (cp == '"' || cp == '\\') {
+        if (named) { chunk = named; length = 2; }
+        else {
+            static const char hex[] = "0123456789abcdef";
+            scratch[0] = '\\'; scratch[1] = 'u'; scratch[2] = '0'; scratch[3] = '0';
+            scratch[4] = hex[(cp >> 4) & 0xf];
+            scratch[5] = hex[cp & 0xf];
+            length = 6;
+        }
+    } else if (cp == '"' || cp == '\\') {
         scratch[0] = '\\';
         scratch[1] = (char)cp;
-        return json_buf_append_raw(buf, scratch, 2);
+        length = 2;
+    } else {
+        length = encode_utf8(scratch, cp);
     }
-    size_t n = encode_utf8(scratch, cp);
-    return json_buf_append_raw(buf, scratch, n);
+    return escape_emit(sink, chunk, length);
 }
 
-bool json_buf_append_json_string(JsonBuf *buf, const wchar_t *text) {
+/* One traversal of a UTF-16 string body, without the surrounding quotes.
+   Returns false only when writing into a real buffer failed. */
+static bool escape_text(EscapeSink *sink, const wchar_t *text) {
     if (!text) text = L"";
-    if (!json_buf_append_raw(buf, "\"", 1)) return false;
     const wchar_t *p = text;
     for (;;) {
         wchar_t c = *p++;
@@ -163,19 +181,32 @@ bool json_buf_append_json_string(JsonBuf *buf, const wchar_t *text) {
             /* Composer text arrives with CRLF; JSON and the model both want
                plain newlines. */
             if (*p == L'\n') ++p;
-            if (!append_escaped_codepoint(buf, '\n')) return false;
+            if (!append_escaped_codepoint(sink, '\n')) return false;
             continue;
         }
         if (c >= 0xd800 && c <= 0xdbff && *p >= 0xdc00 && *p <= 0xdfff) {
             uint32_t cp = 0x10000 + ((c - 0xd800) << 10) + (*p - 0xdc00);
             ++p;
-            if (!append_escaped_codepoint(buf, cp)) return false;
+            if (!append_escaped_codepoint(sink, cp)) return false;
             continue;
         }
         if (c >= 0xd800 && c <= 0xdfff) c = 0xfffd;  /* lone surrogate */
-        if (!append_escaped_codepoint(buf, (uint32_t)c)) return false;
+        if (!append_escaped_codepoint(sink, (uint32_t)c)) return false;
     }
+    return true;
+}
+
+bool json_buf_append_json_string(JsonBuf *buf, const wchar_t *text) {
+    if (!json_buf_append_raw(buf, "\"", 1)) return false;
+    EscapeSink sink = { buf, 0 };
+    if (!escape_text(&sink, text)) return false;
     return json_buf_append_raw(buf, "\"", 1);
+}
+
+size_t json_encoded_string_size(const wchar_t *text) {
+    EscapeSink sink = { NULL, 2 };  /* both quotes, then the escaped body */
+    escape_text(&sink, text);
+    return sink.bytes;
 }
 
 /* --- Decoding ----------------------------------------------------------- */

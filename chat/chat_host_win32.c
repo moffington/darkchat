@@ -3,6 +3,7 @@
 #include "rich_text_win32.h"
 #include "transcript_win32.h"
 #include "openrouter_winhttp.h"
+#include "context.h"
 #include "storage.h"
 #include "actions_win32.h"
 #include "../platform/renderer.h"
@@ -35,6 +36,9 @@ typedef struct {
     UiId accessibility_focus;
     OpenRouterClient client;
     int request_generation, request_conversation, request_message;
+    /* Request-scoped: how many older messages the live request omitted to fit
+       the context budget. Shown by the one-second generating status sweep. */
+    int context_dropped;
     bool generating, stopping, accepting, dirty, editing, content_started;
     bool reasoning_streaming;
     /* Appended text not yet written to the live body; a scheduled flush
@@ -332,6 +336,9 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     sync_model(host);
     int index=chat_begin_response(chat,mode,prompt);
     if (index<0) { set_status(host,L"Action unavailable: check the latest turn and conversation capacity."); return; }
+    /* Resolved only once the response exists, so a rejected action cannot
+       touch a conversation it never used. */
+    ChatConversation *c=&chat->conversations[chat->active];
     host->request_conversation=chat->active; host->request_message=index;
     /* Retry/regenerate/edit-resend reuse turn slots: their stale identity,
        pending updates and selections are dropped so the next render replaces
@@ -352,19 +359,43 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     host->dirty=true;
     /* Persist the user turn and pending response before starting network work. */
     bool saved=save(host);
-    OpenRouterMessage messages[CHAT_MAX_MESSAGES+1]; int used=0;
-    if (chat->system_prompt[0]) messages[used++]=(OpenRouterMessage){CHAT_ROLE_SYSTEM,chat->system_prompt};
-    ChatConversation *c=&chat->conversations[chat->active];
-    for (int i=0;i<index;i++) if (chat_history_message(&c->messages[i]))
-        messages[used++]=(OpenRouterMessage){c->messages[i].role,
-            chat_message_text(&c->messages[i])};
-    host->request_generation=saved ? openrouter_request(&host->client,
-        host->config.api_key_utf8,chat->model,messages,used) : 0;
+    /* The request context is a bounded projection of the conversation: the
+       system prompt, the triggering user message and the newest eligible
+       history that fits CHAT_CONTEXT_BUDGET_BYTES. Persisted history is never
+       changed by this. A save failure outranks every context diagnostic. */
+    ChatRequestContext context;
+    ChatContextResult built=chat_context_build(chat,c,index-1,
+        CHAT_CONTEXT_BUDGET_BYTES,&context);
+    host->context_dropped=built==CHAT_CONTEXT_OK ? context.dropped_messages : 0;
+    host->request_generation=saved && built==CHAT_CONTEXT_OK ? openrouter_request(&host->client,
+        host->config.api_key_utf8,chat->model,context.messages,context.count) : 0;
     if (!host->request_generation) {
         m->generation.state=CHAT_GENERATION_FAILED;
         m->generation.finished_at=chat_now();
         m->generation.latency_ms=0;
-        wcscpy(m->generation.error,!saved ? L"Could not save pending response; request was not sent." :
+        if (!saved) wcscpy(m->generation.error,
+            L"Could not save pending response; request was not sent.");
+        else if (built==CHAT_CONTEXT_INVALID) wcscpy(m->generation.error,
+            L"The request context could not be built; the latest turn is inconsistent.");
+        else if (built!=CHAT_CONTEXT_OK) {
+            /* required_bytes is the complete body the indispensable content
+               needs, so the diagnostic states the cause and the real size
+               instead of implying a single offending message. */
+            const wchar_t *cause = built==CHAT_CONTEXT_OVERSIZE_SYSTEM
+                ? L"the system prompt is too large; shorten it in Settings"
+                : built==CHAT_CONTEXT_OVERSIZE_USER
+                ? L"this message is too large; shorten it to send"
+                : L"the system prompt and this message are too large together; shorten either";
+            const size_t bound=sizeof m->generation.error/sizeof *m->generation.error;
+            swprintf(m->generation.error,bound,
+                L"Request not sent: %ls. The request body needs %lu bytes; the budget is %lu.",
+                cause,(unsigned long)context.required_bytes,
+                (unsigned long)CHAT_CONTEXT_BUDGET_BYTES);
+            /* Truncation semantics of a full buffer are unspecified for
+               swprintf: terminate explicitly so every reader is safe. */
+            m->generation.error[bound-1]=0;
+        }
+        else wcscpy(m->generation.error,
             !host->config.api_key_utf8 || !host->config.api_key_utf8[0] ?
             L"OPENROUTER_API_KEY is unavailable. Set the Windows User environment variable and restart." :
             L"Could not start OpenRouter request.");
@@ -375,7 +406,12 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
         host->stop_state=CHAT_GENERATION_CANCELLED;
         chat_ui_set_generation(&host->chat_ui,true,false);
         EnableWindow(host->field.window,FALSE);
-        set_status(host,L"Generating...");
+        if (host->context_dropped) {
+            wchar_t status[CHAT_STATUS_TEXT];
+            swprintf(status,CHAT_STATUS_TEXT,L"Generating... (%d older messages omitted to fit the request budget)",host->context_dropped);
+            status[CHAT_STATUS_TEXT-1]=0;   /* truncation must still terminate */
+            set_status(host,status);
+        } else set_status(host,L"Generating...");
     }
     render_transcript(host); chat_ui_sync(&host->chat_ui); flush(host);
 }
@@ -507,6 +543,7 @@ static void finish_request(ChatHost *host, OpenRouterEvent *event) {
     m->modified_at=chat_now();
     host->config.chat->conversations[host->request_conversation].modified_at=m->modified_at;
     host->generating=false; host->stopping=false; host->accepting=false;
+    host->context_dropped=0;   /* the omission count belongs to the live request */
     chat_ui_set_generation(&host->chat_ui,false,false); EnableWindow(host->field.window,TRUE);
     set_status(host,chat_generation_name(g->state));
     /* The full transcript render flushes any body rebuild the streaming
@@ -952,9 +989,19 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
               transcript_apply_pending(&host->transcript, &feed); }
             if (save(host) && host->generating) {
                 wchar_t status[CHAT_STATUS_TEXT];
-                swprintf(status,CHAT_STATUS_TEXT,L"%ls | %ls | %.1f s elapsed",
-                    host->stopping ? L"Stopping" : L"Generating",pending(host)->generation.requested_model,
-                    (GetTickCount64()-host->started_tick)/1000.0);
+                if (host->context_dropped)
+                    swprintf(status,CHAT_STATUS_TEXT,
+                        L"%ls | %ls | %.1f s elapsed | %d older messages omitted",
+                        host->stopping ? L"Stopping" : L"Generating",
+                        pending(host)->generation.requested_model,
+                        (GetTickCount64()-host->started_tick)/1000.0,
+                        host->context_dropped);
+                else
+                    swprintf(status,CHAT_STATUS_TEXT,L"%ls | %ls | %.1f s elapsed",
+                        host->stopping ? L"Stopping" : L"Generating",
+                        pending(host)->generation.requested_model,
+                        (GetTickCount64()-host->started_tick)/1000.0);
+                status[CHAT_STATUS_TEXT-1]=0;   /* truncation must still terminate */
                 set_status(host,status);
             }
         }
@@ -1060,6 +1107,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             save(host);
             openrouter_shutdown(&host->client);
             host->generating = false;
+            host->context_dropped = 0;
             MSG queued;
             while (PeekMessageW(&queued, window, CHAT_WM_OPENROUTER_EVENT,
                 CHAT_WM_OPENROUTER_EVENT, PM_REMOVE))

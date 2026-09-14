@@ -11,7 +11,9 @@
 
 #define CHAT_WM_OPENROUTER_EVENT (WM_APP + 0x4e)
 
-typedef struct { ChatRole role; const wchar_t *text; } OpenRouterMessage;
+/* The client consumes the same borrowed role/text view the request context
+   builder produces (chat/context.h), so a built context needs no conversion. */
+typedef ChatRequestMessage OpenRouterMessage;
 
 typedef enum {
     OPENROUTER_DELTA, OPENROUTER_REASONING, OPENROUTER_DONE, OPENROUTER_ERROR,
