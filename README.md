@@ -1,168 +1,208 @@
-# Dark UI — native foundation
+# DarkChat
 
-The DarkChat application lives alongside the toolkit. Build with `chat.bat`,
-run `build\darkchat.exe`, and see [CHAT.md](docs/CHAT.md) for daily-use actions,
-persistence/recovery, lifecycle semantics and verification. `chat.bat test` is the
-single verification command: it runs the chat tests and the DarkUI toolkit suite.
+DarkChat is a native OpenRouter chat client for Windows, written in C17 with Win32, Direct2D, DirectWrite, Rich Edit, and WinHTTP.
 
-A small retained UI framework and runnable control showcase in **C17, Win32,
-Direct2D and DirectWrite**. The original charcoal surfaces, Segoe UI typography,
-subtle separators and restrained blue accent are preserved. Image-browser
-models, generated image data and application globals have been removed.
+It provides streaming responses, per-turn reasoning views, progressive Markdown rendering, durable local conversation history, and the basic lifecycle tools expected from a usable desktop chat client—without Electron, a browser runtime, or third-party libraries.
+
+> **Status:** DarkChat is functional and under active development. It is currently a focused personal desktop client rather than a finished general-purpose release.
+
+## Current capabilities
+
+- Stream responses from any OpenRouter model identifier over SSE.
+- Display reasoning separately for each assistant turn.
+  - Reasoning is collapsed by default.
+  - Live reasoning can be opened, scrolled, collapsed, and reopened without losing its place.
+  - Reasoning content and duration persist across restarts.
+- Render assistant Markdown progressively while streaming.
+  - Headings
+  - Bold and italic text
+  - Inline and fenced code
+  - Flat ordered and unordered lists
+  - Links
+  - Blockquotes
+- Preserve transcript selection and reading position while responses stream.
+- Create, rename, reopen, clear, and delete conversations.
+- Keep an independent autosaved draft for each conversation.
+- Retry unsuccessful responses, regenerate the latest response, or edit and resend the latest user message.
+- Stop an active request while retaining its partial response.
+- Copy responses, transcript selections, and composer text.
+- Configure the model, global system prompt, and sidebar width.
+- Recall the 16 most recently used model identifiers with `Ctrl+Space`.
+- Show completion metadata including:
+  - Time to first token
+  - Total latency
+  - Input and output tokens
+  - OpenRouter-reported cost
+  - Requested and actual model
+  - Unusual finish reasons
+- Recover interrupted generations and valid backup snapshots after a crash or torn write.
+
+Only one request runs at a time. You can switch conversations or create a new one while a response is generating; the response remains attached to the conversation where it began.
 
 ## Build and run
 
-Windows 10 1703 or newer, with MinGW-w64 / w64devkit (`gcc` and `windres`) on PATH.
-No third-party libraries or C++ runtime are required.
+DarkChat requires Windows 10 version 1703 or newer and MinGW-w64 or w64devkit with `gcc` and `windres` available on `PATH`.
+
+```bat
+chat.bat
+build\darkchat.exe
+```
+
+You can also build and launch it in one command:
+
+```bat
+chat.bat run
+```
+
+Build output is written to `build\`. Compilation uses strict C17 warnings with `-Wall -Wextra -Wpedantic -Werror`.
+
+There is no C++ runtime and no third-party dependency to install.
+
+## OpenRouter setup
+
+DarkChat reads the API key from an environment variable named:
+
+```text
+OPENROUTER_API_KEY
+```
+
+For the current PowerShell session:
+
+```powershell
+$env:OPENROUTER_API_KEY = "your-key-here"
+.\build\darkchat.exe
+```
+
+You can instead create `OPENROUTER_API_KEY` as a Windows User environment variable. DarkChat also checks the corresponding User environment registry value, allowing an already-running desktop session to see a newly configured key.
+
+The key is never written to conversation state or included in persisted history, and temporary key buffers are cleared before release.
+
+Enter any valid OpenRouter model identifier in the model field. DarkChat currently does not download OpenRouter’s model catalog or expose provider-routing controls.
+
+## Everyday controls
+
+- `Enter` sends a message.
+- `Shift+Enter` inserts a newline.
+- `Ctrl+Space` opens recently used model identifiers.
+- The Send button becomes Stop during generation.
+- Conversation actions provide New, Rename, Delete, and Clear messages.
+- Response actions provide Retry, Regenerate, Edit latest user message, Cancel edit, Copy response, and Copy transcript selection.
+
+Changing the system prompt affects future requests only. It does not rewrite existing history.
+
+Retry, regenerate, and edit-and-resend replace the latest response rather than creating branches or retaining response variants.
+
+## Local persistence
+
+DarkChat stores its state at:
+
+```text
+%LOCALAPPDATA%\DarkChat\state.jsonl
+```
+
+The snapshot contains conversations, messages, drafts, model history, generation metadata, settings, and window geometry. It does not contain the OpenRouter API key.
+
+Persistence uses a checksummed UTF-8 JSONL format with:
+
+- Atomic same-volume replacement
+- Write-through flushing
+- A validated backup snapshot
+- Recovery from complete temporary snapshots
+- Strict validation before loaded data is adopted
+- An exclusive directory lock to prevent two instances from overwriting one another
+
+State is autosaved roughly once per second while dirty and immediately after important lifecycle actions such as sending, stopping, completing, deleting, or closing.
+
+A running assistant message is persisted before the network request begins. If the application closes or crashes during generation, the partial response is retained and recovered as Interrupted rather than silently marked successful.
+
+## Architecture
+
+DarkChat now represents most of the active development in this repository.
+
+| Area | Main files | Responsibility |
+| --- | --- | --- |
+| Chat model | `chat/chat.*` | Conversations, messages, request lifecycle, IDs, metadata, drafts, retry/regenerate/edit behavior |
+| Windows host | `chat/chat_host_win32.*` | Application window, worker coordination, timers, persistence scheduling, native event routing |
+| Application UI | `chat/chat_ui.*`, `chat/actions_win32.*` | Sidebar, composer, menus, settings, commands, and visible application state |
+| Transcript | `chat/transcript_win32.*`, `chat/rich_text_win32.*` | Per-turn native controls, scrolling, selection preservation, reasoning viewports, incremental updates |
+| Markdown | `chat/markdown.*` | Transactional, platform-independent Markdown subset parser |
+| OpenRouter | `chat/openrouter_winhttp.*`, `chat/sse.*`, `chat/json.*` | Request encoding, WinHTTP streaming, SSE framing, response decoding |
+| Storage | `chat/storage.*` | Checksummed JSONL snapshots, atomic replacement, backup and recovery |
+| DarkUI foundation | `ui/*`, `platform/*` | Retained controls, theme, painting, layout, Direct2D/DirectWrite rendering, and accessibility infrastructure |
+
+### Relationship to DarkUI
+
+This repository began as **DarkUI**, a small retained-mode UI foundation and control showcase. DarkChat was built on top of that work and still uses its theme, retained controls, layout, renderer, and platform infrastructure for parts of the application shell.
+
+DarkChat has since grown substantially beyond the original showcase. Its transcript, streaming protocol, reasoning surfaces, Markdown renderer, persistence system, lifecycle model, and native Windows integration currently live in chat-specific modules.
+
+The original toolkit showcase remains available as:
 
 ```bat
 build.bat
 build\darkui.exe
-
-rem Build and run the regression and Direct2D integration tests:
-build.bat test
-
-rem Produce five deterministic Direct2D/WIC preview PNGs:
-render.bat
 ```
 
-Outputs go in `build/`. The pre-existing root `darkui.exe`, if present, is the old
-prototype; launch **`build\darkui.exe`**. The build uses `-Wall -Wextra -Wpedantic
--Werror`. Test failures propagate a nonzero exit code. Close a running showcase
-before rebuilding its executable.
+The long-term direction is to move generally useful pieces back into the shared DarkUI foundation as the application’s interfaces mature. For now, the repository should be understood primarily as the DarkChat application with DarkUI underneath it—not as a completed general-purpose UI toolkit.
 
-The showcase provides functioning action buttons, disabled states, checkboxes,
-switches, a slider linked to a progress bar, a workspace field, a filtered control
-catalog, theme specimens and a nested scrolling exercise. Navigation stays
-available at the 600 × 420 DIP minimum client size; panels stack and the secondary
-inspector disappears as space decreases.
+## Verification
 
-## Architecture
+Run the complete regression suite with:
 
-| Layer | Files | Responsibility |
-| --- | --- | --- |
-| Core | `ui/ui.h`, `ui/ui.c` | Stable IDs, owned text, tree, layout, input, focus and scrolling; no Win32 or graphics headers |
-| Design | `ui/theme.c`, `ui/paint.c` | Semantic colors, typography, spacing, control appearance, renderer-independent painter callbacks |
-| Rendering | `platform/renderer.*` | DirectWrite measurement/layout cache, Direct2D target and brush lifetime, target recovery; caller-owned targets supported for export |
-| Platform | `platform/win32.*`, `platform/accessibility.*` | HWND/message loop, UI Automation, DPI conversion, capture, native text editor, GDI resources and invalidation |
-| Application | `showcase/showcase.*`, `main.c` | Composition, responsive breakpoints, sample state and event handling |
-
-The platform knows nothing about the showcase. The showcase knows nothing about
-HWNDs, Windows messages, Direct2D or DirectWrite. `main.c` is the composition root.
-The renderer exposes a callback painter instead of putting COM calls in controls.
-
-## Using the core
-
-Initialize a fresh `Ui`, create exactly one root, and append children to containers.
-Nodes are context-owned. IDs are opaque generation handles that remain valid until
-their node is removed or `ui_init` resets the context; use `ui_node` to access a
-node rather than indexing the arena with an ID. Use `ui_set_text` for owned text,
-and the hidden and disabled setters to keep focus/capture state consistent. Check
-`ui_add` for `UI_NONE`; `ui.overflow` latches invalid-parent/capacity errors.
-
-```c
-ui_init(ui, NULL, NULL);
-UiId root = ui_add(ui, UI_NONE, UI_COLUMN, L"");
-UiId button = ui_add(ui, root, UI_BUTTON, L"Run action");
-if (!root || !button) { /* report construction failure */ }
-ui_node(ui, root)->style.padding = ui->theme.padding;
-ui_node(ui, button)->style.width = ui_fixed(140);
-ui->on_event = handle_event;
-ui->event_user = app;
+```bat
+chat.bat test
 ```
 
-Pass the tree through `UiWindowConfig` to `ui_win32_run`. The host installs the
-renderer measurement callback, lays out the tree, routes input, paints when dirty,
-and releases its resources on return. Constructing and mutating the tree belongs
-on the UI thread. Event callbacks run synchronously after control state changes;
-they may update properties, text and visibility, but must not reset the context
-or re-enter event dispatch. Direct style/value mutations require
-`ui_invalidate(ui, true)` for layout changes, or `false` for appearance changes.
+This builds DarkChat, runs its chat and hidden-window integration tests, and then runs the DarkUI toolkit suite through `build.bat test`.
 
-`ui_remove` recursively removes a subtree and invalidates every handle to it;
-freed arena slots are reused without making stale handles valid. `ui_reparent`
-appends a non-root node to another container and rejects cycles. Both operations
-repair focus and active gestures immediately. Event callbacks may remove or
-reparent their event target, but must still not reset the context or re-enter
-event dispatch.
+Coverage includes:
 
-Accessible names default to node text and can be overridden with
-`ui_set_accessible_name` or derived from another node with `ui_set_labelled_by`.
-Use `ui_set_help_text` for concise interaction guidance. The Win32 host exposes
-the visible retained tree through UI Automation with stable runtime IDs, roles,
-bounds, enabled/focused state and button Invoke support. Provider calls are
-generation-checked, so removed nodes report that the element is unavailable.
+- Conversation and message lifecycle transitions
+- Retry, regenerate, edit-and-resend, cancellation, and crash recovery
+- Dynamic message allocation and injected allocation failures
+- Unicode, JSON, SSE, and split-boundary parsing
+- OpenRouter request and response fixtures
+- Reasoning ownership and live reasoning viewports
+- Progressive Markdown rendering
+- Selection-preserving transcript updates
+- Scheduled streaming flushes
+- Long-transcript control stability
+- Persistence round trips, checksums, backup recovery, and failed writes
+- Direct2D/DirectWrite renderer integration
+- Retained UI layout, input, scrolling, and UI Automation behavior
 
-### Layout contract
+Tests treat warnings as errors and propagate a nonzero exit code on failure. They use isolated directories under `build\` and do not touch the user’s conversation store.
 
-- Every logical size, font size, pointer coordinate and scroll offset is in DIPs.
-  The host converts client pixels once; Direct2D applies target DPI once.
-- Rows lay children horizontally; columns vertically. Padding and gaps are explicit.
-  `ui_fixed`, `ui_auto` and weighted `ui_flex` work with min/max dimensions.
-- Flex distributes the space remaining after fixed/auto children and gaps, freezing
-  constrained children before redistributing. Auto dimensions use intrinsic child
-  measurements. Flex in an auto-sized parent contributes its intrinsic size.
-- Cross-axis flex stretches. Other cross-axis sizes align at the start. Fixed/auto
-  children retain their size under pressure; overflow is clipped, not implicitly
-  shrunk. Responsive composition is the application's responsibility.
-- Scroll containers are vertical. Their children use intrinsic/fixed heights;
-  main-axis flex does not consume the viewport. A stable gutter prevents layout
-  oscillation when a scrollbar appears. Offsets clamp after resize/content changes.
-- The same arranged rectangles and ancestor clips govern rendering and hit testing.
-  All containers clip; children outside a viewport cannot receive pointer events.
+A real OpenRouter request can be checked manually after building the tests:
 
-### Input contract
+```powershell
+$env:OPENROUTER_API_KEY = [Environment]::GetEnvironmentVariable(
+    'OPENROUTER_API_KEY',
+    'User'
+)
+.\build\test_openrouter.exe --live
+Remove-Item Env:OPENROUTER_API_KEY
+```
 
-- Tab and Shift+Tab follow depth-first tree order, skipping hidden/disabled subtrees.
-  Focus reveals descendants through nested scroll views. Keyboard focus is drawn
-  only while the window is active.
-- Buttons/choices activate on matching release, with key-repeat suppression.
-  Dragging away cancels a button click. Capture loss, cancellation and deactivation
-  clear gesture state. Sliders retain capture while dragging beyond their bounds.
-- Slider arrows change 1%, page keys change 10%, Home/End reach the bounds.
-  Other controls route scrolling keys to the nearest ancestor viewport.
-- Fractional wheel distance is preserved, follows system wheel-line preferences,
-  and bubbles at nested scroll boundaries. Scrollbars support thumb drag and
-  track paging.
-- A focused textbox uses one shared Win32 `EDIT` child. The core retains the text;
-  native editing supplies selection, clipboard, undo and IME. The bridge handles
-  Tab traversal, Ctrl+A, field changes, clipping and DPI-sized fonts. Enter/Escape
-  leave the editor; changes are immediate, so Escape does not roll them back.
+The automated suite does not require an API key or make live OpenRouter requests.
 
-### Theme and resources
+## Current limits
 
-Set tokens on `ui.theme` before running the host. Color roles cover background,
-panel, toolbar, text hierarchy, hover, selection, accent and control states.
-`ui_theme_dark()` holds the original RGB palette. Typography, default control
-height, default gaps, radius and scrollbar metrics live alongside the palette;
-showcase-specific composition dimensions stay in the showcase.
+- Windows only
+- One active request at a time
+- 16 conversations
+- 64 messages per conversation
+- 16,383 UTF-16 code units each for answer and reasoning text
+- 128 MB maximum persisted snapshot
+- 16 recently used model identifiers
+- No full model-catalog browser
+- No provider-routing UI
+- No response branches or retained variants
+- No global conversation search
+- Markdown tables, images, nested lists, and other unsupported syntax remain literal
 
-DirectWrite formats and a bounded LRU text-layout cache are independent of device
-targets. Theme font replacement is transactional through `renderer_set_theme`.
-The HWND target and its brush are released together on draw/resize failure and
-recreated lazily. The host uses BeginPaint/EndPaint, skips minimized drawing and
-uses bounded, paced retries after a rendering failure. There is no idle animation
-timer or background render loop. Live theme switching through the host is not
-exposed yet; it would also need to refresh native editor fonts/GDI brushes.
+Responses that reach the local text limit are retained and marked Interrupted rather than incorrectly reported as complete.
 
-## Validation and deliberate limits
+Interactive clipboard and IME behavior, modal appearance, physical multi-monitor DPI transitions, and live provider behavior still require manual desktop verification. Hidden-window tests cover the underlying contracts but are not a replacement for visual review.
 
-`tests/test_ui.c` covers flex constraints, clipping, disabled ancestors, focus order,
-activation/cancellation, nested wheel bubbling, focus reveal, scrollbar dragging,
-slider bounds, text capacity and all three pages at six widths. The core tests
-need no Windows APIs. `tests/test_renderer.c` runs actual Direct2D/DirectWrite
-integration against a test-owned hidden HWND at 96/144/192/240 DPI, including forced
-target recreation, theme changes and repeated teardown. `tests/test_accessibility.c`
-drives the UIA provider against a hidden HWND, including fragment navigation,
-properties, bounds, focus, Invoke and stale-provider behavior. `render.bat`
-exercises the same painter through WIC for visual review without desktop capture.
-
-This is a foundation, not a complete widget library. It intentionally has a bounded
-255-node arena, 191-code-unit text buffers, vertical scrolling, single-line text,
-and one top-level host window per `ui_win32_run`. There is no virtualized list,
-popup/menu system or multiline/rich-text layout. UI Automation patterns for
-toggle, range and value controls are not implemented yet. Native text fields
-expose native accessibility while active, but their relationship to the retained
-provider still needs explicit bridging before screen-reader-ready use.
-
-See [HANDOFF.md](HANDOFF.md) for the next pass and the exact verification limits.
+For the detailed behavioral and persistence contract, see [`docs/CHAT.md`](docs/CHAT.md).
