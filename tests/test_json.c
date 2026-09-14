@@ -212,6 +212,69 @@ static void test_utf16_conversion(void) {
     free(converted);
 }
 
+static void test_field_kind(void) {
+    JsonFieldKind kind;
+    double value = -1;
+    /* Absent fields are distinguished from present-but-invalid values. */
+    check(json_query_field("{\"a\":1}", "b", &kind, &value) &&
+        kind == JSON_FIELD_ABSENT, "absent field reports ABSENT");
+    check(json_query_field("{\"id\":5}", "id", &kind, &value) &&
+        kind == JSON_FIELD_NUMBER && value == 5,
+        "present number reports NUMBER");
+    check(json_query_field("{\"id\":2.5}", "id", &kind, &value) &&
+        kind == JSON_FIELD_NUMBER && value == 2.5,
+        "fractional number reports NUMBER with its value");
+    check(json_query_field("{\"id\":-3}", "id", &kind, &value) &&
+        kind == JSON_FIELD_NUMBER && value == -3,
+        "negative number reports NUMBER with its value");
+    /* Present but not numeric: a quoted "5" is a string, never parsed as the
+       number 5 (no substring matching anywhere in the query path). */
+    check(json_query_field("{\"id\":\"5\"}", "id", &kind, &value) &&
+        kind == JSON_FIELD_INVALID, "quoted number reports INVALID");
+    check(json_query_field("{\"id\":true}", "id", &kind, &value) &&
+        kind == JSON_FIELD_INVALID, "bool reports INVALID");
+    check(json_query_field("{\"id\":null}", "id", &kind, &value) &&
+        kind == JSON_FIELD_INVALID, "null reports INVALID");
+    check(json_query_field("{\"id\":{}}", "id", &kind, &value) &&
+        kind == JSON_FIELD_INVALID, "object reports INVALID");
+    check(json_query_field("{\"id\":[]}", "id", &kind, &value) &&
+        kind == JSON_FIELD_INVALID, "array reports INVALID");
+    /* Navigation and boundary behavior. */
+    check(json_query_field("{\"a\":{\"id\":7}}", "a.id", &kind, &value) &&
+        kind == JSON_FIELD_NUMBER && value == 7, "nested field found");
+    check(json_query_field("[{\"id\":9}]", "[0].id", &kind, &value) &&
+        kind == JSON_FIELD_NUMBER && value == 9, "array element found");
+    check(json_query_field("{\"identifier\":3}", "id", &kind, &value) &&
+        kind == JSON_FIELD_ABSENT, "a longer key never substring-matches");
+    check(json_query_field("{\"id\":5}", "", &kind, &value) == false,
+        "empty path rejected");
+    check(json_query_field(NULL, "id", &kind, &value) == false &&
+        json_query_field("{}", "id", NULL, &value) == false,
+        "invalid arguments rejected");
+    check(json_query_field("{\"a\":1}", "b", &kind, NULL) &&
+        kind == JSON_FIELD_ABSENT, "value pointer optional");
+    /* Malformed paths are rejected as errors, not reported absent, and the
+       kind is still initialized for the caller. */
+    JsonFieldKind preset = JSON_FIELD_INVALID;
+    check(json_query_field("{\"a\":{\"b\":1}}", "a.", &kind, &value) == false &&
+        kind == JSON_FIELD_ABSENT, "trailing dot rejected");
+    kind = preset;
+    check(json_query_field("{\"a\":1}", ".a", &kind, &value) == false &&
+        kind == JSON_FIELD_ABSENT, "leading dot rejected");
+    kind = preset;
+    check(json_query_field("{\"a\":{\"b\":1}}", "a..b", &kind, &value) == false &&
+        kind == JSON_FIELD_ABSENT, "empty middle segment rejected");
+    kind = preset;
+    check(json_query_field("{\"[x]\":1}", "[x]", &kind, &value) == false &&
+        kind == JSON_FIELD_ABSENT, "non-numeric index rejected");
+    kind = preset;
+    check(json_query_field("{\"a[3\":1}", "a[3", &kind, &value) == false &&
+        kind == JSON_FIELD_ABSENT, "unterminated index rejected");
+    /* A valid path that names nothing stays ABSENT, distinct from malformed. */
+    check(json_query_field("{\"a\":{\"b\":1}}", "a.c", &kind, &value) &&
+        kind == JSON_FIELD_ABSENT, "missing key under valid path is absent");
+}
+
 int main(void) {
     double value;
     check(json_validate("{\"n\":-1.25e+2,\"s\":\"\\uD83D\\uDE80\"}"), "strict document validates");
@@ -228,6 +291,7 @@ int main(void) {
     test_encoded_size();
     test_buffers();
     test_utf16_conversion();
+    test_field_kind();
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("\nall json checks passed\n");
     return 0;

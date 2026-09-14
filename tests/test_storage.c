@@ -60,15 +60,16 @@ static bool same_generation(const ChatGeneration *a, const ChatGeneration *b) {
         !wcscmp(a->error, b->error);
 }
 static bool same_message(const ChatMessage *a, const ChatMessage *b) {
-    return a->role == b->role && a->created_at == b->created_at &&
+    return a->role == b->role && a->id == b->id &&
+        a->created_at == b->created_at &&
         a->modified_at == b->modified_at &&
         !wcscmp(chat_message_text(a), chat_message_text(b)) &&
         !wcscmp(chat_message_reasoning(a), chat_message_reasoning(b)) &&
         same_generation(&a->generation, &b->generation);
 }
-/* Compares every logically persisted field. View bookkeeping (message ids,
-   revisions, expansion) and runtime-only state (status, reply counter) are
-   deliberately excluded: they are not part of a snapshot. */
+/* Compares every logically persisted field, including the stable message ids.
+    View bookkeeping (revisions, expansion) and runtime-only state (status,
+    reply counter) are deliberately excluded: they are not part of a snapshot. */
 static bool same_chat(const Chat *a, const Chat *b) {
     if (a->next_id != b->next_id || a->active != b->active ||
         a->conversation_count != b->conversation_count ||
@@ -100,18 +101,153 @@ static void corrupt(const wchar_t *path) {
     FILE *f=_wfopen(path,L"wb");
     if (f) { fputs("{\"version\":1,\"truncated\":",f); fclose(f); }
 }
-static bool files_equal(const wchar_t *a, const wchar_t *b) {
-    FILE *fa=_wfopen(a,L"rb"), *fb=_wfopen(b,L"rb");
-    if (!fa || !fb) { if (fa) fclose(fa); if (fb) fclose(fb); return false; }
-    bool equal=true; int ca, cb;
-    do { ca=fgetc(fa); cb=fgetc(fb); if (ca!=cb) { equal=ca==cb; break; } } while (ca!=EOF);
-    fclose(fa); fclose(fb);
-    return equal;
-}
 static void remove_store(const ChatStorage *store, const wchar_t *dir) {
     DeleteFileW(store->path); DeleteFileW(store->backup); DeleteFileW(store->temporary);
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock);
     RemoveDirectoryW(dir);
+}
+
+/* The commit checksum is the same FNV-1a the storage module computes. */
+static uint32_t fnv1a(const char *s, size_t n) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < n; i++) hash = (hash ^ (unsigned char)s[i]) * 16777619u;
+    return hash;
+}
+/* Writes a hand-built snapshot: one record per line, each LF-terminated,
+    followed by a commit record whose checksum covers every byte before it. */
+static bool write_snapshot(const wchar_t *path, const char *const *lines,
+    size_t count) {
+    size_t total = 0;
+    for (size_t i = 0; i < count; i++) total += strlen(lines[i]) + 1;
+    char *body = malloc(total);
+    FILE *f = body ? _wfopen(path, L"wb") : NULL;
+    if (!f) { free(body); return false; }
+    size_t used = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t n = strlen(lines[i]);
+        memcpy(body + used, lines[i], n);
+        used += n;
+        body[used++] = '\n';
+    }
+    char commit[96];
+    snprintf(commit, sizeof commit, "{\"type\":\"commit\",\"checksum\":%u}",
+        fnv1a(body, used));
+    bool ok = fwrite(body, 1, used, f) == used &&
+        fwrite(commit, 1, strlen(commit), f) == strlen(commit) &&
+        fwrite("\n", 1, 1, f) == 1;
+    fclose(f);
+    free(body);
+    return ok;
+}
+/* One message record; `id_field` is `""` for an older id-less record or
+    something like `"\"id\":7,"` for a new-format one. */
+static void msg_raw(char *out, size_t cap, const char *id_field) {
+    snprintf(out, cap,
+        "{\"type\":\"message\",%s\"role\":0,\"created_at\":1000,"
+        "\"modified_at\":1000,\"text\":\"m\",\"state\":0,\"started_at\":0,"
+        "\"finished_at\":0,\"first_token_at\":0,\"ttft_ms\":-1,\"latency_ms\":-1,"
+        "\"prompt_tokens\":-1,\"completion_tokens\":-1,\"total_tokens\":-1,"
+        "\"cost\":-1,\"requested_model\":\"\",\"actual_model\":\"\","
+        "\"finish_reason\":\"\",\"error\":\"\"}", id_field);
+}
+/* Builds a fresh one-conversation, two-message snapshot in its own store
+    directory, loads it and removes the store. Returns storage_load's result
+    (or -2 when building failed). A rejected load leaves `dest` untouched. */
+static int load_case(const wchar_t *tag, long long next_id, const char *m0,
+    const char *m1, Chat *dest) {
+    wchar_t dir[256];
+    swprintf(dir, 256, L"build\\storage-id-%ls-%lu", tag, GetCurrentProcessId());
+    ChatStorage store;
+    if (!storage_open(&store, dir)) return -2;
+    char settings[384], conversation[256];
+    snprintf(settings, sizeof settings,
+        "{\"type\":\"settings\",\"version\":1,\"next_id\":%lld,\"active\":0,"
+        "\"conversation_count\":1,\"model_history_count\":0,\"window_x\":0,"
+        "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+        "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+        "\"system_prompt\":\"\"}", next_id);
+    snprintf(conversation, sizeof conversation,
+        "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
+        "\"modified_at\":1000,\"renamed\":0,\"message_count\":2,"
+        "\"title\":\"c\",\"draft\":\"\"}");
+    const char *lines[4] = { settings, conversation, m0, m1 };
+    int result = write_snapshot(store.path, lines, 4) ?
+        storage_load(&store, dest) : -2;
+    storage_close(&store);
+    remove_store(&store, dir);
+    return result;
+}
+/* Downgrade simulation: removes the stable id field from every message
+    record, recomputes the commit checksum and rewrites the file, so an older
+    build could have written it. */
+static bool downgrade_strip_ids(const wchar_t *path) {
+    FILE *f = _wfopen(path, L"rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0) { fclose(f); return false; }
+    char *data = malloc((size_t)size + 1), *out = malloc((size_t)size + 128);
+    bool ok = data && out && fread(data, 1, (size_t)size, f) == (size_t)size;
+    fclose(f);
+    if (!ok) { free(data); free(out); return false; }
+    data[size] = 0;
+    size_t used = 0;
+    char *body_end = NULL;   /* everything before the commit record */
+    char *cursor = data;
+    while (cursor < data + size) {
+        char *end = strchr(cursor, '\n');
+        if (!end) end = data + size;
+        size_t len = (size_t)(end - cursor);
+        char *line = malloc(len + 1);
+        if (!line) { free(data); free(out); return false; }
+        memcpy(line, cursor, len);
+        line[len] = 0;
+        bool commit = strstr(line, "\"type\":\"commit\"") != NULL;
+        if (!commit && strstr(line, "\"type\":\"message\"")) {
+            char *field = strstr(line, "\"id\":");
+            if (field) {
+                char *p = field + 5;
+                while (*p >= '0' && *p <= '9') ++p;
+                if (p != field + 5 && *p == ',') {
+                    size_t removed = (size_t)(p + 1 - field);
+                    memmove(field, field + removed, strlen(field + removed) + 1);
+                    len -= removed;
+                }
+            }
+        }
+        memcpy(out + used, line, len);
+        used += len;
+        out[used++] = '\n';
+        free(line);
+        if (commit) { body_end = out + used - (len + 1); break; }
+        cursor = end + 1;
+    }
+    if (!body_end) { free(data); free(out); return false; }
+    char commit[96];
+    snprintf(commit, sizeof commit, "{\"type\":\"commit\",\"checksum\":%u}",
+        fnv1a(out, (size_t)(body_end - out)));
+    f = _wfopen(path, L"wb");
+    ok = f && fwrite(out, 1, (size_t)(body_end - out), f) ==
+        (size_t)(body_end - out) &&
+        fwrite(commit, 1, strlen(commit), f) == strlen(commit) &&
+        fwrite("\n", 1, 1, f) == 1;
+    if (f) fclose(f);
+    free(data); free(out);
+    return ok;
+}
+static bool read_file_bytes(const wchar_t *path, char **out, size_t *size) {
+    FILE *f = _wfopen(path, L"rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long length = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *data = length > 0 ? malloc((size_t)length) : NULL;
+    bool ok = data && fread(data, 1, (size_t)length, f) == (size_t)length;
+    fclose(f);
+    if (ok) { *out = data; *size = (size_t)length; }
+    else free(data);
+    return ok;
 }
 int main(void) {
     wchar_t dir[256]; swprintf(dir,256,L"build\\storage-test-%lu",GetCurrentProcessId());
@@ -206,7 +342,8 @@ int main(void) {
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
     /* A version 1 snapshot produced by the previous build of the same format
        loads unchanged, decodes into reserved dynamic message capacity, and
-       saving identical logical content reproduces the exact bytes. */
+       migrates: every id-less message gets a deterministic nonzero stable id
+       in file order from the persisted counter, and the counter is bumped. */
     {
         wchar_t fdir[256]; swprintf(fdir,256,L"build\\storage-fixture-%lu",GetCurrentProcessId());
         ChatStorage fstore;
@@ -235,10 +372,29 @@ int main(void) {
         CHECK(fixture->conversations[1].messages[1].generation.state==CHAT_GENERATION_INTERRUPTED);
         CHECK(!wcscmp(fixture->system_prompt,L"Be concise.\nUnicode \x03bb"));
         CHECK(!wcscmp(fixture->conversations[0].draft,L"Unsent draft"));
-        /* Roundtrip identity: loading the fixture and saving it again writes
-           the same bytes the previous build produced. */
+        /* Migration: the fixture stored next_id 1789338462008 and four
+           id-less messages, so file order assigns 009, 010, 011, 012 and the
+           counter ends exactly at the last synthesized id. */
+        CHECK(fixture->conversations[0].messages[0].id==1789338462009);
+        CHECK(fixture->conversations[0].messages[1].id==1789338462010);
+        CHECK(fixture->conversations[1].messages[0].id==1789338462011);
+        CHECK(fixture->conversations[1].messages[1].id==1789338462012);
+        CHECK(fixture->next_id==1789338462012);
+        /* Saving the migrated state writes the new format and reloading it
+           reproduces the same logical content: migration is idempotent. */
         CHECK(storage_save(&fstore,fixture));
-        CHECK(files_equal(fstore.path,L"tests\\state-v1-fixture.jsonl"));
+        CHECK(storage_load(&fstore,fixture)==1 && !fstore.recovered);
+        CHECK(fixture->conversations[0].messages[0].id==1789338462009);
+        CHECK(fixture->next_id==1789338462012);
+        /* Repeated saves of the loaded state are byte-stable: every message
+           now carries its persisted id and nothing else moves. */
+        char *first=NULL,*second=NULL; size_t first_size=0,second_size=0;
+        CHECK(storage_save(&fstore,fixture));
+        CHECK(read_file_bytes(fstore.path,&first,&first_size));
+        CHECK(storage_save(&fstore,fixture));
+        CHECK(read_file_bytes(fstore.path,&second,&second_size));
+        CHECK(first_size==second_size && !memcmp(first,second,first_size));
+        free(first); free(second);
         chat_dispose(fixture); free(fixture);
         storage_close(&fstore);
         remove_store(&fstore,fdir);
@@ -344,6 +500,179 @@ int main(void) {
         remove_store(&estore,edir);
         chat_dispose(before); free(before);
         chat_dispose(dest); free(dest);
+    }
+
+    /* Stage 3: stable persisted message identities. Every present id must be
+       an exact integer in [1, stored_next_id] and globally unused; absent ids
+       (older snapshots) are synthesized deterministically in file order; any
+       other form rejects the snapshot transactionally. */
+    {
+        char a[512], b[512];
+        /* New-format ids roundtrip, including the stored-counter boundary. */
+        msg_raw(a,sizeof a,"\"id\":2,"); msg_raw(b,sizeof b,"\"id\":100,");
+        CHECK(load_case(L"valid",100,a,b,loaded)==1);
+        CHECK(loaded->conversations[0].messages[0].id==2);
+        CHECK(loaded->conversations[0].messages[1].id==100);
+        CHECK(loaded->next_id==100);
+        /* Unknown optional fields remain tolerated: decode queries only the
+           names it knows, so extra fields neither break nor shift anything. */
+        msg_raw(a,sizeof a,"\"id\":2,"); msg_raw(b,sizeof b,"\"id\":3,");
+        a[strlen(a)-1]=0; strcat(a, ",\"future_field\":true}");
+        CHECK(load_case(L"unknown",100,a,b,loaded)==1);
+        CHECK(loaded->conversations[0].messages[0].id==2);
+        CHECK(loaded->conversations[0].messages[1].id==3);
+        /* Id-less records migrate: ids are assigned in file order from the
+           stored counter and the counter ends at the last synthesized id. */
+        msg_raw(a,sizeof a,""); msg_raw(b,sizeof b,"");
+        CHECK(load_case(L"migrate",100,a,b,loaded)==1);
+        CHECK(loaded->conversations[0].messages[0].id==101);
+        CHECK(loaded->conversations[0].messages[1].id==102);
+        CHECK(loaded->next_id==102);
+        /* Mixed old/new records are valid in both orders. */
+        msg_raw(a,sizeof a,"\"id\":5,"); msg_raw(b,sizeof b,"");
+        CHECK(load_case(L"mixed-a",100,a,b,loaded)==1);
+        CHECK(loaded->conversations[0].messages[0].id==5);
+        CHECK(loaded->conversations[0].messages[1].id==101);
+        CHECK(loaded->next_id==101);
+        msg_raw(a,sizeof a,""); msg_raw(b,sizeof b,"\"id\":5,");
+        CHECK(load_case(L"mixed-b",100,a,b,loaded)==1);
+        CHECK(loaded->conversations[0].messages[0].id==101);
+        CHECK(loaded->conversations[0].messages[1].id==5);
+        CHECK(loaded->next_id==101);
+        /* Invalid forms: zero, negative, fractional, string, above the
+           stored counter, and duplicate within the conversation. */
+        msg_raw(a,sizeof a,"\"id\":0,"); msg_raw(b,sizeof b,"\"id\":3,");
+        CHECK(load_case(L"zero",100,a,b,loaded)==-1);
+        msg_raw(a,sizeof a,"\"id\":-1,"); msg_raw(b,sizeof b,"\"id\":3,");
+        CHECK(load_case(L"negative",100,a,b,loaded)==-1);
+        msg_raw(a,sizeof a,"\"id\":2.5,"); msg_raw(b,sizeof b,"\"id\":3,");
+        CHECK(load_case(L"fractional",100,a,b,loaded)==-1);
+        msg_raw(a,sizeof a,"\"id\":\"2\","); msg_raw(b,sizeof b,"\"id\":3,");
+        CHECK(load_case(L"string",100,a,b,loaded)==-1);
+        msg_raw(a,sizeof a,"\"id\":101,"); msg_raw(b,sizeof b,"\"id\":3,");
+        CHECK(load_case(L"above",100,a,b,loaded)==-1);
+        msg_raw(a,sizeof a,"\"id\":2,"); msg_raw(b,sizeof b,"\"id\":2,");
+        CHECK(load_case(L"duplicate",100,a,b,loaded)==-1);
+        /* A message id colliding with its own conversation id. */
+        msg_raw(a,sizeof a,"\"id\":1,"); msg_raw(b,sizeof b,"\"id\":3,");
+        CHECK(load_case(L"convhit",100,a,b,loaded)==-1);
+        /* A later persisted id equal to the id this pass just synthesized is
+           rejected: validation always uses the stored counter, never the
+           mutated one. */
+        msg_raw(a,sizeof a,""); msg_raw(b,sizeof b,"\"id\":101,");
+        CHECK(load_case(L"synthhit",100,a,b,loaded)==-1);
+        /* Counter exhaustion while synthesizing is corruption and fails the
+           whole snapshot. */
+        msg_raw(a,sizeof a,""); msg_raw(b,sizeof b,"\"id\":1,");
+        CHECK(load_case(L"exhausted",(long long)CHAT_MAX_ID,a,b,loaded)==-1);
+        /* Global uniqueness across conversations, in both directions. */
+        {
+            wchar_t gdir[256]; swprintf(gdir,256,L"build\\storage-id-global-%lu",GetCurrentProcessId());
+            ChatStorage gstore;
+            char settings[384], c0[256], c1[256];
+            CHECK(storage_open(&gstore,gdir));
+            msg_raw(a,sizeof a,"\"id\":7,"); msg_raw(b,sizeof b,"\"id\":7,");
+            snprintf(settings,sizeof settings,
+                "{\"type\":\"settings\",\"version\":1,\"next_id\":100,\"active\":0,"
+                "\"conversation_count\":2,\"model_history_count\":0,\"window_x\":0,"
+                "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+                "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+                "\"system_prompt\":\"\"}");
+            snprintf(c0,sizeof c0,
+                "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
+                "\"modified_at\":1000,\"renamed\":0,\"message_count\":1,"
+                "\"title\":\"c\",\"draft\":\"\"}");
+            snprintf(c1,sizeof c1,
+                "{\"type\":\"conversation\",\"id\":2,\"created_at\":1000,"
+                "\"modified_at\":1000,\"renamed\":0,\"message_count\":1,"
+                "\"title\":\"c\",\"draft\":\"\"}");
+            const char *dup_lines[5]={settings,c0,a,c1,b};
+            CHECK(write_snapshot(gstore.path,dup_lines,5));
+            CHECK(storage_load(&gstore,loaded)==-1);
+            storage_close(&gstore); remove_store(&gstore,gdir);
+            /* A conversation id equal to an earlier message id. */
+            CHECK(storage_open(&gstore,gdir));
+            msg_raw(a,sizeof a,"\"id\":7,");
+            snprintf(c1,sizeof c1,
+                "{\"type\":\"conversation\",\"id\":7,\"created_at\":1000,"
+                "\"modified_at\":1000,\"renamed\":0,\"message_count\":1,"
+                "\"title\":\"c\",\"draft\":\"\"}");
+            const char *conv_lines[5]={settings,c0,a,c1,b};
+            CHECK(write_snapshot(gstore.path,conv_lines,5));
+            CHECK(storage_load(&gstore,loaded)==-1);
+            storage_close(&gstore); remove_store(&gstore,gdir);
+        }
+        /* A rejected primary falls back to a valid backup. */
+        {
+            wchar_t rdir[256]; swprintf(rdir,256,L"build\\storage-id-recover-%lu",GetCurrentProcessId());
+            ChatStorage rstore;
+            char p0[512],p1[512],q0[512],q1[512],settings[384],conversation[256];
+            CHECK(storage_open(&rstore,rdir));
+            snprintf(settings,sizeof settings,
+                "{\"type\":\"settings\",\"version\":1,\"next_id\":100,\"active\":0,"
+                "\"conversation_count\":1,\"model_history_count\":0,\"window_x\":0,"
+                "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+                "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+                "\"system_prompt\":\"\"}");
+            snprintf(conversation,sizeof conversation,
+                "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
+                "\"modified_at\":1000,\"renamed\":0,\"message_count\":2,"
+                "\"title\":\"c\",\"draft\":\"\"}");
+            msg_raw(p0,sizeof p0,"\"id\":0,"); msg_raw(p1,sizeof p1,"\"id\":3,");
+            msg_raw(q0,sizeof q0,"\"id\":2,"); msg_raw(q1,sizeof q1,"\"id\":3,");
+            const char *bad[4]={settings,conversation,p0,p1};
+            const char *good[4]={settings,conversation,q0,q1};
+            CHECK(write_snapshot(rstore.path,bad,4));
+            CHECK(write_snapshot(rstore.backup,good,4));
+            CHECK(storage_load(&rstore,loaded)==1 && rstore.recovered);
+            CHECK(loaded->conversations[0].messages[0].id==2);
+            CHECK(loaded->conversations[0].messages[1].id==3);
+            storage_close(&rstore); remove_store(&rstore,rdir);
+            /* Both snapshots invalid: no recovery, writes disabled. */
+            CHECK(storage_open(&rstore,rdir));
+            CHECK(write_snapshot(rstore.path,bad,4));
+            CHECK(write_snapshot(rstore.backup,bad,4));
+            CHECK(storage_load(&rstore,loaded)==-1);
+            CHECK(!rstore.writable);
+            CHECK(!storage_save(&rstore,loaded));
+            storage_close(&rstore); remove_store(&rstore,rdir);
+        }
+        /* Downgrade simulation: strip message ids from a new-format snapshot,
+           recompute the checksum, then reload and remigrate. The identity
+           values are gone, so new ids are assigned above the stored counter
+           and the counter is bumped again; the result is a valid, stable
+           snapshot once more. */
+        {
+            wchar_t ddir[256]; swprintf(ddir,256,L"build\\storage-id-downgrade-%lu",GetCurrentProcessId());
+            ChatStorage dstore;
+            CHECK(storage_open(&dstore,ddir));
+            CHECK(storage_save(&dstore,chat));
+            uint64_t saved_next=chat->next_id;
+            size_t message_total=0;
+            for (size_t i=0;i<(size_t)chat->conversation_count;i++)
+                message_total+=chat->conversations[i].message_count;
+            CHECK(downgrade_strip_ids(dstore.path));
+            CHECK(storage_load(&dstore,loaded)==1 && !dstore.recovered);
+            CHECK(loaded->next_id==saved_next+message_total);
+            for (int i=0,k=0;i<loaded->conversation_count;i++)
+                for (size_t j=0;j<loaded->conversations[i].message_count;j++,k++)
+                    CHECK(loaded->conversations[i].messages[j].id==saved_next+1+(uint64_t)k);
+            /* The remigrated state saves and reloads idempotently. */
+            CHECK(storage_save(&dstore,loaded));
+            Chat *again=calloc(1,sizeof *again);
+            CHECK(again);
+            CHECK(storage_load(&dstore,again)==1 && !dstore.recovered);
+            CHECK(same_chat(again,loaded));
+            char *first=NULL,*second=NULL; size_t first_size=0,second_size=0;
+            CHECK(storage_save(&dstore,again));
+            CHECK(read_file_bytes(dstore.path,&first,&first_size));
+            CHECK(storage_save(&dstore,again));
+            CHECK(read_file_bytes(dstore.path,&second,&second_size));
+            CHECK(first_size==second_size && !memcmp(first,second,first_size));
+            free(first); free(second);
+            chat_dispose(again); free(again);
+            storage_close(&dstore); remove_store(&dstore,ddir);
+        }
     }
 
     chat_dispose(chat); chat_dispose(loaded);

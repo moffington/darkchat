@@ -70,7 +70,7 @@ between turns, so historical assistant turns keep their own reasoning affordance
 and content across switching, reload and restart.
 
 Update bookkeeping lives in its own module (`chat/transcript_win32.c`). Every
-turn records the message identity its surfaces were built from â€” conversation
+turn records the message identity its surfaces were built from — conversation
 id, message instance id, a per-message revision counter and the observable
 rendering state. When a rebuild finds a message unchanged, destructive content
 writes are skipped entirely, so unchanged historical controls survive sibling
@@ -236,14 +236,19 @@ into the transcript or the payload.
    index, next ID counter, record counts, model/system prompt and geometry.
 2. Zero or more `type: "model"` history records.
 3. For each conversation, a `type: "conversation"` record followed by its declared
-   number of `type: "message"` records.
+   number of `type: "message"` records, each carrying its stable `"id"`.
 4. A `type: "commit"` record containing the 32-bit FNV-1a checksum of every byte
    before that record (including LF separators).
 
 Conversation IDs are numeric, store-local, monotonically allocated from a
 persisted counter initially seeded from the current time. They do not depend on
-names or array positions and are not reused after deletion. Conversation/message
-created and modified timestamps and generation started/first-token/finished
+names or array positions and are not reused after deletion. Every message also
+carries a stable identity drawn from the same counter and persisted in its
+record (`"id"`): retry/regenerate keep the user turn's id and give the fresh
+assistant turn a new one; edit-and-resend preserves the edited user id and
+creates a new assistant id. Older builds that predate the field simply ignore
+it when reading, so the format version stays 1. Conversation/message created
+and modified timestamps and generation started/first-token/finished
 timestamps are Unix milliseconds (currently second-resolution wall clock).
 TTFT and latency use monotonic millisecond timing. A zero generation timestamp
 means unknown; numeric metadata uses -1 for unavailable. Cost is supplied by
@@ -264,7 +269,24 @@ At most roughly one second of recent streamed text or ordinary draft typing can
 be lost on abrupt termination (long UI/disk stalls can increase that interval).
 
 Load validates JSON, version, ranges, counts, identities and checksum into a
-separate Chat before adopting it. Decoding reserves backing storage for each
+separate Chat before adopting it. Message identity is validated strictly: a
+present `"id"` must be an exact integer in `[1, next_id]` as the settings
+record stored it, and it must be globally unused — not equal to any other
+message's id or any conversation's id anywhere in the snapshot. A missing
+`"id"` (a snapshot written before the field existed) is migrated: the message
+receives `next_id + 1, next_id + 2, …` in file order and the counter is
+bumped; those synthesized values are never validated against a persisted id,
+because persisted ids are always checked against the counter exactly as it
+was stored. Exhausting that exact-integer ceiling while synthesizing is
+corruption, not a resource condition, and fails the whole snapshot. Any
+present-but-invalid id — zero, negative, fractional, a string, above the
+stored counter, duplicated or globally colliding — is corruption and rejects
+the snapshot, which then falls back to the backup/complete-temporary recovery
+below; there is no tolerant or self-repairing interpretation. A downgrade
+(removing `"id"` fields and rewriting the checksum) is always loadable again,
+but the identity values are gone and a fresh migration assigns new ids above
+the stored counter.
+Decoding reserves backing storage for each
 conversation's declared message count, but a slot counts as live only once it
 has been zeroed and construction has begun, so the quarantine disposes exactly
 the messages it built and a decode failure can never leave partially decoded
@@ -288,12 +310,21 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   64-message cap, allocation invariants after every operation, append and
   send/retry/regenerate/edit-resend transactional failure semantics under
   injected allocation failures, retained-capacity trims, a version 1 fixture
-  from the previous build loading (and re-encoding) byte-identically, and
-  decode allocation failures (including the conversation-array reservation and
-  a mid-message failure under a poisoned, non-zero-filled allocator) recovered
-  through the fallback or leaving the destination's previous content and the
-  store untouched, plus ownership transfer across mid-list conversation
-  deletion.
+  from the previous build loading and migrating to deterministic nonzero ids
+  with a bumped counter, idempotent save/load after migration and byte-stable
+  repeated saves, and decode allocation failures (including the
+  conversation-array reservation and a mid-message failure under a poisoned,
+  non-zero-filled allocator) recovered through the fallback or leaving the
+  destination's previous content and the store untouched, plus ownership
+  transfer across mid-list conversation deletion.
+- Stable message identities: new-format id roundtrips, old/new mixed records in
+  both orders, deterministic migration in file order, and rejection of every
+  invalid id form (zero, negative, fractional, string, above the stored
+  counter, duplicate, message/conversation collision in both directions, a
+  later persisted id equal to a synthesized one, and counter exhaustion),
+  primary rejection recovering from a valid backup, write disabling when no
+  snapshot can be recovered, downgrade simulation (ids stripped, checksum
+  recomputed, reload remigrates) and tolerated unknown optional fields.
 - JSON number/structure validation, optional usage values and fractional cost.
 - Bounded request context (pure module): the newest-fit suffix rule at exact byte
   boundaries, oldest-first dropping with exact message counts, eligibility of
@@ -309,9 +340,10 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   successful send with omitted history and checks exactly which messages the
   client received, that the dropped text was not among them, and that the
   omission count stays in the generating status sweep.
-- Storage round trips, Unicode/drafts/settings/metadata, exclusive writer lock,
-  corrupt/torn snapshots, backup/temp recovery, denied temp writes and failed
-  atomic replacement, and protection against unknown versions.
+- Storage round trips with stable message ids, Unicode/drafts/settings/metadata,
+  exclusive writer lock, corrupt/torn snapshots, backup/temp recovery, denied
+  temp writes and failed atomic replacement, and protection against unknown
+  versions.
 - Real request encoder/SSE callback fixtures for model, usage, cost, TTFT,
   finish reason and provider errors after partial content, now also the enabled
   reasoning request parameter and reasoning_details/text-summary/plain fallback
@@ -329,7 +361,8 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   `stop` omitted and unusual finish reasons surfaced. A running turn's answer
   never contains stats, and no footer exists until the turn is terminal.
 - Storage round-trips reasoning and its duration and still loads a version 1
-  snapshot whose message lines omit the optional fields.
+  snapshot whose message lines omit both the optional reasoning fields and the
+  stable message ids.
 - Hidden native HWND host integration: stale events, switching during generation,
   partial failures, cancel/DONE races, empty replies, edit-and-resend draft
   preservation, inline reasoning row/surface transitions, reasoning persistence,

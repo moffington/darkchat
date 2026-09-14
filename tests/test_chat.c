@@ -684,6 +684,41 @@ int main(void) {
         chat_dispose(bad_mode); free(bad_mode);
     }
 
+    /* Identity-counter exhaustion: allocation fails without mutating
+       anything, exactly like the message-cap and allocation-failure paths. */
+    {
+        Chat *exhausted = (Chat *)calloc(1, sizeof *exhausted);
+        if (!exhausted) return 2;
+        chat_init(exhausted); chat_clear(exhausted);
+        exhausted->next_id = CHAT_MAX_ID;
+        int before_count = exhausted->conversation_count;
+        int before_active = exhausted->active;
+        uint64_t before_conversation_id = exhausted->conversations[0].id;
+        int64_t before_modified = chat_active(exhausted)->modified_at;
+        check(chat_new_conversation(exhausted) == -1 &&
+            exhausted->conversation_count == before_count &&
+            exhausted->active == before_active &&
+            exhausted->next_id == CHAT_MAX_ID,
+            "a conversation cannot be created at the id ceiling");
+        check(chat_append(exhausted, CHAT_ROLE_USER, L"hi") == -1 &&
+            chat_active(exhausted)->message_count == 0 &&
+            exhausted->next_id == CHAT_MAX_ID &&
+            exhausted->conversations[0].id == before_conversation_id &&
+            chat_active(exhausted)->modified_at == before_modified,
+            "an append at the id ceiling mutates nothing");
+        check_invariants(exhausted);
+        /* Just below the ceiling both allocations work again. */
+        exhausted->next_id = CHAT_MAX_ID - 2;
+        check(chat_new_conversation(exhausted) == 1 &&
+            exhausted->conversations[1].id == CHAT_MAX_ID - 1,
+            "conversation allocation resumes below the ceiling");
+        check(chat_append_at(exhausted, 0, CHAT_ROLE_USER, L"hi") == 0 &&
+            exhausted->conversations[0].messages[0].id == CHAT_MAX_ID,
+            "the last id below the ceiling is still allocatable");
+        check_invariants(exhausted);
+        chat_dispose(exhausted); free(exhausted);
+    }
+
     chat_dispose(chat);
     free(chat);
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }

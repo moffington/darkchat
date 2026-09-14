@@ -220,6 +220,7 @@ void chat_init(Chat *chat) {
 
 int chat_new_conversation(Chat *chat) {
     if (chat->conversation_count >= CHAT_MAX_CONVERSATIONS) return -1;
+    if (chat->next_id >= CHAT_MAX_ID) return -1;
     int index = chat->conversation_count++;
     ChatConversation *conversation = &chat->conversations[index];
     memset(conversation, 0, sizeof *conversation);
@@ -264,6 +265,10 @@ int chat_append_at(Chat *chat, int conversation_index, ChatRole role,
     const wchar_t *text) {
     if (conversation_index < 0 ||
         conversation_index >= chat->conversation_count) return -1;
+    /* Every appended message consumes a stable id; the persisted counter
+       ceiling is a hard limit like the message cap, and exhaustion must fail
+       before any observable mutation. */
+    if (chat->next_id >= CHAT_MAX_ID) return -1;
     ChatConversation *conversation = &chat->conversations[conversation_index];
     if (conversation->message_count >= CHAT_MAX_MESSAGES) return -1;
     /* Phase 1: ensure capacity before any observable mutation. */
@@ -281,7 +286,8 @@ int chat_append_at(Chat *chat, int conversation_index, ChatRole role,
     }
     /* Phase 3: commit — only non-failing operations from here on. */
     message->created_at = message->modified_at = chat_now();
-    /* Process-local instance id: view bookkeeping, never persisted. */
+    /* Stable message id, drawn from the same persisted counter as
+       conversation ids and saved with the message. */
     message->id = ++chat->next_id;
     int index = (int)conversation->message_count++;
     conversation->modified_at = message->modified_at;

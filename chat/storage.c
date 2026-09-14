@@ -53,6 +53,31 @@ static bool get_message_string(const char *s, const char *name,
 static bool integer(const char *s, const char *name, double min, double max, double *out) {
     return json_query_number(s, name, out) && *out >= min && *out <= max && floor(*out) == *out;
 }
+/* True when `id` already belongs to a decoded conversation id or to any live
+   message decoded before the record now being decoded (conversation `ci`,
+   messages before index `j`). Message and conversation identities share the
+   one persisted counter, so a collision in either direction is corruption. */
+static bool message_id_taken(const Chat *chat, uint64_t id, int ci, size_t j) {
+    for (int i = 0; i <= ci; i++) {
+        const ChatConversation *c = &chat->conversations[i];
+        if (c->id == id) return true;
+        size_t limit = i < ci ? c->message_count : j;
+        for (size_t k = 0; k < limit; k++)
+            if (c->messages[k].id == id) return true;
+    }
+    return false;
+}
+/* True when a conversation id collides with any earlier conversation or with
+   any message decoded so far. */
+static bool conversation_id_taken(const Chat *chat, uint64_t id, int ci) {
+    for (int i = 0; i < ci; i++) {
+        const ChatConversation *c = &chat->conversations[i];
+        if (c->id == id) return true;
+        for (size_t k = 0; k < c->message_count; k++)
+            if (c->messages[k].id == id) return true;
+    }
+    return false;
+}
 #define NUM(b,obj,field) number(b, #field, (double)(obj)->field)
 #define STR(b,obj,field) string(b, #field, (obj)->field)
 #define READ_INT(obj,field,min,max) do { if (!integer(line,#field,min,max,&v)) goto bad; (obj)->field = v; } while (0)
@@ -93,6 +118,10 @@ static bool encode(const Chat *chat, JsonBuf *b) {
             const ChatMessage *m = &c->messages[j];
             const ChatGeneration *g = &m->generation;
             raw(b, "{\"type\":\"message\"");
+            /* Stable message identity: the persisted counter value this
+               message was allocated from. Older builds that do not know the
+               field simply ignore it. */
+            NUM(b, m, id);
             NUM(b, m, role);
             NUM(b, m, created_at);
             NUM(b, m, modified_at);
@@ -149,7 +178,11 @@ static bool decode(char *data, Chat *chat) {
     char *cursor = data, *line = next_line(&cursor);
     if (!type_is(line,"settings") || !integer(line,"version",FORMAT_VERSION,FORMAT_VERSION,&v)) return false;
     memset(chat,0,sizeof *chat);
-    READ_INT(chat, next_id, 1, 9007199254740000.0);
+    READ_INT(chat, next_id, 1, (double)CHAT_MAX_ID);
+    /* The counter exactly as it was persisted: every persisted identity is
+       validated against this ceiling, never against the mutated counter that
+       grows while ids are synthesized for older id-less messages. */
+    double stored_next_id = (double)chat->next_id;
     READ_INT(chat, active, 0, CHAT_MAX_CONVERSATIONS-1);
     READ_INT(chat, conversation_count, 1, CHAT_MAX_CONVERSATIONS);
     READ_INT(chat, model_history_count, 0, CHAT_MODEL_HISTORY);
@@ -170,7 +203,7 @@ static bool decode(char *data, Chat *chat) {
         ChatConversation *c=&chat->conversations[i];
         line=next_line(&cursor);
         if (!type_is(line,"conversation")) goto bad;
-        READ_INT(c, id, 1, chat->next_id);
+        READ_INT(c, id, 1, stored_next_id);
         READ_INT(c, created_at, 1, 9007199254740991.0);
         READ_INT(c, modified_at, 1, 9007199254740991.0);
         READ_INT(c, renamed, 0, 1);
@@ -187,13 +220,35 @@ static bool decode(char *data, Chat *chat) {
         if (!chat_reserve_messages(c, declared)) goto bad;
         READ_STR(c, title);
         READ_STR(c, draft);
-        for (int k=0; k<i; k++) if (chat->conversations[k].id == c->id) goto bad;
+        if (conversation_id_taken(chat, c->id, i)) goto bad;
         for (size_t j=0; j<declared; j++) {
             ChatMessage *m=&c->messages[j]; ChatGeneration *g=&m->generation;
             memset(m, 0, sizeof *m);
             c->message_count = j + 1;   /* live before any fallible decoding */
             line=next_line(&cursor);
             if (!type_is(line,"message")) goto bad;
+            /* Stable message identity. A persisted id must be an exact
+               integer in [1, stored_next_id] and globally unused; an absent
+               id (older version 1 snapshots) is synthesized deterministically
+               in file order from the live counter. Persisted ids are never
+               re-checked against the mutated counter, so a stored id equal to
+               a value this pass already synthesized is out of range and
+               rejected. Counter exhaustion is corruption and fails the whole
+               snapshot transactionally. */
+            {
+                JsonFieldKind kind;
+                double id_value;
+                if (!json_query_field(line,"id",&kind,&id_value)) goto bad;
+                if (kind == JSON_FIELD_ABSENT) {
+                    if (chat->next_id >= CHAT_MAX_ID) goto bad;
+                    m->id = ++chat->next_id;
+                } else if (kind == JSON_FIELD_NUMBER &&
+                    id_value >= 1.0 && id_value <= stored_next_id &&
+                    floor(id_value) == id_value) {
+                    m->id = (uint64_t)id_value;
+                } else goto bad;
+                if (message_id_taken(chat, m->id, i, j)) goto bad;
+            }
             READ_INT(m, role, 0, CHAT_ROLE_ERROR);
             READ_INT(m, created_at, 1, 9007199254740991.0);
             READ_INT(m, modified_at, 1, 9007199254740991.0);

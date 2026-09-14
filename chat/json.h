@@ -49,4 +49,21 @@ bool json_query_number(const char *json, const char *path, double *out);
 /* Returns the number of elements in the array named by path. */
 bool json_query_array_length(const char *json, const char *path, size_t *out);
 
+/* Classifies the value a path names, so a caller can tell an absent field
+   apart from one that is present but not a number. The field is located by
+   exact key navigation (never substring matching), so "id" cannot match
+   "identifier" and a quoted "5" is not a number. A malformed path (trailing
+   dot, empty segment, malformed or unterminated index) returns false; a
+   syntactically valid path that names nothing reports JSON_FIELD_ABSENT.
+   Whenever `kind` is non-NULL it is always set on return: ABSENT for a
+   rejected call, JSON_FIELD_NUMBER with the parsed value when a finite number
+   is present, JSON_FIELD_INVALID for a string, bool, null, object or array. */
+typedef enum {
+    JSON_FIELD_ABSENT,
+    JSON_FIELD_NUMBER,
+    JSON_FIELD_INVALID
+} JsonFieldKind;
+bool json_query_field(const char *json, const char *path, JsonFieldKind *kind,
+    double *value);
+
 #endif

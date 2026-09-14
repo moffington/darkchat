@@ -439,9 +439,10 @@ static bool next_segment(const char **cursor, char *name, size_t capacity,
     return true;
 }
 
-bool json_query_string(const char *json, const char *path, char *out,
-    size_t capacity) {
-    if (!json || !path || !out || capacity == 0) return false;
+/* Resolves a dot/index path from a document to the exact value position, or
+   false when the path names nothing. Shared by every query. */
+static bool find_path(const char *json, const char *path, const char **out) {
+    if (!json || !path) return false;
     const char *p = skip_ws(json);
     if (*p != '{' && *p != '[') return false;
     const char *cursor = path;
@@ -453,6 +454,15 @@ bool json_query_string(const char *json, const char *path, char *out,
         if (!p) return false;
         p = skip_ws(p);
     }
+    *out = p;
+    return true;
+}
+
+bool json_query_string(const char *json, const char *path, char *out,
+    size_t capacity) {
+    if (!json || !path || !out || capacity == 0) return false;
+    const char *p;
+    if (!find_path(json, path, &p)) return false;
     return *p == '"' && json_decode_string(p, out, capacity) != NULL;
 }
 
@@ -464,14 +474,8 @@ bool json_validate(const char *json) {
 
 bool json_query_number(const char *json, const char *path, double *out) {
     if (!json || !path || !out) return false;
-    const char *p = skip_ws(json), *cursor = path;
-    while (*cursor) {
-        char name[128]; int index;
-        if (!next_segment(&cursor, name, sizeof name, &index)) return false;
-        p = navigate(p, name, index);
-        if (!p) return false;
-        p = skip_ws(p);
-    }
+    const char *p;
+    if (!find_path(json, path, &p)) return false;
     const char *end = skip_number(p);
     if (!end || (*end && !strchr(",}] \t\r\n", *end))) return false;
     char *parsed;
@@ -484,14 +488,8 @@ bool json_query_number(const char *json, const char *path, double *out) {
 
 bool json_query_array_length(const char *json, const char *path, size_t *out) {
     if (!json || !path || !out) return false;
-    const char *p = skip_ws(json), *cursor = path;
-    while (*cursor) {
-        char name[128]; int index;
-        if (!next_segment(&cursor, name, sizeof name, &index)) return false;
-        p = navigate(p, name, index);
-        if (!p) return false;
-        p = skip_ws(p);
-    }
+    const char *p;
+    if (!find_path(json, path, &p)) return false;
     if (*p != '[') return false;
     p = skip_ws(p + 1);
     size_t count = 0;
@@ -505,4 +503,54 @@ bool json_query_array_length(const char *json, const char *path, size_t *out) {
         if (*p != ',') return false;
         p = skip_ws(p + 1);
     }
+}
+
+/* Validates a path's syntax without touching the document: every segment
+   must parse cleanly through the end of the path. Trailing dots, empty
+   segments and malformed indexes make a path malformed, which is distinct
+   from a valid path that names nothing. */
+static bool path_valid(const char *path) {
+    const char *cursor = path;
+    while (*cursor) {
+        char name[128];
+        int index;
+        if (!next_segment(&cursor, name, sizeof name, &index)) return false;
+    }
+    return true;
+}
+
+bool json_query_field(const char *json, const char *path, JsonFieldKind *kind,
+    double *value) {
+    /* Initialize whenever possible: even a rejected call reports ABSENT. */
+    if (kind) *kind = JSON_FIELD_ABSENT;
+    if (!kind || !json || !path || !*path || !path_valid(path)) return false;
+    const char *p;
+    /* The path is syntactically valid, so a navigation miss means the field
+       is genuinely absent, never that the path was malformed. */
+    if (!find_path(json, path, &p)) return true;
+    p = skip_ws(p);
+    /* In a validated document a value can only start one of these ways; a
+       number never starts with a letter or punctuation like these. */
+    switch (*p) {
+    case '"': case '{': case '[':
+    case 't': case 'f': case 'n':
+        *kind = JSON_FIELD_INVALID;
+        return true;
+    default: break;
+    }
+    const char *end = skip_number(p);
+    if (!end || (*end && !strchr(",}] \t\r\n", *end))) {
+        *kind = JSON_FIELD_INVALID;
+        return true;
+    }
+    char *parsed;
+    errno = 0;
+    double number = strtod(p, &parsed);
+    if (errno || parsed != end || !isfinite(number)) {
+        *kind = JSON_FIELD_INVALID;
+        return true;
+    }
+    *kind = JSON_FIELD_NUMBER;
+    if (value) *value = number;
+    return true;
 }

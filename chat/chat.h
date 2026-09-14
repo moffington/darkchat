@@ -11,6 +11,11 @@
 
 #define CHAT_MAX_CONVERSATIONS 16
 #define CHAT_MAX_MESSAGES 64
+/* Every persisted identity (conversation and stable message ids) comes from
+   one counter that the storage format encodes as an exact double. This is the
+   shared allocation ceiling: exhausting it is treated as corruption on load
+   and blocks further allocation at runtime. */
+#define CHAT_MAX_ID 9007199254740000ULL
 /* Fixed inline space covers prompts and ordinary replies without allocations.
    Streamed model output grows onto the heap when it exceeds this size. */
 #define CHAT_MESSAGE_TEXT 16384
@@ -57,11 +62,14 @@ typedef struct {
     wchar_t *text_overflow, *reasoning_overflow;
     size_t text_length, reasoning_length;
     size_t text_capacity, reasoning_capacity;
-    /* View bookkeeping, never persisted: `id` is a process-local instance id
-       distinguishing a message from any other that later occupies the same
-       turn slot (retry/regenerate replacement). `revision` counts every
-       observable change; `body_revision` counts answer-text changes only, so a
-       metadata-only generation update does not invalidate the rendered body. */
+    /* Stable message identity, allocated from the same persisted counter as
+       conversation ids and saved in the snapshot: a message keeps its id
+       across restarts, and retry/regenerate/edit-and-resend give the new
+       assistant turn a fresh id. `revision` counts every observable change;
+       `body_revision` counts answer-text changes only, so a metadata-only
+       generation update does not invalidate the rendered body. The counters
+       and the expansion flag below are per-session view bookkeeping and are
+       never persisted. */
     uint64_t id, revision, body_revision;
     /* View state: whether this turn's reasoning viewport is expanded. Owned by
        the rendered turn; reset with the message, not persisted. */
