@@ -75,20 +75,23 @@ static void begin_regenerate(ChatHost *h) { begin_mode(h,CHAT_REGENERATE); }
 /* Reads a turn's rendered controls back to prove per-turn ownership. */
 static void head_text(ChatHost *h,int i,wchar_t *out,size_t cap) {
     out[0]=0;
-    if (h->transcript.turns[i].head.window) rich_text_get_text(&h->transcript.turns[i].head,out,cap);
+    RichTextControl *control=transcript_surface(&h->transcript,i,TRANSCRIPT_HEAD);
+    if (control) rich_text_get_text(control,out,cap);
 }
 static void reasoning_text(ChatHost *h,int i,wchar_t *out,size_t cap) {
     out[0]=0;
-    if (h->transcript.turns[i].reasoning.window)
-        rich_text_get_text(&h->transcript.turns[i].reasoning,out,cap);
+    RichTextControl *control=transcript_surface(&h->transcript,i,TRANSCRIPT_REASON);
+    if (control) rich_text_get_text(control,out,cap);
 }
 static void body_text(ChatHost *h,int i,wchar_t *out,size_t cap) {
     out[0]=0;
-    if (h->transcript.turns[i].body.window) rich_text_get_text(&h->transcript.turns[i].body,out,cap);
+    RichTextControl *control=transcript_surface(&h->transcript,i,TRANSCRIPT_BODY);
+    if (control) rich_text_get_text(control,out,cap);
 }
 static void meta_text(ChatHost *h,int i,wchar_t *out,size_t cap) {
     out[0]=0;
-    if (h->transcript.turns[i].meta.window) rich_text_get_text(&h->transcript.turns[i].meta,out,cap);
+    RichTextControl *control=transcript_surface(&h->transcript,i,TRANSCRIPT_META);
+    if (control) rich_text_get_text(control,out,cap);
 }
 static bool row_present(ChatHost *h,int i) {
     wchar_t text[96]; head_text(h,i,text,96);
@@ -96,7 +99,13 @@ static bool row_present(ChatHost *h,int i) {
 }
 /* Drives the real whole-row click path for one turn. */
 static void click_row(ChatHost *h,int i) {
-    if (h->transcript.turns[i].head.window) turn_row_click(h,&h->transcript.turns[i].head,1,false);
+    RichTextControl *head=transcript_surface(&h->transcript,i,TRANSCRIPT_HEAD);
+    if (head) turn_row_click(h,head,1,false);
+}
+/* Bound body window of one record, or NULL. */
+static HWND body_window(ChatHost *h,int i) {
+    RichTextControl *control=transcript_surface(&h->transcript,i,TRANSCRIPT_BODY);
+    return control ? control->window : NULL;
 }
 /* Appends a completed user/assistant turn with optional reasoning. */
 static int add_turn(Chat *chat,const wchar_t *prompt,const wchar_t *answer,
@@ -350,18 +359,18 @@ int main(void) {
     int second=add_turn(chat,L"second",L"Second answer",L"Beta reasoning",2500);
     wchar_t text[128];
     render_transcript(h);
-    CHECK(h->transcript.turn_count==4);
+    CHECK(h->transcript.record_count==4);
     CHECK(row_present(h,first) && row_present(h,second));
-    CHECK(!h->transcript.turns[first].reason_live && !h->transcript.turns[second].reason_live);
+    CHECK(!h->transcript.records[first].reason_live && !h->transcript.records[second].reason_live);
     head_text(h,first,text,128);
     CHECK(wcsstr(text,L"1.5s")!=NULL);
     /* Expanding one turn never touches another. */
     click_row(h,first);
-    CHECK(h->transcript.turns[first].reason_live && !h->transcript.turns[second].reason_live);
+    CHECK(h->transcript.records[first].reason_live && !h->transcript.records[second].reason_live);
     reasoning_text(h,first,text,128);
     CHECK(!wcscmp(text,L"Alpha reasoning"));
     /* Measuring text must not include its position in the transcript. */
-    { TranscriptTurn *turn=&h->transcript.turns[first];
+    { TranscriptRecord *turn=&h->transcript.records[first];
       int height=turn->head_h;
       CHECK(height<px(h,50));
       CHECK(turn->reason_y-turn->head_y-height==px(h,8));
@@ -370,39 +379,39 @@ int main(void) {
       transcript_layout_from(&h->transcript,0,false);
       CHECK(turn->head_h==height); }
     click_row(h,second);
-    CHECK(h->transcript.turns[first].reason_live && h->transcript.turns[second].reason_live);
+    CHECK(h->transcript.records[first].reason_live && h->transcript.records[second].reason_live);
     reasoning_text(h,second,text,128);
     CHECK(!wcscmp(text,L"Beta reasoning"));
     reasoning_text(h,first,text,128);
     CHECK(!wcscmp(text,L"Alpha reasoning"));
     click_row(h,first);
-    CHECK(!h->transcript.turns[first].reason_live && h->transcript.turns[second].reason_live);
+    CHECK(!h->transcript.records[first].reason_live && h->transcript.records[second].reason_live);
     /* Collapsed by default while waiting; explicit expansion streams live into
        that turn only and is not collapsed when the answer begins. */
     begin_regenerate(h);
     CHECK(pending(h)->generation.state==CHAT_GENERATION_RUNNING);
     head_text(h,second,text,128);
     CHECK(wcsstr(text,L"Thinking")!=NULL);
-    CHECK(!h->transcript.turns[second].reason_live);
+    CHECK(!h->transcript.records[second].reason_live);
     click_row(h,second);
-    CHECK(h->transcript.turns[second].reason_live &&
+    CHECK(h->transcript.records[second].reason_live &&
         chat->conversations[cv].messages[second].reasoning_open);
     handle_event(h,fixture(h,OPENROUTER_REASONING,L"stream rea"));
     handle_event(h,fixture(h,OPENROUTER_REASONING,L"soning"));
     reasoning_text(h,second,text,128);
     CHECK(!wcscmp(text,L"stream reasoning"));
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"Streamed answer"));
-    CHECK(h->transcript.turns[second].reason_live &&
+    CHECK(h->transcript.records[second].reason_live &&
         chat->conversations[cv].messages[second].reasoning_open);
     CHECK(pending(h)->generation.reasoning_ms>=0);
     /* The running answer is never mixed with metadata, and no footer exists
        until the turn is terminal. */
     { wchar_t body[256]; body_text(h,second,body,256);
       CHECK(!wcscmp(body,L"Streamed answer")); }
-    CHECK(!h->transcript.turns[second].meta_live);
+    CHECK(!h->transcript.records[second].meta_live);
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
-    CHECK(h->transcript.turns[second].meta_live);
+    CHECK(h->transcript.records[second].meta_live);
     { wchar_t meta[256]; meta_text(h,second,meta,256);
       CHECK(wcsstr(meta,L"Complete")!=NULL); }
     /* Reasoning and duration persist per message. */
@@ -427,11 +436,11 @@ int main(void) {
     chat->conversations[cv].messages[second].reasoning_open=true;
     chat_message_touch(&chat->conversations[cv].messages[second]);
     render_transcript(h);
-    CHECK(h->transcript.turns[second].reason_live);
+    CHECK(h->transcript.records[second].reason_live);
     begin_regenerate(h);
     CHECK(chat->conversations[cv].messages[second].reasoning[0]==0);
     CHECK(!chat->conversations[cv].messages[second].reasoning_open);
-    CHECK(!h->transcript.turns[second].reason_live);
+    CHECK(!h->transcript.records[second].reason_live);
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED);
     /* Cancellation/error keeps that turn coherent: reasoning retained, row and
@@ -439,7 +448,7 @@ int main(void) {
     begin_regenerate(h);
     handle_event(h,fixture(h,OPENROUTER_REASONING,L"kept"));
     click_row(h,second);
-    CHECK(h->transcript.turns[second].reason_live);
+    CHECK(h->transcript.records[second].reason_live);
     handle_event(h,fixture(h,OPENROUTER_ERROR,L"boom"));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED);
     CHECK(!wcscmp(chat->conversations[cv].messages[second].reasoning,L"kept"));
@@ -450,13 +459,13 @@ int main(void) {
     chat->conversations[0].messages[1].reasoning_open=false;
     chat_message_touch(&chat->conversations[0].messages[1]);
     command(h,CHAT_COMMAND_SELECT,0);
-    CHECK(h->transcript.turn_count==2);
+    CHECK(h->transcript.record_count==2);
     CHECK(row_present(h,1));
     click_row(h,1);
     { wchar_t text[128]; reasoning_text(h,1,text,128);
       CHECK(!wcscmp(text,L"Conv zero")); }
     command(h,CHAT_COMMAND_SELECT,cv);
-    CHECK(h->transcript.turn_count==4);
+    CHECK(h->transcript.record_count==4);
     { wchar_t text[128]; reasoning_text(h,second,text,128);
       CHECK(!wcscmp(text,L"kept")); }
     /* An answer past the old fixed-size limit streams to completion. */
@@ -508,7 +517,7 @@ int main(void) {
     click_row(h,second);
     handle_event(h,fixture(h,OPENROUTER_REASONING,L"Working through it"));
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"Answer"));
-    { TranscriptTurn *turn=&h->transcript.turns[second];
+    { TranscriptRecord *turn=&h->transcript.records[second];
       int head_height=turn->head_h;
       int reason_y=turn->reason_y;
       position_turns(h,true);
@@ -519,7 +528,7 @@ int main(void) {
           CHECK(turn->body_h>=height && turn->body_h-height<px(h,40));
           CHECK(h->transcript.view_scroll>=scroll && transcript_pinned(&h->transcript));
           POINT origin={0,0};
-          SendMessageW(turn->body.window,EM_GETSCROLLPOS,0,(LPARAM)&origin);
+          SendMessageW(body_window(h,second),EM_GETSCROLLPOS,0,(LPARAM)&origin);
           CHECK(origin.y==0);
       }
       /* The burst stayed within the throttle window, so nothing above was
@@ -589,19 +598,19 @@ int main(void) {
       CHECK(!wcscmp(body,L"Title bold and code and\r\nnext **ope"));
       CHARFORMAT2W f;
       memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* "bold" */
-      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_SETSEL,6,7);
-      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_GETCHARFORMAT,
+      SendMessageW(body_window(h,stream_turn),EM_SETSEL,6,7);
+      SendMessageW(body_window(h,stream_turn),EM_GETCHARFORMAT,
           SCF_SELECTION,(LPARAM)&f);
       CHECK((f.dwEffects & CFE_BOLD) && !(f.dwEffects & CFE_ITALIC));
       memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* "code" */
-      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_SETSEL,15,16);
-      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_GETCHARFORMAT,
+      SendMessageW(body_window(h,stream_turn),EM_SETSEL,15,16);
+      SendMessageW(body_window(h,stream_turn),EM_GETCHARFORMAT,
           SCF_SELECTION,(LPARAM)&f);
       CHECK(!wcscmp(f.szFaceName,L"Consolas") &&
           (f.dwMask & CFM_BACKCOLOR));
       memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* plain tail */
-      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_SETSEL,26,27);
-      SendMessageW(h->transcript.turns[stream_turn].body.window,EM_GETCHARFORMAT,
+      SendMessageW(body_window(h,stream_turn),EM_SETSEL,26,27);
+      SendMessageW(body_window(h,stream_turn),EM_GETCHARFORMAT,
           SCF_SELECTION,(LPARAM)&f);
       CHECK(!(f.dwEffects & CFE_BOLD) && !wcscmp(f.szFaceName,L"Segoe UI")); }
     CHECK(!wcscmp(pending(h)->text,
@@ -624,7 +633,7 @@ int main(void) {
       wcscpy(m->generation.actual_model,L"deepseek/deepseek-v4.1-flash");
       chat_message_touch(m);
       render_transcript(h);
-      CHECK(h->transcript.turns[second].meta_live);
+      CHECK(h->transcript.records[second].meta_live);
       meta_text(h,second,meta,256);
       CHECK(wcsstr(meta,L"Complete")!=NULL);
       CHECK(wcsstr(meta,L"TTFT 18.0s")!=NULL);
@@ -652,7 +661,7 @@ int main(void) {
     /* ---- Revision-tracked updates and selection preservation ---- */
     /* An active selection in an unchanged historical turn survives transcript
        rebuilds and a sibling turn's replacement untouched. */
-    { HWND body=h->transcript.turns[first].body.window;
+    { HWND body=body_window(h,first);
       CHECK(body);
       SendMessageW(body,EM_SETSEL,2,6);
       render_transcript(h);
@@ -670,8 +679,8 @@ int main(void) {
        the answer) leaves the body current, so the body write is skipped, not
        deferred, and a selection placed in it stays put. */
     { ChatMessage *m=&chat->conversations[cv].messages[first];
-      HWND body=h->transcript.turns[first].body.window;
-      TranscriptTurn *turn=&h->transcript.turns[first];
+      HWND body=body_window(h,first);
+      TranscriptRecord *turn=&h->transcript.records[first];
       CHECK(body && turn->body_live);
       SendMessageW(body,EM_SETSEL,0,0);        /* apply any prior deferral */
       render_transcript(h);
@@ -689,8 +698,8 @@ int main(void) {
     /* Starting another response resets the host-global content_started, which
        only shapes the row of the turn that is actually streaming: a completed
        historical turn stays current, so head and body are not rewritten. */
-    { HWND body=h->transcript.turns[first].body.window;
-      TranscriptTurn *turn=&h->transcript.turns[first];
+    { HWND body=body_window(h,first);
+      TranscriptRecord *turn=&h->transcript.records[first];
       SendMessageW(body,EM_SETSEL,0,0);
       render_transcript(h);
       CHECK(!turn->body_pending && !turn->head_pending);
@@ -708,8 +717,8 @@ int main(void) {
        bottom-following stay correct even with no further stream event. */
     begin_regenerate(h);
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"**raw *stream"));
-    { HWND body=h->transcript.turns[second].body.window;
-      TranscriptTurn *turn=&h->transcript.turns[second];
+    { HWND body=body_window(h,second);
+      TranscriptRecord *turn=&h->transcript.records[second];
       CHECK(body);
       SendMessageW(body,EM_SETSEL,3,7);
       h->transcript.body_render_tick=0;   /* force the throttled rebuild */
@@ -740,15 +749,15 @@ int main(void) {
        relayouts so the following metadata footer and scrollbar follow. */
     begin_regenerate(h);
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"**raw *stream"));
-    { HWND body=h->transcript.turns[second].body.window;
-      TranscriptTurn *turn=&h->transcript.turns[second];
+    { HWND body=body_window(h,second);
+      TranscriptRecord *turn=&h->transcript.records[second];
       CHECK(body);
       SendMessageW(body,EM_SETSEL,3,7);
       h->transcript.body_render_tick=0;
       handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nmore"));
       handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
       CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
-      CHECK(h->transcript.turns[second].meta_live);
+      CHECK(h->transcript.records[second].meta_live);
       wchar_t shown[256]; body_text(h,second,shown,256);
       CHECK(wcsstr(shown,L"more")==NULL);   /* terminal render still deferred */
       h->transcript.view_scroll=0x7fffffff;
@@ -765,9 +774,9 @@ int main(void) {
     /* Streaming reasoning appends preserve an in-progress selection. */
     begin_regenerate(h);
     click_row(h,second);
-    CHECK(h->transcript.turns[second].reason_live);
+    CHECK(h->transcript.records[second].reason_live);
     handle_event(h,fixture(h,OPENROUTER_REASONING,L"alpha beta"));
-    { HWND vp=h->transcript.turns[second].reasoning.window;
+    { HWND vp=transcript_surface(&h->transcript,second,TRANSCRIPT_REASON)->window;
       CHECK(vp);
       SendMessageW(vp,EM_SETSEL,2,5);
       handle_event(h,fixture(h,OPENROUTER_REASONING,L" gamma"));
@@ -816,8 +825,8 @@ int main(void) {
        rebuild is deferred, then applied and relaid out when the range clears. */
     begin_regenerate(h);
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"streamed so far"));
-    { HWND body=h->transcript.turns[second].body.window;
-      TranscriptTurn *turn=&h->transcript.turns[second];
+    { HWND body=body_window(h,second);
+      TranscriptRecord *turn=&h->transcript.records[second];
       CHECK(body);
       SendMessageW(body,EM_SETSEL,3,7);
       int body_before=turn->body_h;
@@ -853,9 +862,9 @@ int main(void) {
        the footer, leaving a selection in the live body untouched. */
     begin_regenerate(h);
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"first token"));
-    { TranscriptTurn *turn=&h->transcript.turns[second];
+    { TranscriptRecord *turn=&h->transcript.records[second];
       ChatMessage *m=&chat->conversations[cv].messages[second];
-      HWND body=turn->body.window; CHECK(body);
+      HWND body=body_window(h,second); CHECK(body);
       CHECK(turn->body_revision==m->body_revision);
       handle_event(h,fixture(h,OPENROUTER_DELTA,L" second"));
       handle_event(h,fixture(h,OPENROUTER_DELTA,L" part"));
@@ -876,23 +885,23 @@ int main(void) {
        stream then resumes appending into that turn's own viewport. */
     begin_regenerate(h);
     click_row(h,second);
-    CHECK(h->transcript.turns[second].reason_live);
+    CHECK(h->transcript.records[second].reason_live);
     handle_event(h,fixture(h,OPENROUTER_REASONING,L"first"));
     handle_event(h,fixture(h,OPENROUTER_REASONING,L" second"));
     { wchar_t shown[128]; reasoning_text(h,second,shown,128);
       CHECK(!wcscmp(shown,L"first second")); }
     click_row(h,second);                     /* collapse mid-stream */
-    CHECK(!h->transcript.turns[second].reason_live);
+    CHECK(!h->transcript.records[second].reason_live);
     handle_event(h,fixture(h,OPENROUTER_REASONING,L" hidden"));
     click_row(h,second);                     /* reopen */
-    CHECK(h->transcript.turns[second].reason_live);
+    CHECK(h->transcript.records[second].reason_live);
     { wchar_t shown[128]; reasoning_text(h,second,shown,128);
       CHECK(!wcscmp(shown,L"first second hidden")); }
     handle_event(h,fixture(h,OPENROUTER_REASONING,L" live"));
     { wchar_t shown[128]; reasoning_text(h,second,shown,128);
       CHECK(!wcscmp(shown,L"first second hidden live")); }
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"answer after reasoning"));
-    CHECK(h->transcript.turns[second].reason_live);  /* answer start keeps it */
+    CHECK(h->transcript.records[second].reason_live);  /* answer start keeps it */
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
     /* ---- Long transcript: bounded renders and reader state ---- */
     /* A maximum-length transcript must not realize additional controls when it
@@ -919,7 +928,7 @@ int main(void) {
     render_transcript(h);
     CHECK(child_controls(h->view,false)==realized);  /* rerender adds none */
     int older=1;                                     /* unchanged historical turn */
-    { HWND body=h->transcript.turns[older].body.window;
+    { HWND body=body_window(h,older);
       CHECK(body);
       SendMessageW(body,EM_SETSEL,1,5); }
     begin_regenerate(h);
@@ -947,7 +956,7 @@ int main(void) {
     CHECK(h->transcript.view_scroll==scroll);        /* completion did not follow */
     /* The historical turn was neither rewritten nor deselected by the stream,
        the flush or the terminal render. */
-    { HWND body=h->transcript.turns[older].body.window;
+    { HWND body=body_window(h,older);
       CHARRANGE sel; memset(&sel,0,sizeof sel);
       SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
       CHECK(sel.cpMin==1 && sel.cpMax==5);
@@ -956,6 +965,217 @@ int main(void) {
     printf("long transcript: %d controls (%d visible), full render %.1f ms, "
         "scheduled flush to visible %.1f ms\n",
         realized,visible,render_ms,flush_ms);
+    /* ---- Records, slots: rebind, debt survival, protection, P-CAP ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int ra=add_turn(chat,L"rebind question a",L"Alpha answer",NULL,-1);
+        int rb=add_turn(chat,L"rebind question b",L"Beta answer",NULL,-1);
+        render_transcript(h);
+        Transcript *tr=&h->transcript;
+        CHECK(tr->slot_capacity==CHAT_MAX_MESSAGES);      /* retain-all */
+        CHECK(tr->records[ra].slot>=0 && tr->records[rb].slot>=0 &&
+            tr->records[ra].slot!=tr->records[rb].slot);
+        /* Retain-all P-CAP checkpoint: the required capacity is computed
+           every render, recorded, and can never exceed the pool. */
+        CHECK(tr->policy_needed>0 && tr->policy_needed<=tr->slot_capacity);
+        /* An unfocused live selection is decision-time debt: protected. */
+        CHECK(!transcript_record_debt(tr,ra));
+        SendMessageW(body_window(h,ra),EM_SETSEL,0,4);
+        CHECK(transcript_record_debt(tr,ra));
+        CHECK(tr->policy_needed<=tr->slot_capacity);
+        SendMessageW(body_window(h,ra),EM_SETSEL,0,0);
+        CHECK(!transcript_record_debt(tr,ra));
+
+        /* Debt survives an unrealized interval AND a fresh binding
+           incarnation: defer a body rewrite behind a live selection, unbind
+           the record, and the pending write must remain; rebinding assigns
+           a new binding generation, so the acquired surfaces' selection is
+           cleared and the preserved debt applies in the same pass. */
+        SendMessageW(body_window(h,rb),EM_SETSEL,0,4);
+        CHECK(chat_message_set_text(
+            &chat->conversations[chat->active].messages[rb],
+            L"Beta answer edited"));
+        render_transcript(h);
+        CHECK(tr->records[rb].body_pending);
+        CHECK(tr->records[rb].body_revision!=
+            chat->conversations[chat->active].messages[rb].body_revision);
+        { int old=tr->records[rb].slot;
+          tr->slots[old].record=-1;          /* dormant unrealized state */
+          tr->records[rb].slot=-1; }
+        CHECK(transcript_surface(tr,rb,TRANSCRIPT_BODY)==NULL);
+        { TranscriptFeed feed=transcript_feed(h);
+          transcript_apply_pending(tr,&feed); }   /* must not clear debt */
+        CHECK(tr->records[rb].body_pending);
+        render_transcript(h);   /* rebind: fresh generation, same slot number */
+        CHECK(tr->records[rb].slot>=0);
+        CHECK(tr->records[rb].rendered_generation==
+            tr->slots[tr->records[rb].slot].generation);
+        CHECK(!tr->records[rb].body_pending);  /* debt applied to the new
+                                                  incarnation */
+        CHECK(tr->records[rb].body_revision==
+            chat->conversations[chat->active].messages[rb].body_revision);
+        { wchar_t shown[256]; body_text(h,rb,shown,256);
+          CHECK(wcsstr(shown,L"Beta answer edited")!=NULL); }
+        CHECK(tr->policy_needed<=tr->slot_capacity);
+
+        /* A debt-bearing record rebinding to a DIFFERENT slot preserves and
+           applies its debt on the newly bound surfaces. The pool here is
+           fully bound (the long transcript's retain-all bindings persist
+           across conversation switches), so the rebind target is another
+           live record's slot, exchanged so the bijection survives; each
+           acquired association is fresh, as ensure_slot would make it. */
+        {
+            int rc=add_turn(chat,L"debt question",L"Delta answer",NULL,-1);
+            render_transcript(h);
+            int old=tr->records[rc].slot;
+            int neighbor=rc-1, other=tr->records[neighbor].slot;
+            CHECK(old>=0 && other>=0 && other!=old);
+            SendMessageW(body_window(h,rc),EM_SETSEL,0,4);
+            CHECK(chat_message_set_text(
+                &chat->conversations[chat->active].messages[rc],
+                L"Delta answer edited"));
+            render_transcript(h);
+            CHECK(tr->records[rc].body_pending);
+            tr->slots[other].record=rc; tr->records[rc].slot=other;
+            tr->slots[other].generation=++tr->clock;
+            tr->slots[old].record=neighbor; tr->records[neighbor].slot=old;
+            tr->slots[old].generation=++tr->clock;
+            render_transcript(h);
+            CHECK(tr->records[rc].slot==other);
+            CHECK(!tr->records[rc].body_pending);
+            CHECK(tr->records[rc].body_revision==
+                chat->conversations[chat->active].messages[rc].body_revision);
+            { wchar_t shown[256]; body_text(h,rc,shown,256);
+              CHECK(wcsstr(shown,L"Delta answer edited")!=NULL); }
+        }
+
+        /* A record rebound onto surfaces that rendered another record must
+           never accept its cached identity as fresh: the slot's stale
+           selection is cleared first and every applicable surface is
+           completely rewritten. */
+        { int sa=tr->records[ra].slot, sb=tr->records[rb].slot;
+          CHECK(sa>=0 && sb>=0 && sa!=sb);
+          SendMessageW(body_window(h,rb),EM_SETSEL,1,5);
+          /* Exchange the bindings, preserving the bijection; each acquired
+             association is fresh, as ensure_slot would make it. Record ra
+             now points at surfaces still holding Beta's content. */
+          tr->records[ra].slot=sb; tr->slots[sb].record=ra;
+          tr->slots[sb].generation=++tr->clock;
+          tr->records[rb].slot=sa; tr->slots[sa].record=rb;
+          tr->slots[sa].generation=++tr->clock;
+          wchar_t stale[256]; body_text(h,ra,stale,256);
+          CHECK(wcsstr(stale,L"Beta answer")!=NULL);   /* the hazard */
+          render_transcript(h);
+          wchar_t shown[256]; body_text(h,ra,shown,256);
+          CHECK(wcsstr(shown,L"Alpha answer")!=NULL);
+          CHECK(wcsstr(shown,L"Beta answer")==NULL);
+          CHARRANGE sel; memset(&sel,0,sizeof sel);
+          SendMessageW(body_window(h,ra),EM_EXGETSEL,0,(LPARAM)&sel);
+          /* The stale selection is gone: the range is collapsed (the
+             rewrite leaves the caret at the text end, never a live range). */
+          CHECK(sel.cpMin==sel.cpMax);
+          CHECK(!rich_text_has_selection(
+              transcript_surface(tr,ra,TRANSCRIPT_BODY)));
+          body_text(h,rb,shown,256);
+          CHECK(wcsstr(shown,L"Beta answer edited")!=NULL); }
+
+        /* catch_up refuses stale conversation/message identity: debt that
+           outlives its message is dropped, the selection is cleared, the
+           cached identity invalidated, and the old content is not
+           rewritten; the next render performs the replacement. */
+        SendMessageW(body_window(h,rb),EM_SETSEL,0,4);
+        CHECK(chat_message_set_text(
+            &chat->conversations[chat->active].messages[rb],
+            L"Beta rewritten"));
+        render_transcript(h);
+        CHECK(tr->records[rb].body_pending);
+        tr->records[rb].message+=1;          /* simulated identity drift */
+        { TranscriptFeed feed=transcript_feed(h);
+          transcript_apply_pending(tr,&feed); }
+        CHECK(!tr->records[rb].body_pending);
+        CHECK(!tr->records[rb].rendered_valid);
+        { CHARRANGE sel; memset(&sel,0,sizeof sel);
+          SendMessageW(body_window(h,rb),EM_EXGETSEL,0,(LPARAM)&sel);
+          CHECK(sel.cpMin==0 && sel.cpMax==0); }
+        { wchar_t shown[256]; body_text(h,rb,shown,256);
+          CHECK(wcsstr(shown,L"Beta answer")!=NULL);
+          CHECK(wcsstr(shown,L"Beta rewritten")==NULL); }
+        render_transcript(h);
+        CHECK(tr->records[rb].rendered_valid);
+        CHECK(tr->records[rb].message==
+            chat->conversations[chat->active].messages[rb].id);
+        { wchar_t shown[256]; body_text(h,rb,shown,256);
+          CHECK(wcsstr(shown,L"Beta rewritten")!=NULL); }
+        CHECK(tr->records[rb].body_revision==
+            chat->conversations[chat->active].messages[rb].body_revision);
+        CHECK(tr->policy_needed<=tr->slot_capacity);
+    }
+    /* ---- Binding generations: ABA slot-number reuse ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int ra=add_turn(chat,L"aba question a",L"Alpha answer",NULL,-1);
+        int rb=add_turn(chat,L"aba question b",L"Beta answer",NULL,-1);
+        render_transcript(h);
+        Transcript *tr=&h->transcript;
+        int sa=tr->records[ra].slot, sb=tr->records[rb].slot;
+        CHECK(sa>=0 && sb>=0 && sa!=sb);
+        CHECK(tr->records[ra].rendered_slot==sa);
+        CHECK(tr->records[ra].rendered_generation==
+            tr->slots[sa].generation);
+        /* A carries a deferred body write, then unbinds; its cached
+           certification still names slot sa with its old generation. */
+        SendMessageW(body_window(h,ra),EM_SETSEL,0,4);
+        CHECK(chat_message_set_text(
+            &chat->conversations[chat->active].messages[ra],
+            L"Alpha answer edited"));
+        render_transcript(h);
+        CHECK(tr->records[ra].body_pending);
+        tr->slots[sa].record=-1; tr->records[ra].slot=-1;
+        CHECK(tr->records[ra].rendered_slot==sa);   /* cache untouched */
+        /* B takes the SAME numerical slot as a new binding association (a
+           fresh generation, exactly what ensure_slot assigns) and rewrites
+           the surfaces. Only B prepares, so A's cache survives. */
+        tr->slots[sb].record=-1; tr->records[rb].slot=-1;
+        tr->slots[sa].record=rb; tr->records[rb].slot=sa;
+        tr->slots[sa].generation=++tr->clock;
+        CHECK(tr->slots[sa].generation!=
+            tr->records[ra].rendered_generation);
+        refresh_turn(h,rb);
+        { RichTextControl *body=transcript_surface(tr,rb,TRANSCRIPT_BODY);
+          CHECK(body);
+          wchar_t shown[256]; rich_text_get_text(body,shown,256);
+          CHECK(wcsstr(shown,L"Beta answer")!=NULL); }   /* B rewrote it */
+        /* A returns to the SAME numerical slot while still unprepared: the
+           slot number agrees with A's rendered_slot and only the generation
+           differs -- a slot-number-only check would wrongly certify. */
+        tr->slots[sa].record=-1; tr->records[rb].slot=-1;
+        tr->slots[sa].record=ra; tr->records[ra].slot=sa;
+        CHECK(tr->records[ra].rendered_slot==sa);
+        CHECK(tr->records[ra].rendered_generation!=
+            tr->slots[sa].generation);
+        /* catch_up: matching message identity, stale binding generation --
+           it must touch no surface and preserve the debt for prepare. */
+        { TranscriptFeed feed=transcript_feed(h);
+          transcript_apply_pending(tr,&feed); }
+        CHECK(tr->records[ra].body_pending);
+        { RichTextControl *body=transcript_surface(tr,ra,TRANSCRIPT_BODY);
+          CHECK(body);
+          wchar_t shown[256]; rich_text_get_text(body,shown,256);
+          CHECK(wcsstr(shown,L"Beta answer")!=NULL);      /* untouched */
+          CHECK(wcsstr(shown,L"Alpha answer edited")==NULL); }
+        /* The render rebinds the incarnation: complete rewrite of B's
+           surfaces, and the preserved debt applies. */
+        render_transcript(h);
+        { wchar_t shown[256]; body_text(h,ra,shown,256);
+          CHECK(wcsstr(shown,L"Alpha answer edited")!=NULL);
+          CHECK(wcsstr(shown,L"Beta answer")==NULL); }
+        CHECK(!tr->records[ra].body_pending);
+        CHECK(tr->records[ra].body_revision==
+            chat->conversations[chat->active].messages[ra].body_revision);
+        CHECK(tr->records[ra].rendered_generation==
+            tr->slots[sa].generation);
+        CHECK(tr->policy_needed<=tr->slot_capacity);
+    }
     /* ---- Stable conversation search and jump ---- */
     command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
     int search_a=chat->active;
@@ -981,8 +1201,8 @@ int main(void) {
     CHECK(h->search_results.count==2 && h->search_has_selection &&
         h->search_selected==0);
     CHECK(chat->conversations[chat->active].id==search_a_id &&
-        h->transcript.turns[search_body].message==search_body_id);
-    { TranscriptTurn *turn=&h->transcript.turns[search_body];
+        h->transcript.records[search_body].message==search_body_id);
+    { TranscriptRecord *turn=&h->transcript.records[search_body];
       int expected=turn->height>h->transcript.view_page ? turn->y :
           turn->y+turn->height-h->transcript.view_page;
       if (expected<0) expected=0;
@@ -994,11 +1214,11 @@ int main(void) {
           h->transcript.view_scroll==revealed); }
     /* Jumping again to an active body only reveals it. A deliberately stale
        unrelated rendered identity proves no full transcript pass occurred. */
-    { bool valid=h->transcript.turns[0].rendered_valid;
-      h->transcript.turns[0].rendered_valid=false;
+    { bool valid=h->transcript.records[0].rendered_valid;
+      h->transcript.records[0].rendered_valid=false;
       CHECK(jump_search_result(h,0));
-      CHECK(!h->transcript.turns[0].rendered_valid);
-      h->transcript.turns[0].rendered_valid=valid; }
+      CHECK(!h->transcript.records[0].rendered_valid);
+      h->transcript.records[0].rendered_valid=valid; }
     CHECK(wcsstr(ui_node(ui,h->chat_ui.search_status)->text,
         L"Assistant message")!=NULL);
     /* F3 resolves the next result by stable ids, switches conversations, opens
@@ -1006,21 +1226,21 @@ int main(void) {
     CHECK(surface_key(h,VK_F3,false,false,true));
     CHECK(h->search_selected==1 &&
         chat->conversations[chat->active].id==search_b_id &&
-        h->transcript.turns[search_reason].message==search_reason_id &&
+        h->transcript.records[search_reason].message==search_reason_id &&
         chat->conversations[chat->active].messages[search_reason].reasoning_open &&
-        h->transcript.turns[search_reason].reason_live);
-    { TranscriptTurn *turn=&h->transcript.turns[search_reason];
+        h->transcript.records[search_reason].reason_live);
+    { TranscriptRecord *turn=&h->transcript.records[search_reason];
       CHECK(turn->y+turn->height>h->transcript.view_scroll &&
           turn->y<h->transcript.view_scroll+h->transcript.view_page); }
     /* Opening reasoning in the active conversation refreshes only its turn. */
     chat->conversations[search_b].messages[search_reason].reasoning_open=false;
     refresh_turn(h,search_reason);
-    { bool valid=h->transcript.turns[0].rendered_valid;
-      h->transcript.turns[0].rendered_valid=false;
+    { bool valid=h->transcript.records[0].rendered_valid;
+      h->transcript.records[0].rendered_valid=false;
       CHECK(jump_search_result(h,1));
-      CHECK(h->transcript.turns[search_reason].reason_live &&
-          !h->transcript.turns[0].rendered_valid);
-      h->transcript.turns[0].rendered_valid=valid; }
+      CHECK(h->transcript.records[search_reason].reason_live &&
+          !h->transcript.records[0].rendered_valid);
+      h->transcript.records[0].rendered_valid=valid; }
     CHECK(surface_key(h,VK_F3,true,false,true));
     CHECK(h->search_selected==0 &&
         chat->conversations[chat->active].id==search_a_id);
@@ -1065,7 +1285,7 @@ int main(void) {
     command(h,CHAT_COMMAND_SELECT,conv_a);
     begin_regenerate(h);
     click_row(h,1);
-    CHECK(h->transcript.turns[1].reason_live);
+    CHECK(h->transcript.records[1].reason_live);
     handle_event(h,fixture(h,OPENROUTER_REASONING,L"A live"));
     command(h,CHAT_COMMAND_SELECT,conv_b);
     CHECK(chat->active==conv_b);
@@ -1090,12 +1310,12 @@ int main(void) {
     int cvb=chat->active;
     add_turn(chat,L"prompt",L"Distinct answer",NULL,-1);
     render_transcript(h);
-    CHECK(h->transcript.turn_count==2);
-    SendMessageW(h->transcript.turns[1].body.window,EM_SETSEL,0,4);
+    CHECK(h->transcript.record_count==2);
+    SendMessageW(body_window(h,1),EM_SETSEL,0,4);
     command(h,CHAT_COMMAND_SELECT,0);
-    CHECK(h->transcript.turn_count==2);
+    CHECK(h->transcript.record_count==2);
     { CHARRANGE sel; memset(&sel,0,sizeof sel);
-      HWND body=h->transcript.turns[1].body.window;
+      HWND body=body_window(h,1);
       CHECK(body);
       SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
       CHECK(sel.cpMin==0 && sel.cpMax==0);   /* nothing carried over */
@@ -1403,9 +1623,21 @@ int main(void) {
     DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
     ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer);
-    DeleteObject(h->background); rich_text_library_close();
+    DeleteObject(h->background);
+    /* Slot-pool lifetime order: the container and EVERY child surface are
+       already destroyed (WM_CLOSE completed full teardown above), so each
+       surface's GWLP_USERDATA is unreachable before the pool is freed. The
+       dispose call lives in this ownership layer, never in the window
+       procedure. */
+    for (int s = 0; s < h->transcript.slot_capacity; s++)
+        for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++)
+            CHECK(!IsWindow(h->transcript.slots[s].surface[k].window));
+    CHECK(!IsWindow(window) && !IsWindow(h->view));
+    transcript_dispose(&h->transcript);
+    CHECK(!h->transcript.slots && !h->transcript.slot_capacity);
+    rich_text_library_close();
     chat_dispose(loaded); chat_dispose(chat);
     free(loaded); free(chat); free(ui); free(h); CoUninitialize();
-    puts("Hidden host: failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, stable-id conversation search with body/reasoning jumps and stale-result rejection, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen, background snapshot writer (snapshot isolation across an in-flight write, per-handoff completion accounting, failure latch and retry, pre-request flush gate refusing to send, latest-wins coalescing, shutdown drain) passed");
+    puts("Hidden host: failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, stable-id conversation search with body/reasoning jumps and stale-result rejection, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen, background snapshot writer (snapshot isolation across an in-flight write, per-handoff completion accounting, failure latch and retry, pre-request flush gate refusing to send, latest-wins coalescing, shutdown drain), slot-pool lifetime ordering with disposal after full child teardown, record/slot rebind that never accepts foreign surfaces as fresh with debt surviving an unrealized interval and unfocused selections protected, binding-generation certification covering ABA slot-number reuse with a stale-generation catch_up refusal and cross-slot debt application, catch_up stale-identity refusal, and the retain-all P-CAP checkpoint passed");
     return 0;
 }

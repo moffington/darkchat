@@ -8,7 +8,7 @@ rem MinGW-w64 / w64devkit; no third-party dependencies.
 if not exist build mkdir build
 windres app.rc -O coff -o build\chat_app.res
 if errorlevel 1 exit /b 1
-gcc -std=c17 -municode -mwindows -Wall -Wextra -Wpedantic -Werror -O2 chat_main.c chat\chat.c chat\context.c chat\search.c chat\chat_ui.c chat\transcript_win32.c chat\chat_host_win32.c chat\storage.c chat\saver.c chat\actions_win32.c chat\rich_text_win32.c chat\markdown.c chat\json.c chat\sse.c chat\openrouter_winhttp.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c build\chat_app.res -o build\darkchat.exe -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp -ladvapi32
+gcc -std=c17 -municode -mwindows -Wall -Wextra -Wpedantic -Werror -O2 chat_main.c chat\chat.c chat\context.c chat\search.c chat\chat_ui.c chat\transcript_policy.c chat\transcript_win32.c chat\chat_host_win32.c chat\storage.c chat\saver.c chat\actions_win32.c chat\rich_text_win32.c chat\markdown.c chat\json.c chat\sse.c chat\openrouter_winhttp.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c build\chat_app.res -o build\darkchat.exe -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp -ladvapi32
 if errorlevel 1 exit /b 1
 echo Built build\darkchat.exe
 if /i "%~1"=="run" start "" "build\darkchat.exe"
@@ -33,6 +33,10 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_markdown_win.exe
     if errorlevel 1 exit /b 1
+    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_transcript_slots.c chat\transcript_win32.c chat\transcript_policy.c chat\rich_text_win32.c chat\chat.c chat\markdown.c chat\json.c -o build\test_transcript_slots.exe -lgdi32 -lshell32 -luser32 -Wl,--wrap=calloc
+    if errorlevel 1 exit /b 1
+    build\test_transcript_slots.exe
+    if errorlevel 1 exit /b 1
     gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat_ui.c chat\chat.c chat\chat_ui.c ui\ui.c ui\theme.c ui\paint.c -o build\test_chat_ui.exe
     if errorlevel 1 exit /b 1
     build\test_chat_ui.exe
@@ -44,6 +48,10 @@ if /i "%~1"=="test" (
     gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_context.c chat\context.c chat\chat.c chat\json.c -o build\test_context.exe
     if errorlevel 1 exit /b 1
     build\test_context.exe
+    if errorlevel 1 exit /b 1
+    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_transcript_policy.c chat\transcript_policy.c -o build\test_transcript_policy.exe
+    if errorlevel 1 exit /b 1
+    build\test_transcript_policy.exe
     if errorlevel 1 exit /b 1
     gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_search.c chat\search.c chat\chat.c -o build\test_search.exe -Wl,--wrap=malloc -Wl,--wrap=realloc
     if errorlevel 1 exit /b 1
@@ -57,7 +65,7 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_openrouter.exe
     if errorlevel 1 exit /b 1
-    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat_host.c chat\context.c chat\search.c chat\chat.c chat\chat_ui.c chat\transcript_win32.c chat\storage.c chat\saver.c chat\actions_win32.c chat\rich_text_win32.c chat\markdown.c chat\json.c chat\sse.c chat\openrouter_winhttp.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c -o build\test_chat_host.exe -Wl,--wrap=openrouter_request -Wl,--wrap=storage_save -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp
+    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat_host.c chat\context.c chat\search.c chat\chat.c chat\chat_ui.c chat\transcript_policy.c chat\transcript_win32.c chat\storage.c chat\saver.c chat\actions_win32.c chat\rich_text_win32.c chat\markdown.c chat\json.c chat\sse.c chat\openrouter_winhttp.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c -o build\test_chat_host.exe -Wl,--wrap=openrouter_request -Wl,--wrap=storage_save -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp
     if errorlevel 1 exit /b 1
     build\test_chat_host.exe
     if errorlevel 1 exit /b 1

@@ -168,8 +168,9 @@ static bool turn_row_click(void *user, RichTextControl *control, int line,
     bool down) {
     ChatHost *host = (ChatHost *)user;
     Chat *chat = host->config.chat;
-    for (int i = 0; i < host->transcript.turn_count; i++) {
-        if (&host->transcript.turns[i].head != control) continue;
+    for (int i = 0; i < host->transcript.record_count; i++) {
+        if (transcript_surface(&host->transcript, i, TRANSCRIPT_HEAD) !=
+            control) continue;
         if (line != 1) return false;          /* only the reasoning row line */
         if (!down &&
             chat->active >= 0 && chat->active < chat->conversation_count &&
@@ -614,13 +615,14 @@ static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
     mark_dirty(host);
     if (incoming>0 && host->request_conversation==host->config.chat->active) {
         int index=host->request_message;
-        TranscriptTurn *turn=&host->transcript.turns[index];
+        TranscriptRecord *rec=&host->transcript.records[index];
         if (first) {
             /* Rebuilds this turn's body and refreshes/removes its row. */
             refresh_turn(host,index);
             host->transcript.body_render_tick=GetTickCount64();
             cancel_body_flush(host);
-        } else if (turn->body_live && turn->body.window) {
+        } else if (rec->body_live &&
+            transcript_surface(&host->transcript,index,TRANSCRIPT_BODY)) {
             /* Deltas accumulate in the message; the visible body is rebuilt
                as Markdown at most once per interval, so a token storm never
                reparses per token. A delta inside the window only marks the
@@ -656,12 +658,13 @@ static void append_reasoning_delta(ChatHost *host, OpenRouterEvent *event) {
             return;
         }
         if (host->request_conversation==host->config.chat->active) {
-            TranscriptTurn *turn=&host->transcript.turns[host->request_message];
-            if (m->reasoning_open && !turn->reason_live)
+            TranscriptRecord *rec=&host->transcript.records[host->request_message];
+            RichTextControl *reason=transcript_surface(&host->transcript,
+                host->request_message,TRANSCRIPT_REASON);
+            if (m->reasoning_open && !rec->reason_live)
                 refresh_turn(host,host->request_message);
-            else if (m->reasoning_open && turn->reason_live &&
-                turn->reasoning.window)
-                rich_text_append_reasoning(&turn->reasoning,event->text);
+            else if (m->reasoning_open && rec->reason_live && reason)
+                rich_text_append_reasoning(reason,event->text);
         }
     }
     m->modified_at=chat_now();
@@ -875,14 +878,15 @@ static void action(ChatHost *host, int code) {
     }
     if (code==ACTION_SELECTION) {
         /* Copy whichever turn viewport/block currently holds a selection. */
-        for (int i=0;i<host->transcript.turn_count;i++) {
-            RichTextControl *controls[3]={&host->transcript.turns[i].head,
-                &host->transcript.turns[i].body,
-                &host->transcript.turns[i].reasoning};
+        const TranscriptSurface surfaces[3]={TRANSCRIPT_HEAD,TRANSCRIPT_BODY,
+            TRANSCRIPT_REASON};
+        for (int i=0;i<host->transcript.record_count;i++) {
             for (int k=0;k<3;k++) {
-                if (!controls[k]->window) continue;
-                if (rich_text_has_selection(controls[k])) {
-                    SendMessageW(controls[k]->window,WM_COPY,0,0);
+                RichTextControl *control=transcript_surface(&host->transcript,
+                    i,surfaces[k]);
+                if (!control) continue;
+                if (rich_text_has_selection(control)) {
+                    SendMessageW(control->window,WM_COPY,0,0);
                     set_status(host,L"Transcript selection copied");
                     return;
                 }
@@ -1037,12 +1041,10 @@ static bool owns_child_window(ChatHost *host, HWND window) {
     if (window == host->composer.window || window == host->field.window ||
         window == host->search.window)
         return true;
-    for (int i = 0; i < CHAT_MAX_MESSAGES; i++) {
-        TranscriptTurn *turn = &host->transcript.turns[i];
-        if (window == turn->head.window || window == turn->body.window ||
-            window == turn->reasoning.window || window == turn->meta.window)
-            return true;
-    }
+    for (int s = 0; s < host->transcript.slot_capacity; s++)
+        for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++)
+            if (host->transcript.slots[s].surface[k].window == window)
+                return true;
     return false;
 }
 
@@ -1103,8 +1105,10 @@ static LRESULT CALLBACK view_proc(HWND window, UINT message, WPARAM w,
         HWND child = ChildWindowFromPointEx(window, point,
             CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
         if (child && child != window && delta) {
-            for (int i = 0; i < host->transcript.turn_count; i++) {
-                if (host->transcript.turns[i].reasoning.window != child)
+            for (int i = 0; i < host->transcript.record_count; i++) {
+                RichTextControl *reason = transcript_surface(&host->transcript,
+                    i, TRANSCRIPT_REASON);
+                if (!reason || reason->window != child)
                     continue;
                 SCROLLINFO inner;
                 memset(&inner, 0, sizeof inner);
@@ -1192,8 +1196,8 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
             0, 0, 10, 10, window, NULL, GetModuleHandleW(NULL), host);
         if (!host->view) return -1;
-        transcript_create(&host->transcript, host->view, &host->rich_theme,
-            host->dpi);
+        if (!transcript_create(&host->transcript, host->view,
+                &host->rich_theme, host->dpi)) return -1;
         host->transcript.callbacks.surface_key = surface_key;
         host->transcript.callbacks.row_click = turn_row_click;
         host->transcript.callbacks.user = host;
@@ -1561,6 +1565,13 @@ cleanup:
     config->ui->measure_user = NULL;
     renderer_dispose(&host->renderer);
     if (host->background) DeleteObject(host->background);
+    /* Lifetime order: the window hierarchy is fully destroyed by now (the
+       message loop exits from WM_DESTROY, and a failed WM_CREATE reaches
+       cleanup only after CreateWindowExW completed its teardown), so every
+       child surface is gone and each surface's GWLP_USERDATA is no longer
+       reachable. Only now may the slot pool be freed; never dispose from the
+       parent window procedure, whose WM_DESTROY runs while children exist. */
+    transcript_dispose(&host->transcript);
     rich_text_library_close();
     storage_close(&host->storage);
     free(host);

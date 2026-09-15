@@ -2,9 +2,9 @@
 
 Build with `chat.bat`; run `build\darkchat.exe`. `chat.bat test` is the single
 reproducible verification command: it builds the app, runs all chat tests
-(including the transcript-isolation, scheduled-flush, message-growth-boundary and
-request-context regressions), then runs the unchanged DarkUI toolkit suite via
-`build.bat test`.
+(including the transcript-isolation, scheduled-flush, message-growth-boundary,
+request-context, realization-policy and slot-pool regressions), then runs the
+unchanged DarkUI toolkit suite via `build.bat test`.
 No third-party dependencies are required (C17, MinGW-w64, Win32).
 
 ## Daily use
@@ -67,17 +67,25 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
 
 ## Transcript rendering
 
-The transcript is a native scroll container over per-turn layout records. Each
-turn owns its Rich Edit surfaces: an assistant turn can own a
-header/reasoning-row block, an optional reasoning viewport, an answer block and a
-terminal metadata footer; other turns use a single block. A turn's surfaces are
-created once when first needed and then retained for the life of the process:
-the container measures, positions and shows only the turns that intersect the
-viewport and hides the rest, so off-screen controls are not destroyed or
-recycled. An unchanged historical surface keeps its selection because its
-content write is skipped; an expanded reasoning viewport keeps its own inner
-scroll position because it is never rebuilt while live. The container owns the
-one outer scroll for the whole
+The transcript is a native scroll container over per-message layout records.
+Each record (`chat/transcript_win32.h`, `TranscriptRecord`) is lightweight and
+owns no windows: it stores the message identity its surfaces were built from
+by value (conversation id, message id, per-message revision and answer-text
+revision), the deferred-write debt per surface, the visibility state, the
+geometry and a measurement stamp, plus the index of the realized slot bound
+to it. A realized slot (`TranscriptSlot`) owns the native Rich Edit surfaces:
+an assistant turn can own a header/reasoning-row block, an optional reasoning
+viewport, an answer block and a terminal metadata footer; other turns use a
+single block. A slot binds at most one record and a record at most one slot;
+control ids are slot-based (`100 + slot*4 + surface`), which with this pass's
+permanent binding produces the same numeric ids as before. A turn's surfaces
+are created once when first needed and then retained for the life of the
+process: the container measures, positions and shows only the turns that
+intersect the viewport and hides the rest, so off-screen controls are not
+destroyed or recycled. An unchanged historical surface keeps its selection
+because its content write is skipped; an expanded reasoning viewport keeps
+its own inner scroll position because it is never rebuilt while live. The
+container owns the one outer scroll for the whole
 conversation and repositions each realized turn's controls as it scrolls. An
 expanded reasoning viewport is inset, tinted
 (`UI_PANEL`) and separated by an 8 DIP gap above and below, so it reads as its
@@ -86,6 +94,32 @@ wheel scrolls the viewport first and chains to the transcript at its ends, so
 the target never depends on which control holds focus. No control is shared
 between turns, so historical assistant turns keep their own reasoning affordance
 and content across switching, reload and restart.
+
+Which records must be realized, how many slots are required, and which slot a
+new binding takes are pure policy decisions (`chat/transcript_policy.h` — no
+Win32, no allocation): geometry-derived visibility (edge-touch excluded,
+unmeasured heights read at the minimum height), class protection (streaming,
+focused, selection/debt-bearing, expanded reasoning), rank/index realization
+ordering with the LRU stamp reserved for eviction only, required capacity
+|visible ∪ protected| plus two spare slots, fail-closed victim selection, and
+exact message-instance identity validation. The pool in this pass is
+retained-everything (capacity equals the 512-message bound): every record
+binds one slot on first use and keeps it for the process lifetime, so
+realization behavior is unchanged. Each render computes the required capacity
+at a single documented checkpoint under the stated precondition — capacity
+must cover |visible ∪ protected|; under it, realizing all visible and
+protected records first and evicting only from the remainder leaves no
+visible turn unrealized (a fail-closed `-1` from victim selection never
+avoids a gap, it only refuses to evict a must-keep record, and the correct
+answer is raising capacity). Protecting every expanded reasoning viewport can
+legitimately grow the protected set to the whole record count; that cost is
+accepted here and must be bounded deliberately by any future capacity-
+governed pass. The pool is created with exactly one allocation and its
+exhaustion fails startup closed; `transcript_dispose` frees it exactly once
+per host from the ownership layer, after the window hierarchy is fully
+destroyed — never from the parent window procedure, whose `WM_DESTROY` runs
+while child surfaces still exist and reference the pool through their
+`GWLP_USERDATA`.
 
 Update bookkeeping lives in its own module (`chat/transcript_win32.c`). Every
 turn records the message identity its surfaces were built from — conversation
@@ -428,7 +462,21 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   with the same failure, and never invokes the client, then drives a real
   successful send with omitted history and checks exactly which messages the
   client received, that the dropped text was not among them, and that the
-  omission count stays in the generating status sweep.
+   omission count stays in the generating status sweep.
+- Transcript realization policy (pure module): geometry-derived visibility
+  with edge-touch exclusion and unmeasured heights read at the minimum
+  height, class protection (streaming, focused, debt, expanded), rank/index
+  realization ordering with the LRU stamp excluded from it, exact
+  |visible ∪ protected| required capacity with clamped spare slots and
+  page/count monotonicity, fail-closed victim selection that returns the
+  slot position (never the represented record index) with LRU ranking among
+  evictable slots only, and exact message-instance identity validation.
+- Transcript slot-pool lifecycle (wrapped calloc): dispose on zeroed state,
+  deterministic pool-allocation failure that leaves every record unbound and
+  the transcript safe, successful creation with exactly one allocation and a
+  fully unbound pool, idempotent double dispose, accessor refusals after
+  disposal, and — in the hidden-HWND host suite — disposal only after the
+  window hierarchy is fully destroyed.
 - Storage round trips with stable message ids, Unicode/drafts/settings/metadata,
   exclusive writer lock, corrupt/torn snapshots, backup/temp recovery, denied
   temp writes and failed atomic replacement, and protection against unknown
