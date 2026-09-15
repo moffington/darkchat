@@ -8,12 +8,13 @@
 /* The persisted conversation still has a broad corruption/resource guard.
    Individual model outputs have no smaller fixed-size truncation point. */
 #define STORAGE_LIMIT (128u * 1024u * 1024u)
-/* Format 2 raised the conversation bound to 128; the record layout is
-   unchanged from format 1. Both versions decode, so old snapshots migrate on
-   their next save; version 3+ is unsupported and fails the load closed
-   (writes disabled, backup never tried) so an old build can never silently
-   restore stale state over a newer primary. See docs/CHAT.md. */
-#define FORMAT_VERSION 2
+/* Format 2 raised the conversation bound to 128; format 3 raised the
+   per-conversation message bound from 64 to 512. The record layout is
+   unchanged across all three versions. Formats 1-3 all decode, so old
+   snapshots migrate on their next save; version 4+ is unsupported and fails
+   the load closed (writes disabled, backup never tried) so an older build can
+   never silently restore stale state over a newer primary. See docs/CHAT.md. */
+#define FORMAT_VERSION 3
 #define FORMAT_VERSION_MIN 1
 
 static uint32_t checksum(const char *s, size_t n) {
@@ -62,7 +63,11 @@ static bool integer(const char *s, const char *name, double min, double max, dou
 /* True when `id` already belongs to a decoded conversation id or to any live
    message decoded before the record now being decoded (conversation `ci`,
    messages before index `j`). Message and conversation identities share the
-   one persisted counter, so a collision in either direction is corruption. */
+   one persisted counter, so a collision in either direction is corruption.
+   Known scaling risk, deliberate until a future pass justifies an index: the
+   scan is quadratic in persisted messages, so a fully loaded maximum store
+   (128 x 512 = 65,536 messages) can require roughly 2.15 billion prior-id
+   comparisons. */
 static bool message_id_taken(const Chat *chat, uint64_t id, int ci, size_t j) {
     for (int i = 0; i <= ci; i++) {
         const ChatConversation *c = &chat->conversations[i];
@@ -92,7 +97,11 @@ static bool conversation_id_taken(const Chat *chat, uint64_t id, int ci) {
 
 static bool encode(const Chat *chat, JsonBuf *b) {
     json_buf_init(b, 8192);
-    raw(b, "{\"type\":\"settings\",\"version\":2");
+    /* The emitted version is always the canonical format definition. */
+    char header[64];
+    snprintf(header, sizeof header,
+        "{\"type\":\"settings\",\"version\":%d", FORMAT_VERSION);
+    raw(b, header);
     NUM(b, chat, next_id);
     NUM(b, chat, active);
     NUM(b, chat, conversation_count);

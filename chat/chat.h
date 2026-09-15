@@ -10,11 +10,12 @@
 #include <stdint.h>
 
 /* Up to 128 conversations; snapshot format 2 raised this bound from 16.
-   The storage decode accepts both format versions and enforces this bound;
-   older 16-conversation builds reject format 2 as unsupported. The
-   downgrade contract is documented in docs/CHAT.md. */
+   Snapshot format 3 raised the per-conversation message bound from 64 to 512.
+   The storage decode accepts formats 1-3 and enforces these bounds; older
+   builds reject newer snapshots as unsupported. The downgrade contract is
+   documented in docs/CHAT.md. */
 #define CHAT_MAX_CONVERSATIONS 128
-#define CHAT_MAX_MESSAGES 64
+#define CHAT_MAX_MESSAGES 512
 /* Every persisted identity (conversation and stable message ids) comes from
    one counter that the storage format encodes as an exact double. This is the
    shared allocation ceiling: exhausting it is treated as corruption on load

@@ -330,17 +330,17 @@ int main(void) {
     CHECK(!storage_save(&store,chat)); /* preserve unreadable files */
     storage_close(&store);
     /* An unknown newer version must not be overwritten by an older backup:
-       the load fails closed with writes disabled and no backup is tried. */
+        the load fails closed with writes disabled and no backup is tried. */
     CHECK(storage_open(&store,dir));
     CHECK(storage_save(&store,chat)); CHECK(storage_save(&store,chat));
     CHECK(read_file_bytes(store.path,&first_bytes,&first_size));
-    CHECK(strstr(first_bytes,"\"version\":2")); /* this build writes format 2 */
+    CHECK(strstr(first_bytes,"\"version\":3")); /* this build writes format 3 */
     free(first_bytes);
     FILE *future=_wfopen(store.path,L"r+b"); CHECK(future);
     char header[64]={0}; CHECK(fread(header,1,63,future)==63);
-    char *version=strstr(header,"\"version\":2"); CHECK(version);
+    char *version=strstr(header,"\"version\":3"); CHECK(version);
     CHECK(fseek(future,(long)(version-header)+(long)strlen("\"version\":"),SEEK_SET)==0);
-    fputc('3',future); fclose(future);
+    fputc('4',future); fclose(future);
     CHECK(storage_load(&store,loaded)==-1 && !store.writable);
     storage_close(&store);
     DeleteFileW(store.path); DeleteFileW(store.backup); DeleteFileW(store.temporary);
@@ -403,6 +403,147 @@ int main(void) {
         chat_dispose(fixture); free(fixture);
         storage_close(&fstore);
         remove_store(&fstore,fdir);
+    }
+    /* Format 2 snapshots (the previous build's output, 64-message era) still
+        decode: the record layout is unchanged, so a format 2 file loads and
+        migrates to format 3 on its next save. */
+    {
+        wchar_t v2dir[256]; swprintf(v2dir,256,L"build\\storage-v2-%lu",GetCurrentProcessId());
+        ChatStorage v2store;
+        char settings[384], conversation[256], a[512], b[512];
+        CHECK(storage_open(&v2store,v2dir));
+        snprintf(settings, sizeof settings,
+            "{\"type\":\"settings\",\"version\":2,\"next_id\":100,\"active\":0,"
+            "\"conversation_count\":1,\"model_history_count\":0,\"window_x\":0,"
+            "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+            "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+            "\"system_prompt\":\"\"}");
+        snprintf(conversation, sizeof conversation,
+            "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
+            "\"modified_at\":1000,\"renamed\":0,\"message_count\":2,"
+            "\"title\":\"c\",\"draft\":\"\"}");
+        msg_raw(a,sizeof a,"\"id\":2,"); msg_raw(b,sizeof b,"\"id\":3,");
+        const char *v2_lines[4]={settings,conversation,a,b};
+        CHECK(write_snapshot(v2store.path,v2_lines,4));
+        CHECK(storage_load(&v2store,loaded)==1 && !v2store.recovered);
+        CHECK(loaded->conversations[0].messages[0].id==2);
+        CHECK(loaded->conversations[0].messages[1].id==3);
+        CHECK(loaded->next_id==100);
+        /* The next save emits the canonical format 3 and reloads. */
+        CHECK(storage_save(&v2store,loaded));
+        char *v2_saved=NULL; size_t v2_saved_size=0;
+        CHECK(read_file_bytes(v2store.path,&v2_saved,&v2_saved_size));
+        CHECK(v2_saved && strstr(v2_saved,"\"version\":3"));
+        free(v2_saved);
+        CHECK(storage_load(&v2store,loaded)==1 && !v2store.recovered);
+        CHECK(loaded->conversations[0].messages[0].id==2);
+        storage_close(&v2store);
+        remove_store(&v2store,v2dir);
+    }
+    /* Format 3 at the shipped bound: a conversation with exactly 512 messages
+        (including a promoted overflow answer and reasoning) saves, reloads
+        and round-trips with count, order, stable ids and content intact. */
+    {
+        wchar_t f3dir[256]; swprintf(f3dir,256,L"build\\storage-full512-%lu",GetCurrentProcessId());
+        ChatStorage f3store;
+        Chat *full=calloc(1,sizeof *full), *back=calloc(1,sizeof *back);
+        CHECK(full && back);
+        chat_init(full); chat_clear(full);
+        ChatConversation *c=&full->conversations[0];
+        wchar_t text[64];
+        for (int i=0;i<CHAT_MAX_MESSAGES;i++) {
+            swprintf(text,64,L"message %d",i);
+            CHECK(chat_append(full,i%2 ? CHAT_ROLE_ASSISTANT : CHAT_ROLE_USER,text)>=0);
+            if (i%2) c->messages[i].generation.state=CHAT_GENERATION_COMPLETE;
+        }
+        CHECK(c->message_count==CHAT_MAX_MESSAGES &&
+            c->message_capacity==CHAT_MAX_MESSAGES);
+        wchar_t *big=(wchar_t *)malloc(70001*sizeof *big);
+        CHECK(big);
+        for (int i=0;i<70000;i++) big[i]=L'a';
+        big[70000]=0;
+        CHECK(chat_message_set_text(&c->messages[511],big));
+        CHECK(chat_message_set_reasoning(&c->messages[511],L"why"));
+        free(big);
+        c->messages[511].generation.reasoning_ms=42.0;
+        uint64_t first_id=c->messages[0].id, last_id=c->messages[511].id;
+        CHECK(storage_open(&f3store,f3dir));
+        CHECK(storage_save(&f3store,full));
+        char *saved3=NULL; size_t saved3_size=0;
+        CHECK(read_file_bytes(f3store.path,&saved3,&saved3_size));
+        CHECK(saved3 && strstr(saved3,"\"version\":3"));   /* format 3 on disk */
+        free(saved3);
+        CHECK(storage_load(&f3store,back)==1 && !f3store.recovered);
+        CHECK(same_chat(back,full));   /* logical equality, field for field */
+        CHECK(back->conversations[0].message_count==CHAT_MAX_MESSAGES);
+        CHECK(back->conversations[0].messages[0].id==first_id);
+        CHECK(back->conversations[0].messages[511].id==last_id);
+        CHECK(!wcscmp(chat_message_text(&back->conversations[0].messages[0]),
+            L"message 0"));
+        CHECK(!wcscmp(chat_message_text(&back->conversations[0].messages[510]),
+            L"message 510"));
+        CHECK(wcslen(chat_message_text(&back->conversations[0].messages[511]))
+            ==70000);
+        CHECK(!wcscmp(chat_message_reasoning(&back->conversations[0].messages[511]),
+            L"why"));
+        chat_dispose(full); free(full);
+        chat_dispose(back); free(back);
+        storage_close(&f3store);
+        remove_store(&f3store,f3dir);
+    }
+    /* A checksummed format 3 snapshot declaring 513 messages exceeds the
+        persisted bound. With no recovery copies the load fails closed:
+        transactionally (the destination keeps its previous content), writes
+        stay disabled, and every snapshot file is preserved byte for byte. */
+    {
+        wchar_t odir[256]; swprintf(odir,256,L"build\\storage-over512-%lu",GetCurrentProcessId());
+        ChatStorage ostore;
+        Chat *before=calloc(1,sizeof *before);
+        CHECK(before);
+        chat_init(before); chat_clear(before);
+        CHECK(chat_append(before,CHAT_ROLE_USER,L"baseline")>=0);
+        Chat *dest=chat_snapshot(before);   /* owned deep copy as the baseline */
+        CHECK(dest);
+        CHECK(storage_open(&ostore,odir));
+        char settings[384], conversation[256];
+        snprintf(settings, sizeof settings,
+            "{\"type\":\"settings\",\"version\":3,\"next_id\":515,\"active\":0,"
+            "\"conversation_count\":1,\"model_history_count\":0,\"window_x\":0,"
+            "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+            "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+            "\"system_prompt\":\"\"}");
+        snprintf(conversation, sizeof conversation,
+            "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
+            "\"modified_at\":1000,\"renamed\":0,\"message_count\":513,"
+            "\"title\":\"c\",\"draft\":\"\"}");
+        char (*msgs)[400]=malloc((CHAT_MAX_MESSAGES+1)*sizeof *msgs);
+        const char **lines=malloc((CHAT_MAX_MESSAGES+3)*sizeof *lines);
+        CHECK(msgs && lines);
+        lines[0]=settings; lines[1]=conversation;
+        for (int i=0;i<CHAT_MAX_MESSAGES+1;i++) {
+            char id_field[24];
+            snprintf(id_field,sizeof id_field,"\"id\":%d,",i+2);
+            msg_raw(msgs[i],sizeof *msgs,id_field);
+            lines[2+i]=msgs[i];
+        }
+        CHECK(write_snapshot(ostore.path,lines,(size_t)CHAT_MAX_MESSAGES+3));
+        free(msgs); free(lines);
+        DeleteFileW(ostore.backup); DeleteFileW(ostore.temporary);   /* no recovery copies */
+        char *sent=NULL; size_t sent_size=0;
+        CHECK(read_file_bytes(ostore.path,&sent,&sent_size));
+        CHECK(storage_load(&ostore,dest)==-1);
+        CHECK(!ostore.writable);
+        CHECK(!storage_save(&ostore,dest));   /* writes disabled, files untouched */
+        CHECK(same_chat(dest,before));        /* destination unchanged */
+        char *again=NULL; size_t again_size=0;
+        CHECK(read_file_bytes(ostore.path,&again,&again_size));
+        CHECK(again_size==sent_size && !memcmp(again,sent,sent_size));
+        CHECK(storage_load(&ostore,dest)==-1 && !ostore.writable);  /* stays failed closed */
+        free(sent); free(again);
+        chat_dispose(before); free(before);
+        chat_dispose(dest); free(dest);
+        storage_close(&ostore);
+        remove_store(&ostore,odir);
     }
     /* Decode failures under the poisoned allocator. The destination passed to
        storage_load is the object under test: a successful recovery must give
@@ -680,10 +821,11 @@ int main(void) {
         }
     }
 
-    /* Stage 6: format 2 carries the 128-conversation bound. A hand-built
-       version 1 snapshot declaring 128 conversations loads and round-trips
-       as format 2; a declared 129th is ordinary corruption (rejected, no
-       fallback, writes disabled, files preserved). */
+    /* Stage 6: format 2 raised the conversation bound to 128 and format 3
+        raised the message bound to 512. A hand-built version 1 snapshot
+        declaring 128 conversations loads and round-trips as format 3; a
+        declared 129th is ordinary corruption (rejected, no fallback, writes
+        disabled, files preserved). */
     {
         wchar_t cdir[256]; swprintf(cdir,256,L"build\\storage-cap-%lu",GetCurrentProcessId());
         ChatStorage cstore;

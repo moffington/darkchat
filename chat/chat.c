@@ -534,10 +534,11 @@ bool chat_history_message(const ChatMessage *m) {
 /* Replacement/send preflight: validates the requested mode, then computes the
    final post-operation live message count — counting only messages the
    completed operation keeps or adds, never messages it will trim or replace —
-   and reserves capacity for that shape before any destructive mutation. A
-   conversation at the 64-message cap can still replace its tail (final count
-   unchanged), and an operation that would genuinely need 65 live messages
-   fails before anything is modified. After the reservation succeeds, no
+    and reserves capacity for that shape before any destructive mutation. A
+    conversation at the message cap can still replace its tail (final count
+    unchanged), and an operation that would genuinely need more live messages
+    than the cap allows fails before anything is modified. After the
+    reservation succeeds, no
    remaining step can fail on array growth, so a -1 return from this function
    always leaves the conversation exactly as it was. */
 int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt) {

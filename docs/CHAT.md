@@ -183,7 +183,7 @@ Prior response variants are deliberately not retained; there are no branches.
 
 Each conversation holds its messages in one dynamic array, not a fixed inline
 array: `messages`, `message_count` and `message_capacity` with the invariants
-`0 <= message_count <= message_capacity <= CHAT_MAX_MESSAGES` (still 64) and
+`0 <= message_count <= message_capacity <= CHAT_MAX_MESSAGES` (512) and
 `messages == NULL` exactly when capacity is zero. A never-used conversation
 allocates nothing; the first message reserves a small initial budget and
 growth doubles up to the hard cap transactionally (a failed growth leaves the
@@ -196,7 +196,7 @@ timestamps, count, title) only after every fallible step succeeded, so a
 failed append consumes no ID and changes nothing observable. Replacement
 operations preflight the **final post-operation message shape** and reserve
 capacity for it before trimming or editing, so replacing the tail works even
-at the 64-message cap and an allocation failure can never leave a partially
+at the message cap and an allocation failure can never leave a partially
 applied send/retry/regenerate/edit. Because growth reallocs, element pointers
 are not stable across appending operations: identity is re-derived from the
 conversation plus index or stable message ID (the transcript already stores
@@ -216,7 +216,7 @@ product limit and never share the message residue. A fixed-residue
 amplification gate in the chat suite bounds the structural copies a save can
 hold simultaneously — live state plus the saver's pending, in-flight and
 constructing snapshots, the latter built before the displaced pending copy is
-disposed — at the planned 128-conversation × 512-message target to ≤ 1 GiB of
+disposed — at the 128-conversation × 512-message bound to ≤ 1 GiB of
 fixed struct/slack cost. The gate deliberately excludes heap-backed live text,
 which is proportional to actual content, so it is not a complete worst-case
 memory bound.
@@ -266,9 +266,9 @@ into the transcript or the payload.
 
 ## Persistence format and recovery
 
-`%LOCALAPPDATA%\DarkChat\state.jsonl` is a UTF-8, version-2 JSONL snapshot:
+`%LOCALAPPDATA%\DarkChat\state.jsonl` is a UTF-8, version-3 JSONL snapshot:
 
-1. A settings record with `type: "settings"`, `version: 2`, selected conversation
+1. A settings record with `type: "settings"`, `version: 3`, selected conversation
    index, next ID counter, record counts, model/system prompt and geometry.
 2. Zero or more `type: "model"` history records.
 3. For each conversation, a `type: "conversation"` record followed by its declared
@@ -276,17 +276,17 @@ into the transcript or the payload.
 4. A `type: "commit"` record containing the 32-bit FNV-1a checksum of every byte
    before that record (including LF separators).
 
-Format 2 differs from format 1 only in the accepted bounds: it raised the
-conversation limit from 16 to 128. The record layout is unchanged, and this
-build decodes both versions, so an old snapshot migrates to format 2 on its
-next save. **Downgrade contract:** an older (version-1) build that encounters a
-format 2 or newer file treats it as an unsupported version and stops
-immediately — it does not fall back to `state.bak.jsonl`, never overwrites the
-newer primary with a stale backup, and disables writes until a build that
-understands the format runs again. (A count above an older build's bound in an
-otherwise current file would be indistinguishable from corruption, which is
-why the bound change required the version bump rather than relying on the
-count check.)
+The record layout is identical in formats 1–3. Format 2 raised the conversation
+limit from 16 to 128, and format 3 raised the per-conversation message limit
+from 64 to 512. This build decodes all three versions, so an old snapshot
+migrates to format 3 on its next save. **Downgrade contract:** an older
+(version-1 or version-2) build that encounters a format 3 or newer file treats
+it as an unsupported version and stops immediately — it does not fall back to
+`state.bak.jsonl`, never overwrites the newer primary with a stale backup, and
+disables writes until a build that understands the format runs again. (A count
+above an older build's bound in an otherwise current file would be
+indistinguishable from corruption, which is why each bound change required a
+version bump rather than relying on the count check.)
 
 Conversation IDs are numeric, store-local, monotonically allocated from a
 persisted counter initially seeded from the current time. They do not depend on
@@ -389,7 +389,7 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
 - Lifecycle state transitions, retry/regenerate/edit replacement, full-capacity
   retries, stable IDs after rename/clear/delete, and bounded model history.
 - Dynamic message storage: transactional doubling growth bounded by the
-  64-message cap, allocation invariants after every operation, append and
+   512-message cap, allocation invariants after every operation, append and
   send/retry/regenerate/edit-resend transactional failure semantics under
   injected allocation failures, retained-capacity trims, a version 1 fixture
   from the previous build loading and migrating to deterministic nonzero ids
@@ -403,9 +403,9 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   promotion to overflow, shrinking back inline and re-promotion, repeated
   streamed heap growth, transactional failure of the inline-to-overflow
   transitions (inline content, length and revision untouched), snapshot
-  capacities of promoted text/reasoning, and the fixed-residue amplification
-  gate (4 structural copies × 128 conversations × the planned 512-message
-  target ≤ 1 GiB of fixed struct/slack cost; heap-backed live text excluded).
+   capacities of promoted text/reasoning, and the fixed-residue amplification
+   gate (4 structural copies × 128 conversations × the 512-message bound
+   ≤ 1 GiB of fixed struct/slack cost; heap-backed live text excluded).
 - Stable message identities: new-format id roundtrips, old/new mixed records in
   both orders, deterministic migration in file order, and rejection of every
   invalid id form (zero, negative, fractional, string, above the stored
@@ -474,8 +474,9 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   selections are preserved, destructive reformatting of selected text is
   deferred until the selection clears, and switching conversations replaces
   content immediately. Streaming reasoning appends preserve a selection.
-- A maximum-length 64-message transcript renders with a bounded, stable number of
-  native controls: re-rendering and streaming one turn realize no additional
+- A maximum-length 512-message transcript renders with a bounded, stable
+  number of native controls: re-rendering and streaming one turn realize no
+  additional
   controls, off-screen controls are hidden rather than recycled, and an unchanged
   historical turn keeps its content and selection through the stream, the
   scheduled flush and the terminal render. Render time and control counts are
@@ -510,7 +511,7 @@ isolated directories under `build`, not the user's conversation store. Search
 matching, snippets, invalidation, stable-ID resolution and hidden-host jumps are
 also covered.
 
-Remaining limits: 128 conversations, 64 messages each, and a 128 MB on-disk
+Remaining limits: 128 conversations, 512 messages each, and a 128 MB on-disk
 snapshot bound. The conversation cap fails closed — the New button disables and
 creation is refused; nothing is ever evicted. Snapshots declaring more than 128
 conversations are rejected as corruption (the backup recovery path still
@@ -519,8 +520,11 @@ UTF-16 code units; each message keeps only a 255-unit inline residue, and
 message text past it (streamed replies) lives in heap-backed overflow storage,
 so its ceiling is memory and the snapshot bound rather than a fixed count. A
 fixed-residue amplification gate bounds the structural copies a save can hold
-(live, pending, in-flight and constructing) at the planned 512-message target
-to ≤ 1 GiB of fixed struct/slack cost; heap-backed live text is excluded. A
+(live, pending, in-flight and constructing) at the 512-message bound
+to ≤ 1 GiB of fixed struct/slack cost; heap-backed live text is excluded.
+Load-time global identity validation is a deliberate quadratic scan (there is
+no index): a maximum store of 65,536 messages can require roughly 2.15 billion
+prior-id comparisons, a known scaling risk deferred to a future pass. A
 request sends at most the 64 KiB context budget and drops the oldest eligible
 history beyond it; the budget is a local proxy for prompt size, not a model's
 context window. Responses past the local limit stop as Interrupted without

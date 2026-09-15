@@ -94,25 +94,22 @@ int main(void) {
     check(chat_remaining(chat) == CHAT_MAX_MESSAGES - 1, "remaining after welcome");
 
     /* Fixed-residue amplification gate. This bounds the fixed struct/slack
-       cost that every structural copy carries: live state plus the saver's
-       pending and in-flight snapshots plus the snapshot under construction,
-       which is built before the displaced pending copy is disposed (4
-       simultaneous structural copies). It deliberately excludes heap-backed
-       live text, which is proportional to actual content, so it is not a
-       complete worst-case memory bound. The per-conversation message target
-       (512) is the planned next-pass limit; CHAT_MAX_MESSAGES is still the
-       shipped bound in this pass, and the gate must already hold at the
-       planned target so the limit bump cannot invalidate it later. */
+        cost that every structural copy carries: live state plus the saver's
+        pending and in-flight snapshots plus the snapshot under construction,
+        which is built before the displaced pending copy is disposed (4
+        simultaneous structural copies). It deliberately excludes heap-backed
+        live text, which is proportional to actual content, so it is not a
+        complete worst-case memory bound. CHAT_MAX_MESSAGES is the shipped
+        bound (512, raised by format 3), and the gate must hold at it. */
     {
-        const size_t planned_messages = 512;
         const size_t structural_copies = 4;
         size_t amplified = structural_copies *
-            (sizeof(Chat) + (size_t)CHAT_MAX_CONVERSATIONS * planned_messages *
+            (sizeof(Chat) + (size_t)CHAT_MAX_CONVERSATIONS * CHAT_MAX_MESSAGES *
                 sizeof(ChatMessage));
         printf("amplification gate: sizeof(Chat)=%zu sizeof(ChatMessage)=%zu "
             "peak=%zu bytes\n", sizeof(Chat), sizeof(ChatMessage), amplified);
         check(amplified <= ((size_t)1 << 30),
-            "fixed structural amplification stays within 1 GiB at the planned limits");
+            "fixed structural amplification stays within 1 GiB at the shipped limits");
     }
 
     ChatGeneration generation;
@@ -506,15 +503,27 @@ int main(void) {
         while (c->message_count < 32)
             chat_append(growth, CHAT_ROLE_ASSISTANT, L"filler");
         chat_append(growth, CHAT_ROLE_USER, L"thirty-third");
-        check(c->message_capacity == 64, "growth doubles to the hard cap");
+        check(c->message_capacity == 64, "growth doubles to 64");
         while (c->message_count < 64)
             chat_append(growth, CHAT_ROLE_ASSISTANT, L"filler");
-        check(c->message_count == 64 && c->message_capacity == 64,
-            "the conversation holds exactly 64 messages at full capacity");
+        chat_append(growth, CHAT_ROLE_USER, L"sixty-fifth");
+        check(c->message_capacity == 128, "growth doubles past 64");
+        while (c->message_count < 128)
+            chat_append(growth, CHAT_ROLE_ASSISTANT, L"filler");
+        chat_append(growth, CHAT_ROLE_USER, L"129th");
+        check(c->message_capacity == 256, "growth doubles past 128");
+        while (c->message_count < 256)
+            chat_append(growth, CHAT_ROLE_ASSISTANT, L"filler");
+        chat_append(growth, CHAT_ROLE_USER, L"257th");
+        check(c->message_capacity == 512, "growth doubles to the hard cap");
+        while (c->message_count < 512)
+            chat_append(growth, CHAT_ROLE_ASSISTANT, L"filler");
+        check(c->message_count == 512 && c->message_capacity == 512,
+            "the conversation holds exactly 512 messages at full capacity");
         check(chat_append(growth, CHAT_ROLE_USER, L"overflow") < 0,
             "no message is accepted beyond the cap");
-        check(c->message_count == 64 && c->message_capacity == 64,
-            "capacity never rises above 64");
+        check(c->message_count == 512 && c->message_capacity == 512,
+            "capacity never rises above 512");
         check_invariants(growth);
         chat_dispose(growth); free(growth);
     }
@@ -727,58 +736,58 @@ int main(void) {
         free(prompt); free(limit);
     }
 
-    /* Replacement at the 64-message cap: the final live count is within the
-       cap, so no growth is needed and the operation succeeds. */
+    /* Replacement at the 512-message cap: the final live count is within the
+        cap, so no growth is needed and the operation succeeds. */
     {
         Chat *cap = (Chat *)calloc(1, sizeof *cap);
         if (!cap) return 2;
         chat_init(cap); chat_clear(cap);
         const ChatConversation *c = chat_active(cap);
-        fill_conversation(cap, 32, 0);     /* 64 messages, capacity 64 */
-        check(c->message_count == 64 && c->message_capacity == 64,
+        fill_conversation(cap, 256, 0);    /* 512 messages, capacity 512 */
+        check(c->message_count == 512 && c->message_capacity == 512,
             "boundary conversation is at the hard cap");
         /* Retry replaces the last response, so the old one must be in a
-           failed terminal state first. */
-        c->messages[63].generation.state = CHAT_GENERATION_FAILED;
-        check(chat_begin_response(cap, CHAT_RETRY, NULL) == 63,
-            "retry succeeds at the 64-message cap");
-        check(c->message_count == 64 && c->message_capacity == 64,
+            failed terminal state first. */
+        c->messages[511].generation.state = CHAT_GENERATION_FAILED;
+        check(chat_begin_response(cap, CHAT_RETRY, NULL) == 511,
+            "retry succeeds at the 512-message cap");
+        check(c->message_count == 512 && c->message_capacity == 512,
             "retry at the cap needs no growth");
-        check(!wcscmp(c->messages[62].text, L"question") &&
-            !c->messages[63].text[0],
+        check(!wcscmp(c->messages[510].text, L"question") &&
+            !c->messages[511].text[0],
             "retry at the cap replaced the last response");
-        c->messages[63].generation.state = CHAT_GENERATION_COMPLETE;
-        check(chat_begin_response(cap, CHAT_REGENERATE, NULL) == 63,
-            "regenerate succeeds at the 64-message cap");
-        c->messages[63].generation.state = CHAT_GENERATION_COMPLETE;
+        c->messages[511].generation.state = CHAT_GENERATION_COMPLETE;
+        check(chat_begin_response(cap, CHAT_REGENERATE, NULL) == 511,
+            "regenerate succeeds at the 512-message cap");
+        c->messages[511].generation.state = CHAT_GENERATION_COMPLETE;
         check(chat_begin_response(cap, CHAT_EDIT_RESEND, L"edited at the cap")
-            == 63, "edit-resend succeeds at the 64-message cap");
-        check(!wcscmp(c->messages[62].text, L"edited at the cap") &&
-            c->message_count == 64,
+            == 511, "edit-resend succeeds at the 512-message cap");
+        check(!wcscmp(c->messages[510].text, L"edited at the cap") &&
+            c->message_count == 512,
             "edit-resend at the cap replaced the user text");
         check_invariants(cap);
 
-        /* A final shape of 65 is rejected without mutation. */
+        /* A final shape of 513 is rejected without mutation. */
         chat_clear(cap);
-        fill_conversation(cap, 31, 1);     /* 63 messages, last is user */
+        fill_conversation(cap, 255, 1);    /* 511 messages, last is user */
         uint64_t next_id = cap->next_id;
         int64_t modified_at = c->modified_at;
         check(chat_begin_response(cap, CHAT_SEND, L"one too many") < 0,
-            "a send whose final shape needs 65 live messages is rejected");
-        check(c->message_count == 63 && cap->next_id == next_id &&
+            "a send whose final shape needs 513 live messages is rejected");
+        check(c->message_count == 511 && cap->next_id == next_id &&
             c->modified_at == modified_at,
             "a rejected send mutates nothing");
-        chat_append(cap, CHAT_ROLE_USER, L"sixty-fourth");  /* user at 63 */
+        chat_append(cap, CHAT_ROLE_USER, L"512th");  /* user at 511 */
         next_id = cap->next_id; modified_at = c->modified_at;
         check(chat_begin_response(cap, CHAT_REGENERATE, NULL) < 0,
-            "a regenerate whose final shape needs 65 live messages is rejected");
+            "a regenerate whose final shape needs 513 live messages is rejected");
         check(chat_begin_response(cap, CHAT_RETRY, NULL) < 0,
-            "a retry whose final shape needs 65 live messages is rejected");
+            "a retry whose final shape needs 513 live messages is rejected");
         check(chat_begin_response(cap, CHAT_EDIT_RESEND, L"no") < 0,
-            "an edit-resend whose final shape needs 65 live messages is rejected");
-        check(c->message_count == 64 && cap->next_id == next_id &&
+            "an edit-resend whose final shape needs 513 live messages is rejected");
+        check(c->message_count == 512 && cap->next_id == next_id &&
             c->modified_at == modified_at,
-            "rejected 65-message replacements mutate nothing");
+            "rejected 513-message replacements mutate nothing");
         check_invariants(cap);
         chat_dispose(cap); free(cap);
     }

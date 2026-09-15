@@ -901,7 +901,7 @@ int main(void) {
        recorded, not asserted as a wall-clock threshold. */
     command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
     { wchar_t answer[1024];
-      for (int t=0;t<32;t++) {
+      for (int t=0;t<256;t++) {
           size_t n=0;
           for (int line=0;line<12;line++)
               n+=swprintf(answer+n,1024-n,L"Line %d of answer %d.\n",line,t);
