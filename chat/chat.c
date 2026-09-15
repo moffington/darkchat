@@ -85,7 +85,7 @@ bool chat_message_set_text(ChatMessage *m,const wchar_t *text) {
     if (!text) text=L"";
     const wchar_t *previous=message_value(m->text,m->text_overflow);
     bool unchanged=!wcscmp(previous,text);
-    if (!set_message_value(m->text,CHAT_MESSAGE_TEXT,&m->text_overflow,
+    if (!set_message_value(m->text,CHAT_MESSAGE_INLINE,&m->text_overflow,
         &m->text_length,&m->text_capacity,text)) return false;
     /* Bump only when the stored value actually changes. The text-only
        revision lets the transcript keep the rendered body when only metadata
@@ -98,7 +98,7 @@ bool chat_message_set_reasoning(ChatMessage *m,const wchar_t *text) {
     if (!text) text=L"";
     const wchar_t *previous=message_value(m->reasoning,m->reasoning_overflow);
     bool unchanged=!wcscmp(previous,text);
-    if (!set_message_value(m->reasoning,CHAT_REASONING_TEXT,
+    if (!set_message_value(m->reasoning,CHAT_REASONING_INLINE,
         &m->reasoning_overflow,&m->reasoning_length,&m->reasoning_capacity,
         text)) return false;
     if (!unchanged) ++m->revision;
@@ -106,14 +106,14 @@ bool chat_message_set_reasoning(ChatMessage *m,const wchar_t *text) {
 }
 bool chat_message_append_text(ChatMessage *m,const wchar_t *text) {
     if (!m) return false;
-    if (!append_message_value(m->text,CHAT_MESSAGE_TEXT,&m->text_overflow,
+    if (!append_message_value(m->text,CHAT_MESSAGE_INLINE,&m->text_overflow,
         &m->text_length,&m->text_capacity,text)) return false;
     if (text && text[0]) { ++m->revision; ++m->body_revision; }
     return true;
 }
 bool chat_message_append_reasoning(ChatMessage *m,const wchar_t *text) {
     if (!m) return false;
-    if (!append_message_value(m->reasoning,CHAT_REASONING_TEXT,
+    if (!append_message_value(m->reasoning,CHAT_REASONING_INLINE,
         &m->reasoning_overflow,&m->reasoning_length,&m->reasoning_capacity,
         text)) return false;
     if (text && text[0]) ++m->revision;
@@ -550,7 +550,7 @@ int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt) {
     int user = chat_latest_user(c);
     size_t final_count;
     if (mode == CHAT_SEND) {
-        if (!prompt || !prompt[0] || wcslen(prompt) >= CHAT_MESSAGE_TEXT ||
+        if (!prompt || !prompt[0] || wcslen(prompt) >= CHAT_COMPOSER_TEXT ||
             c->message_count + 2 > CHAT_MAX_MESSAGES) return -1;
         final_count = c->message_count + 2; /* user turn + fresh response */
     } else {
@@ -560,7 +560,7 @@ int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt) {
             c->messages[user + 1].generation.state != CHAT_GENERATION_CANCELLED &&
             c->messages[user + 1].generation.state != CHAT_GENERATION_INTERRUPTED) return -1;
         if (mode == CHAT_EDIT_RESEND) {
-            if (!prompt || !prompt[0] || wcslen(prompt) >= CHAT_MESSAGE_TEXT) return -1;
+            if (!prompt || !prompt[0] || wcslen(prompt) >= CHAT_COMPOSER_TEXT) return -1;
         }
         /* Kept messages [0..user] plus the fresh response. */
         final_count = (size_t)user + 2;

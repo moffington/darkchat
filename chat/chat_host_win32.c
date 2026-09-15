@@ -455,8 +455,8 @@ static void focus_surface(ChatHost *host, bool reverse) {
 }
 static void capture_settings(ChatHost *host) {
     Chat *chat=host->config.chat;
-    wchar_t draft[CHAT_MESSAGE_TEXT];
-    rich_text_get_text(&host->composer,draft,CHAT_MESSAGE_TEXT);
+    wchar_t draft[CHAT_COMPOSER_TEXT];
+    rich_text_get_text(&host->composer,draft,CHAT_COMPOSER_TEXT);
     ChatConversation *c=&chat->conversations[chat->active];
     if (!host->editing && wcscmp(draft,c->draft)) {
         wcscpy(c->draft,draft); c->modified_at=chat_now(); mark_dirty(host);
@@ -582,8 +582,8 @@ static void perform_send(ChatHost *host) {
         }
         return;
     }
-    wchar_t prompt[CHAT_MESSAGE_TEXT];
-    rich_text_get_text(&host->composer,prompt,CHAT_MESSAGE_TEXT);
+    wchar_t prompt[CHAT_COMPOSER_TEXT];
+    rich_text_get_text(&host->composer,prompt,CHAT_COMPOSER_TEXT);
     start_response(host,host->editing ? CHAT_EDIT_RESEND : CHAT_SEND,prompt);
 }
 
@@ -923,8 +923,8 @@ static void action(ChatHost *host, int code) {
             chat_ui_request_reveal(&host->chat_ui,
                 chat->conversations[chat->active].id);
     } else if (code==ACTION_SYSTEM) {
-        wchar_t prompt[CHAT_MESSAGE_TEXT]; wcscpy(prompt,chat->system_prompt);
-        if (chat_edit_dialog(host->window,L"System prompt (applies to future requests)",prompt,CHAT_MESSAGE_TEXT,true))
+        wchar_t prompt[CHAT_COMPOSER_TEXT]; wcscpy(prompt,chat->system_prompt);
+        if (chat_edit_dialog(host->window,L"System prompt (applies to future requests)",prompt,CHAT_COMPOSER_TEXT,true))
             wcscpy(chat->system_prompt,prompt);
     } else if (code==ACTION_SIDEBAR) {
         wchar_t width[16]; swprintf(width,16,L"%d",chat->sidebar_width);

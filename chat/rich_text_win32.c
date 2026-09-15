@@ -223,7 +223,7 @@ bool rich_text_create_composer(RichTextControl *control, HWND parent, int id,
     const RichTextTheme *theme, float dpi) {
     /* Bound input to what the host can read back, so nothing is silently lost. */
     return create_control(control, parent, id, theme, dpi, true, false, true,
-        (long)(CHAT_MESSAGE_TEXT - 1), theme->composer_background, NULL);
+        (long)(CHAT_COMPOSER_TEXT - 1), theme->composer_background, NULL);
 }
 
 bool rich_text_create_field(RichTextControl *control, HWND parent, int id,

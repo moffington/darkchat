@@ -105,7 +105,7 @@ static int add_turn(Chat *chat,const wchar_t *prompt,const wchar_t *answer,
     int index=chat_append(chat,CHAT_ROLE_ASSISTANT,answer);
     ChatMessage *m=&chat->conversations[chat->active].messages[index];
     m->generation.state=CHAT_GENERATION_COMPLETE;
-    if (reasoning) wcscpy(m->reasoning,reasoning);
+    if (reasoning) chat_message_set_reasoning(m,reasoning);
     m->generation.reasoning_ms=reasoning?reasoning_ms:-1;
     chat_message_touch(m);
     return index;
@@ -1111,7 +1111,7 @@ int main(void) {
     rich_text_set_text(&h->composer,L"Edited question"); perform_send(h);
     CHECK(!h->editing && !wcscmp(chat->conversations[0].messages[0].text,L"Edited question"));
     CHECK(chat->conversations[0].message_count==2);
-    wchar_t composer[CHAT_MESSAGE_TEXT]; rich_text_get_text(&h->composer,composer,CHAT_MESSAGE_TEXT);
+    wchar_t composer[CHAT_COMPOSER_TEXT]; rich_text_get_text(&h->composer,composer,CHAT_COMPOSER_TEXT);
     CHECK(!wcscmp(composer,L"Unsent draft"));
     /* ---- Background snapshot writer ---- */
     /* The saver hands off immutable deep snapshots; the live Chat may keep

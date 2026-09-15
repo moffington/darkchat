@@ -20,10 +20,16 @@
    shared allocation ceiling: exhausting it is treated as corruption on load
    and blocks further allocation at runtime. */
 #define CHAT_MAX_ID 9007199254740000ULL
-/* Fixed inline space covers prompts and ordinary replies without allocations.
-   Streamed model output grows onto the heap when it exceeds this size. */
-#define CHAT_MESSAGE_TEXT 16384
-#define CHAT_REASONING_TEXT CHAT_MESSAGE_TEXT
+/* Composer input, per-conversation drafts and the system prompt keep the
+   16,383-code-unit product limit (the composer enforces one less through
+   EM_LIMITTEXT). These buffers are never message storage. */
+#define CHAT_COMPOSER_TEXT 16384
+/* A message keeps only a small inline residue: at most CHAT_MESSAGE_INLINE - 1
+   stored code units plus the terminator. Growth past it promotes to the
+   heap-backed overflow representation below, so the fixed per-message cost
+   stays small and streamed output pays only for the text it actually holds. */
+#define CHAT_MESSAGE_INLINE 256
+#define CHAT_REASONING_INLINE CHAT_MESSAGE_INLINE
 #define CHAT_TITLE_TEXT 64
 #define CHAT_MODEL_TEXT 96
 #define CHAT_STATUS_TEXT 160
@@ -57,12 +63,13 @@ typedef struct { ChatRole role; const wchar_t *text; } ChatRequestMessage;
 
 typedef struct {
     ChatRole role;
-    wchar_t text[CHAT_MESSAGE_TEXT];
+    /* Inline residue; growth past it promotes to text_overflow below. */
+    wchar_t text[CHAT_MESSAGE_INLINE];
     /* Optional streamed model reasoning for this turn; empty when the provider
        supplied none. Never fabricated locally. */
-    wchar_t reasoning[CHAT_REASONING_TEXT];
-    /* Oversized model output is stored here instead of reserving its worst-case
-       size in every message slot. Access through chat_message_* helpers. */
+    wchar_t reasoning[CHAT_REASONING_INLINE];
+    /* Heap-backed promotion of the text/reasoning residue. Access through
+       chat_message_* helpers. */
     wchar_t *text_overflow, *reasoning_overflow;
     size_t text_length, reasoning_length;
     size_t text_capacity, reasoning_capacity;
@@ -87,7 +94,7 @@ typedef struct {
     uint64_t id;
     int64_t created_at, modified_at;
     bool renamed;
-    wchar_t draft[CHAT_MESSAGE_TEXT];
+    wchar_t draft[CHAT_COMPOSER_TEXT];
     /* Dynamic message storage. `messages` points to `message_capacity`
        slots and is NULL exactly when `message_capacity` is 0; the invariants
 
@@ -140,7 +147,7 @@ typedef struct {
     wchar_t status[CHAT_STATUS_TEXT];
     unsigned replies;
     uint64_t next_id;
-    wchar_t system_prompt[CHAT_MESSAGE_TEXT];
+    wchar_t system_prompt[CHAT_COMPOSER_TEXT];
     wchar_t model_history[CHAT_MODEL_HISTORY][CHAT_MODEL_TEXT];
     int model_history_count;
     int window_x, window_y, window_width, window_height, maximized, sidebar_width;

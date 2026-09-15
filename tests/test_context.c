@@ -71,8 +71,9 @@ static const ChatConversation *active(Chat *chat) {
 }
 
 /* Fills a heap text of `units` copies of `fill` (NUL-terminated). Message text
-   is not globally capped: values past CHAT_MESSAGE_TEXT land in overflow
-   storage, which is what these tests exercise. */
+   is not globally capped: values past the small inline residue
+   (CHAT_MESSAGE_INLINE) land in overflow storage, which is what these tests
+   exercise. */
 static wchar_t *long_text(size_t units, wchar_t fill) {
     wchar_t *text = (wchar_t *)malloc((units + 1) * sizeof *text);
     if (!text) return NULL;
@@ -248,8 +249,8 @@ static void test_oversize(void) {
     ChatRequestContext context;
     size_t base = TEST_ENVELOPE + json_encoded_string_size(chat->model);
     /* 3 UTF-8 bytes per code unit, so the indispensable pair outgrows a small
-       budget without any single message being enormous. Text past
-       CHAT_MESSAGE_TEXT (overflow storage) is covered separately. */
+       budget without any single message being enormous. Promoted overflow
+       storage is covered separately. */
     wchar_t *big = long_text(4000, L'\u2014');
     wchar_t *medium = long_text(1000, L'\u2014');
 

@@ -93,6 +93,28 @@ int main(void) {
     check(active && active->message_count == 1, "welcome message present");
     check(chat_remaining(chat) == CHAT_MAX_MESSAGES - 1, "remaining after welcome");
 
+    /* Fixed-residue amplification gate. This bounds the fixed struct/slack
+       cost that every structural copy carries: live state plus the saver's
+       pending and in-flight snapshots plus the snapshot under construction,
+       which is built before the displaced pending copy is disposed (4
+       simultaneous structural copies). It deliberately excludes heap-backed
+       live text, which is proportional to actual content, so it is not a
+       complete worst-case memory bound. The per-conversation message target
+       (512) is the planned next-pass limit; CHAT_MAX_MESSAGES is still the
+       shipped bound in this pass, and the gate must already hold at the
+       planned target so the limit bump cannot invalidate it later. */
+    {
+        const size_t planned_messages = 512;
+        const size_t structural_copies = 4;
+        size_t amplified = structural_copies *
+            (sizeof(Chat) + (size_t)CHAT_MAX_CONVERSATIONS * planned_messages *
+                sizeof(ChatMessage));
+        printf("amplification gate: sizeof(Chat)=%zu sizeof(ChatMessage)=%zu "
+            "peak=%zu bytes\n", sizeof(Chat), sizeof(ChatMessage), amplified);
+        check(amplified <= ((size_t)1 << 30),
+            "fixed structural amplification stays within 1 GiB at the planned limits");
+    }
+
     ChatGeneration generation;
     chat_generation_init(&generation);
     check(generation.reasoning_ms == -1,
@@ -106,8 +128,10 @@ int main(void) {
     check(wcscmp(active->title, L"Explain native text controls") == 0,
         "first user message names the conversation");
 
-    wchar_t reply[CHAT_MESSAGE_TEXT];
-    chat_fake_reply(chat, L"Explain native text controls", reply, CHAT_MESSAGE_TEXT);
+    /* The generated reply is far beyond the message inline residue, so it
+       needs a buffer sized to the fake reply itself, not to the residue. */
+    wchar_t reply[2048];
+    chat_fake_reply(chat, L"Explain native text controls", reply, 2048);
     check(wcslen(reply) > 40, "fake reply has content");
     check(wcsstr(reply, L"```") != NULL, "fake reply contains a code fence");
     check(wcsstr(reply, L"http") != NULL, "fake reply contains a URL");
@@ -138,14 +162,14 @@ int main(void) {
     Chat *spare = (Chat *)calloc(1, sizeof *spare);
     if (!spare) return 2;
     chat_init(spare);
-    wchar_t *big = (wchar_t *)malloc(sizeof(wchar_t) * (CHAT_MESSAGE_TEXT * 2));
+    wchar_t *big = (wchar_t *)malloc(sizeof(wchar_t) * (CHAT_MESSAGE_INLINE * 2));
     if (!big) return 2;
-    for (size_t i = 0; i < CHAT_MESSAGE_TEXT * 2 - 1; i++) big[i] = L'x';
-    big[CHAT_MESSAGE_TEXT * 2 - 1] = 0;
+    for (size_t i = 0; i < CHAT_MESSAGE_INLINE * 2 - 1; i++) big[i] = L'x';
+    big[CHAT_MESSAGE_INLINE * 2 - 1] = 0;
     chat_append(spare, CHAT_ROLE_USER, big);
     const ChatMessage *last =
         &chat_active(spare)->messages[chat_active(spare)->message_count - 1];
-    check(wcslen(chat_message_text(last)) == CHAT_MESSAGE_TEXT * 2 - 1,
+    check(wcslen(chat_message_text(last)) == CHAT_MESSAGE_INLINE * 2 - 1,
         "oversized model text grows beyond inline storage");
     free(big);
 
@@ -169,7 +193,7 @@ int main(void) {
     check(mid_index >= 0 &&
         wcslen(chat_message_text(
             &chat_active(long_chat)->messages[mid_index])) == 12000,
-        "a 12,000-unit response is preserved past the old 4,096 limit");
+        "a 12,000-unit response is preserved in overflow storage");
     free(mid);
     chat_dispose(long_chat); free(long_chat);
 
@@ -179,10 +203,10 @@ int main(void) {
     Chat *grow = (Chat *)calloc(1, sizeof *grow);
     if (!grow) return 2;
     chat_init(grow);
-    wchar_t *fill = (wchar_t *)malloc(sizeof(wchar_t) * (CHAT_MESSAGE_TEXT + 1));
+    wchar_t *fill = (wchar_t *)malloc(sizeof(wchar_t) * (CHAT_MESSAGE_INLINE + 1));
     if (!fill) return 2;
-    for (size_t i = 0; i < CHAT_MESSAGE_TEXT - 1; i++) fill[i] = L'x';
-    fill[CHAT_MESSAGE_TEXT - 1] = 0;
+    for (size_t i = 0; i < CHAT_MESSAGE_INLINE - 1; i++) fill[i] = L'x';
+    fill[CHAT_MESSAGE_INLINE - 1] = 0;
     int stream = chat_append(grow, CHAT_ROLE_ASSISTANT, L"");
     check(stream >= 0, "empty assistant message appended");
     ChatMessage *m = &grow->conversations[grow->active].messages[stream];
@@ -191,11 +215,11 @@ int main(void) {
     check(chat_message_append_text(m, L"!"),
         "appending past the boundary succeeds");
     check(m->text_overflow != NULL, "the crossed answer moved to heap storage");
-    check(wcslen(chat_message_text(m)) == CHAT_MESSAGE_TEXT,
+    check(wcslen(chat_message_text(m)) == CHAT_MESSAGE_INLINE,
         "the crossed answer keeps every character");
     check(chat_message_text(m)[0] == L'x' &&
-        chat_message_text(m)[CHAT_MESSAGE_TEXT - 2] == L'x' &&
-        chat_message_text(m)[CHAT_MESSAGE_TEXT - 1] == L'!',
+        chat_message_text(m)[CHAT_MESSAGE_INLINE - 2] == L'x' &&
+        chat_message_text(m)[CHAT_MESSAGE_INLINE - 1] == L'!',
         "the crossed answer preserves head, seam and tail");
     /* Further growth reuses and doubles the heap buffer without touching the
        inline source again; content must survive every hop, including a
@@ -203,14 +227,14 @@ int main(void) {
     for (int i = 0; i < 3; i++) {
         check(chat_message_append_text(m, fill) &&
             wcslen(chat_message_text(m)) ==
-                CHAT_MESSAGE_TEXT + (size_t)(i + 1) * (CHAT_MESSAGE_TEXT - 1),
+                CHAT_MESSAGE_INLINE + (size_t)(i + 1) * (CHAT_MESSAGE_INLINE - 1),
             "repeated heap growth preserves the streamed answer");
     }
 
     /* The reasoning buffer has the same inline size and grows identically,
        without disturbing the answer stored beside it. */
-    for (size_t i = 0; i < CHAT_MESSAGE_TEXT - 1; i++) fill[i] = L'r';
-    fill[CHAT_MESSAGE_TEXT - 1] = 0;
+    for (size_t i = 0; i < CHAT_MESSAGE_INLINE - 1; i++) fill[i] = L'r';
+    fill[CHAT_MESSAGE_INLINE - 1] = 0;
     int think = chat_append(grow, CHAT_ROLE_ASSISTANT, L"");
     check(think >= 0, "second assistant message appended");
     ChatMessage *t = &grow->conversations[grow->active].messages[think];
@@ -219,15 +243,134 @@ int main(void) {
     check(chat_message_append_reasoning(t, L"!"),
         "reasoning appending past the boundary succeeds");
     check(t->reasoning_overflow != NULL &&
-        wcslen(chat_message_reasoning(t)) == CHAT_MESSAGE_TEXT &&
+        wcslen(chat_message_reasoning(t)) == CHAT_MESSAGE_INLINE &&
         chat_message_reasoning(t)[0] == L'r' &&
-        chat_message_reasoning(t)[CHAT_MESSAGE_TEXT - 2] == L'r' &&
-        chat_message_reasoning(t)[CHAT_MESSAGE_TEXT - 1] == L'!',
+        chat_message_reasoning(t)[CHAT_MESSAGE_INLINE - 2] == L'r' &&
+        chat_message_reasoning(t)[CHAT_MESSAGE_INLINE - 1] == L'!',
         "the crossed reasoning preserves head, seam and tail");
     check(!t->text[0] && !t->text_overflow,
         "answer storage is untouched by reasoning growth");
     free(fill);
     chat_dispose(grow); free(grow);
+
+    /* Inline-residue contract: the exact set-path boundaries at
+       capacity-1/capacity/capacity+1, shrinking back to inline, and
+       re-promoting afterwards. The set path draws the boundary one unit
+       tighter than the append path (needed < inline_capacity fits), so a
+       capacity-unit message is already on overflow storage. */
+    {
+        ChatMessage *probe = (ChatMessage *)calloc(1, sizeof *probe);
+        check(probe != NULL, "inline-residue probe allocated");
+        if (probe) {
+            wchar_t text[CHAT_MESSAGE_INLINE + 2];
+            for (size_t i = 0; i < CHAT_MESSAGE_INLINE - 1; i++) text[i] = L'a';
+            text[CHAT_MESSAGE_INLINE - 1] = 0;
+            check(chat_message_set_text(probe, text) && !probe->text_overflow &&
+                probe->text_length == CHAT_MESSAGE_INLINE - 1,
+                "a capacity-minus-one message set stays inline");
+            text[CHAT_MESSAGE_INLINE - 1] = L'a';
+            text[CHAT_MESSAGE_INLINE] = 0;
+            check(chat_message_set_text(probe, text) && probe->text_overflow &&
+                probe->text_length == CHAT_MESSAGE_INLINE &&
+                probe->text_capacity == CHAT_MESSAGE_INLINE + 1,
+                "a capacity-unit message set promotes to overflow");
+            text[CHAT_MESSAGE_INLINE] = L'b';
+            text[CHAT_MESSAGE_INLINE + 1] = 0;
+            check(chat_message_set_text(probe, text) && probe->text_overflow &&
+                probe->text_length == CHAT_MESSAGE_INLINE + 1,
+                "a capacity-plus-one message set promotes to overflow");
+            check(chat_message_set_text(probe, L"back") && !probe->text_overflow &&
+                probe->text_capacity == 0 && probe->text_length == 4 &&
+                !wcscmp(probe->text, L"back"),
+                "setting a short message shrinks back to inline storage");
+            text[CHAT_MESSAGE_INLINE + 1] = 0;
+            check(chat_message_set_text(probe, text) && probe->text_overflow &&
+                probe->text_length == CHAT_MESSAGE_INLINE + 1,
+                "the message promotes to overflow again after shrinking");
+            chat_message_dispose(probe);
+            free(probe);
+        }
+    }
+
+    /* The newly fallible short-to-overflow transitions are transactional:
+       a failed promotion leaves the message exactly as it was, inline
+       content included, and the same operation succeeds once allocation is
+       allowed again. */
+    {
+        ChatMessage *cross = (ChatMessage *)calloc(1, sizeof *cross);
+        ChatMessage *setfail = (ChatMessage *)calloc(1, sizeof *setfail);
+        check(cross != NULL && setfail != NULL, "transition probes allocated");
+        if (cross && setfail) {
+            wchar_t fill[CHAT_MESSAGE_INLINE + 1];
+            for (size_t i = 0; i < CHAT_MESSAGE_INLINE - 1; i++) fill[i] = L'x';
+            fill[CHAT_MESSAGE_INLINE - 1] = 0;
+            check(chat_message_append_text(cross, fill) && !cross->text_overflow,
+                "the crossing probe fills the inline residue");
+            uint64_t before_revision = cross->revision;
+            fail_next_reallocs = 1;
+            bool crossed = chat_message_append_text(cross, L"!");
+            fail_next_reallocs = 0;
+            check(!crossed, "the inline-to-overflow transition can fail");
+            check(!cross->text_overflow && cross->text_capacity == 0 &&
+                cross->text_length == CHAT_MESSAGE_INLINE - 1 &&
+                !wcsncmp(cross->text, fill, CHAT_MESSAGE_INLINE - 1) &&
+                cross->revision == before_revision,
+                "a failed transition leaves the message inline and unchanged");
+            check(chat_message_append_text(cross, L"!") && cross->text_overflow &&
+                cross->text_length == CHAT_MESSAGE_INLINE,
+                "the same transition succeeds once allocation is allowed");
+            chat_message_dispose(cross);
+
+            check(chat_message_set_text(setfail, L"seed") &&
+                !setfail->text_overflow, "the promotion probe seeds inline");
+            wchar_t long_text[CHAT_MESSAGE_INLINE + 8];
+            for (size_t i = 0; i < CHAT_MESSAGE_INLINE + 7; i++) long_text[i] = L'y';
+            long_text[CHAT_MESSAGE_INLINE + 7] = 0;
+            fail_next_mallocs = 1;
+            bool stored = chat_message_set_text(setfail, long_text);
+            fail_next_mallocs = 0;
+            check(!stored && !setfail->text_overflow &&
+                setfail->text_length == 4 && !wcscmp(setfail->text, L"seed"),
+                "a failed promotion leaves the previous inline content intact");
+            check(chat_message_set_text(setfail, long_text) &&
+                setfail->text_overflow != NULL,
+                "the promotion succeeds once allocation is allowed");
+            chat_message_dispose(setfail);
+        }
+        free(cross); free(setfail);
+    }
+
+    /* The reasoning promotion has the same transactional failure behavior:
+       a failed set leaves the inline content, length and revision exactly as
+       they were, and the same operation succeeds once allocation is allowed. */
+    {
+        ChatMessage *reasonfail = (ChatMessage *)calloc(1, sizeof *reasonfail);
+        check(reasonfail != NULL, "reasoning promotion probe allocated");
+        if (reasonfail) {
+            check(chat_message_set_reasoning(reasonfail, L"seed") &&
+                !reasonfail->reasoning_overflow,
+                "the reasoning promotion probe seeds inline");
+            uint64_t before_revision = reasonfail->revision;
+            wchar_t long_text[CHAT_REASONING_INLINE + 8];
+            for (size_t i = 0; i < CHAT_REASONING_INLINE + 7; i++)
+                long_text[i] = L'y';
+            long_text[CHAT_REASONING_INLINE + 7] = 0;
+            fail_next_mallocs = 1;
+            bool stored = chat_message_set_reasoning(reasonfail, long_text);
+            fail_next_mallocs = 0;
+            check(!stored && !reasonfail->reasoning_overflow &&
+                reasonfail->reasoning_length == 4 &&
+                !wcscmp(reasonfail->reasoning, L"seed") &&
+                reasonfail->revision == before_revision,
+                "a failed reasoning promotion leaves inline content and revision intact");
+            check(chat_message_set_reasoning(reasonfail, long_text) &&
+                reasonfail->reasoning_overflow != NULL &&
+                reasonfail->reasoning_length == CHAT_REASONING_INLINE + 7,
+                "the reasoning promotion succeeds once allocation is allowed");
+            chat_message_dispose(reasonfail);
+            free(reasonfail);
+        }
+    }
 
     /* A protected boundary catches overreads that content checks cannot: a
        too-large copy count still produces a correct, NUL-terminated string
@@ -241,23 +384,23 @@ int main(void) {
         if (guarded) {
             memset(guarded->reasoning, 0xA5, sizeof guarded->reasoning);
             guarded->role = CHAT_ROLE_ASSISTANT;
-            wchar_t *fill = (wchar_t *)malloc(sizeof(wchar_t) * CHAT_MESSAGE_TEXT);
+            wchar_t *fill = (wchar_t *)malloc(sizeof(wchar_t) * CHAT_MESSAGE_INLINE);
             if (!fill) return 2;
-            for (size_t i = 0; i < CHAT_MESSAGE_TEXT - 1; i++) fill[i] = L'w';
-            fill[CHAT_MESSAGE_TEXT - 1] = 0;
+            for (size_t i = 0; i < CHAT_MESSAGE_INLINE - 1; i++) fill[i] = L'w';
+            fill[CHAT_MESSAGE_INLINE - 1] = 0;
             check(chat_message_append_text(guarded, fill),
                 "the guarded message fills its inline buffer");
             check(chat_message_append_text(guarded, L"!"),
                 "the guarded boundary crossing succeeds");
             check(guarded->text_overflow != NULL &&
-                wcslen(chat_message_text(guarded)) == CHAT_MESSAGE_TEXT &&
+                wcslen(chat_message_text(guarded)) == CHAT_MESSAGE_INLINE &&
                 chat_message_text(guarded)[0] == L'w' &&
-                chat_message_text(guarded)[CHAT_MESSAGE_TEXT - 1] == L'!',
+                chat_message_text(guarded)[CHAT_MESSAGE_INLINE - 1] == L'!',
                 "the guarded crossing preserves the message");
             int intact = 1;
-            /* Spare capacity begins one past the new terminator. */
-            for (size_t i = CHAT_MESSAGE_TEXT + 1;
-                i < CHAT_MESSAGE_TEXT + 257; i++)
+            /* Spare capacity begins one past the new terminator and ends at
+               the promoted allocation's own capacity. */
+            for (size_t i = CHAT_MESSAGE_INLINE + 1; i < guarded->text_capacity; i++)
                 if (guarded->text_overflow[i] != (wchar_t)0x5C5C) intact = 0;
             check(intact,
                 "the crossing copied nothing beyond the inline terminator");
@@ -412,10 +555,10 @@ int main(void) {
         /* A construction failure without growth keeps capacity exactly as it
            was and commits nothing. */
         wchar_t *oversized = (wchar_t *)malloc(
-            sizeof(wchar_t) * (CHAT_MESSAGE_TEXT + 700));
+            sizeof(wchar_t) * (CHAT_MESSAGE_INLINE + 700));
         if (!oversized) return 2;
-        for (size_t i = 0; i < CHAT_MESSAGE_TEXT + 699; i++) oversized[i] = L'x';
-        oversized[CHAT_MESSAGE_TEXT + 699] = 0;
+        for (size_t i = 0; i < CHAT_MESSAGE_INLINE + 699; i++) oversized[i] = L'x';
+        oversized[CHAT_MESSAGE_INLINE + 699] = 0;
         fail_next_mallocs = 1;
         rejected = chat_append(atom, CHAT_ROLE_USER, oversized);
         fail_next_mallocs = 0;
@@ -536,6 +679,52 @@ int main(void) {
             "edit-resend replaced the user text and response");
         check_invariants(br);
         chat_dispose(br); free(br);
+    }
+
+    /* Product input limit: chat_begin_response itself enforces the composer's
+       16,383-unit bound, independently of the much smaller message inline
+       residue, so the residue can never drift into becoming the input limit.
+       Prompts past the residue are accepted and stored through overflow. */
+    {
+        wchar_t *prompt = (wchar_t *)malloc(
+            sizeof(wchar_t) * (CHAT_COMPOSER_TEXT + 1));
+        Chat *limit = (Chat *)calloc(1, sizeof *limit);
+        check(prompt != NULL && limit != NULL, "input-limit fixture allocated");
+        if (prompt && limit) {
+            for (size_t i = 0; i < CHAT_COMPOSER_TEXT; i++) prompt[i] = L'x';
+            prompt[CHAT_COMPOSER_TEXT] = 0;
+            chat_init(limit); chat_clear(limit);
+            const ChatConversation *c = chat_active(limit);
+
+            prompt[300] = 0;
+            check(chat_begin_response(limit, CHAT_SEND, prompt) >= 0 &&
+                c->message_count == 2 &&
+                c->messages[0].text_overflow != NULL &&
+                c->messages[0].text_length == 300,
+                "a prompt past the inline residue is accepted through overflow");
+            chat_clear(limit);
+
+            prompt[300] = L'x';
+            prompt[CHAT_COMPOSER_TEXT - 1] = 0;
+            check(chat_begin_response(limit, CHAT_SEND, prompt) >= 0 &&
+                c->messages[0].text_overflow != NULL &&
+                c->messages[0].text_length == CHAT_COMPOSER_TEXT - 1,
+                "a CHAT_COMPOSER_TEXT - 1 unit prompt is accepted whole");
+            chat_clear(limit);
+
+            prompt[CHAT_COMPOSER_TEXT - 1] = L'x';
+            uint64_t before_id = limit->next_id;
+            int64_t before_modified = c->modified_at;
+            size_t before_count = c->message_count;
+            check(chat_begin_response(limit, CHAT_SEND, prompt) < 0 &&
+                c->message_count == before_count &&
+                limit->next_id == before_id &&
+                c->modified_at == before_modified,
+                "a CHAT_COMPOSER_TEXT unit prompt is rejected transactionally");
+            check_invariants(limit);
+            chat_dispose(limit);
+        }
+        free(prompt); free(limit);
     }
 
     /* Replacement at the 64-message cap: the final live count is within the
@@ -686,10 +875,10 @@ int main(void) {
         if (!own) return 2;
         chat_init(own);
         wchar_t *big = (wchar_t *)malloc(
-            sizeof(wchar_t) * (CHAT_MESSAGE_TEXT * 2));
+            sizeof(wchar_t) * (CHAT_MESSAGE_INLINE * 2));
         if (!big) return 2;
-        for (size_t i = 0; i < CHAT_MESSAGE_TEXT * 2 - 1; i++) big[i] = L'x';
-        big[CHAT_MESSAGE_TEXT * 2 - 1] = 0;
+        for (size_t i = 0; i < CHAT_MESSAGE_INLINE * 2 - 1; i++) big[i] = L'x';
+        big[CHAT_MESSAGE_INLINE * 2 - 1] = 0;
         check(chat_new_conversation(own) == 1, "second conversation created");
         check(chat_append(own, CHAT_ROLE_USER, L"question one") >= 0,
             "user turn in the conversation to move");
@@ -708,12 +897,12 @@ int main(void) {
             moved->message_capacity >= 2,
             "the moved conversation kept its storage");
         check(wcslen(chat_message_text(&moved->messages[1])) ==
-            CHAT_MESSAGE_TEXT * 2 - 1,
+            CHAT_MESSAGE_INLINE * 2 - 1,
             "the moved overflow allocation survived the ownership transfer");
         check(chat_append(own, CHAT_ROLE_ASSISTANT, L"after the move") == 2,
             "the moved conversation still appends after a deletion elsewhere");
         check(wcslen(chat_message_text(&own->conversations[0].messages[1])) ==
-            CHAT_MESSAGE_TEXT * 2 - 1,
+            CHAT_MESSAGE_INLINE * 2 - 1,
             "appending after the move did not disturb earlier content");
         check_invariants(own);
         check(chat_delete_all(own), "delete-all releases every conversation");
@@ -793,13 +982,13 @@ int main(void) {
         Chat *own = (Chat *)calloc(1, sizeof *own);
         if (!own) return 2;
         chat_init(own); chat_clear(own);
-        wchar_t *big = (wchar_t *)malloc(sizeof(wchar_t) * (CHAT_MESSAGE_TEXT * 2));
-        wchar_t *thought = (wchar_t *)malloc(sizeof(wchar_t) * (CHAT_REASONING_TEXT + 8));
+        wchar_t *big = (wchar_t *)malloc(sizeof(wchar_t) * (CHAT_MESSAGE_INLINE * 2));
+        wchar_t *thought = (wchar_t *)malloc(sizeof(wchar_t) * (CHAT_REASONING_INLINE + 8));
         if (!big || !thought) return 2;
-        for (size_t i = 0; i < CHAT_MESSAGE_TEXT * 2 - 1; i++) big[i] = L'x';
-        big[CHAT_MESSAGE_TEXT * 2 - 1] = 0;
-        for (size_t i = 0; i < CHAT_REASONING_TEXT + 7; i++) thought[i] = L'y';
-        thought[CHAT_REASONING_TEXT + 7] = 0;
+        for (size_t i = 0; i < CHAT_MESSAGE_INLINE * 2 - 1; i++) big[i] = L'x';
+        big[CHAT_MESSAGE_INLINE * 2 - 1] = 0;
+        for (size_t i = 0; i < CHAT_REASONING_INLINE + 7; i++) thought[i] = L'y';
+        thought[CHAT_REASONING_INLINE + 7] = 0;
         check(chat_append(own, CHAT_ROLE_USER, L"question one") == 0,
             "snapshot fixture user turn appended");
         int answer = chat_append(own, CHAT_ROLE_ASSISTANT, big);
@@ -828,6 +1017,11 @@ int main(void) {
                 !wcscmp(chat_message_reasoning(&copy->conversations[0].messages[1]),
                     thought),
                 "snapshot carries inline and overflow content verbatim");
+            check(copy->conversations[0].messages[1].text_capacity ==
+                    wcslen(big) + 1 &&
+                copy->conversations[0].messages[1].reasoning_capacity ==
+                    wcslen(thought) + 1,
+                "snapshot overflow capacities match the promoted lengths");
             check(copy->conversations[0].messages[1].id == answer_id,
                 "snapshot keeps stable message identity");
             check(copy->conversations[0].message_capacity ==
@@ -846,7 +1040,7 @@ int main(void) {
             free(copy);
             check(own->conversations[0].messages[1].text_overflow != NULL &&
                 wcslen(chat_message_text(&own->conversations[0].messages[1])) ==
-                    CHAT_MESSAGE_TEXT * 2 - 1 + 5,
+                    CHAT_MESSAGE_INLINE * 2 - 1 + 5,
                 "disposing the snapshot leaves the source's storage intact");
         }
         size_t answer_len = wcslen(chat_message_text(&own->conversations[0].messages[1]));

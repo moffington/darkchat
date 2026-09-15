@@ -207,6 +207,20 @@ arrays remain UI-thread-owned; worker threads never borrow them, and
 asynchronous persistence uses `chat_snapshot` — a deep, transactional copy
 handed to one background writer thread.
 
+Each message keeps only a small inline residue — at most 255 UTF-16 code units
+for text and for reasoning — and promotes to heap-backed overflow storage on
+first growth past it, so the fixed per-message cost is small and snapshot
+copies pay for the live text rather than per-message slack. Composer input,
+per-conversation drafts and the system prompt keep a separate 16,383-code-unit
+product limit and never share the message residue. A fixed-residue
+amplification gate in the chat suite bounds the structural copies a save can
+hold simultaneously — live state plus the saver's pending, in-flight and
+constructing snapshots, the latter built before the displaced pending copy is
+disposed — at the planned 128-conversation × 512-message target to ≤ 1 GiB of
+fixed struct/slack cost. The gate deliberately excludes heap-backed live text,
+which is proportional to actual content, so it is not a complete worst-case
+memory bound.
+
 Request history includes user/system messages and completed generated assistant
 responses. Local welcome/error notes, running responses and all unsuccessful
 assistant responses are excluded. Persisted metadata and error descriptions are
@@ -383,8 +397,15 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   repeated saves, and decode allocation failures (including the
   conversation-array reservation and a mid-message failure under a poisoned,
   non-zero-filled allocator) recovered through the fallback or leaving the
-  destination's previous content and the store untouched, plus ownership
-  transfer across mid-list conversation deletion.
+   destination's previous content and the store untouched, plus ownership
+   transfer across mid-list conversation deletion.
+- Inline residue: exact set/append boundaries at capacity−1/capacity/capacity+1,
+  promotion to overflow, shrinking back inline and re-promotion, repeated
+  streamed heap growth, transactional failure of the inline-to-overflow
+  transitions (inline content, length and revision untouched), snapshot
+  capacities of promoted text/reasoning, and the fixed-residue amplification
+  gate (4 structural copies × 128 conversations × the planned 512-message
+  target ≤ 1 GiB of fixed struct/slack cost; heap-backed live text excluded).
 - Stable message identities: new-format id roundtrips, old/new mixed records in
   both orders, deterministic migration in file order, and rejection of every
   invalid id form (zero, negative, fractional, string, above the stored
@@ -493,9 +514,13 @@ Remaining limits: 128 conversations, 64 messages each, and a 128 MB on-disk
 snapshot bound. The conversation cap fails closed — the New button disables and
 creation is refused; nothing is ever evicted. Snapshots declaring more than 128
 conversations are rejected as corruption (the backup recovery path still
-applies). The composer and the system prompt are bounded at 16,383 UTF-16
-code units; message text past that (streamed replies) lives in overflow storage,
+applies). The composer, drafts and the system prompt are bounded at 16,383
+UTF-16 code units; each message keeps only a 255-unit inline residue, and
+message text past it (streamed replies) lives in heap-backed overflow storage,
 so its ceiling is memory and the snapshot bound rather than a fixed count. A
+fixed-residue amplification gate bounds the structural copies a save can hold
+(live, pending, in-flight and constructing) at the planned 512-message target
+to ≤ 1 GiB of fixed struct/slack cost; heap-backed live text is excluded. A
 request sends at most the 64 KiB context budget and drops the oldest eligible
 history beyond it; the budget is a local proxy for prompt size, not a model's
 context window. Responses past the local limit stop as Interrupted without
