@@ -40,6 +40,7 @@ int main(void) {
     UiId root=ui_add(&ui,UI_NONE,UI_COLUMN,L"Accessibility test");
     UiId label=ui_add(&ui,root,UI_LABEL,L"PRIMARY ACTION");
     UiId button=ui_add(&ui,root,UI_BUTTON,L"Run");
+    UiId button2=ui_add(&ui,root,UI_BUTTON,L"Second");
     ui_set_labelled_by(&ui,button,label); ui_set_help_text(&ui,button,L"Runs the primary action.");
     ui_layout(&ui,320,200);
     accessibility=ui_accessibility_create(window,&ui); CHECK(accessibility);
@@ -94,6 +95,26 @@ int main(void) {
 
     CHECK(ui_remove(&ui,button));
     CHECK(IRawElementProviderSimple_GetPropertyValue(button_simple,UIA_NamePropertyId,&value)==(HRESULT)UIA_E_ELEMENTNOTAVAILABLE);
+
+    /* Rebinding semantics: providers are stateless over live node state, so a
+       retained provider observes the new name of the same runtime id, and the
+       notification helpers raise events safely even with no client attached.
+       Hidden nodes make the provider unavailable and the helpers no-op. */
+    IRawElementProviderFragment *button2_fragment=navigate(label_fragment,NavigateDirection_NextSibling);
+    IRawElementProviderSimple *button2_simple=NULL;
+    CHECK(SUCCEEDED(IRawElementProviderFragment_QueryInterface(button2_fragment,&IID_IRawElementProviderSimple,(void **)&button2_simple)));
+    check_string(button2_simple,UIA_NamePropertyId,L"Second");
+    ui_set_text(&ui,button2,L"Rebound");
+    check_string(button2_simple,UIA_NamePropertyId,L"Rebound");
+    ui_accessibility_property_changed(accessibility,button2,L"Second",L"Rebound");
+    ui_accessibility_children_invalidated(accessibility,root);
+    ui_accessibility_property_changed(accessibility,UI_NONE,L"A",L"B");
+    ui_set_hidden(&ui,button2,true);
+    CHECK(IRawElementProviderSimple_GetPropertyValue(button2_simple,UIA_NamePropertyId,&value)==(HRESULT)UIA_E_ELEMENTNOTAVAILABLE);
+    ui_accessibility_property_changed(accessibility,button2,L"Rebound",L"Hidden");
+    ui_accessibility_children_invalidated(accessibility,button2);
+    IRawElementProviderFragment_Release(button2_fragment);
+    IRawElementProviderSimple_Release(button2_simple);
 
     ui_accessibility_destroy(accessibility); accessibility=NULL;
     CHECK(IRawElementProviderSimple_GetPropertyValue(label_simple,UIA_NamePropertyId,&value)==(HRESULT)UIA_E_ELEMENTNOTAVAILABLE);

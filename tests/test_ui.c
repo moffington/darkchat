@@ -105,6 +105,32 @@ static void scrolling_test(void) {
     for (UiId c=NODE(inner).first;c;c=NODE(c).next) ui_set_hidden(&u,c,c!=last);
     ui_layout(&u,300,200); NEAR(NODE(inner).scroll,0); NEAR(ui_scroll_thumb(&u,inner).h,0);
 }
+static void scroll_api_test(void) {
+    UiId root=init(UI_SCROLL); NODE(root).style.gap=0;
+    UiId a=ui_add(&u,root,UI_BUTTON,L"A"), b=ui_add(&u,root,UI_BUTTON,L"B");
+    UiId filler=ui_add(&u,root,UI_COLUMN,L""); NODE(filler).style.height=ui_fixed(500);
+    ui_layout(&u,200,100);
+    NEAR(ui_scroll_offset(&u,root),0);
+    NEAR(ui_scroll_viewport_h(&u,root),100);
+    CHECK(!ui_layout_pending(&u));
+    /* Absolute set clamps to the scroll range and marks layout only on change. */
+    ui_scroll_to(&u,root,1000);
+    NEAR(ui_scroll_offset(&u,root),ui_scroll_max(&u,root));
+    CHECK(ui_layout_pending(&u));
+    ui_layout(&u,200,100);
+    ui_scroll_to(&u,root,-50); NEAR(ui_scroll_offset(&u,root),0);
+    CHECK(ui_layout_pending(&u));
+    ui_layout(&u,200,100);
+    ui_scroll_to(&u,root,0); CHECK(!ui_layout_pending(&u));
+    /* A spacer child drives the extent exactly. */
+    NEAR(ui_scroll_max(&u,root),460);
+    /* Non-scroll or invalid ids read as zero and set nothing. */
+    CHECK(ui_scroll_offset(&u,b)==0 && ui_scroll_viewport_h(&u,b)==0);
+    CHECK(ui_scroll_offset(&u,UI_NONE)==0 && ui_scroll_viewport_h(&u,UI_NONE)==0);
+    ui_scroll_to(&u,UI_NONE,42); CHECK(!ui_layout_pending(&u));
+    ui_scroll_to(&u,a,42); CHECK(!ui_layout_pending(&u));
+    (void)a; (void)b;
+}
 static void slider_test(void) {
     UiId root=init(UI_COLUMN), slider=ui_add(&u,root,UI_SLIDER,L"Value");
     ui_layout(&u,200,100);
@@ -233,7 +259,7 @@ static void showcase_test(void) {
     CHECK(visible==1 && !NODE(s.catalog_rows[4]).hidden);
 }
 int main(void) {
-    layout_test(); input_test(); scrolling_test(); slider_test(); text_and_capacity_test(); lifetime_test(); accessibility_metadata_test(); showcase_test();
+    layout_test(); input_test(); scrolling_test(); scroll_api_test(); slider_test(); text_and_capacity_test(); lifetime_test(); accessibility_metadata_test(); showcase_test();
     printf("PASS: %u assertions (layout, input, nested scroll, focus reveal, values, lifetime, capacity, showcase breakpoints)\n",assertions);
     return 0;
 }

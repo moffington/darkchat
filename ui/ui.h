@@ -144,6 +144,17 @@ void ui_focus(Ui *ui, UiId id, bool keyboard);
 void ui_set_active(Ui *ui, bool active);
 UiRect ui_scroll_thumb(const Ui *ui, UiId id);
 float ui_scroll_max(const Ui *ui, UiId id);
+/* Absolute read access to a scroll container's state: the current offset and
+   the laid-out viewport height (0 before the first layout or when id is not
+   a scroll node). Windowed lists derive their visible range from these. */
+float ui_scroll_offset(const Ui *ui, UiId id);
+float ui_scroll_viewport_h(const Ui *ui, UiId id);
+/* Sets the absolute scroll offset, clamped to [0, ui_scroll_max]. Marks the
+   layout dirty only when the value actually changes. */
+void ui_scroll_to(Ui *ui, UiId id, float offset);
+/* True when the tree changed since the last ui_layout and a relayout is
+   owed before painting or reading arranged geometry. */
+bool ui_layout_pending(const Ui *ui);
 bool ui_contains(UiRect r, float x, float y);
 UiRect ui_intersect(UiRect a, UiRect b);
 

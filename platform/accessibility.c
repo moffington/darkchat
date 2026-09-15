@@ -281,3 +281,20 @@ void ui_accessibility_focus_changed(UiAccessibility *a, UiId id) {
     UiProvider *p=provider_new(a,id); if (!p) return;
     UiaRaiseAutomationEvent(&p->simple,UIA_AutomationFocusChangedEventId); provider_release(p);
 }
+void ui_accessibility_property_changed(UiAccessibility *a, UiId id,
+    const wchar_t *old_text, const wchar_t *new_text) {
+    UiProvider *p=provider_new(a,id); if (!p) return;
+    VARIANT old_value, new_value;
+    VariantInit(&old_value); VariantInit(&new_value);
+    if (SUCCEEDED(string_variant(&old_value,old_text)) &&
+        SUCCEEDED(string_variant(&new_value,new_text)))
+        UiaRaiseAutomationPropertyChangedEvent(&p->simple,UIA_NamePropertyId,
+            old_value,new_value);
+    VariantClear(&old_value); VariantClear(&new_value);
+    provider_release(p);
+}
+void ui_accessibility_children_invalidated(UiAccessibility *a, UiId id) {
+    UiProvider *p=provider_new(a,id); if (!p) return;
+    UiaRaiseStructureChangedEvent(&p->simple,StructureChangeType_ChildrenInvalidated,NULL,0);
+    provider_release(p);
+}

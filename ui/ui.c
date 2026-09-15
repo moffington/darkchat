@@ -196,6 +196,21 @@ float ui_scroll_max(const Ui *u, UiId id) {
     const UiNode *n=const_node(u,id);
     return maxf(0,n->content_height-n->viewport.h);
 }
+float ui_scroll_offset(const Ui *u, UiId id) {
+    if (!valid(u,id) || const_node(u,id)->kind!=UI_SCROLL) return 0;
+    return const_node(u,id)->scroll;
+}
+float ui_scroll_viewport_h(const Ui *u, UiId id) {
+    if (!valid(u,id) || const_node(u,id)->kind!=UI_SCROLL) return 0;
+    return const_node(u,id)->viewport.h;
+}
+void ui_scroll_to(Ui *u, UiId id, float offset) {
+    UiNode *n=ui_node(u,id);
+    if (!n || n->kind!=UI_SCROLL) return;
+    float next=clamp(offset,0,ui_scroll_max(u,id));
+    if (next!=n->scroll) { n->scroll=next; ui_invalidate(u,true); }
+}
+bool ui_layout_pending(const Ui *u) { return u->layout_dirty; }
 UiRect ui_scroll_thumb(const Ui *u, UiId id) {
     if (!valid(u,id)) return (UiRect){0};
     const UiNode *n=const_node(u,id);
