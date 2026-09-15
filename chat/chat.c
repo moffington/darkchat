@@ -241,6 +241,15 @@ bool chat_select_conversation(Chat *chat, int index) {
     return true;
 }
 
+/* Stable-identity lookup for the sidebar and search navigation: array
+   positions shift on deletion, ids never do. */
+int chat_index_of_id(const Chat *chat, uint64_t id) {
+    if (!chat || !id) return -1;
+    for (int i = 0; i < chat->conversation_count; i++)
+        if (chat->conversations[i].id == id) return i;
+    return -1;
+}
+
 const ChatConversation *chat_active(const Chat *chat) {
     if (chat->active < 0 || chat->active >= chat->conversation_count) return NULL;
     return &chat->conversations[chat->active];

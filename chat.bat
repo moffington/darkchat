@@ -33,7 +33,7 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_markdown_win.exe
     if errorlevel 1 exit /b 1
-    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat_ui.c chat\chat.c chat\chat_ui.c ui\ui.c ui\theme.c -o build\test_chat_ui.exe
+    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat_ui.c chat\chat.c chat\chat_ui.c ui\ui.c ui\theme.c ui\paint.c -o build\test_chat_ui.exe
     if errorlevel 1 exit /b 1
     build\test_chat_ui.exe
     if errorlevel 1 exit /b 1

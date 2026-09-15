@@ -192,7 +192,8 @@ The automated suite does not require an API key or make live OpenRouter requests
 
 - Windows only
 - One active request at a time
-- 16 conversations
+- 128 conversations (snapshots from older 16-conversation builds still load;
+  older builds refuse this format's snapshots)
 - 64 messages per conversation
 - 16,383 UTF-16 code units each for answer and reasoning text
 - 128 MB maximum persisted snapshot

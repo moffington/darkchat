@@ -251,6 +251,7 @@ static bool read_file_bytes(const wchar_t *path, char **out, size_t *size) {
 }
 int main(void) {
     wchar_t dir[256]; swprintf(dir,256,L"build\\storage-test-%lu",GetCurrentProcessId());
+    char *first_bytes=NULL; size_t first_size=0;
     Chat *chat=calloc(1,sizeof *chat), *loaded=calloc(1,sizeof *loaded);
     CHECK(chat && loaded);
     chat_init(chat); chat_clear(chat);
@@ -328,14 +329,18 @@ int main(void) {
     CHECK(storage_load(&store,loaded)==-1);
     CHECK(!storage_save(&store,chat)); /* preserve unreadable files */
     storage_close(&store);
-    /* An unknown newer version must not be overwritten by an older backup. */
+    /* An unknown newer version must not be overwritten by an older backup:
+       the load fails closed with writes disabled and no backup is tried. */
     CHECK(storage_open(&store,dir));
     CHECK(storage_save(&store,chat)); CHECK(storage_save(&store,chat));
+    CHECK(read_file_bytes(store.path,&first_bytes,&first_size));
+    CHECK(strstr(first_bytes,"\"version\":2")); /* this build writes format 2 */
+    free(first_bytes);
     FILE *future=_wfopen(store.path,L"r+b"); CHECK(future);
     char header[64]={0}; CHECK(fread(header,1,63,future)==63);
-    char *version=strstr(header,"\"version\":1"); CHECK(version);
+    char *version=strstr(header,"\"version\":2"); CHECK(version);
     CHECK(fseek(future,(long)(version-header)+(long)strlen("\"version\":"),SEEK_SET)==0);
-    fputc('2',future); fclose(future);
+    fputc('3',future); fclose(future);
     CHECK(storage_load(&store,loaded)==-1 && !store.writable);
     storage_close(&store);
     DeleteFileW(store.path); DeleteFileW(store.backup); DeleteFileW(store.temporary);
@@ -673,6 +678,59 @@ int main(void) {
             chat_dispose(again); free(again);
             storage_close(&dstore); remove_store(&dstore,ddir);
         }
+    }
+
+    /* Stage 6: format 2 carries the 128-conversation bound. A hand-built
+       version 1 snapshot declaring 128 conversations loads and round-trips
+       as format 2; a declared 129th is ordinary corruption (rejected, no
+       fallback, writes disabled, files preserved). */
+    {
+        wchar_t cdir[256]; swprintf(cdir,256,L"build\\storage-cap-%lu",GetCurrentProcessId());
+        ChatStorage cstore;
+        CHECK(storage_open(&cstore,cdir));
+        for (int pass = 0; pass < 2; pass++) {
+            int declared = pass == 0 ? CHAT_MAX_CONVERSATIONS
+                                     : CHAT_MAX_CONVERSATIONS + 1;
+            char settings[320];
+            static char conv[CHAT_MAX_CONVERSATIONS + 1][160];
+            const char *lines[CHAT_MAX_CONVERSATIONS + 2];
+            int total = 0;
+            snprintf(settings, sizeof settings,
+                "{\"type\":\"settings\",\"version\":1,\"next_id\":%lld,\"active\":0,"
+                "\"conversation_count\":%d,\"model_history_count\":0,\"window_x\":0,"
+                "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+                "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+                "\"system_prompt\":\"\"}", (long long)(declared + 71), declared);
+            lines[total++] = settings;
+            for (int i = 0; i < declared; i++) {
+                snprintf(conv[i], sizeof conv[i],
+                    "{\"type\":\"conversation\",\"id\":%d,\"created_at\":1000,"
+                    "\"modified_at\":1000,\"renamed\":0,\"message_count\":0,"
+                    "\"title\":\"c\",\"draft\":\"\"}", i + 1);
+                lines[total++] = conv[i];
+            }
+            CHECK(write_snapshot(cstore.path, lines, (size_t)total));
+            if (pass == 1) {
+                /* Remove the fallback copies so the declared 129th is tested
+                   with nothing valid to recover. */
+                DeleteFileW(cstore.backup);
+                DeleteFileW(cstore.temporary);
+            }
+            if (pass == 0) {
+                CHECK(storage_load(&cstore, loaded) == 1 && !cstore.recovered);
+                CHECK(loaded->conversation_count == CHAT_MAX_CONVERSATIONS);
+                for (int i = 0; i < CHAT_MAX_CONVERSATIONS; i++)
+                    CHECK(loaded->conversations[i].id == (uint64_t)(i + 1));
+                CHECK(storage_save(&cstore, loaded));
+                CHECK(storage_load(&cstore, loaded) == 1 && !cstore.recovered);
+                CHECK(loaded->conversation_count == CHAT_MAX_CONVERSATIONS);
+            } else {
+                CHECK(storage_load(&cstore, loaded) == -1);
+                CHECK(!cstore.writable);
+            }
+        }
+        storage_close(&cstore);
+        remove_store(&cstore, cdir);
     }
 
     chat_dispose(chat); chat_dispose(loaded);

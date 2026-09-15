@@ -8,7 +8,13 @@
 /* The persisted conversation still has a broad corruption/resource guard.
    Individual model outputs have no smaller fixed-size truncation point. */
 #define STORAGE_LIMIT (128u * 1024u * 1024u)
-#define FORMAT_VERSION 1
+/* Format 2 raised the conversation bound to 128; the record layout is
+   unchanged from format 1. Both versions decode, so old snapshots migrate on
+   their next save; version 3+ is unsupported and fails the load closed
+   (writes disabled, backup never tried) so an old build can never silently
+   restore stale state over a newer primary. See docs/CHAT.md. */
+#define FORMAT_VERSION 2
+#define FORMAT_VERSION_MIN 1
 
 static uint32_t checksum(const char *s, size_t n) {
     uint32_t hash = 2166136261u;
@@ -86,7 +92,7 @@ static bool conversation_id_taken(const Chat *chat, uint64_t id, int ci) {
 
 static bool encode(const Chat *chat, JsonBuf *b) {
     json_buf_init(b, 8192);
-    raw(b, "{\"type\":\"settings\",\"version\":1");
+    raw(b, "{\"type\":\"settings\",\"version\":2");
     NUM(b, chat, next_id);
     NUM(b, chat, active);
     NUM(b, chat, conversation_count);
@@ -176,7 +182,8 @@ static bool decode(char *data, Chat *chat) {
         !integer(footer,"checksum",0,4294967295.0,&v) ||
         (uint32_t)v != checksum(data,(size_t)(footer-data))) return false;
     char *cursor = data, *line = next_line(&cursor);
-    if (!type_is(line,"settings") || !integer(line,"version",FORMAT_VERSION,FORMAT_VERSION,&v)) return false;
+    if (!type_is(line,"settings") ||
+        !integer(line,"version",FORMAT_VERSION_MIN,FORMAT_VERSION,&v)) return false;
     memset(chat,0,sizeof *chat);
     READ_INT(chat, next_id, 1, (double)CHAT_MAX_ID);
     /* The counter exactly as it was persisted: every persisted identity is
@@ -298,7 +305,8 @@ static bool read_snapshot(const wchar_t *path, Chat *chat, bool *unsupported) {
     if (ok) {
         data[got]=0;
         double version;
-        if (json_query_number(data,"version",&version) && version!=FORMAT_VERSION) *unsupported=true;
+        if (json_query_number(data,"version",&version) &&
+            (version<FORMAT_VERSION_MIN || version>FORMAT_VERSION)) *unsupported=true;
         ok=!*unsupported && strlen(data)==got && decode(data,chat);
     }
     free(data);

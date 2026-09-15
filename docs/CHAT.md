@@ -13,6 +13,16 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   Delete, Clear messages. Rename survives subsequent edits and clearing. Delete
   and Clear ask for confirmation. Deleting the final conversation creates a new
   empty one with a new ID.
+- The conversation list is virtualized: DarkUI retains buttons only for the
+  rows currently in view (bounded by the sidebar viewport, not the 128-
+  conversation cap), and top/bottom spacers keep the scrollbar sized to the
+  full list. Every row carries the conversation's stable ID, so activation,
+  search jumps and UIA Invoke always open the conversation actually displayed;
+  scrolling never snaps back to the active row, which is revealed only by
+  selection, deletion, a new conversation, search navigation or startup.
+  Screen readers are notified of row rebinding through UIA name-changed and
+  structure-changed events; keyboard Tab, Enter, arrows, PgUp/PgDn, Home/End
+  behave as before.
 - Enter sends; Shift+Enter inserts a newline. Send becomes Stop while generating.
   New/open remains available during generation; the reply stays with its origin.
   History mutations and settings changes are blocked until the worker finishes.
@@ -242,9 +252,9 @@ into the transcript or the payload.
 
 ## Persistence format and recovery
 
-`%LOCALAPPDATA%\DarkChat\state.jsonl` is a UTF-8, version-1 JSONL snapshot:
+`%LOCALAPPDATA%\DarkChat\state.jsonl` is a UTF-8, version-2 JSONL snapshot:
 
-1. A settings record with `type: "settings"`, `version: 1`, selected conversation
+1. A settings record with `type: "settings"`, `version: 2`, selected conversation
    index, next ID counter, record counts, model/system prompt and geometry.
 2. Zero or more `type: "model"` history records.
 3. For each conversation, a `type: "conversation"` record followed by its declared
@@ -252,14 +262,25 @@ into the transcript or the payload.
 4. A `type: "commit"` record containing the 32-bit FNV-1a checksum of every byte
    before that record (including LF separators).
 
+Format 2 differs from format 1 only in the accepted bounds: it raised the
+conversation limit from 16 to 128. The record layout is unchanged, and this
+build decodes both versions, so an old snapshot migrates to format 2 on its
+next save. **Downgrade contract:** an older (version-1) build that encounters a
+format 2 or newer file treats it as an unsupported version and stops
+immediately — it does not fall back to `state.bak.jsonl`, never overwrites the
+newer primary with a stale backup, and disables writes until a build that
+understands the format runs again. (A count above an older build's bound in an
+otherwise current file would be indistinguishable from corruption, which is
+why the bound change required the version bump rather than relying on the
+count check.)
+
 Conversation IDs are numeric, store-local, monotonically allocated from a
 persisted counter initially seeded from the current time. They do not depend on
 names or array positions and are not reused after deletion. Every message also
 carries a stable identity drawn from the same counter and persisted in its
 record (`"id"`): retry/regenerate keep the user turn's id and give the fresh
 assistant turn a new one; edit-and-resend preserves the edited user id and
-creates a new assistant id. Older builds that predate the field simply ignore
-it when reading, so the format version stays 1. Conversation/message created
+creates a new assistant id. Conversation/message created
 and modified timestamps and generation started/first-token/finished
 timestamps are Unix milliseconds (currently second-resolution wall clock).
 TTFT and latency use monotonic millisecond timing. A zero generation timestamp
@@ -468,8 +489,11 @@ isolated directories under `build`, not the user's conversation store. Search
 matching, snippets, invalidation, stable-ID resolution and hidden-host jumps are
 also covered.
 
-Remaining limits: 16 conversations, 64 messages each, and a 128 MB on-disk
-snapshot bound. The composer and the system prompt are bounded at 16,383 UTF-16
+Remaining limits: 128 conversations, 64 messages each, and a 128 MB on-disk
+snapshot bound. The conversation cap fails closed — the New button disables and
+creation is refused; nothing is ever evicted. Snapshots declaring more than 128
+conversations are rejected as corruption (the backup recovery path still
+applies). The composer and the system prompt are bounded at 16,383 UTF-16
 code units; message text past that (streamed replies) lives in overflow storage,
 so its ceiling is memory and the snapshot bound rather than a fixed count. A
 request sends at most the 64 KiB context budget and drops the oldest eligible

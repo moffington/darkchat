@@ -62,6 +62,9 @@ typedef struct {
     bool search_has_selection;
     ULONGLONG started_tick;
     ChatGenerationState stop_state;
+    /* Latest sidebar remap change report, translated into UIA notifications
+       by the host (chat_ui.c itself knows nothing about accessibility). */
+    ChatUiRemapReport remap;
 
 } ChatHost;
 
@@ -358,15 +361,53 @@ static void layout(ChatHost *host) {
     if (host->minimized) return;
     RECT client;
     GetClientRect(host->window, &client);
-    chat_ui_resize(&host->chat_ui, dip(host, client.right), dip(host, client.bottom));
+    /* chat_ui_resize lays out only when the client size changed or a relayout
+       is owed; when it early-outs the native overlay rectangles cannot have
+       moved either, so repositioning them is skipped as well. */
+    if (!chat_ui_resize(&host->chat_ui, dip(host, client.right),
+            dip(host, client.bottom)))
+        return;
     place_container(host);
     place(host, &host->composer, host->chat_ui.composer, 1.0f);
     place_field(host, &host->field, host->chat_ui.model);
     place_field(host, &host->search, host->chat_ui.search);
 }
 
+/* Translates the sidebar remap change report into UIA notifications. Row
+   bindings are compared by stable id, never by title text. */
+static void sidebar_accessibility(ChatHost *host, const ChatUiRemapReport *report) {
+    if (!host->accessibility) return;
+    if (report->mapping_changed)
+        ui_accessibility_children_invalidated(host->accessibility,
+            host->chat_ui.list);
+    for (int i = 0; i < report->name_changed_count; i++) {
+        const wchar_t *current = ui_accessible_name(host->config.ui,
+            report->name_changed[i].id);
+        ui_accessibility_property_changed(host->accessibility,
+            report->name_changed[i].id,
+            report->name_changed[i].old_title, current);
+    }
+    if (report->focus_binding_changed)
+        ui_accessibility_focus_changed(host->accessibility,
+            host->config.ui->focus ? host->config.ui->focus
+                                   : host->config.ui->root);
+}
+
 static void flush(ChatHost *host) {
     layout(host);
+    /* A reveal runs a second remap within this flush; the report
+       accumulates so the first remap's findings are never overwritten. */
+    chat_ui_remap_report_clear(&host->remap);
+    chat_ui_sidebar_remap(&host->chat_ui, &host->remap);
+    if (ui_layout_pending(host->config.ui)) layout(host);
+    /* Reveal is applied after the remap so the scroll range reflects the
+       current conversation count; a moved scroll rebinds the pool once more. */
+    if (chat_ui_apply_reveal(&host->chat_ui)) {
+        layout(host);
+        chat_ui_sidebar_remap(&host->chat_ui, &host->remap);
+        if (ui_layout_pending(host->config.ui)) layout(host);
+    }
+    sidebar_accessibility(host, &host->remap);
     if (host->accessibility &&
         host->accessibility_focus != host->config.ui->focus) {
         host->accessibility_focus = host->config.ui->focus;
@@ -691,6 +732,9 @@ static void command(void *user, ChatCommand code, int index) {
             render_transcript(host);
             rich_text_set_text(&host->composer, L"");
             chat_ui_sync(&host->chat_ui);
+            /* The new row sits below the window until it is revealed. */
+            chat_ui_request_reveal(&host->chat_ui,
+                chat->conversations[chat->active].id);
         }
     } else if (code == CHAT_COMMAND_SELECT) {
         if (chat_select_conversation(chat, index)) {
@@ -699,6 +743,10 @@ static void command(void *user, ChatCommand code, int index) {
             render_transcript(host);
             rich_text_set_text(&host->composer,chat->conversations[chat->active].draft);
             chat_ui_sync(&host->chat_ui);
+            /* Identity-based selection may target a row outside the window
+               (search navigation, UIA SetFocus on a list summary). */
+            chat_ui_request_reveal(&host->chat_ui,
+                chat->conversations[chat->active].id);
         }
     }
     mark_dirty(host); save(host);
@@ -745,6 +793,10 @@ static bool jump_search_result(ChatHost *host, size_t index) {
 
     host->search_selected = index;
     host->search_has_selection = true;
+    /* Every successful navigation reveals the active conversation's sidebar
+       row, including navigation within the already-active conversation. */
+    chat_ui_request_reveal(&host->chat_ui,
+        chat->conversations[chat->active].id);
     const ChatSearchResult *result = &host->search_results.items[index];
     wchar_t status[UI_TEXT_CAPACITY];
     swprintf(status, UI_TEXT_CAPACITY, L"%llu/%llu %ls %ls: %ls",
@@ -865,6 +917,11 @@ static void action(ChatHost *host, int code) {
         else chat_clear(chat);
         transcript_invalidate(&host->transcript);
         host->editing=false; rich_text_set_text(&host->composer,chat->conversations[chat->active].draft); render_transcript(host);
+        /* The active conversation may have shifted above or below the
+           sidebar window after deletion. */
+        if (chat->active >= 0 && chat->active < chat->conversation_count)
+            chat_ui_request_reveal(&host->chat_ui,
+                chat->conversations[chat->active].id);
     } else if (code==ACTION_SYSTEM) {
         wchar_t prompt[CHAT_MESSAGE_TEXT]; wcscpy(prompt,chat->system_prompt);
         if (chat_edit_dialog(host->window,L"System prompt (applies to future requests)",prompt,CHAT_MESSAGE_TEXT,true))
@@ -1423,6 +1480,12 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
     if (!chat_ui_init(&host->chat_ui, config->ui, config->chat)) goto cleanup;
     host->chat_ui.command = command;
     host->chat_ui.command_user = host;
+    /* The list has no extent before the first layout, so the storage load's
+       active conversation is revealed by pending id on the first flush. */
+    if (config->chat->active >= 0 &&
+        config->chat->active < config->chat->conversation_count)
+        chat_ui_request_reveal(&host->chat_ui,
+            config->chat->conversations[config->chat->active].id);
     config->ui->on_event = host_event;
     config->ui->event_user = host;
     HRESULT hr = renderer_init(&host->renderer, &config->ui->theme);

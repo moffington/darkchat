@@ -1273,6 +1273,120 @@ int main(void) {
         rich_text_set_text(&h->composer,L"Unsent draft");
         chat_dispose(loaded); free(loaded);
     }
+    /* Stage 6: the windowed sidebar through the real flush pipeline. */
+    {
+        while (chat->conversation_count < 110) chat_new_conversation(chat);
+        command(h, CHAT_COMMAND_SELECT, 109);   /* selects and requests reveal */
+        pump_messages(50);
+        CHECK(h->chat_ui.pool_count > 1 && h->chat_ui.pool_count < 40);
+        CHECK(h->chat_ui.window_offset > 0);    /* the reveal scrolled down */
+        bool found = false;
+        for (int j = 0; j < h->chat_ui.pool_count; j++)
+            if ((uint64_t)ui_node(ui, h->chat_ui.rows[j])->tag ==
+                chat->conversations[109].id) found = true;
+        CHECK(found);
+        /* A settled, no-op flush changes nothing: layout stays gated and no
+           new paint is requested. */
+        pump_messages(30);
+        bool paint_before = ui->paint_dirty;
+        CHECK(!ui_layout_pending(ui));
+        flush(h);
+        CHECK(!ui_layout_pending(ui));
+        CHECK(ui->paint_dirty == paint_before);
+        /* Invoking a row deep in the window selects the conversation it
+           displays, by id. */
+        int last = h->chat_ui.pool_count - 1;
+        uint64_t displayed = (uint64_t)ui_node(ui, h->chat_ui.rows[last])->tag;
+        CHECK(ui_invoke(ui, h->chat_ui.rows[last]));
+        CHECK(chat->active == chat_index_of_id(chat, displayed));
+        /* Wheel-style scrolling does not snap back to the active row. */
+        UiRect row_rect = ui_node(ui, h->chat_ui.rows[0])->rect;
+        ui_scroll(ui, row_rect.x + 10, row_rect.y + 5, -400);
+        pump_messages(30);
+        CHECK(!chat_ui_apply_reveal(&h->chat_ui));
+        CHECK(chat->active == chat_index_of_id(chat, displayed));
+        /* Search navigation to a conversation above the window selects and
+           reveals it by stable id. */
+        CHECK(chat_append_at(chat, 1, CHAT_ROLE_USER, L"sidebar needle zzz") >= 0);
+        rich_text_set_text(&h->search, L"sidebar needle");
+        CHECK(search_refresh(h, false));
+        CHECK(chat->active == 1);
+        pump_messages(30);
+        bool in_window = false;
+        for (int j = 0; j < h->chat_ui.pool_count; j++)
+            if ((uint64_t)ui_node(ui, h->chat_ui.rows[j])->tag ==
+                chat->conversations[chat->active].id) in_window = true;
+        CHECK(in_window);
+        /* Restore the exact state the close/reopen test below expects. */
+        command(h, CHAT_COMMAND_SELECT, 0);
+        pump_messages(30);
+        rich_text_set_text(&h->composer, L"Unsent draft");
+    }
+    /* Reveal geometry and report merging through the real flush: renaming a
+       conversation bound to the partly visible overscan row requests a
+       reveal; the reveal scrolls without changing the offset, so the
+       second remap is a no-op and must not discard the first remap's
+       NamePropertyChanged finding. */
+    {
+        int probe_j = h->chat_ui.pool_count - 1;   /* the overscan row */
+        UiId probe_row = h->chat_ui.rows[probe_j];
+        int probe_index = h->chat_ui.window_offset + probe_j;
+        wchar_t probe_old[CHAT_TITLE_TEXT];
+        wcscpy(probe_old, ui_node(ui, probe_row)->text);
+        float viewport = ui_scroll_viewport_h(ui, h->chat_ui.list);
+        float pitch = ui->theme.control_height +
+            ui_node(ui, h->chat_ui.list)->style.gap;
+        float row_bottom = probe_index * pitch + ui->theme.control_height;
+        int offset_before = h->chat_ui.window_offset;
+        float scroll = ui_scroll_offset(ui, h->chat_ui.list);
+        CHECK(probe_index * pitch >= scroll &&
+            row_bottom > scroll + viewport);   /* partly visible only */
+        wcscpy(chat->conversations[probe_index].title, L"Merge probe");
+        chat_ui_request_reveal(&h->chat_ui,
+            chat->conversations[probe_index].id);
+        flush(h);
+        pump_messages(30);
+        CHECK(fabsf(ui_scroll_offset(ui, h->chat_ui.list) -
+            (row_bottom - viewport)) < .05f);
+        CHECK(h->chat_ui.window_offset == offset_before);
+        bool merged = false;
+        for (int i = 0; i < h->remap.name_changed_count; i++)
+            if (h->remap.name_changed[i].id == probe_row &&
+                !wcscmp(h->remap.name_changed[i].old_title, probe_old))
+                merged = true;
+        CHECK(merged);
+        CHECK(!wcscmp(ui_node(ui, probe_row)->text, L"Merge probe"));
+    }
+    /* Search navigation within the already-active conversation must also
+       reveal the sidebar row. */
+    {
+        command(h, CHAT_COMMAND_SELECT, 100);
+        pump_messages(30);
+        UiRect list_rect = ui_node(ui, h->chat_ui.list)->rect;
+        ui_scroll(ui, list_rect.x + 20, list_rect.y + list_rect.h / 2, -1000);
+        flush(h);                                /* remap the scrolled window */
+        pump_messages(30);
+        bool out_of_window = true;
+        for (int j = 0; j < h->chat_ui.pool_count; j++)
+            if ((uint64_t)ui_node(ui, h->chat_ui.rows[j])->tag ==
+                chat->conversations[chat->active].id) out_of_window = false;
+        CHECK(out_of_window);   /* the active row is scrolled away */
+        CHECK(chat_append(chat, CHAT_ROLE_USER, L"active needle qqq") >= 0);
+        render_transcript(h);   /* the host renders after every mutation */
+        rich_text_set_text(&h->search, L"active needle");
+        CHECK(search_refresh(h, false));
+        CHECK(chat->active == 100);
+        pump_messages(30);
+        bool in_window = false;
+        for (int j = 0; j < h->chat_ui.pool_count; j++)
+            if ((uint64_t)ui_node(ui, h->chat_ui.rows[j])->tag ==
+                chat->conversations[chat->active].id) in_window = true;
+        CHECK(in_window);
+        /* Restore the exact state the close/reopen test below expects. */
+        command(h, CHAT_COMMAND_SELECT, 0);
+        pump_messages(30);
+        rich_text_set_text(&h->composer, L"Unsent draft");
+    }
     begin_fixture(h); handle_event(h,fixture(h,OPENROUTER_DELTA,L"Closing partial"));
     SendMessageW(window,WM_CLOSE,0,0);
     CHECK(!IsWindow(window) && !h->generating);

@@ -625,6 +625,59 @@ int main(void) {
         chat_dispose(stable); free(stable);
     }
 
+    /* Stage 6: the 128-conversation bound, stable-identity lookup, and
+       deletion invariants at scale. */
+    {
+        Chat *many = (Chat *)calloc(1, sizeof *many);
+        if (!many) return 2;
+        chat_init(many);
+        for (int i = 1; i < CHAT_MAX_CONVERSATIONS; i++)
+            check(chat_new_conversation(many) == i,
+                "a conversation is created below the cap");
+        check(chat_new_conversation(many) == -1,
+            "creation fails closed at the conversation cap");
+        check(many->conversation_count == CHAT_MAX_CONVERSATIONS,
+            "the conversation cap is reached exactly");
+        uint64_t seen[CHAT_MAX_CONVERSATIONS];
+        int duplicates = 0;
+        for (int i = 0; i < many->conversation_count; i++) {
+            seen[i] = many->conversations[i].id;
+            for (int j = 0; j < i; j++)
+                if (seen[i] == seen[j]) duplicates++;
+        }
+        check(duplicates == 0, "conversation ids are unique across the range");
+        check(chat_index_of_id(many, many->conversations[7].id) == 7,
+            "stable-identity lookup resolves a middle conversation");
+        check(chat_index_of_id(many, many->conversations[CHAT_MAX_CONVERSATIONS - 1].id)
+            == CHAT_MAX_CONVERSATIONS - 1,
+            "stable-identity lookup resolves the last conversation");
+        check(chat_index_of_id(many, 0) == -1 &&
+            chat_index_of_id(many,
+                many->conversations[CHAT_MAX_CONVERSATIONS - 1].id + 1) == -1,
+            "unknown or zero ids resolve to -1");
+        /* Deleting a middle conversation shifts indices but never ids. */
+        uint64_t victim = many->conversations[5].id;
+        uint64_t survivor = many->conversations[6].id;
+        many->active = 5;
+        check(chat_delete(many), "a middle conversation deletes");
+        check(many->conversation_count == CHAT_MAX_CONVERSATIONS - 1,
+            "the count shrinks by one");
+        check(many->conversations[5].id == survivor,
+            "the survivor shifts into the vacated index");
+        check(chat_index_of_id(many, victim) == -1 &&
+            chat_index_of_id(many, survivor) == 5,
+            "identity lookup follows the deletion");
+        check(chat_new_conversation(many) == CHAT_MAX_CONVERSATIONS - 1,
+            "room below the cap is restored by deletion");
+        /* Deleting the active last conversation clamps the selection. */
+        many->active = many->conversation_count - 1;
+        check(chat_delete(many) && chat_active(many) != NULL &&
+            many->active == many->conversation_count - 1,
+            "deleting the active last conversation clamps the selection");
+        check_invariants(many);
+        chat_dispose(many); free(many);
+    }
+
     /* Ownership: deleting a mid-list conversation transfers the surviving
        conversations' allocations without double frees, and the moved
        conversation keeps accepting messages. */

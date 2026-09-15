@@ -9,7 +9,11 @@
 #include <wchar.h>
 #include <stdint.h>
 
-#define CHAT_MAX_CONVERSATIONS 16
+/* Up to 128 conversations; snapshot format 2 raised this bound from 16.
+   The storage decode accepts both format versions and enforces this bound;
+   older 16-conversation builds reject format 2 as unsupported. The
+   downgrade contract is documented in docs/CHAT.md. */
+#define CHAT_MAX_CONVERSATIONS 128
 #define CHAT_MAX_MESSAGES 64
 /* Every persisted identity (conversation and stable message ids) comes from
    one counter that the storage format encodes as an exact double. This is the
@@ -181,6 +185,8 @@ void chat_init(Chat *chat);
 /* Creates an empty conversation, selects it and returns its index, or -1. */
 int chat_new_conversation(Chat *chat);
 bool chat_select_conversation(Chat *chat, int index);
+/* Index of the conversation with this stable id, or -1 when unknown. */
+int chat_index_of_id(const Chat *chat, uint64_t id);
 /* Appends a message to the active conversation. Returns its index, or -1. */
 int chat_append(Chat *chat, ChatRole role, const wchar_t *text);
 /* Appends a message to a specific conversation, whichever is active or not;
