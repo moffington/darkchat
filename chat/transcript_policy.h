@@ -35,18 +35,25 @@
 #define TRANSCRIPT_SPARE_SLOTS 2
 
 /* A borrowed description of one layout record (or of one slot's bound
-   record) at decision time. `index` is always the represented record index,
-   or -1 for a free slot; the slot position in a victim search is the array
-   position of the item, never item.index. `height <= 0` means "not yet
-   measured" and every geometry-aware seam reads it as h_min. Flags are
-   computed by the caller from record state at decision time; nothing here
-   caches them. `last_used` is the record-owned LRU stamp: it ranks eviction
-   candidates only and never participates in realization ordering. */
+    record) at decision time. `index` is always the represented record index,
+    or -1 for a free slot; the slot position in a victim search is the array
+    position of the item, never item.index. `height <= 0` means "not yet
+    measured" and every geometry-aware seam reads it as h_min. Flags are
+    computed by the caller from record state at decision time; nothing here
+    caches them. `last_used` is the record-owned LRU stamp: it ranks eviction
+    candidates only and never participates in realization ordering.
+
+    `created_kinds` describes the native surface kinds the slot already owns
+    (bitmask, bit k = kind k has a created window; 0 = pristine slot). It
+    feeds only transcript_policy_pick_slot's shape-aware reuse tiers; the
+    retain-all victim search ignores it. The mapping from bit to surface kind
+    belongs to the caller (the transcript's TranscriptSurface order). */
 typedef struct {
     int index;
     int y, height;
     bool streaming, focused, debt, expanded;
     uint64_t last_used;
+    uint32_t created_kinds;
 } TranscriptPolicyItem;
 
 /* Visibility is geometry with one source of truth, mirroring the transcript
@@ -91,14 +98,44 @@ int transcript_policy_needed_slots(const TranscriptPolicyItem *items,
     int count, int scroll, int page, int h_min, int spare_slots);
 
 /* Slot selection for a new binding. `bound` describes every slot by array
-   position: bound[s].index is the record slot s currently renders, or -1
-   when s is free; the returned value is the slot position, never item.index.
-   Preference: a free slot first (the lowest-positioned one); otherwise the
-   oldest-last_used bound slot that is neither visible nor class-protected
-   (ties keep the lowest position); -1 when every slot is must-keep, which
-   under P-CAP is unreachable and must be answered by raising capacity. */
+    position: bound[s].index is the record slot s currently renders, or -1
+    when s is free; the returned value is the slot position, never item.index.
+    Preference: a free slot first (the lowest-positioned one); otherwise the
+    oldest-last_used bound slot that is neither visible nor class-protected
+    (ties keep the lowest position); -1 when every slot is must-keep, which
+    under P-CAP is unreachable and must be answered by raising capacity.
+
+    This is the retain-all-era contract: it still backs the dormant victim
+    path when the pool fills. Bounded realization binds through
+    transcript_policy_pick_slot instead. */
 int transcript_policy_pick_victim(const TranscriptPolicyItem *bound,
     int slot_count, int scroll, int page, int h_min);
+
+/* Shape-aware bounded-mode slot selection. The caller passes the padded
+    viewport (scroll and page already widened by the realization overscan) so
+    the must-keep set is padded-window ∪ protected; `needed_kinds` is the
+    bitmask of surface kinds the new binding requires. Tiers, in order:
+
+    1. a free slot whose created_kinds equals needed_kinds (pure HWND reuse,
+       no eviction) — free-slot ties take the lowest position;
+    2. an evictable bound slot whose created_kinds equals needed_kinds
+       (pre-eviction: the departed record is outside the must-keep set, so
+       unbinding it destroys no reader state);
+    3. a free slot with created HWNDs and the most kind overlap (free-slot
+       ties take the lowest position);
+    4. an evictable bound slot with the most kind overlap (any overlap,
+       including zero) — evictable ties take the oldest last_used, then the
+       lowest position;
+    5. a pristine free slot (created_kinds == 0) — lowest position — the
+       final step: a pristine slot is never consumed while any free slot
+       with HWNDs or any evictable bound slot exists, so the HWND arena stays
+       viewport-shaped under non-accumulating use.
+
+    -1 only when every slot is a bound must-keep record and none is free,
+    which cannot happen while the pool has at least as many slots as records;
+    it is preserved fail-closed for a future hard-capped arena. */
+int transcript_policy_pick_slot(const TranscriptPolicyItem *bound,
+    int slot_count, uint32_t needed_kinds, int scroll, int page, int h_min);
 
 /* Identity validation: true iff the message instance a slot's surfaces were
    built from is exactly the message instance about to be rendered. A false

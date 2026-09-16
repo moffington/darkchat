@@ -77,7 +77,7 @@ static void capture_settings(ChatHost *host);
 static bool surface_key(void *user, WPARAM key, bool shift, bool control,
     bool down);
 static void refresh_turn(ChatHost *host, int index);
-static void stream_body_markdown(ChatHost *host, int index);
+static bool stream_body_markdown(ChatHost *host, int index);
 static void position_turns(ChatHost *host, bool follow);
 static void schedule_body_flush(ChatHost *host);
 static void cancel_body_flush(ChatHost *host);
@@ -119,12 +119,13 @@ static void refresh_turn(ChatHost *host, int index) {
     TranscriptFeed feed = transcript_feed(host);
     transcript_refresh_turn(&host->transcript, &feed, index);
 }
-static void stream_body_markdown(ChatHost *host, int index) {
+static bool stream_body_markdown(ChatHost *host, int index) {
     TranscriptFeed feed = transcript_feed(host);
-    transcript_stream_body(&host->transcript, &feed, index);
+    return transcript_stream_body(&host->transcript, &feed, index);
 }
 static void position_turns(ChatHost *host, bool follow) {
-    transcript_position(&host->transcript, follow);
+    TranscriptFeed feed = transcript_feed(host);
+    transcript_position(&host->transcript, &feed, follow);
 }
 /* Arms a one-shot flush so deltas appended inside the throttle window reach
    the body even if the stream then pauses with no further delta to cross it.
@@ -153,14 +154,27 @@ static void cancel_body_flush(ChatHost *host) {
 }
 /* Applies the scheduled rebuild. A body holding a selection is not rewritten:
    transcript_stream_body records the debt as a pending write and returns, so
-   the reader's range survives and the deferred render lands when it clears. */
+   the reader's range survives and the deferred render lands when it clears.
+   A missing body surface (creation failed) is retried inside
+   transcript_stream_body; a false return keeps the flush armed and re-arms
+   the one-shot timer at the throttle interval, so the retry cadence
+   continues without waiting for another delta. The re-arm uses a raw
+   SetTimer and never schedule_body_flush, whose SetTimer-failure fallback
+   calls this function -- re-entering the scheduler would recurse. A failed
+   re-arm simply falls back to the external retry paths (next incoming
+   delta, the 1 Hz sweep, the next render). */
 static void flush_stream_body(ChatHost *host) {
     if (host->window) KillTimer(host->window, CHAT_TIMER_BODY_FLUSH);
     if (!host->body_flush_pending || !host->generating) return;
     if (host->request_conversation != host->config.chat->active) return;
     host->body_flush_pending = false;
     host->transcript.body_render_tick = GetTickCount64();
-    stream_body_markdown(host, host->request_message);
+    if (stream_body_markdown(host, host->request_message)) return;
+    if (!host->transcript.bounded) return;
+    host->body_flush_pending = true;
+    if (host->window)
+        SetTimer(host->window, CHAT_TIMER_BODY_FLUSH, CHAT_BODY_RENDER_MS,
+            NULL);
 }
 /* Whole-row click on one turn's reasoning row: toggles only that turn, whose
    expansion is stored on its own message. */
@@ -639,6 +653,13 @@ static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
                 host->body_flush_pending=true;
                 schedule_body_flush(host);
             }
+        } else if (host->transcript.bounded && !host->body_flush_pending) {
+            /* The body surface is missing (never created, or its creation
+               failed): arm the flush so the retry paths — this delta's
+               schedule, the 1 Hz sweep, the terminal render — recreate it.
+               Each retry is one bounded attempt; no path recurses. */
+            host->body_flush_pending=true;
+            schedule_body_flush(host);
         }
     }
 }
@@ -784,15 +805,20 @@ static bool jump_search_result(ChatHost *host, size_t index) {
         /* Selection invalidates and renders once. Set per-turn view state first
            so a reasoning result is realized by that render. */
         command(host, CHAT_COMMAND_SELECT, target.conversation);
-    } else if (open_reasoning) {
+    } else if (open_reasoning && !host->transcript.bounded) {
         /* Only the newly opened reasoning turn needs synchronization. Body
-           results and already-open reasoning results need no render at all. */
+           results and already-open reasoning results need no render at all.
+           Bounded reveal performs this reconciliation in its one epoch. */
         refresh_turn(host, target.message);
     }
     if (target.conversation != chat->active || target.message < 0 ||
         (size_t)target.message >= chat->conversations[chat->active].message_count)
         return false;
-    if (!transcript_reveal_turn(&host->transcript, target.message)) return false;
+    {
+        TranscriptFeed feed = transcript_feed(host);
+        if (!transcript_reveal_turn(&host->transcript, &feed, target.message))
+            return false;
+    }
 
     host->search_selected = index;
     host->search_has_selection = true;
@@ -1283,6 +1309,11 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             capture_settings(host);
             { TranscriptFeed feed = transcript_feed(host);
               transcript_apply_pending(&host->transcript, &feed); }
+            /* Bounded 1 Hz retry for an armed, still-missing streaming body:
+               timer context, one attempt, no re-arming loop. */
+            if (host->transcript.bounded && host->body_flush_pending &&
+                host->generating)
+                flush_stream_body(host);
             /* One-second autosave: hand a snapshot to the background writer.
                While a save failure is latched the sweep stays silent so the
                failure report remains visible, exactly like the synchronous
@@ -1317,6 +1348,19 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
                 host->dpi);
             ui_invalidate(u, true);
             flush(host);
+        }
+        return 0;
+    case WM_ENTERSIZEMOVE:
+        /* Interactive drag: defer off-screen re-measurement (the realize
+           loop keeps last-known off-screen heights; visible records still
+           live-measure each step). The settle render below restores exact
+           geometry. Behavior-neutral in retain-all mode. */
+        if (host->transcript.bounded) host->transcript.resizing = true;
+        return 0;
+    case WM_EXITSIZEMOVE:
+        if (host->transcript.bounded) {
+            host->transcript.resizing = false;
+            render_transcript(host);
         }
         return 0;
     case WM_DPICHANGED: {

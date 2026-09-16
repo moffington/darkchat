@@ -126,6 +126,12 @@ static double now_ms(void) {
     QueryPerformanceCounter(&counter);
     return (double)counter.QuadPart*1000.0/(double)frequency.QuadPart;
 }
+/* Feed seam for direct transcript_position/reveal calls in the tests. */
+static TranscriptFeed *feed_arg(ChatHost *h) {
+    static TranscriptFeed feed;
+    feed = transcript_feed(h);
+    return &feed;
+}
 /* Pumps real messages, letting the host's scheduled flush timer fire the way
    it does in the running app. */
 static void pump_messages(DWORD ms) {
@@ -178,6 +184,24 @@ static bool wait_save_failed(ChatHost *h,DWORD timeout_ms) {
 /* Transcript child controls the container currently owns (realized or shown).
    WS_VISIBLE is read directly: the host's own top-level window is never shown
    in this headless test, so IsWindowVisible would report every child hidden. */
+/* Bounded-realization failure injector: fail exactly the surface creation
+    whose control id matches (0 disarms). Deterministic per surface: turn ids
+    are 100 + slot*4 + surface, and the measurer is id TRANSCRIPT_MEASURE_ID. */
+static int block_fail_id, viewport_fail_id;
+bool __real_rich_text_create_block(RichTextControl *control, HWND parent,
+    int id, const RichTextTheme *theme, float dpi);
+bool __wrap_rich_text_create_block(RichTextControl *control, HWND parent,
+    int id, const RichTextTheme *theme, float dpi) {
+    if (block_fail_id && id == block_fail_id) return false;
+    return __real_rich_text_create_block(control, parent, id, theme, dpi);
+}
+bool __real_rich_text_create_viewport(RichTextControl *control, HWND parent,
+    int id, const RichTextTheme *theme, float dpi);
+bool __wrap_rich_text_create_viewport(RichTextControl *control, HWND parent,
+    int id, const RichTextTheme *theme, float dpi) {
+    if (viewport_fail_id && id == viewport_fail_id) return false;
+    return __real_rich_text_create_viewport(control, parent, id, theme, dpi);
+}
 static int child_controls(HWND parent,bool visible_only) {
     int count=0;
     for (HWND child=GetWindow(parent,GW_CHILD); child;
@@ -186,7 +210,23 @@ static int child_controls(HWND parent,bool visible_only) {
             (GetWindowLongPtrW(child,GWL_STYLE) & WS_VISIBLE)) count++;
     return count;
 }
-int main(void) {
+/* Every record that strictly intersects the viewport is bound and shows its
+    own body — the qualified I-GAP probe used across the bounded suite. */
+static bool visible_realized(ChatHost *h) {
+    Transcript *tr=&h->transcript;
+    int count=tr->record_count;
+    if (count<0) count=0;
+    if (count>CHAT_MAX_MESSAGES) count=CHAT_MAX_MESSAGES;
+    for (int i=0;i<count;i++) {
+        TranscriptRecord *rec=&tr->records[i];
+        int top=rec->y-tr->view_scroll;
+        if (top>=tr->view_page || top+rec->height<=0) continue;
+        if (!transcript_surface(tr,i,TRANSCRIPT_BODY)) return false;
+        if (!rec->body_live) return false;
+    }
+    return true;
+}
+static int default_suite(void) {
     CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
@@ -733,7 +773,7 @@ int main(void) {
          remeasures: the turn grows, the following surface and the scrollbar
          range move, and a pinned transcript still follows the bottom. */
       h->transcript.view_scroll=0x7fffffff;
-      transcript_position(&h->transcript,false);   /* pin to the bottom */
+      transcript_position(&h->transcript,feed_arg(h),false);   /* pin to the bottom */
       int body_before=turn->body_h, height_before=turn->height;
       int content_before=h->transcript.view_content;
       SendMessageW(body,EM_SETSEL,0,0);
@@ -761,7 +801,7 @@ int main(void) {
       wchar_t shown[256]; body_text(h,second,shown,256);
       CHECK(wcsstr(shown,L"more")==NULL);   /* terminal render still deferred */
       h->transcript.view_scroll=0x7fffffff;
-      transcript_position(&h->transcript,false);
+      transcript_position(&h->transcript,feed_arg(h),false);
       int body_before=turn->body_h, meta_before=turn->meta_y;
       int content_before=h->transcript.view_content;
       SendMessageW(body,EM_SETSEL,0,0);
@@ -844,7 +884,7 @@ int main(void) {
       wchar_t shown[256]; body_text(h,second,shown,256);
       CHECK(wcsstr(shown,L"plus more")==NULL);
       h->transcript.view_scroll=0x7fffffff;
-      transcript_position(&h->transcript,false);   /* pin to the bottom */
+      transcript_position(&h->transcript,feed_arg(h),false);   /* pin to the bottom */
       int content_before=h->transcript.view_content;
       SendMessageW(body,EM_SETSEL,0,0);
       CHECK(turn->body_h>body_before);
@@ -940,7 +980,7 @@ int main(void) {
     CHECK(h->body_flush_pending);
     CHECK(h->transcript.view_content>h->transcript.view_page);
     h->transcript.view_scroll=0;
-    transcript_position(&h->transcript,false);       /* reading an older turn */
+    transcript_position(&h->transcript,feed_arg(h),false);       /* reading an older turn */
     CHECK(!transcript_pinned(&h->transcript));
     int scroll=h->transcript.view_scroll;
     double flush_started=now_ms();
@@ -1193,7 +1233,7 @@ int main(void) {
     uint64_t search_reason_id=chat->conversations[search_b].messages[search_reason].id;
     render_transcript(h);
     h->transcript.view_scroll=0;
-    transcript_position(&h->transcript,false);
+    transcript_position(&h->transcript,feed_arg(h),false);
     CHECK(h->search.window &&
         (GetWindowLongPtrW(h->search.window,GWL_STYLE)&WS_VISIBLE));
     rich_text_set_text(&h->search,L"HOST-search-token");
@@ -1210,7 +1250,7 @@ int main(void) {
       CHECK(turn->y+turn->height>h->transcript.view_scroll &&
           turn->y<h->transcript.view_scroll+h->transcript.view_page);
       int revealed=h->transcript.view_scroll;
-      CHECK(transcript_reveal_turn(&h->transcript,search_body) &&
+      CHECK(transcript_reveal_turn(&h->transcript,feed_arg(h),search_body) &&
           h->transcript.view_scroll==revealed); }
     /* Jumping again to an active body only reveals it. A deliberately stale
        unrelated rendered identity proves no full transcript pass occurred. */
@@ -1607,6 +1647,9 @@ int main(void) {
         pump_messages(30);
         rich_text_set_text(&h->composer, L"Unsent draft");
     }
+    /* F1: retain-all never enters bounded realization or creates its measurer. */
+    CHECK(!h->transcript.bounded && !h->transcript.measurer_valid);
+    CHECK(h->transcript.render_epoch==0 && h->transcript.stat.fallback_rounds==0);
     begin_fixture(h); handle_event(h,fixture(h,OPENROUTER_DELTA,L"Closing partial"));
     SendMessageW(window,WM_CLOSE,0,0);
     CHECK(!IsWindow(window) && !h->generating);
@@ -1638,6 +1681,552 @@ int main(void) {
     rich_text_library_close();
     chat_dispose(loaded); chat_dispose(chat);
     free(loaded); free(chat); free(ui); free(h); CoUninitialize();
-    puts("Hidden host: failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, stable-id conversation search with body/reasoning jumps and stale-result rejection, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen, background snapshot writer (snapshot isolation across an in-flight write, per-handoff completion accounting, failure latch and retry, pre-request flush gate refusing to send, latest-wins coalescing, shutdown drain), slot-pool lifetime ordering with disposal after full child teardown, record/slot rebind that never accepts foreign surfaces as fresh with debt surviving an unrealized interval and unfocused selections protected, binding-generation certification covering ABA slot-number reuse with a stale-generation catch_up refusal and cross-slot debt application, catch_up stale-identity refusal, and the retain-all P-CAP checkpoint passed");
     return 0;
+}
+
+/* ---- Bounded-mode suite (separate clean fixture) -------------------------- */
+
+/* Registers a window class that may already exist (the default suite above
+    registered the same names). */
+static bool register_class_once(const WNDCLASSW *cls) {
+    if (RegisterClassW(cls)) return true;
+    return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+/* F2 is intentionally independent from the pristine bounded fixture below:
+   activating bounded mode after retain-all must not contaminate first-arena
+   measurements used by the R-suite. */
+static int seam_toggle_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Seam host",1100,720,720,480,NULL};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-seam-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Seam integration",WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    for (int t=0;t<20;t++) add_turn(chat,L"seam question",
+        L"seam answer\nline two\nline three\nline four\nline five\n"
+        L"line six\nline seven\nline eight",NULL,-1);
+    render_transcript(h);
+    CHECK(!h->transcript.bounded && !h->transcript.measurer_valid);
+    CHECK(h->transcript.render_epoch==0 && transcript_bound_slots(&h->transcript)==40);
+    { wchar_t shown[128]; body_text(h,1,shown,128); CHECK(wcsstr(shown,L"seam answer")); }
+    SetWindowPos(h->view,NULL,0,0,1100,120,
+        SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
+    transcript_set_bounded(&h->transcript,true);
+    render_transcript(h);
+    CHECK(transcript_bound_slots(&h->transcript)<40);
+    CHECK(visible_realized(h));
+    { wchar_t shown[128]; body_text(h,39,shown,128); CHECK(wcsstr(shown,L"seam answer")); }
+    int activated_bound=transcript_bound_slots(&h->transcript);
+    int activated_binds=h->transcript.stat.binds;
+    int activated_evictions=h->transcript.stat.evictions;
+    render_transcript(h);
+    CHECK(transcript_bound_slots(&h->transcript)==activated_bound);
+    CHECK(h->transcript.stat.binds==activated_binds &&
+        h->transcript.stat.evictions==activated_evictions);
+    transcript_set_bounded(&h->transcript,false);
+    render_transcript(h);
+    CHECK(transcript_bound_slots(&h->transcript)==40 && visible_realized(h));
+    { wchar_t shown[128]; body_text(h,1,shown,128); CHECK(wcsstr(shown,L"seam answer")); }
+    SendMessageW(window,WM_CLOSE,0,0); CHECK(!IsWindow(window));
+    saver_shutdown(&h->saver); storage_close(&h->storage);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
+    transcript_dispose(&h->transcript); rich_text_library_close();
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
+static int bounded_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Bounded host",1100,720,720,480,NULL};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-bounded-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Bounded integration",WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+    /* The seam: bounded realization on for this whole fixture; production
+       stays on the retain-all default until the activation pass. */
+    transcript_set_bounded(&h->transcript, true);
+    CHECK(h->transcript.bounded && !h->transcript.measurer_valid);
+    CHECK(transcript_created_windows(&h->transcript) == 0);
+
+    /* ---- F3: pristine bounded first-render counters ---- */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    int f3_conv=chat->active;
+    for (int t=0;t<40;t++) add_turn(chat,L"question",L"answer text",NULL,-1);
+    render_transcript(h);
+    CHECK(chat->conversations[f3_conv].message_count==80);
+    int f3_bound=transcript_bound_slots(&h->transcript);
+    int f3_created=transcript_created_windows(&h->transcript);
+    CHECK(f3_bound>0 && f3_bound<80);            /* window-shaped, not all */
+    CHECK(f3_created<=4*f3_bound+1);             /* arena within bound slots */
+    CHECK(transcript_created_windows(&h->transcript)==child_controls(h->view,false));
+    CHECK(visible_realized(h));
+    CHECK(h->transcript.measurer_valid);         /* lazy creation succeeded */
+    CHECK(h->transcript.stat.rounds<=2*80+4);
+    /* Every stamp EXACT after the first-layout sweep; off-screen heights
+       equal the live measure (equality asserted where both are EXACT). */
+    for (int i=0;i<80;i++)
+        CHECK(h->transcript.records[i].measured_valid &&
+            !h->transcript.records[i].measured_estimated);
+    int exact_after_first=h->transcript.stat.exact_measures;
+    render_transcript(h);
+    CHECK(h->transcript.stat.exact_measures==exact_after_first);
+
+    /* ---- R1: A-short -> B-long replacement on already-bound slots ---- */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    int conv_a=chat->active;
+    add_turn(chat,L"a one",L"A answer one",NULL,-1);
+    add_turn(chat,L"a two",L"A answer two",NULL,-1);
+    render_transcript(h);
+    int created_before_r1=transcript_created_windows(&h->transcript);
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    int conv_b=chat->active;
+    for (int t=0;t<256;t++) {
+        wchar_t answer[128];
+        swprintf(answer,128,L"B answer %d unique-token-%d",t,t);
+        add_turn(chat,L"B question",answer,NULL,-1);
+    }
+    CHECK(chat->conversations[conv_b].message_count==512);
+    render_transcript(h);
+    CHECK(visible_realized(h));
+    { wchar_t shown[256]; body_text(h,511,shown,256);
+      CHECK(wcsstr(shown,L"B answer 255")!=NULL); }   /* replacement, not A */
+    for (int i=0;i<h->transcript.record_count;i++) {
+        if (!transcript_surface(&h->transcript,i,TRANSCRIPT_BODY)) continue;
+        wchar_t shown[256]; body_text(h,i,shown,256);
+        CHECK(wcsstr(shown,L"A answer")==NULL);      /* never foreign */
+    }
+    /* Pure replacement: B's window rebinds onto A's departed slots with
+       matching shapes — zero pristine consumptions, zero new HWNDs. */
+    CHECK(transcript_created_windows(&h->transcript)==created_before_r1);
+    CHECK(transcript_created_windows(&h->transcript)<=4*512+1);
+    /* A returns intact: switching back re-renders A's own content on the
+       recycled slots (A/B/A through real recycling, never foreign). */
+    command(h,CHAT_COMMAND_SELECT,conv_a);
+    render_transcript(h);
+    CHECK(visible_realized(h));
+    { wchar_t shown[256]; body_text(h,3,shown,256);
+      CHECK(wcsstr(shown,L"A answer two")!=NULL);
+      CHECK(wcsstr(shown,L"B answer")==NULL); }
+
+    /* ---- R3: nonlocal jumps, cumulative HWND peaks, zero-creation
+            revisits ---- */
+    command(h,CHAT_COMMAND_SELECT,conv_b);
+    render_transcript(h);
+    h->transcript.view_scroll=0;
+    transcript_position(&h->transcript,feed_arg(h),false);   /* top */
+    CHECK(visible_realized(h));
+    { wchar_t shown[256]; body_text(h,1,shown,256);
+      CHECK(wcsstr(shown,L"B answer 0")!=NULL); }
+    h->transcript.view_scroll=h->transcript.view_content/2;
+    transcript_position(&h->transcript,feed_arg(h),false);   /* middle */
+    CHECK(visible_realized(h));
+    /* Content assertion: every realized visible body renders its own B
+       turn -- never foreign A content, and the assistant turn nearest the
+       middle shows its expected answer text. */
+    { bool any=false;
+      for (int i=0;i<h->transcript.record_count;i++) {
+        TranscriptRecord *rec=&h->transcript.records[i];
+        int top=rec->y-h->transcript.view_scroll;
+        if (top>=h->transcript.view_page || top+rec->height<=0) continue;
+        if (!transcript_surface(&h->transcript,i,TRANSCRIPT_BODY)) continue;
+        wchar_t shown[256]; body_text(h,i,shown,256);
+        CHECK(wcsstr(shown,L"A answer")==NULL);
+        any=true;
+      }
+      CHECK(any); }
+    /* Continuous traversal catches cross-turn bleed within conversation B,
+       not merely stale content from the earlier A conversation. */
+    for (int scroll=0;scroll<h->transcript.view_content;
+         scroll+=h->transcript.view_page/2) {
+        h->transcript.view_scroll=scroll;
+        transcript_position(&h->transcript,feed_arg(h),false);
+        for (int i=0;i<h->transcript.record_count;i++) {
+            TranscriptRecord *rec=&h->transcript.records[i];
+            int top=rec->y-h->transcript.view_scroll;
+            if (top>=h->transcript.view_page || top+rec->height<=0) continue;
+            wchar_t shown[256], expected[64]; body_text(h,i,shown,256);
+            if (i&1) swprintf(expected,64,L"B answer %d",i/2);
+            else wcscpy(expected,L"B question");
+            CHECK(wcsstr(shown,expected)!=NULL);
+        }
+    }
+    h->transcript.view_scroll=0x7fffffff;
+    transcript_position(&h->transcript,feed_arg(h),false);   /* bottom */
+    CHECK(visible_realized(h));
+    { wchar_t shown[256]; body_text(h,511,shown,256);
+      CHECK(wcsstr(shown,L"B answer 255")!=NULL); }   /* bottom content */
+    /* Revisits consume no pristine slots: departed bindings were
+       pre-evicted and their HWNDs reused. */
+    int created_before_revisit=transcript_created_windows(&h->transcript);
+    h->transcript.view_scroll=0;
+    transcript_position(&h->transcript,feed_arg(h),false);
+    CHECK(visible_realized(h));
+    h->transcript.view_scroll=0x7fffffff;
+    transcript_position(&h->transcript,feed_arg(h),false);
+    CHECK(visible_realized(h));
+    CHECK(transcript_created_windows(&h->transcript)==created_before_revisit);
+    CHECK(transcript_created_windows(&h->transcript)<=4*512+1);
+    CHECK(transcript_bound_slots(&h->transcript)<=512);
+    /* A record revisited in a region measured once keeps its exact stamp:
+       heights are consumed, not re-measured (round count stays small). */
+    CHECK(h->transcript.stat.rounds<=2*512+4);
+
+    /* ---- R2: deferred selected content with changed height, including
+            the newly-created-debt preflight ---- */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    int r2_conv=chat->active;
+    for (int t=0;t<6;t++) add_turn(chat,L"r2 question",L"r2 answer line",NULL,-1);
+    render_transcript(h);
+    int r2=0;
+    /* Reveal record 0 first: the funnel realizes it, so the selection below
+       lands on a real surface. */
+    CHECK(transcript_reveal_turn(&h->transcript,feed_arg(h),r2));
+    CHECK(body_window(h,r2));
+    SendMessageW(body_window(h,r2),EM_SETSEL,0,4);
+    int body_before=h->transcript.records[r2].body_h;
+    CHECK(chat_message_set_text(&chat->conversations[r2_conv].messages[r2],
+        L"r2 edited\nsecond much longer line of edited text"));
+    render_transcript(h);
+    CHECK(h->transcript.records[r2].body_pending);
+    CHECK(h->transcript.records[r2].blocked_debt);
+    /* Displayed-true geometry: the old text still shows and the height
+       describes it; the new revision is not claimed. */
+    CHECK(h->transcript.records[r2].body_h==body_before);
+    { CHARRANGE sel; memset(&sel,0,sizeof sel);
+      SendMessageW(body_window(h,r2),EM_EXGETSEL,0,(LPARAM)&sel);
+      CHECK(sel.cpMin==0 && sel.cpMax==4); }
+    { wchar_t shown[256]; body_text(h,r2,shown,256);
+      CHECK(wcsstr(shown,L"r2 edited")==NULL); }
+    /* The selection clears: the external EN_SELCHANGE event applies the
+       debt (one attempt this render; progress rides this event). */
+    SendMessageW(body_window(h,r2),EM_SETSEL,0,0);
+    CHECK(!h->transcript.records[r2].body_pending);
+    CHECK(h->transcript.records[r2].body_revision==
+        chat->conversations[r2_conv].messages[r2].body_revision);
+    CHECK(h->transcript.records[r2].body_h>body_before);
+    { wchar_t shown[256]; body_text(h,r2,shown,256);
+      CHECK(wcsstr(shown,L"r2 edited")!=NULL); }
+
+    /* ---- R4: per-surface creation failure -> bounded retries -> recovery
+            during streaming ---- */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    int r4_conv=chat->active;
+    add_turn(chat,L"r4 filler q",L"r4 filler a",NULL,-1);
+    begin_regenerate(h);
+    int r4=h->request_message;
+    render_transcript(h);
+    { RichTextControl *body=transcript_surface(&h->transcript,r4,TRANSCRIPT_BODY);
+      CHECK(body);
+      block_fail_id=100+h->transcript.records[r4].slot*4+(int)TRANSCRIPT_BODY;
+      DestroyWindow(body->window);
+      CHECK(body->window && !IsWindow(body->window)); }
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"first"));
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L" second"));
+    CHECK(h->body_flush_pending);                /* armed by the missing body */
+    CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_BODY)==NULL);
+    CHECK(h->transcript.records[r4].blocked_resource);
+    CHECK(!wcscmp(chat_message_text(pending(h)),L"first second"));
+    pump_messages(1300);                         /* 1 Hz sweep retries (fails) */
+    CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_BODY)==NULL);
+    CHECK(h->body_flush_pending);
+    block_fail_id=0;
+    pump_messages(1300);                         /* retry succeeds */
+    CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_BODY)!=NULL);
+    CHECK(pump_until_body(h,r4,L"first second",3000));
+    CHECK(h->transcript.records[r4].body_revision==
+        pending(h)->body_revision);
+    /* Head surface fails independently; body stays intact. */
+    { RichTextControl *head=transcript_surface(&h->transcript,r4,TRANSCRIPT_HEAD);
+      CHECK(head);
+      block_fail_id=100+h->transcript.records[r4].slot*4+(int)TRANSCRIPT_HEAD;
+      DestroyWindow(head->window);
+      CHECK(head->window && !IsWindow(head->window)); }
+    render_transcript(h);
+    CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_HEAD)==NULL);
+    CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_BODY)!=NULL);
+    { wchar_t shown[256]; body_text(h,r4,shown,256);
+      CHECK(wcsstr(shown,L"first second")!=NULL); }   /* no foreign content */
+    block_fail_id=0;
+    render_transcript(h);
+    CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_HEAD)!=NULL);
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
+    /* Metadata footer fails independently; body untouched. */
+    { RichTextControl *meta=transcript_surface(&h->transcript,r4,TRANSCRIPT_META);
+      CHECK(meta);
+      block_fail_id=100+h->transcript.records[r4].slot*4+(int)TRANSCRIPT_META;
+      DestroyWindow(meta->window);
+      CHECK(meta->window && !IsWindow(meta->window)); }
+    render_transcript(h);
+    CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_META)==NULL);
+    CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_BODY)!=NULL);
+    block_fail_id=0;
+    render_transcript(h);
+    { wchar_t meta[512]; meta_text(h,r4,meta,512);
+      CHECK(wcsstr(meta,L"Complete")!=NULL); }
+    /* Reasoning viewport (viewport injector): failed expansion stays
+       absent without disturbing the other surfaces; retry recovers. */
+    CHECK(chat_message_set_reasoning(&chat->conversations[r4_conv].messages[r4],
+        L"R4 reasoning"));
+    chat->conversations[r4_conv].messages[r4].reasoning_open=false;
+    refresh_turn(h,r4);
+    CHECK(!h->transcript.records[r4].reason_live);
+    viewport_fail_id=100+h->transcript.records[r4].slot*4+(int)TRANSCRIPT_REASON;
+    chat->conversations[r4_conv].messages[r4].reasoning_open=true;
+    refresh_turn(h,r4);
+    CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_REASON)==NULL);
+    CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_BODY)!=NULL);
+    viewport_fail_id=0;
+    refresh_turn(h,r4);
+    CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_REASON)!=NULL);
+    { wchar_t shown[128]; reasoning_text(h,r4,shown,128);
+      CHECK(!wcscmp(shown,L"R4 reasoning")); }
+
+    /* ---- R5: exact-vs-estimated measurement status, measurer loss and
+            recovery ---- */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    for (int t=0;t<20;t++) add_turn(chat,L"r5 question",L"r5 answer",NULL,-1);
+    render_transcript(h);
+    for (int i=0;i<40;i++)
+        CHECK(h->transcript.records[i].measured_valid &&
+            !h->transcript.records[i].measured_estimated);
+    CHECK(h->transcript.measurer_valid);
+    DestroyWindow(h->transcript.measurer.window);
+    CHECK(h->transcript.measurer.window &&
+        !IsWindow(h->transcript.measurer.window));
+    block_fail_id=TRANSCRIPT_MEASURE_ID;
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    for (int t=0;t<8;t++) add_turn(chat,L"r5b question",L"r5b answer",NULL,-1);
+    render_transcript(h);                        /* measurer cannot be created */
+    CHECK(!h->transcript.measurer_valid);
+    bool any_estimated=false;
+    for (int i=0;i<h->transcript.record_count;i++)
+        if (h->transcript.records[i].measured_estimated) any_estimated=true;
+    CHECK(any_estimated);                        /* flagged, not silently wrong */
+    CHECK(visible_realized(h));                  /* I-GAP under estimates */
+    block_fail_id=0;
+    render_transcript(h);                        /* recovery: recreated */
+    CHECK(h->transcript.measurer_valid);
+    for (int i=0;i<h->transcript.record_count;i++)
+        CHECK(h->transcript.records[i].measured_valid &&
+            !h->transcript.records[i].measured_estimated);
+    CHECK(h->transcript.stat.measure_retries>0);
+    /* I-EQUAL spot check on EXACT results: a realized record's cached body
+       height equals its live measurement exactly. */
+    for (int i=0;i<h->transcript.record_count;i++) {
+        RichTextControl *body=transcript_surface(&h->transcript,i,TRANSCRIPT_BODY);
+        if (!body) continue;
+        CHECK(h->transcript.records[i].body_h==transcript_measure_live(&h->transcript,body,NULL));
+    }
+
+    /* A live measurer that drops its resize notification yields retryable
+       estimates, then recovers to exact results without HWND loss. */
+    h->transcript.diagnostic_drop_measure_notify=true;
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    add_turn(chat,L"notify question",L"notify answer",NULL,-1);
+    render_transcript(h);
+    CHECK(h->transcript.records[0].measured_estimated);
+    h->transcript.diagnostic_drop_measure_notify=false;
+    render_transcript(h);
+    CHECK(h->transcript.records[0].measured_valid &&
+        !h->transcript.records[0].measured_estimated);
+    /* Theme mutation advances a real stamp input and reforms the surface. */
+    RichTextTheme changed=h->transcript.theme;
+    uint32_t theme_before=h->transcript.theme_epoch;
+    changed.ui_size+=1.0f;
+    transcript_set_theme(&h->transcript,&changed);
+    render_transcript(h);
+    CHECK(h->transcript.theme_epoch!=theme_before);
+    CHECK(h->transcript.records[0].measured_theme==h->transcript.theme_epoch &&
+        h->transcript.records[0].measured_valid);
+    /* The defensive cap still prepares strict-visible records and recomputes
+       their geometry, but records no false stable claim. */
+    int fallback_before=h->transcript.stat.fallback_rounds;
+    h->transcript.diagnostic_round_cap=0;
+    CHECK(chat_message_set_text(&chat->conversations[chat->active].messages[1],
+        L"cap fallback answer with enough new content to change geometry and "
+        L"require strict-visible preparation"));
+    render_transcript(h);
+    CHECK(h->transcript.stat.fallback_rounds==fallback_before+1);
+    CHECK(visible_realized(h));
+    { wchar_t shown[256]; body_text(h,1,shown,256);
+      CHECK(wcsstr(shown,L"cap fallback answer")!=NULL); }
+    h->transcript.diagnostic_round_cap=-1;
+    render_transcript(h);
+
+    /* ---- Focused equality: the shared measurement surface must answer
+            exactly what an equivalent live surface answers for identical
+            content, width, DPI, theme and formatting. The same production
+            setters feed both surfaces; both results must be EXACT and
+            equal, and the record's cached (measurer-produced) heights must
+            equal the live measurement for every family it owns. ---- */
+    {
+        Transcript *tr=&h->transcript;
+        int eq=1;    /* a realized assistant turn: head, body and meta live */
+        CHECK(transcript_surface(tr,eq,TRANSCRIPT_HEAD)!=NULL);
+        CHECK(transcript_surface(tr,eq,TRANSCRIPT_BODY)!=NULL);
+        CHECK(transcript_surface(tr,eq,TRANSCRIPT_META)!=NULL);
+        RichTextControl *meas=&tr->measurer;
+        TranscriptMeasureQuality qm=TRANSCRIPT_MEASURE_ESTIMATE,
+            ql=TRANSCRIPT_MEASURE_ESTIMATE;
+        const ChatConversation *cv=&chat->conversations[chat->active];
+        /* verbatim body: record 0 is a user turn whose live body holds
+           exactly set_block(role, text), so feeding the same setter with the
+           same inputs to the measurer must measure identically. The funnel
+           realizes it first: at this point in the suite record 0 may be
+           outside the realization window. */
+        CHECK(transcript_reveal_turn(&h->transcript,feed_arg(h),0));
+        const ChatMessage *u=&cv->messages[0];
+        CHECK(transcript_surface(tr,0,TRANSCRIPT_BODY)!=NULL);
+        rich_text_set_block(meas,u->role,chat_message_text(u));
+        int hm=transcript_measure_live(tr,meas,&qm);
+        int hl=transcript_measure_live(tr,
+            transcript_surface(tr,0,TRANSCRIPT_BODY),&ql);
+        CHECK(qm==TRANSCRIPT_MEASURE_EXACT && ql==TRANSCRIPT_MEASURE_EXACT);
+        CHECK(hm==hl);
+        /* markdown body with real wrapping: headings, prose, an unbroken
+           long token, inline code and a list */
+        const ChatMessage *m=&cv->messages[eq];
+        CHECK(chat_message_set_text(&chat->conversations[chat->active].messages[eq],
+            L"## Wrapped heading\n\nplain prose paragraph that is long enough to "
+            L"wrap several times at this width plus an unbroken token "
+            L"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA and `inline code`.\n\n"
+            L"- list one\n- list two"));
+        refresh_turn(h,eq);
+        m=&chat->conversations[chat->active].messages[eq];
+        rich_text_set_markdown(meas,m->role,chat_message_text(m));
+        hm=transcript_measure_live(tr,meas,&qm);
+        RichTextControl *body=transcript_surface(tr,eq,TRANSCRIPT_BODY);
+        hl=transcript_measure_live(tr,body,&ql);
+        CHECK(qm==TRANSCRIPT_MEASURE_EXACT && ql==TRANSCRIPT_MEASURE_EXACT);
+        CHECK(hm==hl);
+        CHECK(tr->records[eq].body_h==hl);       /* cached == live */
+        /* head label */
+        rich_text_set_head(meas,m->role,NULL);
+        hm=transcript_measure_live(tr,meas,&qm);
+        hl=transcript_measure_live(tr,
+            transcript_surface(tr,eq,TRANSCRIPT_HEAD),&ql);
+        CHECK(qm==TRANSCRIPT_MEASURE_EXACT && ql==TRANSCRIPT_MEASURE_EXACT);
+        CHECK(hm==hl);
+        CHECK(tr->records[eq].head_h==hl);       /* cached == live */
+        /* metadata footer: the cached height came from the measurer's exact
+           production text (format_stats), so cached == live here too */
+        hl=transcript_measure_live(tr,
+            transcript_surface(tr,eq,TRANSCRIPT_META),&ql);
+        CHECK(ql==TRANSCRIPT_MEASURE_EXACT);
+        CHECK(tr->records[eq].meta_h==hl);
+        /* restore the turn's own content and certify the restoration */
+        CHECK(chat_message_set_text(&chat->conversations[chat->active].messages[eq],
+            L"r5 answer"));
+        refresh_turn(h,eq);
+        { wchar_t shown[64]; body_text(h,eq,shown,64);
+          CHECK(!wcscmp(shown,L"r5 answer")); }
+    }
+
+    /* ---- R6: resize storm and settle, then DPI ---- */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    for (int t=0;t<12;t++) add_turn(chat,L"r6 question",L"r6 answer",NULL,-1);
+    render_transcript(h);
+    SendMessageW(window,WM_ENTERSIZEMOVE,0,0);
+    CHECK(h->transcript.resizing);
+    /* A real resize: the view's WM_SIZE drives render_transcript, which
+       re-derives view_width and runs the realize loop under the storm. A
+       bare top-level WM_SIZE changes no geometry and would never reach the
+       transcript, so the storm is simulated by resizing the view itself. */
+    SetWindowPos(h->view,NULL,0,0,700,430,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
+    CHECK(visible_realized(h));                  /* I-GAP holds each step */
+    SetWindowPos(h->view,NULL,0,0,860,510,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
+    CHECK(visible_realized(h));
+    bool stale_offscreen=false;
+    for (int i=0;i<h->transcript.record_count;i++) {
+        TranscriptRecord *rec=&h->transcript.records[i];
+        int top=rec->y-h->transcript.view_scroll;
+        if (top>=h->transcript.view_page || top+rec->height<=0) {
+            if (rec->measured_width!=h->transcript.view_width ||
+                !rec->measured_valid) stale_offscreen=true;
+        }
+    }
+    CHECK(stale_offscreen);                      /* off-screen exactness relaxed */
+    SendMessageW(window,WM_EXITSIZEMOVE,0,0);
+    CHECK(!h->transcript.resizing);
+    for (int i=0;i<h->transcript.record_count;i++)
+        CHECK(h->transcript.records[i].measured_width==h->transcript.view_width &&
+            h->transcript.records[i].measured_valid &&
+            !h->transcript.records[i].measured_estimated);
+    CHECK(visible_realized(h));
+    /* Settled geometry is exact: a reveal to a far turn lands on it. */
+    { TranscriptFeed feed=transcript_feed(h);
+      CHECK(transcript_reveal_turn(&h->transcript,&feed,4));
+      TranscriptRecord *rec=&h->transcript.records[4];
+      CHECK(rec->y+rec->height>h->transcript.view_scroll &&
+          rec->y<h->transcript.view_scroll+h->transcript.view_page); }
+    transcript_set_dpi(&h->transcript,120.0f);
+    render_transcript(h);
+    for (int i=0;i<h->transcript.record_count;i++)
+        CHECK(h->transcript.records[i].measured_dpi==120.0f &&
+            h->transcript.records[i].measured_valid);
+    CHECK(visible_realized(h));
+    transcript_set_dpi(&h->transcript,96.0f);
+    render_transcript(h);
+    for (int i=0;i<h->transcript.record_count;i++)
+        CHECK(h->transcript.records[i].measured_dpi==96.0f &&
+            h->transcript.records[i].measured_valid);
+
+    /* Convergence bookkeeping: no cap fallback, no degraded settle. */
+    CHECK(h->transcript.stat.fallback_rounds==fallback_before+1);
+    CHECK(h->transcript.stat.degraded_rounds==0);
+
+    /* ---- Teardown (same ownership order as the default fixture) ---- */
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(!IsWindow(window) && !IsWindow(h->view));
+    saver_shutdown(&h->saver);
+    storage_close(&h->storage);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer);
+    DeleteObject(h->background);
+    for (int s = 0; s < h->transcript.slot_capacity; s++)
+        for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++)
+            CHECK(!IsWindow(h->transcript.slots[s].surface[k].window));
+    transcript_dispose(&h->transcript);
+    CHECK(!h->transcript.slots && !h->transcript.slot_capacity);
+    rich_text_library_close();
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
+int main(void) {
+    int failed=default_suite();
+    if (failed) return failed;
+    failed=seam_toggle_suite();
+    if (failed) return failed;
+    failed=bounded_suite();
+    if (failed) return failed;
+    puts("Hidden host (default + bounded fixtures): failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, stable-id conversation search with body/reasoning jumps and stale-result rejection, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen, background snapshot writer (snapshot isolation across an in-flight write, per-handoff completion accounting, failure latch and retry, pre-request flush gate refusing to send, latest-wins coalescing, shutdown drain), slot-pool lifetime ordering with disposal after full child teardown, record/slot rebind that never accepts foreign surfaces as fresh with debt surviving an unrealized interval and unfocused selections protected, binding-generation certification covering ABA slot-number reuse with a stale-generation catch_up refusal and cross-slot debt application, catch_up stale-identity refusal, retain-all P-CAP checkpoint, and the bounded realization engine (pristine window-shaped first render, seam toggling with reuse, A-short/B-long replacement without foreign content, zero-creation jump revisits with cumulative HWND peaks, deferred selected content with displayed-true geometry and applied recovery, per-surface creation-failure retries with bounded attempts and streaming recovery, flagged estimates with measurer loss and EXACT recovery, measuring-surface/live-surface equality on identical content, width, DPI, theme and formatting, resize/DPI storm with qualified I-GAP and settled EXACT stamps) passed");
+    return failed;
 }

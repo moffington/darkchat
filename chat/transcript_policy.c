@@ -66,3 +66,76 @@ bool transcript_policy_same_message(uint64_t slot_conversation,
     return slot_conversation == record_conversation &&
         slot_message == record_message;
 }
+
+/* Number of set bits in a kind bitmask. */
+static int kinds_overlap(uint32_t kinds, uint32_t needed) {
+    int overlap = 0;
+    kinds &= needed;
+    while (kinds) { kinds &= kinds - 1; ++overlap; }
+    return overlap;
+}
+
+/* Must-keep test for one slot's bound record at the (padded) viewport. */
+static bool slot_must_keep(const TranscriptPolicyItem *item, int scroll,
+    int page, int h_min) {
+    return transcript_policy_visible(item->y, item->height, scroll, page,
+        h_min) || transcript_policy_protected(item);
+}
+
+int transcript_policy_pick_slot(const TranscriptPolicyItem *bound,
+    int slot_count, uint32_t needed_kinds, int scroll, int page, int h_min) {
+    if (!bound || slot_count <= 0) return -1;
+    /* Tier 1: free slot with an exact kind match: pure reuse, no eviction.
+       Ties take the lowest position (first match in a forward scan). */
+    for (int s = 0; s < slot_count; s++)
+        if (bound[s].index < 0 && bound[s].created_kinds != 0 &&
+            bound[s].created_kinds == needed_kinds) return s;
+    /* Tier 2: evictable bound slot with an exact kind match: pre-eviction
+       under the must-keep set. Ties take the oldest last_used, then the
+       lowest position. */
+    {
+        int best = -1;
+        for (int s = 0; s < slot_count; s++) {
+            if (bound[s].index < 0) continue;
+            if (bound[s].created_kinds != needed_kinds) continue;
+            if (slot_must_keep(&bound[s], scroll, page, h_min)) continue;
+            if (best < 0 || bound[s].last_used < bound[best].last_used) best = s;
+        }
+        if (best >= 0) return best;
+    }
+    /* Tier 3: free slot with created HWNDs and the most kind overlap.
+       Zero overlap remains eligible: every reusable free slot precedes an
+       eviction, even when it needs an additional surface. */
+    {
+        int best = -1, best_overlap = -1;
+        for (int s = 0; s < slot_count; s++) {
+            if (bound[s].index >= 0 || bound[s].created_kinds == 0) continue;
+            int overlap = kinds_overlap(bound[s].created_kinds, needed_kinds);
+            if (overlap > best_overlap) { best_overlap = overlap; best = s; }
+        }
+        if (best >= 0) return best;
+    }
+    /* Tier 4: evictable bound slot with the most kind overlap (any overlap,
+       including zero). Ties take the oldest last_used, then the lowest
+       position. */
+    {
+        int best = -1, best_overlap = -1;
+        for (int s = 0; s < slot_count; s++) {
+            if (bound[s].index < 0) continue;
+            if (slot_must_keep(&bound[s], scroll, page, h_min)) continue;
+            int overlap = kinds_overlap(bound[s].created_kinds, needed_kinds);
+            bool better = overlap > best_overlap ||
+                (overlap == best_overlap && best >= 0 &&
+                 (bound[s].last_used < bound[best].last_used ||
+                  (bound[s].last_used == bound[best].last_used && s < best)));
+            if (better) { best_overlap = overlap; best = s; }
+        }
+        if (best >= 0) return best;
+    }
+    /* Tier 5: any remaining free slot (pristine, or an overlap-zero slot
+       with HWNDs — for creation purposes they are equivalent); lowest
+       position. This is the only step that may consume a pristine slot. */
+    for (int s = 0; s < slot_count; s++)
+        if (bound[s].index < 0) return s;
+    return -1;
+}

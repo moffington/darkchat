@@ -65,7 +65,7 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_openrouter.exe
     if errorlevel 1 exit /b 1
-    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat_host.c chat\context.c chat\search.c chat\chat.c chat\chat_ui.c chat\transcript_policy.c chat\transcript_win32.c chat\storage.c chat\saver.c chat\actions_win32.c chat\rich_text_win32.c chat\markdown.c chat\json.c chat\sse.c chat\openrouter_winhttp.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c -o build\test_chat_host.exe -Wl,--wrap=openrouter_request -Wl,--wrap=storage_save -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp
+    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat_host.c chat\context.c chat\search.c chat\chat.c chat\chat_ui.c chat\transcript_policy.c chat\transcript_win32.c chat\storage.c chat\saver.c chat\actions_win32.c chat\rich_text_win32.c chat\markdown.c chat\json.c chat\sse.c chat\openrouter_winhttp.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c -o build\test_chat_host.exe -Wl,--wrap=openrouter_request -Wl,--wrap=storage_save -Wl,--wrap=rich_text_create_block -Wl,--wrap=rich_text_create_viewport -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp
     if errorlevel 1 exit /b 1
     build\test_chat_host.exe
     if errorlevel 1 exit /b 1

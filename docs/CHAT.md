@@ -121,6 +121,58 @@ destroyed — never from the parent window procedure, whose `WM_DESTROY` runs
 while child surfaces still exist and reference the pool through their
 `GWLP_USERDATA`.
 
+Realization runs in one of two modes, selected per transcript by
+`transcript_set_bounded` (legal at any time; the default is the retain-all
+mode above, so production behavior is unchanged until the activation pass):
+
+- Retain-all (default): every record prepares every render and layout measures
+  every live surface unconditionally, exactly as in earlier passes. The
+  capacity checkpoint records (never enforces) the policy's required count.
+- Bounded (test infrastructure for the activation pass): a fixed-point
+  realize/measure loop binds and prepares only actionable records inside an
+  overscan-widened viewport (`TRANSCRIPT_OVERSCAN_DIPS` beyond the strict
+  viewport) union the class-protected records, through the shape-aware
+  `transcript_policy_pick_slot` tiers (exact-kind free reuse, pre-eviction of
+  evictable kind matches, best-overlap reuse, pristine consumption last), so
+  the native-window arena stays viewport-shaped and a revisit consumes no new
+  HWNDs. Heights are stamped per record and consumed only while the stamp is
+  exact (never an estimate), certified against the current width/DPI/theme/
+  identity, and debt-free; every scroll, reveal and selection path funnels
+  through the same realize loop before placing, so a visible record can never
+  be unrealized. During an interactive resize storm off-screen re-measurement
+  is deferred (last-known heights, stamps left stale for the strict-viewport-
+  invisible records) while visible records keep live-measuring each step, and
+  the `WM_EXITSIZEMOVE` settle render restores exact geometry. Per-surface
+  creation failures block exactly one attempt per render (attempt stamps),
+  surface-liveness reconciliation treats a live-claimed family whose window is
+  gone like a never-created one, and a still-missing streaming body is retried
+  by the re-armed one-shot flush timer plus the 1 Hz sweep, the next delta and
+  the next render. Counters (`TranscriptStats`) record binds, rebinds,
+  evictions, raw HWND creation successes, exact/estimated measurements, retries,
+  rounds and the degraded/fallback exits as diagnostics, never as wall-clock
+  thresholds. Arena cells are the monotone set of slot/surface positions that
+  have ever owned a HWND plus the measurer (at most `4 * 512 + 1`); a destroyed
+  HWND recreates its existing cell. Current HWND count and its peak are derived
+  from live handles, so recreation cannot inflate either arena diagnostic.
+
+Off-screen geometry is measured exactly through one shared measurement
+surface: a read-only Rich Edit block, child of the transcript container, kept
+`WS_VISIBLE` but parked at `TRANSCRIPT_MEASURE_OFFX` beyond the client's right
+edge so the container clips it away entirely. A truly hidden Rich Edit stops
+re-laying-out its text — `EM_REQUESTRESIZE` then answers from the stale,
+over-wrapped layout the control was created at — so the surface must stay
+visible-style while never painting. Its width is the transcript's content
+width from creation and is re-asserted before each content batch (width before
+content). Because a Rich Edit recomputes its line wrap only when a width
+transaction is immediately followed by `EM_REQUESTRESIZE`, every measurement
+re-asserts the width first — a real resize when it differs, and in bounded
+mode a one-pixel down-and-back cycle when it already matches — and only then requests the
+resize; spontaneous notifications fired outside a measurement are rejected by
+the awaiting-control guard. The measuring surface equals an equivalent live
+surface for identical content, width, DPI, theme and formatting: the
+hidden-HWND suite asserts exact quality and equal heights on both surfaces
+and equal cached heights for every family a record owns.
+
 Update bookkeeping lives in its own module (`chat/transcript_win32.c`). Every
 turn records the message identity its surfaces were built from — conversation
 id, message instance id, a per-message revision counter and the observable
@@ -147,6 +199,12 @@ renders immediately; a delta inside the window that leaves the body dirty arms a
 one-shot host flush, so a burst that then pauses still renders on its own rather
 than waiting for another delta to cross the interval, and the terminal event
 always flushes a final render. Token bursts therefore never reparse per token.
+If the body surface is missing (never created, or its creation failed this
+render) the flush retry keeps the flush armed and re-arms the one-shot timer at
+the throttle interval — through a raw `SetTimer`, never through the scheduler
+whose `SetTimer`-failure fallback calls the flush, so no recursion — until the
+surface is recreated or the generation ends; the next incoming delta, the 1 Hz
+sweep and the next render are the additional retry paths.
 A scheduled flush that fires while the body holds a selection is deferred
 through the pending-write path instead of destroying the range. Incomplete
 syntax renders literally while it streams. A rebuild relayouts only from the
@@ -539,6 +597,34 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   viewport, and switching A → B → A while both reasoning viewports are open and
   A keeps streaming while hidden reloads A's own reasoning instead of showing
   or appending to B's.
+- Bounded realization engine (separate hidden-HWND fixture with the seam
+  enabled and Rich Edit creation wrapped for per-surface failure injection):
+  a pristine first render binds a window-shaped subset (never all 80 records)
+  with the shared measurement surface created lazily and arena diagnostics
+  exact; seam toggling retains and reuses every window; an A-short → B-long
+  conversation replacement rebinds B onto A's departed slots with zero new
+  HWNDs and zero foreign content, and switching back restores A's own text;
+  nonlocal jumps to top/middle/bottom realize and render the right content
+  with revisits consuming no pristine slots and no new HWNDs; deferred
+  selected content keeps displayed-true geometry (old height, preserved
+  range, no claimed revision) until the selection clears and the debt
+  applies; per-surface creation failures (body, head, footer, reasoning
+  viewport) block exactly one attempt per render, stay absent without
+  disturbing the other surfaces, and recover through the delta arm, the
+  re-armed flush timer and later renders — during streaming, without foreign
+  content; a destroyed measurement surface degrades one pass to flagged
+  arithmetic estimates (never silently wrong heights) and recovers to exact
+  stamps, with cached heights equal to live measurements wherever both are
+  exact; and a focused equality property feeds the same production setters
+  with identical content to the measurement surface and the live surfaces —
+  verbatim, wrapping markdown and head label — requiring exact quality and
+  equal heights on both, plus cached-equals-live for body, head and footer.
+  A real view-resize storm keeps every step's viewport realized, relaxes
+  off-screen exactness (stamps left stale for strictly off-screen records
+  only), and the settle render plus DPI changes restore exact stamps at the
+  new width and DPI; the equality regression covers user blocks, wrapping
+  markdown, head labels and the metadata footer. Convergence bookkeeping
+  asserts no cap fallback and no degraded settle.
 
 Manual live verification (uses the actual WinHTTP client; never prints the key):
 
