@@ -24,7 +24,7 @@ void markdown_dispose(MdDocument *doc) {
 }
 
 typedef struct {
-    bool bold, italic, mono, code, muted;
+    bool bold, italic, strike, mono, code, muted;
     int heading;
 } MdStyle;
 
@@ -70,7 +70,8 @@ static void emit(MdBuilder *b, const wchar_t *text, size_t length, MdStyle s) {
         MdRun *last = &b->runs[b->run_count - 1];
         if (last->offset + last->length == b->length &&
             last->bold == s.bold && last->italic == s.italic &&
-            last->mono == s.mono && last->code == s.code &&
+            last->strike == s.strike && last->mono == s.mono &&
+            last->code == s.code &&
             last->muted == s.muted && last->heading == s.heading) {
             wmemcpy(b->text + b->length, text, length);
             b->length += length;
@@ -85,6 +86,7 @@ static void emit(MdBuilder *b, const wchar_t *text, size_t length, MdStyle s) {
     run->length = length;
     run->bold = s.bold;
     run->italic = s.italic;
+    run->strike = s.strike;
     run->mono = s.mono;
     run->code = s.code;
     run->muted = s.muted;
@@ -96,7 +98,7 @@ static void emit(MdBuilder *b, const wchar_t *text, size_t length, MdStyle s) {
    coalesce across their lines. Skipped at the start of the document. */
 static void emit_break(MdBuilder *b, bool mono, bool code) {
     if (!b->length) return;
-    MdStyle s = {false, false, mono, code, false, 0};
+    MdStyle s = {false, false, false, mono, code, false, 0};
     emit(b, L"\n", 1, s);
 }
 
@@ -171,8 +173,18 @@ static size_t find_close_bold_italic(const wchar_t *s, size_t n, size_t open) {
     return MD_NPOS;
 }
 
+/* A conservative paired-tilde span needs non-space content at both edges.
+   Other delimiter rules intentionally stay simple, matching this subset's
+   treatment of emphasis rather than attempting full GFM delimiter parsing. */
+static size_t find_close_strike(const wchar_t *s, size_t n, size_t open) {
+    for (size_t j = open + 3; j + 1 < n; j++) {
+        if (s[j] == L'~' && s[j + 1] == L'~' && !is_space(s[j - 1])) return j;
+    }
+    return MD_NPOS;
+}
+
 /* Inline pass, in precedence order: backslash escapes, inline code, links,
-   then emphasis. Anything unmatched is kept literally. */
+   then strikethrough and emphasis. Anything unmatched is kept literally. */
 static void parse_inline(MdBuilder *b, const wchar_t *s, size_t n,
     MdStyle style) {
     size_t i = 0, plain = 0;
@@ -223,6 +235,21 @@ static void parse_inline(MdBuilder *b, const wchar_t *s, size_t n,
             ++i;
             continue;
         }
+        if (c == L'~' && i + 2 < n && s[i + 1] == L'~' &&
+            !is_space(s[i + 2])) {
+            size_t close = find_close_strike(s, n, i);
+            if (close != MD_NPOS) {
+                if (i > plain) emit(b, s + plain, i - plain, style);
+                MdStyle inner = style;
+                inner.strike = true;
+                parse_inline(b, s + i + 2, close - i - 2, inner);
+                i = close + 2;
+                plain = i;
+                continue;
+            }
+            ++i;
+            continue;
+        }
         if ((c == L'*' || c == L'_') && opens_emphasis(s, n, i, c)) {
             if (c == L'*' && i + 1 < n && s[i + 1] == L'*') {
                 bool triple = i + 2 < n && s[i + 2] == L'*';
@@ -268,12 +295,12 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
     const wchar_t *c = line + indent;
     size_t m = n - indent;
     bool marker = m >= 3 && c[0] == L'`' && c[1] == L'`' && c[2] == L'`';
-    MdStyle plain = {false, false, false, false, false, 0};
+    MdStyle plain = {false, false, false, false, false, false, 0};
     if (*fence) {
         if (marker) {
             *fence = false;                 /* closing fence is hidden */
         } else {
-            MdStyle code = {false, false, true, true, false, 0};
+            MdStyle code = {false, false, false, true, true, false, 0};
             emit_break(b, true, true);
             emit(b, c, m, code);
         }
@@ -297,7 +324,7 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
             size_t from = (size_t)level;
             while (from < m && is_space(c[from])) ++from;
             emit_break(b, false, false);
-            MdStyle heading = {true, false, false, false, false, level};
+            MdStyle heading = {true, false, false, false, false, false, level};
             parse_inline(b, c + from, m - from, heading);
             return;
         }

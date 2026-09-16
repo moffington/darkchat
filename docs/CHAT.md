@@ -311,18 +311,19 @@ system and error
 bodies are fully literal, fence markers included, and reasoning is never
 reformatted. The supported subset: headings 1–3 (require a space after the
 marker), `**bold**`, `*italic*`/`_italic_` (word-internal underscores and
-asterisks stay literal), inline and fenced code (fence lines and language tags
-hidden, monospace on the code tint), flat lists (textual `• ` bullets and
-preserved ordered markers), `[label](http(s)://…)` links rendered as
+asterisks stay literal), `~~strikethrough~~` (paired non-space content only),
+inline and fenced code (fence lines and language tags hidden, monospace on the
+code tint), flat lists (textual `• ` bullets and preserved ordered markers),
+`[label](http(s)://…)` links rendered as
 `label (url)` so the native URL detector opens them, and blockquotes (muted,
-bar-prefixed). Precedence is fences → inline code → links → emphasis; escapes
-(`\*`) keep punctuation literal; malformed or unsupported syntax (tables,
-images, nested lists, deeper rules) is preserved verbatim. Every Rich Edit run
-sets bold, italic, face, size and background explicitly, so code tinting cannot
-bleed into following text, and identical adjacent runs coalesce. The parser is
-transactional and O(input)-memory: on allocation failure the body falls back
-to verbatim text. Rebuilds of completed turns may reparse the message; no
-render cache is kept.
+bar-prefixed). Precedence is fences → inline code → links → strikethrough →
+emphasis; escapes (`\*`) keep punctuation literal; malformed or unsupported
+syntax (tables, images, nested lists, deeper rules) is preserved verbatim. Every
+Rich Edit run sets bold, italic, strikethrough, face, size and background
+explicitly, so code tinting cannot bleed into following text, and identical
+adjacent runs coalesce. The parser is transactional and O(input)-memory: on
+allocation failure the body falls back to verbatim text. Rebuilds of completed
+turns may reparse the message; no render cache is kept.
 
 The key is read from `OPENROUTER_API_KEY` in the process environment, falling back
 to the Windows User environment registry value (so an existing desktop session

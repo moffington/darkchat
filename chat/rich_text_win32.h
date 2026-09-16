@@ -91,9 +91,9 @@ void rich_text_set_body(RichTextControl *control, ChatRole role,
     const wchar_t *text);
 /* Live answer text appended verbatim; the completed body is re-rendered. */
 void rich_text_append_body(RichTextControl *control, const wchar_t *text);
-/* Body text only, rendered as Markdown: headings 1-3, bold, italic, inline
-   and fenced code, flat lists, HTTP(S) links and blockquotes. Falls back to
-   verbatim text when parsing or allocation fails. */
+/* Body text only, rendered as Markdown: headings 1-3, bold, italic,
+   strikethrough, inline and fenced code, flat lists, HTTP(S) links and
+   blockquotes. Falls back to verbatim text when parsing or allocation fails. */
 void rich_text_set_markdown(RichTextControl *control, ChatRole role,
     const wchar_t *text);
 /* Compact terminal-state metadata footer (status, timings, tokens, cost,

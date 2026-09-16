@@ -3,11 +3,12 @@
 
 /* DarkChat Markdown renderer. A pure, platform-independent pass that turns
    assistant message text into styled runs a display layer can emit. The
-   supported subset is deliberately small: headings 1-3, bold, italic, inline
-   and fenced code, flat lists, HTTP(S) links and blockquotes. Unsupported or
-   malformed syntax is kept verbatim. Precedence is fenced blocks, then inline
-   code, then links, then emphasis. No tables, images, nested lists, per-
-   language highlighting or full CommonMark behavior. */
+   supported subset is deliberately small: headings 1-3, bold, italic,
+   strikethrough, inline and fenced code, flat lists, HTTP(S) links and
+   blockquotes. Unsupported or malformed syntax is kept verbatim. Precedence
+   is fenced blocks, then inline code, then links, then strikethrough and
+   emphasis. No tables, images, nested lists, per-language highlighting or full
+   CommonMark behavior. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <wchar.h>
@@ -16,7 +17,7 @@
    address it, so a run owns no memory of its own. */
 typedef struct {
     size_t offset, length;
-    bool bold, italic, mono, code, muted;
+    bool bold, italic, strike, mono, code, muted;
     int heading;        /* 0 = body text, 1..3 = heading */
 } MdRun;
 

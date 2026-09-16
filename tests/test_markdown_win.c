@@ -65,6 +65,30 @@ int main(void) {
     CHECK(!wcscmp(f.szFaceName, L"Consolas"));
     CHECK((f.dwMask & CFM_BACKCOLOR) && f.crBackColor == theme.code_background);
 
+    /* Strikethrough is set on its exact run and cleared after it. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"a ~~old~~ b");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"a old b"));
+    f = format_at(&probe, 2);                       /* "old" */
+    CHECK((f.dwMask & CFM_STRIKEOUT) && (f.dwEffects & CFE_STRIKEOUT));
+    f = format_at(&probe, 0);                       /* plain prefix */
+    CHECK((f.dwMask & CFM_STRIKEOUT) && !(f.dwEffects & CFE_STRIKEOUT));
+    f = format_at(&probe, 6);                       /* plain suffix */
+    CHECK((f.dwMask & CFM_STRIKEOUT) && !(f.dwEffects & CFE_STRIKEOUT));
+
+    /* Strikethrough composes with inline-code formatting. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"~~`code`~~ tail");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"code tail"));
+    f = format_at(&probe, 0);
+    CHECK((f.dwEffects & CFE_STRIKEOUT) &&
+        !wcscmp(f.szFaceName, L"Consolas") &&
+        f.crBackColor == theme.code_background);
+    f = format_at(&probe, 5);                       /* plain suffix */
+    CHECK(!(f.dwEffects & CFE_STRIKEOUT) &&
+        !wcscmp(f.szFaceName, L"Segoe UI") &&
+        f.crBackColor == theme.background);
+
     /* Background reset: text after a code run restores the surface. */
     rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"a `c` b");
     read_text(&probe, text, 512);
@@ -150,8 +174,8 @@ int main(void) {
     DestroyWindow(probe.window);
     DestroyWindow(parent);
     rich_text_library_close();
-    puts("Markdown Rich Edit integration: style ranges, background reset, "
-        "CRLF, streaming-to-terminal, repeats, literal user text, malformed/"
-        "long input and allocation fallback passed");
+    puts("Markdown Rich Edit integration: style ranges, strikethrough, "
+        "background reset, CRLF, streaming-to-terminal, repeats, literal user "
+        "text, malformed/long input and allocation fallback passed");
     return 0;
 }

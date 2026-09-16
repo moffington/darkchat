@@ -68,16 +68,18 @@ void rich_text_theme(RichTextTheme *theme, const UiTheme *ui) {
 }
 
 static void apply_format(RichTextControl *control, WPARAM scope, bool bold,
-    bool italic, bool mono, COLORREF color, bool code, float size) {
+    bool italic, bool strike, bool mono, COLORREF color, bool code, float size) {
     const RichTextTheme *theme = &control->theme;
     CHARFORMAT2W format;
     memset(&format, 0, sizeof format);
     format.cbSize = sizeof format;
     /* Every field is set on every call: runs never inherit stale formatting,
-       so emphasis or the code tint cannot bleed into following text. */
+       so emphasis, strikethrough or the code tint cannot bleed into following
+       text. */
     format.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE | CFM_BOLD | CFM_WEIGHT |
-        CFM_ITALIC | CFM_BACKCOLOR;
-    format.dwEffects = (bold ? CFE_BOLD : 0) | (italic ? CFE_ITALIC : 0);
+        CFM_ITALIC | CFM_STRIKEOUT | CFM_BACKCOLOR;
+    format.dwEffects = (bold ? CFE_BOLD : 0) | (italic ? CFE_ITALIC : 0) |
+        (strike ? CFE_STRIKEOUT : 0);
     format.wWeight = (WORD)(bold ? 700 : 400);
     format.crTextColor = color;
     /* yHeight is in twips (1/1440 inch), a physical unit the control already
@@ -102,7 +104,8 @@ static void caret_end(HWND window) {
 /* Inserts text at the caret using an explicit point size. */
 static void run_at(RichTextControl *control, const wchar_t *text, bool bold,
     bool mono, COLORREF color, bool code, float size) {
-    apply_format(control, SCF_SELECTION, bold, false, mono, color, code, size);
+    apply_format(control, SCF_SELECTION, bold, false, false, mono, color, code,
+        size);
     SendMessageW(control->window, EM_REPLACESEL, FALSE, (LPARAM)text);
 }
 
@@ -207,7 +210,7 @@ static bool create_control(RichTextControl *control, HWND parent, int id,
     SendMessageW(control->window, EM_SETEDITSTYLE, SES_EXTENDBACKCOLOR,
         SES_EXTENDBACKCOLOR);
     if (multiline) SendMessageW(control->window, EM_SETTARGETDEVICE, 0, 0);
-    apply_format(control, SCF_DEFAULT, false, false, false, theme->text,
+    apply_format(control, SCF_DEFAULT, false, false, false, false, theme->text,
         false, theme->ui_size);
     set_margin(control, multiline ? 10 : 8, multiline ? 10 : 8);
     return true;
@@ -250,7 +253,7 @@ bool rich_text_create_field_limit(RichTextControl *control, HWND parent, int id,
 void rich_text_set_dpi(RichTextControl *control, float dpi) {
     if (!control->window || dpi <= 0) return;
     control->dpi = dpi;
-    apply_format(control, SCF_DEFAULT, false, false, false,
+    apply_format(control, SCF_DEFAULT, false, false, false, false,
         control->theme.text, false, control->theme.ui_size);
     set_margin(control, control->multiline ? 10 : 8, control->multiline ? 10 : 8);
 }
@@ -400,8 +403,8 @@ void rich_text_set_markdown(RichTextControl *control, ChatRole role,
                 r->heading == 1 ? theme->ui_size + 3.0f :
                 r->heading == 2 ? theme->ui_size + 2.0f :
                 r->heading == 3 ? theme->ui_size + 1.0f : theme->ui_size;
-            apply_format(control, SCF_SELECTION, r->bold, r->italic, r->mono,
-                color, r->code, size);
+            apply_format(control, SCF_SELECTION, r->bold, r->italic, r->strike,
+                r->mono, color, r->code, size);
         }
         markdown_dispose(&document);
         caret_end(control->window);

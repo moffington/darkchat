@@ -15,7 +15,7 @@ It provides streaming responses, per-turn reasoning views, progressive Markdown 
   - Reasoning content and duration persist across restarts.
 - Render assistant Markdown progressively while streaming.
   - Headings
-  - Bold and italic text
+  - Bold, italic, and strikethrough text
   - Inline and fenced code
   - Flat ordered and unordered lists
   - Links

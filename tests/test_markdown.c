@@ -90,6 +90,53 @@ int main(void) {
         check(code && code->mono && code->code && !code->italic,
             "code run mono, not italic");
         markdown_dispose(&d); }
+    { /* Paired tildes strike non-space content and compose with outer styles. */
+        MdDocument d;
+        render_ok(L"a ~~old~~ b **~~bold~~** ~~`code`~~ "
+                  L"~~[link](https://x.io/a)~~", &d, "strike renders");
+        text_is(&d, L"a old b bold code link (https://x.io/a)",
+            "strike markers removed");
+        const MdRun *old = run_over(&d, L"old");
+        const MdRun *bold = run_over(&d, L"bold");
+        const MdRun *code = run_over(&d, L"code");
+        const MdRun *link = run_over(&d, L"link (https://x.io/a)");
+        check(old && old->strike && !old->bold, "plain strike run");
+        check(bold && bold->strike && bold->bold, "bold strike run");
+        check(code && code->strike && code->mono && code->code,
+            "code inside strike keeps styles");
+        check(link && link->strike, "link inside strike keeps style");
+        markdown_dispose(&d); }
+    { /* Unmatched, spaced and escaped paired tildes stay literal. */
+        MdDocument d;
+        render_ok(L"~one~ ~~ open~~", &d,
+            "literal tildes render");
+        text_is(&d, L"~one~ ~~ open~~",
+            "invalid strike syntax literal");
+        check(d.run_count == 1 && !d.runs[0].strike,
+            "invalid strike has no style");
+        markdown_dispose(&d);
+        render_ok(L"~~open ~~", &d, "trailing-space strike renders");
+        text_is(&d, L"~~open ~~", "trailing-space strike literal");
+        check(d.run_count == 1 && !d.runs[0].strike,
+            "trailing-space strike has no style");
+        markdown_dispose(&d);
+        render_ok(L"\\~~escaped~~", &d, "escaped strike renders");
+        text_is(&d, L"~~escaped~~", "escaped strike literal");
+        check(d.run_count == 1 && !d.runs[0].strike,
+            "escaped strike has no style");
+        markdown_dispose(&d); }
+    { /* Inline and fenced code shield tildes from strikethrough parsing. */
+        MdDocument d;
+        render_ok(L"`~~inline~~`\n```\n~~fenced~~\n```", &d,
+            "code shields strike");
+        text_is(&d, L"~~inline~~\n~~fenced~~", "code tildes retained");
+        const MdRun *inline_code = run_over(&d, L"~~inline~~");
+        const MdRun *fenced_code = run_over(&d, L"~~fenced~~");
+        check(inline_code && inline_code->mono && !inline_code->strike,
+            "inline code is not struck");
+        check(fenced_code && fenced_code->mono && fenced_code->code &&
+            !fenced_code->strike, "fenced code is not struck");
+        markdown_dispose(&d); }
     { /* Fenced code: markers and language tag hidden, content literal. */
         MdDocument d; render_ok(L"before\n```c\nint x; // *not*\n```\nafter",
             &d, "fence renders");
@@ -172,7 +219,8 @@ int main(void) {
         markdown_dispose(&d); }
     markdown_dispose(NULL);
     if (failures) { printf("%d markdown test(s) failed\n", failures); return 1; }
-    puts("Markdown parser: headings, emphasis, code, fences, links, lists, "
-        "quotes, escapes, CRLF, long input and allocation fallback passed");
+    puts("Markdown parser: headings, emphasis, strikethrough, code, fences, "
+        "links, lists, quotes, escapes, CRLF, long input and allocation "
+        "fallback passed");
     return 0;
 }
