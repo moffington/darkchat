@@ -1,18 +1,22 @@
 #include "context.h"
+#include "provider_routing.h"
 #include <string.h>
 
 /* Framing costs of the body the client encodes (build_request in
    chat/openrouter_winhttp.c):
 
-     {"model":<model>,"messages":[<message>,...],"stream":true,"reasoning":{"enabled":true}}
+     {"model":<model>,"messages":[<message>,...],"stream":true,"reasoning":{"enabled":true}[,"provider":{...}]}
 
    The three raw literals total 67 bytes; the model and every message text are
    each one quoted JSON string, measured by json_encoded_string_size() so the
    escape rules stay in the encoder. A message is {"role":"<role>","content":
    <text>}: 22 raw bytes plus the role name. Every message after the first is
    preceded by one comma, so a body with `count` messages carries `count - 1`
-   separators. tests/test_openrouter.c proves that the size this module reports
-   equals the length of the body the real encoder produces. */
+   separators. The trailing provider object is empty (sent as nothing) unless a
+   routing control differs from OpenRouter's default; its exact bytes come from
+   provider_routing.c, the same builder the encoder uses, so this budget stays
+   in sync with the body. tests/test_openrouter.c proves that the size this
+   module reports equals the length of the body the real encoder produces. */
 #define ENVELOPE_RAW_BYTES 67u
 #define MESSAGE_RAW_BYTES 22u
 #define SEPARATOR_BYTES 1u
@@ -59,8 +63,9 @@ ChatContextResult chat_context_build(const Chat *chat, const ChatConversation *c
         ? message_bytes(CHAT_ROLE_SYSTEM, chat->system_prompt) : 0;
     size_t trigger_bytes = message_bytes(CHAT_ROLE_USER, chat_message_text(trigger));
     size_t comma_for_trigger = has_system ? SEPARATOR_BYTES : 0;
-    size_t envelope_bytes = add_bytes(ENVELOPE_RAW_BYTES,
-        json_encoded_string_size(chat->model));
+    size_t envelope_bytes = add_bytes(add_bytes(ENVELOPE_RAW_BYTES,
+        json_encoded_string_size(chat->model)),
+        chat_provider_envelope_bytes(&chat->provider_routing));
     /* The complete body the indispensable content would require: the envelope,
        the system prompt when set, and the triggering message with the
        separator that precedes it. Reported by every OVERSIZE result, and

@@ -3,8 +3,9 @@
 Build with `chat.bat`; run `build\darkchat.exe`. `chat.bat test` is the single
 reproducible verification command: it builds the app, runs all chat tests
 (including the transcript-isolation, scheduled-flush, message-growth-boundary,
-request-context, realization-policy and slot-pool regressions), then runs the
-unchanged DarkUI toolkit suite via `build.bat test`.
+request-context, model-catalog, provider-routing, realization-policy and
+slot-pool regressions), then runs the unchanged DarkUI toolkit suite via
+`build.bat test`.
 No third-party dependencies are required (C17, MinGW-w64, Win32).
 
 ## Daily use
@@ -37,6 +38,17 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   The system prompt is prepended to future requests; changing it does not rewrite
   old messages. The model field still accepts any OpenRouter identifier typed
   directly.
+- Settings > Provider routing applies global OpenRouter provider routing to
+  future requests: sorting (Default — balanced, or price/throughput/latency),
+  fallback providers on/off, whether providers that may store data are allowed,
+  and a request-level **Require zero data retention** requirement. Every control
+  defaults to OpenRouter's own default, so an untouched DarkChat sends no
+  `provider` object at all. The ZDR item is only DarkChat's request-level
+  requirement: unchecked it does not turn off ZDR enforced by the OpenRouter
+  account, it just adds nothing. A change applies to the next request and never
+  rewrites history. A routing restriction (no fallbacks, data-collection deny,
+  or ZDR) can make a request fail when no eligible provider exists; the failure
+  surfaces through the ordinary Failed/Retry path.
 - Ctrl+Space opens the model picker (Settings > Choose model...). It opens
   immediately with the current model and the recent-model history, then fills in
   from OpenRouter's catalog when the fetch completes, refreshing in place
@@ -416,6 +428,9 @@ into the transcript or the payload.
   encoder's own escape rules (`json_encoded_string_size`, shared with
   `json_buf_append_json_string`), so the size the drop decision is made on is the
   size actually sent; a test proves equality against the real request encoder.
+  When provider routing is configured the body also carries the optional
+  `provider` object, whose exact bytes are added to the measured envelope by the
+  same pure builder the encoder uses, so the measured size stays exact.
 - If the indispensable messages cannot fit, the request is not sent at all: the
   pending turn is marked Failed with the cause (system prompt, this message, or
   the two together) and the complete body size they would have needed
@@ -432,7 +447,9 @@ into the transcript or the payload.
 `%LOCALAPPDATA%\DarkChat\state.jsonl` is a UTF-8, version-3 JSONL snapshot:
 
 1. A settings record with `type: "settings"`, `version: 3`, selected conversation
-   index, next ID counter, record counts, model/system prompt and geometry.
+   index, next ID counter, record counts, model/system prompt, geometry, and the
+   optional provider-routing fields (`provider_sort`, `provider_no_fallbacks`,
+   `provider_data_collection`, `provider_zdr`).
 2. Zero or more `type: "model"` history records.
 3. For each conversation, a `type: "conversation"` record followed by its declared
    number of `type: "message"` records, each carrying its stable `"id"`.
@@ -441,7 +458,11 @@ into the transcript or the payload.
 
 The record layout is identical in formats 1–3. Format 2 raised the conversation
 limit from 16 to 128, and format 3 raised the per-conversation message limit
-from 64 to 512. This build decodes all three versions, so an old snapshot
+from 64 to 512. Provider-routing settings are additive optional fields appended
+last, emitted only when non-default and defaulted when absent; like the optional
+reasoning fields they do not change the format version, so the emitted version
+stays 3 and older snapshots load with OpenRouter's routing defaults. This build
+decodes all three versions, so an old snapshot
 migrates to format 3 on its next save. **Downgrade contract:** an older
 (version-1 or version-2) build that encounters a format 3 or newer file treats
 it as an unsupported version and stops immediately — it does not fall back to
@@ -654,6 +675,15 @@ The complete coverage includes:
   finish reason and provider errors after partial content, now also the enabled
   reasoning request parameter and reasoning_details/text-summary/plain fallback
   parsing that never fabricates reasoning.
+- Provider routing: an all-default routing sends no `provider` object at all;
+  each control serializes to its exact request JSON shape and only non-default
+  keys are emitted in a fixed order; the request-context budget charges exactly
+  the provider bytes (pinned to the byte) and its oversize diagnostic includes
+  them; storage round-trips the optional fields (emitted only when non-default,
+  old snapshots load the OpenRouter defaults, and a present field with the wrong
+  type or an out-of-range value rejects the snapshot); and the hidden host
+  drives the Settings submenu actions and proves the next request carries the
+  configured routing through the client seam.
 - Model catalog: pure parse of `data[].id/name/context_length` with required
   vs optional typing, Unicode names, exact-id dedupe, the retention cap, id
   length cancellation, malformed roots, an ordinal case-insensitive id/name
@@ -787,7 +817,10 @@ context window. An allocation failure while appending streamed content retains
 the partial response as Interrupted. Conversation search is an on-demand scan
 with no persisted or background index. The model catalog is fetched on demand in
 one unpaginated request, held in memory only and never persisted, so an offline
-restart falls back to history until a later fetch succeeds; response variants
-remain outside this pass. Interactive clipboard/IME behavior,
-modal-dialog appearance and physical multi-monitor DPI transitions still need a
-manual desktop check; hidden-HWND tests do not substitute for that visual review.
+restart falls back to history until a later fetch succeeds. Provider routing
+exposes sorting, fallback, data-collection and ZDR controls only; per-provider
+`only`/`ignore`/`order` selection, quantization, and price/performance
+thresholds are not exposed. Response variants remain outside this pass.
+Interactive clipboard/IME behavior, modal-dialog appearance and physical
+multi-monitor DPI transitions still need a manual desktop check; hidden-HWND
+tests do not substitute for that visual review.

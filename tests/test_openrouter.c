@@ -87,7 +87,42 @@ int main(int argc,char **argv) {
     CHECK(strstr(body.data,"\"reasoning\":{\"enabled\":true}")!=NULL);
     char value[128]; CHECK(json_query_string(body.data,"messages[1].content",value,sizeof value));
     CHECK(!json_query_string(body.data,"messages[2].content",value,sizeof value));
+    /* OpenRouter defaults are preserved: an all-default routing sends no
+       provider object at all, so existing request bytes are unchanged. */
+    CHECK(strstr(body.data,"\"provider\"")==NULL);
     json_buf_free(&body);
+    /* Each control serializes to its exact request JSON shape and only the
+       non-default keys are emitted, in a fixed order. */
+    work.routing.sort=CHAT_PROVIDER_SORT_THROUGHPUT;
+    CHECK(build_request(&work,&body)); CHECK(json_validate(body.data));
+    CHECK(strstr(body.data,"\"provider\":{\"sort\":\"throughput\"}")!=NULL);
+    json_buf_free(&body);
+    work.routing.sort=CHAT_PROVIDER_SORT_DEFAULT;
+    work.routing.disallow_fallbacks=true;
+    CHECK(build_request(&work,&body)); CHECK(json_validate(body.data));
+    CHECK(strstr(body.data,"\"provider\":{\"allow_fallbacks\":false}")!=NULL);
+    json_buf_free(&body);
+    work.routing.disallow_fallbacks=false;
+    work.routing.data_collection=CHAT_DATA_COLLECTION_DENY;
+    CHECK(build_request(&work,&body)); CHECK(json_validate(body.data));
+    CHECK(strstr(body.data,"\"provider\":{\"data_collection\":\"deny\"}")!=NULL);
+    json_buf_free(&body);
+    work.routing.data_collection=CHAT_DATA_COLLECTION_ALLOW;
+    work.routing.zdr=true;
+    CHECK(build_request(&work,&body)); CHECK(json_validate(body.data));
+    CHECK(strstr(body.data,"\"provider\":{\"zdr\":true}")!=NULL);
+    json_buf_free(&body);
+    /* All four together, in the documented fixed order. */
+    work.routing.sort=CHAT_PROVIDER_SORT_PRICE;
+    work.routing.disallow_fallbacks=true;
+    work.routing.data_collection=CHAT_DATA_COLLECTION_DENY;
+    work.routing.zdr=true;
+    CHECK(build_request(&work,&body)); CHECK(json_validate(body.data));
+    CHECK(strstr(body.data,
+        "\"provider\":{\"sort\":\"price\",\"allow_fallbacks\":false,"
+        "\"data_collection\":\"deny\",\"zdr\":true}")!=NULL);
+    json_buf_free(&body);
+    chat_provider_routing_init(&work.routing);
     /* The request context's measured size must equal the body the real encoder
        produces. This is the invariant the budget policy depends on: the
        context decides what to drop by measuring exactly what will be sent. */
@@ -128,6 +163,20 @@ int main(int argc,char **argv) {
     CHECK(json_query_string(measured.data,"messages[0].content",value,sizeof value) &&
         !strcmp(value,"Answer in one short sentence."));
     json_buf_free(&measured);
+    /* The budget also accounts for a non-default provider object; the measured
+       size must still equal the bytes the encoder actually writes. */
+    context_chat->provider_routing.sort=CHAT_PROVIDER_SORT_LATENCY;
+    context_chat->provider_routing.disallow_fallbacks=true;
+    context_chat->provider_routing.data_collection=CHAT_DATA_COLLECTION_DENY;
+    context_chat->provider_routing.zdr=true;
+    CHECK(chat_context_build(context_chat,&context_chat->conversations[0],trigger,
+        CHAT_CONTEXT_BUDGET_BYTES,&context)==CHAT_CONTEXT_OK);
+    sized.routing=context_chat->provider_routing;
+    JsonBuf routed; CHECK(build_request(&sized,&routed));
+    CHECK(json_validate(routed.data));
+    CHECK(routed.length==context.bytes);
+    CHECK(strstr(routed.data,"\"provider\":{")!=NULL);
+    json_buf_free(&routed);
     chat_dispose(context_chat); free(context_chat);
     puts("The bounded request context measures exactly what the encoder writes");
     puts("Actual request encoder and SSE metadata/error decoding passed");
@@ -137,7 +186,7 @@ int main(int argc,char **argv) {
         if (!size || size>=sizeof key) { puts("Live test skipped: API key unavailable"); return 77; }
         OpenRouterMessage message={CHAT_ROLE_USER,L"Reply with exactly the word OK."};
         terminal=0; deltas=0;
-        generation=openrouter_request(&client,key,L"openai/gpt-4o-mini",&message,1);
+        generation=openrouter_request(&client,key,L"openai/gpt-4o-mini",&message,1,NULL);
         CHECK(generation>0);
         CHECK(await_terminal(90000)); openrouter_complete(&client,generation);
         printf("Live outcome=%d, text chunks=%d, usage=%s, cost=%s, model=%s, TTFT=%.0f ms, latency=%.0f ms\n",
@@ -145,13 +194,13 @@ int main(int argc,char **argv) {
             metadata.actual_model[0] ? "present":"absent",metadata.ttft_ms,metadata.latency_ms);
         CHECK(outcome==OPENROUTER_DONE && deltas>0 && metadata.total_tokens>0 && metadata.actual_model[0]);
         terminal=0; deltas=0;
-        generation=openrouter_request(&client,key,L"openai/gpt-4o-mini",&message,1);
+        generation=openrouter_request(&client,key,L"openai/gpt-4o-mini",&message,1,NULL);
         CHECK(generation>0 && openrouter_cancel(&client,generation));
         CHECK(await_terminal(10000)); openrouter_complete(&client,generation);
         CHECK(outcome==OPENROUTER_CANCELLED && terminal==1);
         puts("Live immediate cancellation passed");
         terminal=0;
-        generation=openrouter_request(&client,key,L"darkchat-invalid/model-does-not-exist",&message,1);
+        generation=openrouter_request(&client,key,L"darkchat-invalid/model-does-not-exist",&message,1,NULL);
         CHECK(generation>0 && await_terminal(30000)); openrouter_complete(&client,generation);
         CHECK(outcome==OPENROUTER_ERROR);
         puts("Live invalid-model API error passed");

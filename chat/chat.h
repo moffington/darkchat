@@ -62,6 +62,32 @@ typedef enum {
    copied into persistent state or persisted. */
 typedef struct { ChatRole role; const wchar_t *text; } ChatRequestMessage;
 
+typedef enum {
+    CHAT_PROVIDER_SORT_DEFAULT = 0,   /* OpenRouter's balanced load balancing */
+    CHAT_PROVIDER_SORT_PRICE,
+    CHAT_PROVIDER_SORT_THROUGHPUT,
+    CHAT_PROVIDER_SORT_LATENCY
+} ChatProviderSort;
+
+typedef enum {
+    CHAT_DATA_COLLECTION_ALLOW = 0,   /* OpenRouter's default */
+    CHAT_DATA_COLLECTION_DENY
+} ChatDataCollection;
+
+/* Global OpenRouter provider-routing preferences, applied to every request
+   unless a control is left at its OpenRouter default. The all-zero value is
+   exactly OpenRouter's default routing (balanced load balancing, fallbacks
+   allowed, data collection allowed, no request-level ZDR requirement), so a
+   zeroed or freshly initialized Chat sends no `provider` object at all and
+   OpenRouter defaults are preserved. `disallow_fallbacks` is stored inverted
+   so that zero means the OpenRouter default `allow_fallbacks: true`. */
+typedef struct {
+    ChatProviderSort sort;
+    bool disallow_fallbacks;
+    ChatDataCollection data_collection;
+    bool zdr;
+} ChatProviderRouting;
+
 typedef struct {
     ChatRole role;
     /* Inline residue; growth past it promotes to text_overflow below. */
@@ -149,6 +175,7 @@ typedef struct {
     unsigned replies;
     uint64_t next_id;
     wchar_t system_prompt[CHAT_COMPOSER_TEXT];
+    ChatProviderRouting provider_routing;
     wchar_t model_history[CHAT_MODEL_HISTORY][CHAT_MODEL_TEXT];
     int model_history_count;
     int window_x, window_y, window_width, window_height, maximized, sidebar_width;

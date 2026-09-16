@@ -762,7 +762,8 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
         CHAT_CONTEXT_BUDGET_BYTES,&context);
     host->context_dropped=built==CHAT_CONTEXT_OK ? context.dropped_messages : 0;
     host->request_generation=saved && built==CHAT_CONTEXT_OK ? openrouter_request(&host->client,
-        host->config.api_key_utf8,chat->model,context.messages,context.count) : 0;
+        host->config.api_key_utf8,chat->model,context.messages,context.count,
+        &chat->provider_routing) : 0;
     if (!host->request_generation) {
         m->generation.state=CHAT_GENERATION_FAILED;
         m->generation.finished_at=chat_now();
@@ -1195,6 +1196,32 @@ static void action(ChatHost *host, int code) {
            marks the session dirty; returning here skips the common tail. */
         open_model_picker(host);
         return;
+    } else if (code==ACTION_ROUTING_SORT_DEFAULT || code==ACTION_ROUTING_SORT_PRICE ||
+        code==ACTION_ROUTING_SORT_THROUGHPUT || code==ACTION_ROUTING_SORT_LATENCY) {
+        chat->provider_routing.sort =
+            code==ACTION_ROUTING_SORT_PRICE ? CHAT_PROVIDER_SORT_PRICE :
+            code==ACTION_ROUTING_SORT_THROUGHPUT ? CHAT_PROVIDER_SORT_THROUGHPUT :
+            code==ACTION_ROUTING_SORT_LATENCY ? CHAT_PROVIDER_SORT_LATENCY :
+            CHAT_PROVIDER_SORT_DEFAULT;
+        set_status(host,L"Provider sorting updated for future requests.");
+    } else if (code==ACTION_ROUTING_ALLOW_FALLBACKS) {
+        chat->provider_routing.disallow_fallbacks=
+            !chat->provider_routing.disallow_fallbacks;
+        set_status(host,chat->provider_routing.disallow_fallbacks ?
+            L"Fallback providers disabled; a request may fail if the primary is unavailable." :
+            L"Fallback providers allowed.");
+    } else if (code==ACTION_ROUTING_DATA_COLLECTION) {
+        chat->provider_routing.data_collection =
+            chat->provider_routing.data_collection==CHAT_DATA_COLLECTION_DENY ?
+            CHAT_DATA_COLLECTION_ALLOW : CHAT_DATA_COLLECTION_DENY;
+        set_status(host,chat->provider_routing.data_collection==CHAT_DATA_COLLECTION_DENY ?
+            L"Routing restricted to providers that do not store data." :
+            L"Providers that may store data are allowed.");
+    } else if (code==ACTION_ROUTING_ZDR) {
+        chat->provider_routing.zdr=!chat->provider_routing.zdr;
+        set_status(host,chat->provider_routing.zdr ?
+            L"Request-level zero data retention required; account settings may also apply." :
+            L"DarkChat adds no request-level zero data retention requirement.");
     }
     mark_dirty(host); save(host); chat_ui_sync(&host->chat_ui); flush(host);
 }
@@ -1553,7 +1580,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             ui_set_accessible_name(u, u->root, host->config.title);
         host->accessibility = ui_accessibility_create(window, u);
         if (!host->accessibility) return -1;
-        SetMenu(window,chat_actions_menu());
+        SetMenu(window,chat_actions_menu(host->config.chat));
         SetTimer(window,2,1000,NULL);
         rich_text_set_text(&host->composer,host->config.chat->conversations[host->config.chat->active].draft);
         render_transcript(host);
@@ -1590,6 +1617,13 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         EndPaint(window, &paint);
         return 0;
     }
+    case WM_INITMENUPOPUP:
+        /* Re-derive the routing check/radio marks from live state each time a
+           popup opens, so the menu can never disagree with what a request
+           would send. A no-op for popups without those items. */
+        chat_actions_sync_routing((HMENU)w,host->config.chat);
+        break;
+
     case WM_COMMAND:
         if (!l) { action(host,LOWORD(w)); return 0; }
         break;

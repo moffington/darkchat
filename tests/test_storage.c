@@ -79,7 +79,11 @@ static bool same_chat(const Chat *a, const Chat *b) {
         a->window_height != b->window_height ||
         a->maximized != b->maximized || a->sidebar_width != b->sidebar_width ||
         wcscmp(a->model, b->model) ||
-        wcscmp(a->system_prompt, b->system_prompt)) return false;
+        wcscmp(a->system_prompt, b->system_prompt) ||
+        a->provider_routing.sort != b->provider_routing.sort ||
+        a->provider_routing.disallow_fallbacks != b->provider_routing.disallow_fallbacks ||
+        a->provider_routing.data_collection != b->provider_routing.data_collection ||
+        a->provider_routing.zdr != b->provider_routing.zdr) return false;
     for (int i = 0; i < a->model_history_count; i++)
         if (wcscmp(a->model_history[i], b->model_history[i])) return false;
     for (int i = 0; i < a->conversation_count; i++) {
@@ -172,6 +176,34 @@ static int load_case(const wchar_t *tag, long long next_id, const char *m0,
         "\"title\":\"c\",\"draft\":\"\"}");
     const char *lines[4] = { settings, conversation, m0, m1 };
     int result = write_snapshot(store.path, lines, 4) ?
+        storage_load(&store, dest) : -2;
+    storage_close(&store);
+    remove_store(&store, dir);
+    return result;
+}
+/* Builds a one-conversation, no-message snapshot whose settings line carries
+    `provider_fields` verbatim (empty or NULL for an absent-field snapshot),
+    loads it and removes the store. */
+static int load_routing_case(const char *provider_fields, Chat *dest) {
+    wchar_t dir[256];
+    swprintf(dir, 256, L"build\\storage-route-%lu", GetCurrentProcessId());
+    ChatStorage store;
+    if (!storage_open(&store, dir)) return -2;
+    if (!provider_fields) provider_fields = "";
+    char settings[512], conversation[256];
+    snprintf(settings, sizeof settings,
+        "{\"type\":\"settings\",\"version\":1,\"next_id\":1,\"active\":0,"
+        "\"conversation_count\":1,\"model_history_count\":0,\"window_x\":0,"
+        "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+        "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+        "\"system_prompt\":\"\"%s%s}", provider_fields[0] ? "," : "",
+        provider_fields);
+    snprintf(conversation, sizeof conversation,
+        "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
+        "\"modified_at\":1000,\"renamed\":0,\"message_count\":0,"
+        "\"title\":\"c\",\"draft\":\"\"}");
+    const char *lines[2] = { settings, conversation };
+    int result = write_snapshot(store.path, lines, 2) ?
         storage_load(&store, dest) : -2;
     storage_close(&store);
     remove_store(&store, dir);
@@ -291,6 +323,83 @@ int main(void) {
     CHECK(!wcscmp(loaded->conversations[0].messages[1].reasoning,
         L"Checked the options and chose this."));
     CHECK(loaded->conversations[0].messages[1].generation.reasoning_ms==2500.0);
+    /* Provider routing is optional and persisted only when non-default. A
+       default snapshot carries no provider fields and reloads to defaults. */
+    CHECK(loaded->provider_routing.sort==CHAT_PROVIDER_SORT_DEFAULT &&
+        !loaded->provider_routing.disallow_fallbacks &&
+        loaded->provider_routing.data_collection==CHAT_DATA_COLLECTION_ALLOW &&
+        !loaded->provider_routing.zdr);
+    chat->provider_routing.sort=CHAT_PROVIDER_SORT_LATENCY;
+    chat->provider_routing.disallow_fallbacks=true;
+    chat->provider_routing.data_collection=CHAT_DATA_COLLECTION_DENY;
+    chat->provider_routing.zdr=true;
+    CHECK(storage_save(&store,chat));
+    CHECK(storage_load(&store,loaded)==1);
+    CHECK(loaded->provider_routing.sort==CHAT_PROVIDER_SORT_LATENCY &&
+        loaded->provider_routing.disallow_fallbacks &&
+        loaded->provider_routing.data_collection==CHAT_DATA_COLLECTION_DENY &&
+        loaded->provider_routing.zdr);
+    {
+        char *routed=NULL; size_t routed_size=0;
+        CHECK(read_file_bytes(store.path,&routed,&routed_size));
+        CHECK(strstr(routed,"\"provider_sort\":3")!=NULL);
+        CHECK(strstr(routed,"\"provider_no_fallbacks\":1")!=NULL);
+        CHECK(strstr(routed,"\"provider_data_collection\":1")!=NULL);
+        CHECK(strstr(routed,"\"provider_zdr\":1")!=NULL);
+        free(routed);
+    }
+    /* Reset to defaults: the settings line then has the older shape with no
+       provider fields at all, and reloading preserves the defaults. */
+    chat->provider_routing.sort=CHAT_PROVIDER_SORT_DEFAULT;
+    chat->provider_routing.disallow_fallbacks=false;
+    chat->provider_routing.data_collection=CHAT_DATA_COLLECTION_ALLOW;
+    chat->provider_routing.zdr=false;
+    CHECK(storage_save(&store,chat));
+    {
+        char *plain=NULL; size_t plain_size=0;
+        CHECK(read_file_bytes(store.path,&plain,&plain_size));
+        CHECK(strstr(plain,"provider_")==NULL);
+        free(plain);
+    }
+    CHECK(storage_load(&store,loaded)==1);
+    CHECK(loaded->provider_routing.sort==CHAT_PROVIDER_SORT_DEFAULT &&
+        !loaded->provider_routing.disallow_fallbacks &&
+        loaded->provider_routing.data_collection==CHAT_DATA_COLLECTION_ALLOW &&
+        !loaded->provider_routing.zdr);
+    /* Every optional routing field decodes; an absent field defaults, and a
+       present but malformed one rejects the snapshot. */
+    {
+        Chat *dest=calloc(1,sizeof *dest); CHECK(dest);
+        CHECK(load_routing_case(
+            "\"provider_sort\":1,\"provider_no_fallbacks\":1,"
+            "\"provider_data_collection\":1,\"provider_zdr\":1",dest)==1);
+        CHECK(dest->provider_routing.sort==CHAT_PROVIDER_SORT_PRICE &&
+            dest->provider_routing.disallow_fallbacks &&
+            dest->provider_routing.data_collection==CHAT_DATA_COLLECTION_DENY &&
+            dest->provider_routing.zdr);
+        /* Absent fields are not corruption: the OpenRouter defaults apply. */
+        CHECK(load_routing_case(NULL,dest)==1);
+        CHECK(dest->provider_routing.sort==CHAT_PROVIDER_SORT_DEFAULT &&
+            !dest->provider_routing.disallow_fallbacks &&
+            dest->provider_routing.data_collection==CHAT_DATA_COLLECTION_ALLOW &&
+            !dest->provider_routing.zdr);
+        /* A present but malformed field rejects the whole snapshot. */
+        static const char *const malformed[] = {
+            "\"provider_sort\":99",              /* out of range */
+            "\"provider_sort\":-1",              /* out of range */
+            "\"provider_no_fallbacks\":2",       /* out of range */
+            "\"provider_data_collection\":-1",   /* out of range */
+            "\"provider_zdr\":1.5",              /* not an exact integer */
+            "\"provider_sort\":\"price\"",       /* wrong type */
+            "\"provider_zdr\":true",             /* wrong type */
+            "\"provider_sort\":null"             /* wrong type */
+        };
+        for (size_t i=0;i<sizeof malformed/sizeof malformed[0];i++) {
+            CHECK(load_routing_case(malformed[i],dest)==-1);
+            CHECK(load_routing_case(NULL,dest)==1);   /* store stays loadable */
+        }
+        chat_dispose(dest); free(dest);
+    }
     wchar_t *large_reasoning=(wchar_t *)malloc(70001*sizeof(wchar_t));
     CHECK(large_reasoning);
     for (int i=0;i<70000;i++) large_reasoning[i]=L'r';
@@ -377,6 +486,10 @@ int main(void) {
         CHECK(fixture->conversations[1].messages[1].generation.state==CHAT_GENERATION_INTERRUPTED);
         CHECK(!wcscmp(fixture->system_prompt,L"Be concise.\nUnicode \x03bb"));
         CHECK(!wcscmp(fixture->conversations[0].draft,L"Unsent draft"));
+        CHECK(fixture->provider_routing.sort==CHAT_PROVIDER_SORT_DEFAULT &&
+            !fixture->provider_routing.disallow_fallbacks &&
+            fixture->provider_routing.data_collection==CHAT_DATA_COLLECTION_ALLOW &&
+            !fixture->provider_routing.zdr);
         /* Migration: the fixture stored next_id 1789338462008 and four
            id-less messages, so file order assigns 009, 010, 011, 012 and the
            counter ends exactly at the last synthesized id. */

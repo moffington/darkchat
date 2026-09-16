@@ -37,7 +37,8 @@ typedef struct OpenRouterClient {
 
 void openrouter_init(OpenRouterClient *client, HWND notify, UINT message);
 int openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
-    const wchar_t *model, const OpenRouterMessage *messages, int count);
+    const wchar_t *model, const OpenRouterMessage *messages, int count,
+    const ChatProviderRouting *routing);
 bool openrouter_cancel(OpenRouterClient *client, int generation);
 void openrouter_event_free(OpenRouterEvent *event);
 void openrouter_complete(OpenRouterClient *client, int generation);

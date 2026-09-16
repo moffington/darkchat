@@ -1,5 +1,6 @@
 /* Hidden HWND integration of the real host, lifecycle and storage. */
 #include "../chat/chat_host_win32.c"
+#include "../chat/provider_routing.h"
 #include <process.h>
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
@@ -14,18 +15,23 @@ static int openrouter_request_last_count;
 static ChatRole openrouter_request_last_roles[CHAT_CONTEXT_MAX_ENTRIES];
 static const wchar_t *openrouter_request_last_texts[CHAT_CONTEXT_MAX_ENTRIES];
 static int openrouter_request_fake_generation;   /* 0: delegate to the real client */
+static ChatProviderRouting openrouter_request_last_routing;
 int __real_openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
-    const wchar_t *model, const OpenRouterMessage *messages, int count);
+    const wchar_t *model, const OpenRouterMessage *messages, int count,
+    const ChatProviderRouting *routing);
 int __wrap_openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
-    const wchar_t *model, const OpenRouterMessage *messages, int count) {
+    const wchar_t *model, const OpenRouterMessage *messages, int count,
+    const ChatProviderRouting *routing) {
     ++openrouter_request_calls;
     openrouter_request_last_count=count;
     for (int i=0;i<count && i<CHAT_CONTEXT_MAX_ENTRIES;i++) {
         openrouter_request_last_roles[i]=messages[i].role;
         openrouter_request_last_texts[i]=messages[i].text;
     }
+    if (routing) openrouter_request_last_routing=*routing;
+    else chat_provider_routing_init(&openrouter_request_last_routing);
     if (openrouter_request_fake_generation) return openrouter_request_fake_generation;
-    return __real_openrouter_request(client,api_key_utf8,model,messages,count);
+    return __real_openrouter_request(client,api_key_utf8,model,messages,count,routing);
 }
 /* Catalog seams (linked with -Wl,--wrap=model_catalog_request and
    -Wl,--wrap=model_picker_pump): the fetch is counted but never starts a
@@ -430,6 +436,48 @@ static int default_suite(void) {
         h->generating=false; h->context_dropped=0; h->request_generation=0;
         render_transcript(h);
         free(huge);
+    }
+    /* ---- Provider routing: menu action -> persisted setting -> request ---- */
+    {
+        int calls=openrouter_request_calls;
+        action(h,ACTION_ROUTING_SORT_LATENCY);
+        action(h,ACTION_ROUTING_ALLOW_FALLBACKS);   /* toggles fallbacks off */
+        action(h,ACTION_ROUTING_DATA_COLLECTION);   /* toggles data collection to deny */
+        action(h,ACTION_ROUTING_ZDR);               /* adds request-level ZDR */
+        CHECK(chat->provider_routing.sort==CHAT_PROVIDER_SORT_LATENCY);
+        CHECK(chat->provider_routing.disallow_fallbacks);
+        CHECK(chat->provider_routing.data_collection==CHAT_DATA_COLLECTION_DENY);
+        CHECK(chat->provider_routing.zdr);
+        /* The next request carries exactly this routing, captured at the seam. */
+        rich_text_set_text(&h->composer,L"routed question");
+        openrouter_request_fake_generation=7373;
+        perform_send(h);
+        openrouter_request_fake_generation=0;
+        CHECK(openrouter_request_calls==calls+1);
+        CHECK(h->generating && h->request_generation==7373);
+        CHECK(openrouter_request_last_routing.sort==CHAT_PROVIDER_SORT_LATENCY &&
+            openrouter_request_last_routing.disallow_fallbacks &&
+            openrouter_request_last_routing.data_collection==CHAT_DATA_COLLECTION_DENY &&
+            openrouter_request_last_routing.zdr);
+        handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+        /* Restore OpenRouter defaults so the rest of the suite is unaffected. */
+        action(h,ACTION_ROUTING_SORT_DEFAULT);
+        action(h,ACTION_ROUTING_ALLOW_FALLBACKS);
+        action(h,ACTION_ROUTING_DATA_COLLECTION);
+        action(h,ACTION_ROUTING_ZDR);
+        CHECK(chat->provider_routing.sort==CHAT_PROVIDER_SORT_DEFAULT &&
+            !chat->provider_routing.disallow_fallbacks &&
+            chat->provider_routing.data_collection==CHAT_DATA_COLLECTION_ALLOW &&
+            !chat->provider_routing.zdr);
+        ChatConversation *route_conv=&chat->conversations[0];
+        for (size_t i=2;i<route_conv->message_count;i++)
+            chat_message_dispose(&route_conv->messages[i]);
+        route_conv->message_count=2;
+        chat->system_prompt[0]=0; route_conv->draft[0]=0;
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
     }
     begin_fixture(h); CHECK(h->request_message==1);
     OpenRouterEvent *e=fixture(h,OPENROUTER_DELTA,L"Partial answer");

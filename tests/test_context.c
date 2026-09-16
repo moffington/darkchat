@@ -1,6 +1,7 @@
 #include "../chat/context.h"
 #include "../chat/chat.h"
 #include "../chat/json.h"
+#include "../chat/provider_routing.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -531,6 +532,71 @@ static void test_send_modes(void) {
     check_mode(CHAT_EDIT_RESEND, L"edited", L"edited");
 }
 
+/* The budget must charge exactly the provider object the encoder writes, and
+   nothing at all when every routing control is at OpenRouter's default. */
+static void test_provider_routing(void) {
+    Chat *chat = fresh_chat();
+    int trigger = chat_append(chat, CHAT_ROLE_USER, L"hello");
+    const ChatConversation *c = active(chat);
+    ChatRequestContext context;
+    size_t base = TEST_ENVELOPE + json_encoded_string_size(chat->model);
+    size_t trigger_bytes = message_bytes(CHAT_ROLE_USER, L"hello");
+
+    check(chat_provider_envelope_bytes(&chat->provider_routing) == 0,
+        "default routing serializes to no provider object");
+    check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) == CHAT_CONTEXT_OK,
+        "default routing builds");
+    check(context.bytes == expected_body(chat, &context),
+        "default routing reports the plain body size");
+
+    chat->provider_routing.sort = CHAT_PROVIDER_SORT_THROUGHPUT;
+    chat->provider_routing.disallow_fallbacks = true;
+    chat->provider_routing.data_collection = CHAT_DATA_COLLECTION_DENY;
+    chat->provider_routing.zdr = true;
+    check(chat_provider_envelope_bytes(&chat->provider_routing) == 93,
+        "the provider envelope has a pinned, exact byte size");
+    size_t routing_bytes = chat_provider_envelope_bytes(&chat->provider_routing);
+    check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) == CHAT_CONTEXT_OK,
+        "non-default routing builds");
+    check(context.bytes == base + routing_bytes + trigger_bytes,
+        "the provider object is charged exactly once in the envelope");
+
+    /* The trigger-only boundary moves by exactly the provider bytes, and the
+       OVERSIZE diagnostic reports the routed body. */
+    size_t trigger_only = base + routing_bytes + trigger_bytes;
+    check(chat_context_build(chat, c, trigger, trigger_only, &context) == CHAT_CONTEXT_OK &&
+        context.count == 1, "the trigger still fits at the routed size");
+    check(chat_context_build(chat, c, trigger, trigger_only - 1, &context) ==
+        CHAT_CONTEXT_OVERSIZE_USER, "one byte under the routed size fails explicitly");
+    check(context.required_bytes == trigger_only,
+        "the oversize diagnostic includes the provider object");
+    /* The reported size is exactly what the appender writes for every
+       combination of controls: the size helper is a pure summation with no
+       failure path, so it can never disagree with or understate the output. */
+    for (int bits = 0; bits < 16; bits++) {
+        ChatProviderRouting routing;
+        chat_provider_routing_init(&routing);
+        routing.sort = (bits & 1) ? CHAT_PROVIDER_SORT_PRICE
+            : CHAT_PROVIDER_SORT_DEFAULT;
+        routing.disallow_fallbacks = (bits & 2) != 0;
+        routing.data_collection = (bits & 4) ? CHAT_DATA_COLLECTION_DENY
+            : CHAT_DATA_COLLECTION_ALLOW;
+        routing.zdr = (bits & 8) != 0;
+        JsonBuf buf;
+        json_buf_init(&buf, 16);
+        check(chat_provider_append(&buf, &routing), "the provider appender succeeds");
+        size_t measured = chat_provider_envelope_bytes(&routing);
+        check(measured == buf.length,
+            "the reported provider size is exactly the appended size");
+        if (measured)
+            check(!strncmp(buf.data, ",\"provider\":{", 13) &&
+                buf.data[buf.length - 1] == '}',
+                "the provider envelope is well formed");
+        json_buf_free(&buf);
+    }
+    chat_dispose(chat); free(chat);
+}
+
 int main(void) {
     test_order_and_identity();
     test_oldest_dropped_first();
@@ -543,6 +609,7 @@ int main(void) {
     test_read_only();
     test_budget_sweep();
     test_send_modes();
+    test_provider_routing();
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     puts("Bounded request context: budget, oldest-first dropping, eligibility, "
         "diagnostics, read-only access and send-mode tests passed");

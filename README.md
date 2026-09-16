@@ -2,7 +2,7 @@
 
 DarkChat is a native OpenRouter chat client for Windows, written in C17 with Win32, Direct2D, DirectWrite, Rich Edit, and WinHTTP.
 
-It provides streaming responses, per-turn reasoning views, progressive Markdown rendering, durable local conversation history, and the basic lifecycle tools expected from a usable desktop chat client—without Electron, a browser runtime, or third-party libraries.
+It provides streaming responses, per-turn reasoning views, progressive Markdown rendering, a searchable OpenRouter model catalog, provider-routing controls, durable local conversation history, and the basic lifecycle tools expected from a usable desktop chat client—without Electron, a browser runtime, or third-party libraries.
 
 > **Status:** DarkChat is functional and under active development. It is currently a focused personal desktop client rather than a finished general-purpose release.
 
@@ -26,8 +26,9 @@ It provides streaming responses, per-turn reasoning views, progressive Markdown 
 - Retry unsuccessful responses, regenerate the latest response, or edit and resend the latest user message.
 - Stop an active request while retaining its partial response.
 - Copy responses, transcript selections, and composer text.
-- Configure the model, global system prompt, and sidebar width.
-- Recall the 16 most recently used model identifiers with `Ctrl+Space`.
+- Configure the model, global system prompt, sidebar width, and OpenRouter provider routing.
+- Browse and search OpenRouter's model catalog with `Ctrl+Space`; offline or without a key it falls back to the current model and the 16 most recently used identifiers.
+- Apply global provider routing to future requests: sort by price, throughput, or latency; allow or disable fallback providers; allow or deny providers that may store data; and require Zero Data Retention. Every control defaults to OpenRouter's own default.
 - Show completion metadata including:
   - Time to first token
   - Total latency
@@ -77,13 +78,13 @@ You can instead create `OPENROUTER_API_KEY` as a Windows User environment variab
 
 The key is never written to conversation state or included in persisted history, and temporary key buffers are cleared before release.
 
-Enter any valid OpenRouter model identifier in the model field. DarkChat currently does not download OpenRouter’s model catalog or expose provider-routing controls.
+Enter any valid OpenRouter model identifier in the model field, or press `Ctrl+Space` to search OpenRouter's model catalog. The catalog is fetched on demand with the same key, cached in memory for one hour, and never persisted; offline or without a key, the picker falls back to the current model and recent history. Provider routing is configured under Settings > Provider routing.
 
 ## Everyday controls
 
 - `Enter` sends a message.
 - `Shift+Enter` inserts a newline.
-- `Ctrl+Space` opens recently used model identifiers.
+- `Ctrl+Space` opens the searchable model picker (current model, recent models, then the OpenRouter catalog). Type to filter by id or name, use Up/Down, then Enter or double-click to select; Escape cancels.
 - `Ctrl+F` focuses conversation search. Enter refreshes the search and jumps to
   its first result; `F3` / `Shift+F3` move through message and reasoning hits.
 - The Send button becomes Stop during generation.
@@ -102,7 +103,7 @@ DarkChat stores its state at:
 %LOCALAPPDATA%\DarkChat\state.jsonl
 ```
 
-The snapshot contains conversations, messages, drafts, model history, generation metadata, settings, and window geometry. It does not contain the OpenRouter API key.
+The snapshot contains conversations, messages, drafts, model history, generation metadata, settings (including provider routing), and window geometry. It does not contain the OpenRouter API key.
 
 Persistence uses a checksummed UTF-8 JSONL format with:
 
@@ -133,6 +134,8 @@ DarkChat now represents most of the active development in this repository.
 | Transcript | `chat/transcript_win32.*`, `chat/rich_text_win32.*` | Bounded, recycled native Rich Edit slots; scrolling, selection preservation, reasoning viewports, incremental updates |
 | Markdown | `chat/markdown.*` | Transactional, platform-independent Markdown subset parser |
 | OpenRouter | `chat/openrouter_winhttp.*`, `chat/sse.*`, `chat/json.*` | Request encoding, WinHTTP streaming, SSE framing, response decoding |
+| Model catalog | `chat/model_catalog.*`, `chat/model_catalog_winhttp.*`, `chat/model_picker_win32.*` | Transient OpenRouter model-catalog fetch, parse/merge/filter, and the searchable picker |
+| Provider routing | `chat/provider_routing.*` | OpenRouter `provider` object construction, sharing exact bytes with the request-context budget |
 | Storage | `chat/storage.*` | Checksummed JSONL snapshots, atomic replacement, backup and recovery |
 | DarkUI foundation | `ui/*`, `platform/*` | Retained controls, theme, painting, layout, Direct2D/DirectWrite rendering, and accessibility infrastructure |
 
@@ -168,6 +171,8 @@ Coverage includes:
 - Dynamic message allocation and injected allocation failures
 - Unicode, JSON, SSE, and split-boundary parsing
 - OpenRouter request and response fixtures
+- OpenRouter model-catalog parsing, picker merge/filter, and offline or keyless fallback
+- Provider-routing serialization, request-context budget accounting, persistence round-trips, and the settings-to-request seam
 - Reasoning ownership and live reasoning viewports
 - Progressive Markdown rendering
 - Selection-preserving transcript updates
@@ -201,9 +206,8 @@ The automated suite does not require an API key or make live OpenRouter requests
 - Message text and reasoning use 255-code-unit inline residues, then heap storage;
   they have no fixed per-message length cap
 - 128 MB maximum persisted snapshot
-- 16 recently used model identifiers
-- No full model-catalog browser
-- No provider-routing UI
+- 16 recently used model identifiers (the offline picker fallback)
+- Provider routing exposes sorting, fallback, data-collection, and ZDR controls only; per-provider `only`/`ignore`/`order` selection is not exposed
 - No response branches or retained variants
 - Conversation search scans current in-memory messages on demand; there is no
   persisted or background index

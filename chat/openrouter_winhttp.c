@@ -1,5 +1,6 @@
 #include "openrouter_winhttp.h"
 #include "json.h"
+#include "provider_routing.h"
 #include "sse.h"
 #include <winhttp.h>
 #include <process.h>
@@ -22,6 +23,7 @@ typedef struct {
     ChatRole *roles;
     wchar_t **texts;
     int count;
+    ChatProviderRouting routing;
     ChatGeneration metadata;
     ULONGLONG started_tick;
 } OpenRouterWork;
@@ -111,8 +113,12 @@ static bool build_request(const OpenRouterWork *work, JsonBuf *body) {
             !json_buf_append_json_string(body, work->texts[i]) ||
             !json_buf_append_raw(body, "}", 1)) return false;
     }
-    return json_buf_append_raw(body,
-        "],\"stream\":true,\"reasoning\":{\"enabled\":true}}", 45);
+    if (!json_buf_append_raw(body,
+        "],\"stream\":true,\"reasoning\":{\"enabled\":true}", 44)) return false;
+    /* OpenRouter provider defaults are preserved: nothing is sent unless a
+       routing control differs from the default. */
+    if (!chat_provider_append(body, &work->routing)) return false;
+    return json_buf_append_raw(body, "}", 1);
 }
 
 static wchar_t *build_headers(const char *api_key) {
@@ -522,7 +528,8 @@ static unsigned __stdcall worker(void *parameter) {
 }
 
 int openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
-    const wchar_t *model, const OpenRouterMessage *messages, int count) {
+    const wchar_t *model, const OpenRouterMessage *messages, int count,
+    const ChatProviderRouting *routing) {
     if (!client || !client->notify || !api_key_utf8 || !api_key_utf8[0] ||
         !model || !model[0] || count < 0 || (count > 0 && !messages) ||
         client->thread) return 0;
@@ -539,6 +546,9 @@ int openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
     work->message = client->message;
     work->client = client;
     work->count = count;
+    /* The work item is calloc-zeroed, so a NULL routing keeps OpenRouter's
+       defaults; otherwise the caller's routing is copied for this request. */
+    if (routing) work->routing = *routing;
     size_t key_length = strlen(api_key_utf8);
     work->api_key = (char *)calloc(key_length + 1, 1);
     work->model = copy_wide(model);

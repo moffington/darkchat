@@ -60,6 +60,23 @@ static bool get_message_string(const char *s, const char *name,
 static bool integer(const char *s, const char *name, double min, double max, double *out) {
     return json_query_number(s, name, out) && *out >= min && *out <= max && floor(*out) == *out;
 }
+/* Optional trailing settings field. `fallback` is left in `*out` when the
+   field is absent, which is not corruption; a field that is present but not a
+   finite exact integer in [min,max] (a string, bool, null, object, fraction or
+   out-of-range number) rejects the snapshot. Returns false only for
+   corruption. */
+static bool optional_int(const char *line, const char *name, double min,
+    double max, int fallback, int *out) {
+    JsonFieldKind kind;
+    double value;
+    *out = fallback;
+    if (!json_query_field(line, name, &kind, &value)) return false;
+    if (kind == JSON_FIELD_ABSENT) return true;
+    if (kind != JSON_FIELD_NUMBER || value < min || value > max ||
+        floor(value) != value) return false;
+    *out = (int)value;
+    return true;
+}
 /* True when `id` already belongs to a decoded conversation id or to any live
    message decoded before the record now being decoded (conversation `ci`,
    messages before index `j`). Message and conversation identities share the
@@ -114,6 +131,18 @@ static bool encode(const Chat *chat, JsonBuf *b) {
     NUM(b, chat, sidebar_width);
     STR(b, chat, model);
     STR(b, chat, system_prompt);
+    /* Optional provider-routing settings, appended last and emitted only when
+       non-default, so a default snapshot keeps the older byte shape and an
+       older build simply ignores the fields. The all-zero struct is exactly
+       OpenRouter's default routing. */
+    if (chat->provider_routing.sort != CHAT_PROVIDER_SORT_DEFAULT)
+        number(b, "provider_sort", (double)chat->provider_routing.sort);
+    if (chat->provider_routing.disallow_fallbacks)
+        number(b, "provider_no_fallbacks", 1);
+    if (chat->provider_routing.data_collection != CHAT_DATA_COLLECTION_ALLOW)
+        number(b, "provider_data_collection", (double)chat->provider_routing.data_collection);
+    if (chat->provider_routing.zdr)
+        number(b, "provider_zdr", 1);
     raw(b, "}\n");
     for (int i = 0; i < chat->model_history_count; i++) {
         raw(b, "{\"type\":\"model\""); string(b, "model", chat->model_history[i]); raw(b, "}\n");
@@ -210,6 +239,27 @@ static bool decode(char *data, Chat *chat) {
     READ_INT(chat, sidebar_width, 160, 360);
     READ_STR(chat, model);
     READ_STR(chat, system_prompt);
+    /* Optional provider-routing settings: absent in older snapshots and
+       defaulted here to OpenRouter's routing defaults. A field that is present
+       but malformed (wrong type, fractional, or out of range) is corruption
+       and rejects the snapshot. */
+    chat->provider_routing.sort = CHAT_PROVIDER_SORT_DEFAULT;
+    chat->provider_routing.disallow_fallbacks = false;
+    chat->provider_routing.data_collection = CHAT_DATA_COLLECTION_ALLOW;
+    chat->provider_routing.zdr = false;
+    int routing_value;
+    if (!optional_int(line,"provider_sort",0,CHAT_PROVIDER_SORT_LATENCY,
+            CHAT_PROVIDER_SORT_DEFAULT,&routing_value)) goto bad;
+    chat->provider_routing.sort=(ChatProviderSort)routing_value;
+    if (!optional_int(line,"provider_no_fallbacks",0,1,0,&routing_value))
+        goto bad;
+    chat->provider_routing.disallow_fallbacks=routing_value!=0;
+    if (!optional_int(line,"provider_data_collection",0,1,0,&routing_value))
+        goto bad;
+    chat->provider_routing.data_collection=routing_value ? CHAT_DATA_COLLECTION_DENY
+        : CHAT_DATA_COLLECTION_ALLOW;
+    if (!optional_int(line,"provider_zdr",0,1,0,&routing_value)) goto bad;
+    chat->provider_routing.zdr=routing_value!=0;
     if (chat->active >= chat->conversation_count || !chat->model[0]) goto bad;
     for (int i=0; i<chat->model_history_count; i++) {
         line=next_line(&cursor);

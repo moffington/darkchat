@@ -80,8 +80,31 @@ bool chat_copy_text(HWND owner,const wchar_t *text) {
     if (!ok) GlobalFree(memory);
     return ok;
 }
-HMENU chat_actions_menu(void) {
+static int routing_sort_action(ChatProviderSort sort) {
+    switch (sort) {
+    case CHAT_PROVIDER_SORT_PRICE: return ACTION_ROUTING_SORT_PRICE;
+    case CHAT_PROVIDER_SORT_THROUGHPUT: return ACTION_ROUTING_SORT_THROUGHPUT;
+    case CHAT_PROVIDER_SORT_LATENCY: return ACTION_ROUTING_SORT_LATENCY;
+    default: return ACTION_ROUTING_SORT_DEFAULT;
+    }
+}
+void chat_actions_sync_routing(HMENU menu, const Chat *chat) {
+    if (!menu || !chat) return;
+    const ChatProviderRouting *routing = &chat->provider_routing;
+    CheckMenuRadioItem(menu, ACTION_ROUTING_SORT_DEFAULT,
+        ACTION_ROUTING_SORT_LATENCY, routing_sort_action(routing->sort),
+        MF_BYCOMMAND);
+    CheckMenuItem(menu, ACTION_ROUTING_ALLOW_FALLBACKS,
+        MF_BYCOMMAND | (routing->disallow_fallbacks ? MF_UNCHECKED : MF_CHECKED));
+    CheckMenuItem(menu, ACTION_ROUTING_DATA_COLLECTION,
+        MF_BYCOMMAND | (routing->data_collection == CHAT_DATA_COLLECTION_DENY
+            ? MF_UNCHECKED : MF_CHECKED));
+    CheckMenuItem(menu, ACTION_ROUTING_ZDR,
+        MF_BYCOMMAND | (routing->zdr ? MF_CHECKED : MF_UNCHECKED));
+}
+HMENU chat_actions_menu(const Chat *chat) {
     HMENU bar=CreateMenu(), conversation=CreatePopupMenu(), response=CreatePopupMenu(), settings=CreatePopupMenu();
+    HMENU routing=CreatePopupMenu();
     AppendMenuW(conversation,MF_STRING,ACTION_NEW,L"&New conversation");
     AppendMenuW(conversation,MF_STRING,ACTION_RENAME,L"&Rename...");
     AppendMenuW(conversation,MF_STRING,ACTION_DELETE,L"&Delete...");
@@ -99,6 +122,16 @@ HMENU chat_actions_menu(void) {
     AppendMenuW(settings,MF_STRING,ACTION_SYSTEM,L"&System prompt...");
     AppendMenuW(settings,MF_STRING,ACTION_SIDEBAR,L"Sidebar &width...");
     AppendMenuW(settings,MF_STRING,ACTION_MODELS,L"&Choose model... (Ctrl+Space)");
+    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_SORT_DEFAULT,L"Sort: &Default (balanced)");
+    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_SORT_PRICE,L"Sort: Prefer lowest &price");
+    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_SORT_THROUGHPUT,L"Sort: Prefer highest t&hroughput");
+    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_SORT_LATENCY,L"Sort: Prefer lowest &latency");
+    AppendMenuW(routing,MF_SEPARATOR,0,NULL);
+    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_ALLOW_FALLBACKS,L"Allow fallback &providers");
+    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_DATA_COLLECTION,L"Allow providers that may store &data");
+    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_ZDR,L"Require &zero data retention");
+    chat_actions_sync_routing(routing,chat);
+    AppendMenuW(settings,MF_POPUP,(UINT_PTR)routing,L"Provider &routing");
     AppendMenuW(bar,MF_POPUP,(UINT_PTR)conversation,L"&Conversation");
     AppendMenuW(bar,MF_POPUP,(UINT_PTR)response,L"&Response");
     AppendMenuW(bar,MF_POPUP,(UINT_PTR)settings,L"&Settings");
