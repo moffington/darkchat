@@ -237,6 +237,60 @@ int main(void) {
         check(style_is(code, MD_STYLE_MONO | MD_STYLE_CODE),
             "open fence run mono+code");
         markdown_dispose(&d); }
+    { /* Fences match their delimiter and opener length; longer closers work. */
+        MdDocument d;
+        render_ok(L"before\n````c\n```\n~~~~\n```` text\n``````\nafter", &d,
+            "strict backtick fence renders");
+        text_is(&d, L"before\n```\n~~~~\n```` text\nafter",
+            "invalid fence closers remain code content");
+        check(style_is(run_over(&d, L"```\n~~~~\n```` text"),
+            MD_STYLE_MONO | MD_STYLE_CODE),
+            "short wrong and text-suffixed closers are code");
+        check(style_is(run_over(&d, L"after"), 0),
+            "longer closing fence restores plain text");
+        markdown_dispose(&d); }
+    { /* Tilde fences hide info strings and shield all inline syntax. */
+        MdDocument d;
+        render_ok(L"~~~lang`accepted\n~~old~~\n- [x] task\n~~~", &d,
+            "tilde fence renders");
+        text_is(&d, L"~~old~~\n- [x] task", "tilde content stays raw");
+        check(style_is(run_over(&d, L"~~old~~\n- [x] task"),
+            MD_STYLE_MONO | MD_STYLE_CODE),
+            "tilde fence shields strike and task syntax");
+        markdown_dispose(&d); }
+    { /* Fenced content removes only the recorded opener indentation. */
+        MdDocument d;
+        render_ok(L"  ````\n  zero\n    two\n\t tab\n   ````\n  plain\n    deep",
+            &d, "fence indentation renders");
+        text_is(&d, L"zero\n  two\n\t tab\nplain\n deep",
+            "fence indentation is distinct from ordinary lines");
+        check(style_is(run_over(&d, L"  two"), MD_STYLE_MONO | MD_STYLE_CODE),
+            "remaining fenced indentation is code");
+        check(style_is(run_over(&d, L"plain"), 0),
+            "ordinary indentation behavior remains unchanged");
+        markdown_dispose(&d); }
+    { /* Four leading spaces never open a fence; CRLF fences normalize normally. */
+        MdDocument d;
+        render_ok(L"    ```\nplain", &d, "four-space fence marker renders");
+        text_is(&d, L" ```\nplain", "four-space marker stays ordinary text");
+        check(d.run_count == 1 && d.runs[0].style == 0,
+            "four-space marker has no code style");
+        markdown_dispose(&d);
+        render_ok(L"~~~info\r\n**raw**\r\n~~~~\t\r\nafter", &d,
+            "CRLF tilde fence renders");
+        text_is(&d, L"**raw**\nafter", "CRLF fence lines normalize and hide");
+        check(style_is(run_over(&d, L"**raw**"),
+            MD_STYLE_MONO | MD_STYLE_CODE), "CRLF fenced content is code");
+        markdown_dispose(&d); }
+    { /* An unterminated fence keeps invalid closer candidates as code to EOF. */
+        MdDocument d;
+        render_ok(L"````\n```\n~~~~\n```` text", &d,
+            "unterminated strict fence renders");
+        text_is(&d, L"```\n~~~~\n```` text",
+            "unterminated fence preserves invalid closers");
+        check(style_is(run_over(&d, L"```\n~~~~\n```` text"),
+            MD_STYLE_MONO | MD_STYLE_CODE), "unterminated strict fence is code");
+        markdown_dispose(&d); }
     { /* HTTP(S) links become "label (url)"; other schemes stay literal. */
         MdDocument d;
         render_ok(L"[site](https://example.com/x) [f](ftp://y.io/a) "

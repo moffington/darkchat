@@ -288,7 +288,8 @@ surface is recreated or the generation ends; the next incoming delta, the 1 Hz
 sweep and the next render are the additional retry paths.
 A scheduled flush that fires while the body holds a selection is deferred
 through the pending-write path instead of destroying the range. Incomplete
-syntax renders literally while it streams. A rebuild relayouts only from the
+inline syntax renders literally while it streams; an opened unterminated fence
+renders its remaining source as code. A rebuild relayouts only from the
 streaming turn and follows only when the stored follow mode is `BOTTOM`.
 Terminal metadata updates its own surface without rewriting the body. Skipping
 a destructive content write does not skip placement or visibility
@@ -305,20 +306,28 @@ reasons are surfaced. A running turn never mixes stats into the streaming answer
 Terminal assistant output is Markdown-rendered (`chat/markdown.c`, a pure
 parser with its own test suite); while a response streams, the visible body is
 rebuilt from the accumulated message at most once every ~100 ms (a scheduled flush
-renders a paused burst), incomplete
-syntax stays literal, and the terminal event flushes the final render. User,
-system and error
-bodies are fully literal, fence markers included, and reasoning is never
-reformatted. The supported subset: headings 1–3 (require a space after the
-marker), `**bold**`, `*italic*`/`_italic_` (word-internal underscores and
-asterisks stay literal), `~~strikethrough~~` (paired non-space content only),
-inline code with equal-length backtick runs on one source line (different-length
-runs stay raw content; unmatched runs stay literal), and fenced code (fence
-lines and language tags hidden, monospace on the code tint), flat lists (textual `• ` bullets, `☐ `/`☑ ` unordered task
-markers, and preserved ordered markers), `[label](http(s)://…)` links rendered as
-`label (url)` so the native URL detector opens them, and blockquotes (muted,
-bar-prefixed). Precedence is fences → inline code → links → strikethrough →
-emphasis; escapes (`\*`) keep punctuation literal; malformed or unsupported
+renders a paused burst), incomplete inline syntax stays literal, an opened fence
+keeps its remaining content coded until a valid closer arrives, and the terminal
+event flushes the final render. User, system and error bodies are fully literal,
+fence markers included, and reasoning is never reformatted. The supported subset:
+headings 1–3 (require a space after the marker), `**bold**`, `*italic*`/`_italic_`
+(word-internal underscores and asterisks stay literal), `~~strikethrough~~`
+(paired non-space content only), inline code with equal-length backtick runs on
+one source line (different-length runs stay raw content; unmatched runs stay
+literal), and fenced code with a backtick or tilde opener of at least three
+delimiters after up to three leading spaces. Fences use permissive hidden info
+strings, including backtick-fence info strings containing backticks. A closer
+uses the same delimiter, is at least as long as its opener, and
+has only spaces or tabs after it; shorter, wrong-character and text-suffixed
+candidates remain raw code content, while longer closers are accepted. Fenced
+content is unparsed and removes at most the opener's leading spaces from each
+line; an unterminated fence keeps the remaining document as code. Fence lines and
+info strings are hidden, and code is monospace on the code tint. Flat lists use
+textual `• ` bullets, `☐ `/`☑ ` unordered task markers, and preserved ordered
+markers. `[label](http(s)://…)` links render as `label (url)` so the native URL
+detector opens them, and blockquotes are muted and bar-prefixed. Precedence is
+fences → inline code → links → strikethrough → emphasis; escapes (`\*`) keep
+punctuation literal; malformed or unsupported
 syntax (tables, images, nested lists, deeper rules) is preserved verbatim. Every
 Rich Edit run sets bold, italic, strikethrough, face, size and background
 explicitly, so code tinting cannot bleed into following text, and identical

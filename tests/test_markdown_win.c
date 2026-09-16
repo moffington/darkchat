@@ -117,6 +117,21 @@ int main(void) {
         !wcscmp(f.szFaceName, L"Segoe UI") &&
         f.crTextColor == theme.text && f.crBackColor == theme.background);
 
+    /* Tilde-fenced code hides its markers and receives the complete code format. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"before\n~~~~lang\n**raw**\n~~~~\nafter");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"before\r\n**raw**\r\nafter"));
+    f = format_at(&probe, (int)wcslen(L"before\r\n"));
+    CHECK(!(f.dwEffects & (CFE_BOLD | CFE_ITALIC | CFE_STRIKEOUT)) &&
+        !wcscmp(f.szFaceName, L"Consolas") &&
+        f.yHeight == (LONG)(theme.mono_size * 15.0f + 0.5f) &&
+        f.crTextColor == theme.code_text && f.crBackColor == theme.code_background);
+    f = format_at(&probe, (int)wcslen(L"before\r\n**raw**\r\n"));
+    CHECK(!(f.dwEffects & (CFE_BOLD | CFE_ITALIC | CFE_STRIKEOUT)) &&
+        !wcscmp(f.szFaceName, L"Segoe UI") &&
+        f.crTextColor == theme.text && f.crBackColor == theme.background);
+
     /* Italic and heading sizes. */
     rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"a *em* b");
     read_text(&probe, text, 512);

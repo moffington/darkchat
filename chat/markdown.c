@@ -310,29 +310,63 @@ static void parse_inline(MdBuilder *b, const wchar_t *s, size_t n,
     if (n > plain) emit(b, s + plain, n - plain, style);
 }
 
+typedef struct {
+    wchar_t delimiter;
+    size_t length, indent;
+} MdFence;
+
+/* Openers keep the subset's permissive hidden info strings. Closing validation
+   is separate because only horizontal whitespace may follow a closing run. */
+static bool fence_marker(const wchar_t *line, size_t n, MdFence *marker) {
+    size_t indent = 0;
+    while (indent < n && indent < 3 && line[indent] == L' ') ++indent;
+    size_t from = indent;
+    if (n - from < 3 || (line[from] != L'`' && line[from] != L'~'))
+        return false;
+    wchar_t delimiter = line[from];
+    while (from < n && line[from] == delimiter) ++from;
+    if (from - indent < 3) return false;
+    marker->delimiter = delimiter;
+    marker->length = from - indent;
+    marker->indent = indent;
+    return true;
+}
+
+static bool fence_closes(const wchar_t *line, size_t n, const MdFence *fence) {
+    MdFence marker;
+    if (!fence_marker(line, n, &marker) || marker.delimiter != fence->delimiter ||
+        marker.length < fence->length) return false;
+    for (size_t i = marker.indent + marker.length; i < n; i++)
+        if (!is_space(line[i])) return false;
+    return true;
+}
+
 /* One source line; blocks are recognized line-by-line and fences hide their
    marker lines. Newlines are normalized to LF. */
 static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
-    bool *fence) {
+    MdFence *fence) {
     size_t indent = 0;
     while (indent < n && indent < 3 && line[indent] == L' ') ++indent;
     const wchar_t *c = line + indent;
     size_t m = n - indent;
-    bool marker = m >= 3 && c[0] == L'`' && c[1] == L'`' && c[2] == L'`';
     MdStyle plain = {0};
-    if (*fence) {
-        if (marker) {
-            *fence = false;                 /* closing fence is hidden */
+    if (fence->delimiter) {
+        if (fence_closes(line, n, fence)) {
+            memset(fence, 0, sizeof *fence); /* closing fence is hidden */
         } else {
             MdStyle code = {0};
             code.style = MD_STYLE_MONO | MD_STYLE_CODE;
+            size_t from = 0;
+            while (from < n && from < fence->indent && line[from] == L' ')
+                ++from;
             emit_break(b, code.style);
-            emit(b, c, m, code);
+            emit(b, line + from, n - from, code);
         }
         return;
     }
-    if (marker) {
-        *fence = true;                      /* opening fence is hidden */
+    MdFence marker;
+    if (fence_marker(line, n, &marker)) {
+        *fence = marker;                    /* opening fence is hidden */
         return;
     }
     bool blank = true;
@@ -399,7 +433,7 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
 
 static void render_document(MdBuilder *b, const wchar_t *source) {
     const wchar_t *line = source ? source : L"";
-    bool fence = false;
+    MdFence fence = {0};
     for (;;) {
         const wchar_t *end = line;
         while (*end && *end != L'\n' && *end != L'\r') ++end;
