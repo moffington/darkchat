@@ -100,21 +100,11 @@ new binding takes are pure policy decisions (`chat/transcript_policy.h` — no
 Win32, no allocation): geometry-derived visibility (edge-touch excluded,
 unmeasured heights read at the minimum height), class protection (streaming,
 focused, selection/debt-bearing, expanded reasoning), rank/index realization
-ordering with the LRU stamp reserved for eviction only, required capacity
-|visible ∪ protected| plus two spare slots, fail-closed victim selection, and
-exact message-instance identity validation. The pool in this pass is
-retained-everything (capacity equals the 512-message bound): every record
-binds one slot on first use and keeps it for the process lifetime, so
-realization behavior is unchanged. Each render computes the required capacity
-at a single documented checkpoint under the stated precondition — capacity
-must cover |visible ∪ protected|; under it, realizing all visible and
-protected records first and evicting only from the remainder leaves no
-visible turn unrealized (a fail-closed `-1` from victim selection never
-avoids a gap, it only refuses to evict a must-keep record, and the correct
-answer is raising capacity). Protecting every expanded reasoning viewport can
-legitimately grow the protected set to the whole record count; that cost is
-accepted here and must be bounded deliberately by any future capacity-
-governed pass. The pool is created with exactly one allocation and its
+ordering with the LRU stamp reserved for eviction only, the dynamic required
+slot capacity, fail-closed victim selection, and exact message-instance
+identity validation. In the retain-all pool mode the required capacity is
+|visible ∪ protected| plus two spare slots, recorded at a single documented
+checkpoint. The pool is created with exactly one allocation and its
 exhaustion fails startup closed; `transcript_dispose` frees it exactly once
 per host from the ownership layer, after the window hierarchy is fully
 destroyed — never from the parent window procedure, whose `WM_DESTROY` runs
@@ -135,7 +125,18 @@ mode above, so production behavior is unchanged until the activation pass):
   `transcript_policy_pick_slot` tiers (exact-kind free reuse, pre-eviction of
   evictable kind matches, best-overlap reuse, pristine consumption last), so
   the native-window arena stays viewport-shaped and a revisit consumes no new
-  HWNDs. Heights are stamped per record and consumed only while the stamp is
+  HWNDs. Binding operates inside a raise-only governed slot budget
+  (`slot_limit`): each round first raises the limit to the dynamic required
+  capacity — `ceil(page/h_min)+1` strict-window records plus
+  `ceil(2*overscan/h_min)` overscan records, two Tier-A slots, the 24-record
+  Tier-B allowance and two spares, clamped to the 512-slot arena — counting
+  each raise and never shrinking, and every selection happens only within
+  `[0, slot_limit)`. The bound set is never trimmed toward a target:
+  Tier-B bindings beyond the allowance keep their slots, and forced
+  eviction of the oldest LRU non-window, non-Tier-A binding occurs only
+  when selection inside the limit returns `-1` (the allowance caps the
+  window's membership ranking, not a continuous binding count). Heights are
+  stamped per record and consumed only while the stamp is
   exact (never an estimate), certified against the current width/DPI/theme/
   identity, and debt-free; every scroll, reveal and selection path funnels
   through the same realize loop before placing, so a visible record can never
@@ -146,14 +147,78 @@ mode above, so production behavior is unchanged until the activation pass):
   creation failures block exactly one attempt per render (attempt stamps),
   surface-liveness reconciliation treats a live-claimed family whose window is
   gone like a never-created one, and a still-missing streaming body is retried
-  by the re-armed one-shot flush timer plus the 1 Hz sweep, the next delta and
-  the next render. Counters (`TranscriptStats`) record binds, rebinds,
-  evictions, raw HWND creation successes, exact/estimated measurements, retries,
-  rounds and the degraded/fallback exits as diagnostics, never as wall-clock
-  thresholds. Arena cells are the monotone set of slot/surface positions that
-  have ever owned a HWND plus the measurer (at most `4 * 512 + 1`); a destroyed
-  HWND recreates its existing cell. Current HWND count and its peak are derived
-  from live handles, so recreation cannot inflate either arena diagnostic.
+   by the re-armed one-shot flush timer plus the 1 Hz sweep, the next delta and
+   the next render. Counters (`TranscriptStats`) record binds, rebinds,
+   evictions, raw HWND creation successes, exact/estimated measurements, retries,
+   rounds and the degraded/fallback exits as diagnostics, never as wall-clock
+   thresholds — and the governed capacity's own bookkeeping: capacity raises,
+   forced evictions, the selection-saturation events a full limit produced
+   (`limit_saturated`), bind requests the engine refused with the record left
+   unrealized (`exhaustion_refusals`), and per-kind reader-state restorations
+   (selection, reasoning scroll, conversation anchor). Arena cells are the
+   monotone set of slot/surface positions that
+   have ever owned a HWND plus the measurer (at most `4 * 512 + 1`); a destroyed
+   HWND recreates its existing cell. Current HWND count and its peak are derived
+   from live handles, so recreation cannot inflate either arena diagnostic.
+
+### Reader position: follow mode, anchors and switching
+
+The transcript distinguishes bottom-following (`BOTTOM`: the newest content
+pulls the scroll) from a free reader (`FREE`: the reader's position is held
+against changes above it). Only an explicit user scroll can leave
+bottom-follow, and only a user scroll landing at the bottom re-enters it;
+every mutation pass — streaming deltas, completion, deferred writes, height
+corrections, resize/DPI reflow, reasoning toggles, eviction — preserves the
+mode. A free reader's position is a scroll anchor: a stable (conversation,
+message) identity plus a surface family and a pixel offset, resolved against
+fresh geometry on every placement so growth above the reader is absorbed
+instead of shifting content under them. The anchor's offset is inside the
+surface: only scroll 0 is the top-of-transcript anchor — a position inside
+the top margin above the first turn is named with a negative offset and
+restores exactly — and a positive offset is clamped to the surface's last
+pixel when the surface shrinks, never to the next surface's top. A
+scrollbar thumb drag owns the position while held; whether it ends with a
+release or is cancelled (`WM_CANCELMODE`, which either the container or the
+top-level window may receive), it finishes through the same end-of-drag
+path: the final position is qualified and captured as the fresh anchor.
+
+Each conversation's anchor lives in a per-conversation table keyed by stable
+conversation id (a fixed linear array, never indexed by id — ids are
+monotone store counters and can be sparse). Switching conversations saves
+the departing reader's anchor and loads the arriving conversation's entry:
+a valid saved anchor restores FREE and the saved position exactly; a
+missing or stale entry sets BOTTOM and clears the anchor, so a fresh
+conversation is never blessed with FREE and nothing to restore. The save
+direction is symmetric: a reader who left a conversation without a position
+(bottom-following, or an anchor that no longer names that conversation)
+clears the conversation's stored entry rather than leaving an older FREE
+position behind, so a later return lands where the reader actually left
+it. The load direction resolves the saved message against the arriving
+conversation: an entry whose message no longer exists (deleted, or
+replaced with a fresh identity by a retry/regenerate) is stale — BOTTOM,
+anchor cleared, entry dropped. A render prunes table entries whose
+conversation no longer exists — a session can mint far more distinct ids
+than the table's 128 slots through delete/create churn, so entries are
+reused rather than assumed exhaustible. Reader-state captures taken at
+eviction (per-surface selection ranges, the reasoning viewport's inner
+scroll) ride on the record, are merged into any earlier capture of the
+same record (a surface that cannot be read keeps its previous capture, so
+evicting a partially recreated record cannot erase state), count as
+decision-time debt (Tier-B protection), and are cleared only after their
+successful restoration — applied after the placement transactions, which
+reset a re-shown reasoning viewport's inner scroll — so a failed surface
+creation retains them for the next render's retry.
+
+Reader focus is tracked through the Rich Edit `EN_SETFOCUS`/`EN_KILLFOCUS`
+notifications arriving over `WM_COMMAND` (no event-mask bit is required).
+When a focused surface is about to be hidden, invalidated, rebound,
+switched away, or torn down — including the turn-slot reset a
+send/retry/regenerate performs — focus moves first through the transcript's
+host callback to the composer — ordinary reader flow continues at the
+input, and the transcript container never decides where focus lands. Window
+teardown transfers focus to the top-level window in `WM_CLOSE`
+immediately before `DestroyWindow`, so no transcript child is ever
+destroyed while it holds keyboard focus.
 
 Off-screen geometry is measured exactly through one shared measurement
 surface: a read-only Rich Edit block, child of the transcript container, kept
@@ -526,9 +591,13 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   height, class protection (streaming, focused, debt, expanded), rank/index
   realization ordering with the LRU stamp excluded from it, exact
   |visible ∪ protected| required capacity with clamped spare slots and
-  page/count monotonicity, fail-closed victim selection that returns the
-  slot position (never the represented record index) with LRU ranking among
-  evictable slots only, and exact message-instance identity validation.
+  page/count monotonicity, the dynamic geometric required slot capacity
+  (`ceil(page/h_min)+1` plus `ceil(2*overscan/h_min)`, two Tier-A slots, the
+  Tier-B allowance and two spares, clamped to the arena) with page
+  monotonicity and input floors, fail-closed victim selection that returns
+  the slot position (never the represented record index) with LRU ranking
+  among evictable slots only, and exact message-instance identity
+  validation.
 - Transcript slot-pool lifecycle (wrapped calloc): dispose on zeroed state,
   deterministic pool-allocation failure that leaves every record unbound and
   the transcript safe, successful creation with exactly one allocation and a
@@ -619,12 +688,25 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   with identical content to the measurement surface and the live surfaces —
   verbatim, wrapping markdown and head label — requiring exact quality and
   equal heights on both, plus cached-equals-live for body, head and footer.
-  A real view-resize storm keeps every step's viewport realized, relaxes
-  off-screen exactness (stamps left stale for strictly off-screen records
-  only), and the settle render plus DPI changes restore exact stamps at the
-  new width and DPI; the equality regression covers user blocks, wrapping
-  markdown, head labels and the metadata footer. Convergence bookkeeping
-  asserts no cap fallback and no degraded settle.
+   A real view-resize storm keeps every step's viewport realized, relaxes
+   off-screen exactness (stamps left stale for strictly off-screen records
+   only), and the settle render plus DPI changes restore exact stamps at the
+   new width and DPI; the equality regression covers user blocks, wrapping
+   markdown, head labels and the metadata footer. Convergence bookkeeping
+   asserts no cap fallback and no degraded settle. Explicit regressions
+   cover the follow/anchor lifecycle and the governed capacity: send-while-
+   FREE through the bounded send path holds the anchor and never
+   force-follows; per-conversation anchors restore FREE from a valid saved
+   anchor, land BOTTOM on a fresh conversation (never FREE with no anchor),
+   and survive a churn of far more than 128 distinct conversation ids
+   (entries for deleted conversations are pruned); binding accumulates
+   inside the raise-only governed slot limit (exceeding the Tier-B
+   allowance alone evicts nothing), forced Tier-B eviction fires only when
+   selection inside the limit returns -1, and the limit and HWND arena
+   stay bounded by the limit; eviction restores per-surface selection
+   ranges and the reasoning viewport's inner scroll, retaining captures
+   across creation failure; and reader focus reaches the host composer
+   through the focus-release callback after hides and switches.
 
 Manual live verification (uses the actual WinHTTP client; never prints the key):
 

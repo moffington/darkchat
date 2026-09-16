@@ -137,6 +137,66 @@ int transcript_policy_pick_victim(const TranscriptPolicyItem *bound,
 int transcript_policy_pick_slot(const TranscriptPolicyItem *bound,
     int slot_count, uint32_t needed_kinds, int scroll, int page, int h_min);
 
+/* Bounded realization membership, the capacity-governed pass: true iff record
+    `index` belongs in the realization window. The window is the overscan-
+    widened pixel viewport (caller pads scroll/page; h_min = px(t,8) is the
+    unmeasured worst case) union the Tier-A protected records (streaming or
+    focused, wherever they sit) union at most `tier_b_allowance` Tier-B
+    protected records (deferred debt or expanded reasoning) -- ranked LRU by
+    last_used among themselves, ties by index, so the newest reader state
+    stays realized and the stalest falls out. Pure and read-only. */
+bool transcript_policy_in_window(const TranscriptPolicyItem *items, int count,
+    int index, int scroll, int page, int h_min, int tier_b_allowance);
+
+/* Exact-set required bound-slot capacity for the capacity-governed pool:
+    records visible in the padded pixel window, plus Tier-A protected records
+    anywhere, plus at most `tier_b_allowance` Tier-B protected records, plus
+    min(spare_slots, room), clamped to [0, count]. Window, Tier-A and Tier-B
+    sets are disjoint by construction. Monotone in page and count. This is
+    the per-record exact-set form of the capacity computation -- the
+    transcript raises its governed limit from the geometric
+    transcript_policy_required_slots instead -- and the pure test suite
+    exercises it as the exact-set counterpart (window ∪ Tier-A ∪ Tier-B
+    allowance ∪ spare), with Tier-B deliberately capped by the allowance. */
+int transcript_policy_bounded_capacity(const TranscriptPolicyItem *items,
+    int count, int scroll, int page, int h_min, int tier_b_allowance,
+    int spare_slots);
+
+/* Forced-eviction victim selection, the hard-cap counterpart to
+    pick_victim. The caller passes bound slots (same convention:
+    bound[s].index is the record, -1 free; returned value is the slot
+    position). A victim is a bound record that is neither visible in the
+    padded viewport nor Tier-A protected (streaming or focused): Tier-B
+    records (debt, expanded reasoning) and plain evictables are eligible,
+    because their reader state survives eviction on the record. The oldest
+    last_used wins, then the lowest position. -1 when every bound record is
+    visible or Tier-A -- under P-CAP unreachable; the caller must raise
+    capacity (or fail closed), never evict a must-keep record. */
+int transcript_policy_pick_forced_victim(const TranscriptPolicyItem *bound,
+    int slot_count, int scroll, int page, int h_min);
+
+/* Raise-only governed slot budget, the dynamic required capacity of the
+    capacity-governed pool. Computed from pixel geometry alone -- no
+    per-record scan -- so it is a true upper bound of the padded window's
+    membership and is monotone in the page:
+
+    - ceil(page/h_min) + 1 records can intersect the strict viewport
+      (every height read at the h_min floor; +1 for boundary touches);
+    - ceil(2*overscan/h_min) records can sit in the overscan band above
+      and below it;
+    - two Tier-A protected records anywhere (the streaming turn and the
+      focused record);
+    - the Tier-B allowance records (deferred debt or expanded reasoning);
+    - the spare headroom.
+
+    All inputs are clamped to sane floors (page, overscan, allowance and
+    spares are non-negative; h_min >= 1) and the result is clamped to
+    [0, arena]. The transcript raises its governed slot limit to this
+    value only when the value exceeds the limit -- the limit never
+    shrinks, and binding never operates outside [0, slot_limit). */
+int transcript_policy_required_slots(int page, int h_min, int overscan,
+    int tier_b_allowance, int spare_slots, int arena);
+
 /* Identity validation: true iff the message instance a slot's surfaces were
    built from is exactly the message instance about to be rendered. A false
    result is replacement-class staleness: the transcript must clear the

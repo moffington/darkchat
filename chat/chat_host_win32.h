@@ -19,6 +19,13 @@ typedef struct {
     /* UTF-8 OPENROUTER_API_KEY borrowed from the caller's storage; the host
        neither copies it into persistent state nor logs it. May be empty. */
     const char *api_key_utf8;
+    /* Transcript realization mode, fixed at init: false keeps the retain-all
+       pool (every record binds one slot for the process lifetime); true
+       activates the bounded realization engine (overscan window ∪ class
+       protection, governed hard slot capacity, shared measurement surface).
+       Production runs bounded; the tests drive both modes through this and
+       the transcript_set_bounded seam. */
+    bool bounded_transcript;
 } ChatHostConfig;
 
 int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config);

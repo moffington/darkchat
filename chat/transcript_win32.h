@@ -33,17 +33,22 @@
      enforces) the policy's required count. Behaviorally equivalent to the
      pre-bounded passes.
 
-   - Bounded (test infrastructure for the activation pass): the prepare set
-     is the overscan-widened viewport union the class-protected records; a
-     fixed-point realize/measure loop binds and prepares only actionable
-     records through the shape-aware pick_slot policy; heights are stamped
-     per record and consumed only while exact, certified, and debt-free;
-     off-screen geometry is measured exactly through one shared clipped
-     Rich Edit measurement surface (visible but beyond the client edge; a
-     truly hidden surface stops laying out and answers inflated heights).
-     The slot pool itself is still the one fixed 512-slot
-     allocation, so no bind path can fail for a visible record while the
-     pool has at least as many slots as records.
+    - Bounded (test infrastructure for the activation pass): the prepare set
+      is the overscan-widened viewport union the class-protected records; a
+      fixed-point realize/measure loop binds and prepares only actionable
+      records through the shape-aware pick_slot policy; heights are stamped
+      per record and consumed only while exact, certified, and debt-free;
+      off-screen geometry is measured exactly through one shared clipped
+      Rich Edit measurement surface (visible but beyond the client edge; a
+      truly hidden surface stops laying out and answers inflated heights).
+      Selection operates inside a raise-only governed slot budget
+      (Transcript's slot_limit): the limit starts at 0, is raised to the
+      dynamic required capacity (geometric worst case of the padded window
+      plus Tier-A, the Tier-B allowance and spares, clamped to the 512-slot
+      arena) whenever that exceeds it, and never shrinks. All slot
+      selection -- free reuse, pre-eviction and forced Tier-B eviction --
+      happens only within [0, slot_limit); the bound set is never trimmed
+      toward a target.
 
    Every record stores the message identity its surfaces were built from.
    When that identity still matches, destructive content writes are skipped,
@@ -68,6 +73,14 @@
    in DIPs, before records are realized: overscan keeps small scrolls from
    forcing binds at the window edge. */
 #define TRANSCRIPT_OVERSCAN_DIPS 300
+
+/* Tier-B allowance of the hard slot capacity (see TranscriptStats and
+   transcript_policy_bounded_capacity): at most this many off-screen records
+   carrying reader state (deferred debt or an expanded reasoning viewport)
+   stay realized; population beyond it is answered by forced eviction, which
+   preserves the state on the record, never by unbounded growth. Tier-A
+   records (focused surface, streaming turn) are protected without a cap. */
+#define TRANSCRIPT_TIER_B_ALLOWANCE 24
 
 /* Control id of the shared measurement surface. Slot-based turn ids live at
    100 + slot*4 + surface, so id 1 is unambiguous. */
@@ -154,11 +167,23 @@ typedef struct {
        consumed by realization ordering. */
     uint64_t last_used;
     /* Qualified blocked states, recorded by the last render's prepare
-       passes (cleared at each render start): a same-message destructive
-       write deferred by a live selection (blocked_debt), or a surface
-       creation that failed this render (blocked_resource). Neither prevents
-       convergence; displayed geometry stays valid under qualified I-GAP. */
+        passes (cleared at each render start): a same-message destructive
+        write deferred by a live selection (blocked_debt), or a surface
+        creation that failed this render (blocked_resource). Neither prevents
+        convergence; displayed geometry stays valid under qualified I-GAP. */
     bool blocked_debt, blocked_resource;
+    /* Reader state captured when a bounded eviction (pre-eviction or
+        forced) took the record's slot, restored at the next binding of the
+        same message instance. The deferred-write debt and rendered identity
+        already live on the record and survive unbinding; each surface's
+        selection is saved independently (only when non-empty) and the
+        reasoning viewport's inner scroll only when it was live. (-1 =
+        nothing saved for that surface.) Captures are cleared only after
+        their successful restoration; a failed binding (surface creation
+        failure) retains them for the next render's retry. */
+    int saved_sel_min[TRANSCRIPT_SURFACE_COUNT],
+        saved_sel_max[TRANSCRIPT_SURFACE_COUNT];
+    int saved_reason_scroll;
     /* Per-render attempt stamps (one destructive-write attempt and one
        creation attempt per surface per render): attempted_epoch names the
        render that stamped the bits below. */
@@ -191,14 +216,63 @@ typedef struct {
     int request_conversation, request_message;
 } TranscriptFeed;
 
-/* Host-owned behavior the transcript surfaces need; wired once at creation. */
+/* Host-owned behavior the transcript surfaces need; wired once at creation.
+    `focus_release` moves keyboard focus somewhere safe when a surface is
+    about to be hidden, invalidated, rebound, switched away, or torn down;
+    the host implements it by focusing the composer. */
 typedef struct {
     bool (*surface_key)(void *user, WPARAM key, bool shift, bool control,
         bool down);
     bool (*row_click)(void *user, RichTextControl *control, int line,
         bool down);
+    void (*focus_release)(void *user);
     void *user;
 } TranscriptCallbacks;
+
+/* Reader scroll-intent state. Bottom-follow is entered only through the
+   explicit qualifying transitions in transcript_note_user_scroll (a user
+   scroll that lands at the bottom) or by construction (a fresh transcript);
+   every mutation pass — streaming deltas, completion, deferred-write
+   application, height corrections, resource-retry renders, resize/DPI
+   reflow, reasoning toggles, eviction — preserves the mode, so nothing can
+   force-follow a reader who has left the bottom. The old geometric
+   transcript_pinned query survives only as that qualifying detector's
+   comparison and as a diagnostic; it no longer decides follow behavior. */
+typedef enum { TRANSCRIPT_FOLLOW_BOTTOM, TRANSCRIPT_FOLLOW_FREE }
+    TranscriptFollowMode;
+
+/* Scroll anchor: the reader's position as a stable (conversation, message)
+   identity plus a surface family and a pixel offset below that surface's
+   top. The offset is in [0, height) when the viewport top lies inside the
+   surface, and negative when it lies above that surface's top (in a gap or
+   above a turn), which restores exactly. Resolution always recomputes from
+   fresh geometry, so any change above the anchor surface — a turn growing,
+   a deferred write applied, a reasoning viewport expanding, an estimate
+   correcting to exact, a resize or DPI reflow — is absorbed by the
+   recompute instead of shifting content under the reader; the anchor
+   surface's own top only moves when content above it changed, which is
+   exactly the motion the reader asked to keep. `top` marks the
+   top-of-transcript anchor (view_scroll at the first record's top or
+   above), which restores to scroll 0. */
+typedef struct {
+    bool valid, top;
+    uint64_t conversation, message;
+    TranscriptSurface surface;
+    int offset;
+} TranscriptAnchor;
+
+/* Per-conversation anchor entry. The table is a fixed linear array searched
+    by stable conversation id (never indexed by it: ids are monotone store
+    counters, not array positions, and can be arbitrarily sparse). At most
+    one entry per conversation id; a render prunes entries whose
+    conversation no longer exists -- a session can mint far more than the
+    table's 128 distinct ids through delete/create churn, so the table is
+    reused rather than assumed exhaustible. */
+typedef struct {
+    bool used;
+    uint64_t conversation;
+    TranscriptAnchor anchor;
+} TranscriptAnchorEntry;
 
 /* Bounded-realization instrumentation: counters advanced as work happens,
    never asserted as wall-clock thresholds. Units: binds/rebinds/evictions
@@ -214,6 +288,32 @@ typedef struct {
     int exact_measures, estimates, measure_retries;
     int rounds, degraded_rounds, fallback_rounds;
     int created_hwnds, created_peak, bound_peak;
+    /* Reader-anchor diagnostics: restores counts anchor resolutions that
+        moved the scroll; rejected counts stale anchors (message deleted or
+        replaced) that fell back to the nearest earlier surviving turn. */
+    int anchor_restores, anchor_rejected;
+    /* Capacity-governance diagnostics (bounded mode): capacity_raises
+        counts raises of the governed slot limit (raise-only, never a
+        shrink); forced_evictions counts evictions a full governed limit
+        forced (selection within [0, slot_limit) returned -1 and the LRU
+        non-window/non-Tier-A binding was taken), as opposed to
+        pre-evictions a binding chose itself; limit_saturated counts the
+        selection events that found the governed limit full (the -1
+        pick_slot results a forced eviction or a refusal answers), and
+        exhaustion_refusals counts bind requests the engine gave up on
+        (returned -1 with the record left unrealized) -- fail-closed
+        insurance that must stay zero while the limit covers the window.
+        eviction_restores counts captured reader-state pieces (selection,
+        reasoning scroll) reapplied at a later binding of the same
+        message, with selection_restores and reason_scroll_restores
+        splitting them per kind. focus_transfers counts focus moved off a
+        surface that was about to be hidden, invalidated, rebound,
+        switched away, or torn down. conv_anchor_restores counts
+        conversation switches whose saved anchor was valid and restored
+        the reader's FREE position. */
+    int capacity_raises, forced_evictions, eviction_restores, focus_transfers;
+    int exhaustion_refusals, limit_saturated;
+    int selection_restores, reason_scroll_restores, conv_anchor_restores;
 } TranscriptStats;
 
 typedef struct {
@@ -230,14 +330,18 @@ typedef struct {
     TranscriptSlot *slots;              /* realized-slot pool (heap) */
     int slot_capacity;
     /* Last capacity-checkpoint result (diagnostic): the required slot count
-       the policy computed for the most recent full render, evaluated over
-       the overscan-widened viewport in bounded mode and the strict viewport
-       in retain-all. current_needed, never a trim target. */
+        computed for the most recent full render -- the geometric dynamic
+        formula (window worst case + Tier-A + Tier-B allowance + spares) in
+        bounded mode, the strict-viewport |V u P| in retain-all. Recorded,
+        never a trim target. */
     int policy_needed;
-    /* High-water of policy_needed, raised only; with the fixed 512-slot
-       pool no bind path consults it. It is the recorded seam a future
-       hard-capped arena would govern. */
-    int bound_limit;
+    /* The raise-only governed slot budget of bounded mode: all selection
+        (free reuse, pre-eviction, forced Tier-B eviction) operates only
+        within [0, slot_limit), and the limit is raised to the dynamic
+        required capacity whenever that exceeds it (capacity_raises counts
+        each raise). It never shrinks -- the bound set is never trimmed
+        toward a target -- and retain-all leaves it at 0 (never consulted). */
+    int slot_limit;
     int bound_count;                    /* diagnostic, recomputed at checkpoint */
     uint64_t clock;                     /* monotonic clock: LRU stamps and
                                            nonzero binding generations */
@@ -267,6 +371,29 @@ typedef struct {
     bool measurer_counted;              /* arena accounting: counted once */
     /* Last time the streaming body was rebuilt as Markdown. */
     ULONGLONG body_render_tick;
+    /* Reader scroll-intent state (see TranscriptFollowMode). */
+    TranscriptFollowMode follow;
+    TranscriptAnchor anchor;
+    /* The active conversation's working anchor; per-conversation storage
+        lives in the linear stable-ID table below. `active_conversation` is
+        the conversation id of the last render (0 = none yet), so a switch
+        is detected at the next render and the table entry is loaded. */
+    uint64_t active_conversation;
+    TranscriptAnchorEntry conversation_anchors[CHAT_MAX_CONVERSATIONS];
+    /* Reader focus tracked through WM_COMMAND (EN_SETFOCUS/EN_KILLFOCUS
+        from the transcript surfaces): the last surface the reader focused.
+        Protection, decision-time debt and focus-transfer sites read this
+        instead of GetFocus(), so hiding, invalidating, rebinding,
+        switching and teardown can move focus deliberately before they act. */
+    HWND focus_window;
+    /* Active scrollbar thumb drag: the drag owns the position (nTrackPos);
+        anchor restore and capture are suspended and follow transitions are
+        suppressed until the release event re-qualifies. */
+    bool thumb_drag;
+    /* Set by transcript_note_user_scroll and cleared at the next placement:
+        while set, the user's position is the truth (no anchor restore) and
+        the placement captures a fresh anchor from the final position. */
+    bool user_scroll_pending;
     /* Reentrancy guard: programmatic selection changes fired while this module
         writes must not recursively trigger deferred-update application. */
     bool applying;
@@ -347,6 +474,35 @@ bool transcript_reveal_turn(Transcript *t, const TranscriptFeed *feed,
     int index);
 void transcript_layout_from(Transcript *t, int start, bool follow);
 bool transcript_pinned(const Transcript *t);
+/* Follow mode: BOTTOM follows the newest content on every pass; FREE holds
+    the reader's position (restoring the anchor when geometry changes).
+    Entering BOTTOM clears the anchor. */
+void transcript_set_follow(Transcript *t, TranscriptFollowMode mode);
+bool transcript_following(const Transcript *t);
+/* The one user-scroll entry point. Records the position, marks it as the
+    reader's truth (captured as the new anchor at the next placement), and
+    runs the qualifying transition: a release-position scroll that lands
+    within the pinned tolerance of the bottom re-enters BOTTOM follow;
+    anything else enters FREE. While a thumb drag is active the transition
+    is suppressed and runs on the release event instead. */
+void transcript_note_user_scroll(Transcript *t, int position);
+/* Active thumb drag state: suspends anchor capture/restore and follow
+    transitions while held. */
+void transcript_set_drag(Transcript *t, bool drag);
+/* WM_COMMAND focus notifications from the transcript surfaces
+    (EN_SETFOCUS/EN_KILLFOCUS through WM_COMMAND; no special event mask is
+    required). Updates the tracked reader focus the decision sites read.
+    Control must be a transcript surface (the host routes only its own
+    children). */
+void transcript_focus_notify(Transcript *t, RichTextControl *control,
+    bool gained);
+/* Moves keyboard focus off any tracked transcript surface when one is
+    about to be hidden, invalidated, rebound, switched away, or torn down.
+    The destination is host policy, invoked through
+    TranscriptCallbacks::focus_release (the host focuses the composer), so
+    the transcript container never decides where focus lands. Counts
+    focus_transfers only when a real focused window was moved. */
+void transcript_focus_release(Transcript *t);
 /* EN_SELCHANGE from any turn surface: applies that turn's deferred writes when
    the selection has cleared and relayouts from the affected turn. */
 void transcript_selection_changed(Transcript *t, const TranscriptFeed *feed,

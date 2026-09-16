@@ -33,7 +33,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command,
     chat_init(chat);
     load_api_key();
     ChatHostConfig config = {
-        ui, chat, L"DarkChat", 1100, 720, 720, 480, api_key
+        ui, chat, L"DarkChat", 1100, 720, 720, 480, api_key,
+        /* Bounded transcript realization is the shipped production mode:
+           governed hard slot capacity, anchored FREE scrolling and tracked
+           reader focus. */
+        true
     };
     int result = chat_host_run(instance, show, &config);
     SecureZeroMemory(api_key, sizeof api_key);

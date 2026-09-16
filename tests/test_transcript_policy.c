@@ -395,6 +395,38 @@ static int test_pick_slot(void) {
     return 0;
 }
 
+static int test_required_slots(void) {
+    /* Pure geometry: ceil(page/h_min)+1 window records, ceil(overscan/h_min)
+       overscan records, two Tier-A slots, the Tier-B allowance and the
+       spares. page 500/h_min 8 -> 63+1, overscan 600 -> 75. */
+    CHECK(transcript_policy_required_slots(500, 8, 600, 24, 2, 512)
+        == 63 + 1 + 75 + 2 + 24 + 2);
+    /* Monotone in the page: a taller viewport can hold more records. */
+    int previous = -1;
+    for (int page = 0; page <= 800; page += 8) {
+        int required =
+            transcript_policy_required_slots(page, 8, 600, 24, 2, 512);
+        CHECK(required >= previous);
+        previous = required;
+    }
+    /* The arena clamps the required value. */
+    CHECK(transcript_policy_required_slots(5000, 8, 600, 24, 2, 512)
+        == 512);
+    CHECK(transcript_policy_required_slots(5000, 8, 600, 24, 2, 0) == 0);
+    /* Negative page/overscan/allowance/spares clamp to zero; h_min to 1. */
+    CHECK(transcript_policy_required_slots(-1, 0, -1, -1, -1, 512) == 3);
+    CHECK(transcript_policy_required_slots(0, 0, 0, 0, 0, 512) == 3);
+    /* A negative arena reads as unbounded (no clamp). */
+    CHECK(transcript_policy_required_slots(500, 8, 600, 24, 2, -1)
+        == 63 + 1 + 75 + 2 + 24 + 2);
+    /* Exact boundary: page 16/h_min 8 needs ceil(16/8)+1 = 3 window slots. */
+    CHECK(transcript_policy_required_slots(16, 8, 0, 0, 0, 512) == 5);
+    /* Overscan band: 2*overscan passed in as 600px wide and h_min 8 -> 75. */
+    CHECK(transcript_policy_required_slots(0, 8, 601, 0, 0, 512)
+        == 1 + 76 + 2);
+    return 0;
+}
+
 int main(void) {
     if (test_visibility()) return 1;
     if (test_protection()) return 1;
@@ -403,14 +435,16 @@ int main(void) {
     if (test_pick_victim()) return 1;
     if (test_identity()) return 1;
     if (test_pick_slot()) return 1;
+    if (test_required_slots()) return 1;
     puts("Transcript policy: geometry-derived visibility (edge-touch excluded, "
         "unmeasured heights as h_min), class protection, rank/index ordering "
         "with LRU excluded from realization priority, exact |V u P| capacity "
-        "with clamped spare slots and page/count monotonicity, fail-closed "
-        "victim selection by slot position with LRU among evictable slots "
-        "only, exact message-instance identity, and shape-aware bounded "
-        "pick_slot (kind reuse before pre-eviction, evictable before pristine, "
-        "free ties by lowest position, evictable ties by oldest LRU then "
-        "position, fail closed) passed");
+        "with clamped spare slots and page/count monotonicity, the dynamic "
+        "geometric required slot capacity with arena clamping and page "
+        "monotonicity, fail-closed victim selection by slot position with LRU "
+        "among evictable slots only, exact message-instance identity, and "
+        "shape-aware bounded pick_slot (kind reuse before pre-eviction, "
+        "evictable before pristine, free ties by lowest position, evictable "
+        "ties by oldest LRU then position, fail closed) passed");
     return 0;
 }

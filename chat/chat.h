@@ -195,6 +195,11 @@ int chat_new_conversation(Chat *chat);
 bool chat_select_conversation(Chat *chat, int index);
 /* Index of the conversation with this stable id, or -1 when unknown. */
 int chat_index_of_id(const Chat *chat, uint64_t id);
+/* Index of the message with this stable id inside one conversation, or -1.
+   Pure stable-identity resolution for transcript anchoring and reveal; ids
+   are unique within a conversation and ordered by array position. */
+int chat_message_index_by_id(const Chat *chat, int conversation,
+    uint64_t id);
 /* Appends a message to the active conversation. Returns its index, or -1. */
 int chat_append(Chat *chat, ChatRole role, const wchar_t *text);
 /* Appends a message to a specific conversation, whichever is active or not;

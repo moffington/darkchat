@@ -27,6 +27,12 @@
 #ifndef ENM_SELCHANGE
 #define ENM_SELCHANGE 0x00080000
 #endif
+#ifndef EN_SETFOCUS
+#define EN_SETFOCUS 0x0700
+#endif
+#ifndef EN_KILLFOCUS
+#define EN_KILLFOCUS 0x0702
+#endif
 
 static HMODULE rich_library;
 
@@ -189,9 +195,11 @@ static bool create_control(RichTextControl *control, HWND parent, int id,
     SendMessageW(control->window, EM_EXLIMITTEXT, 0, (LPARAM)limit);
     SendMessageW(control->window, EM_AUTOURLDETECT, TRUE, 0);
     /* Read-only blocks size themselves to their content, so they ask their
-       parent for the required height whenever their text or width changes.
-       They also report selection changes so the transcript can defer
-       destructive rebuilds while a selection is held. */
+        parent for the required height whenever their text or width changes.
+        They also report selection changes so the transcript can defer
+        destructive rebuilds while a selection is held. Focus notifications
+        (EN_SETFOCUS/EN_KILLFOCUS) need no event mask: rich edit controls
+        send them regardless, so no ENM_FOCUS bit is set. */
     DWORD events = ENM_LINK | ENM_SCROLL;
     if (readonly) events |= ENM_SELCHANGE;
     if (readonly && !scrollable) events |= ENM_REQUESTRESIZE;

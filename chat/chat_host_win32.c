@@ -504,6 +504,11 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
        touch a conversation it never used. */
     ChatConversation *c=&chat->conversations[chat->active];
     host->request_conversation=chat->active; host->request_message=index;
+    /* A toolbar-triggered send/retry must not destroy a focused transcript
+       surface: move focus to the composer through the transcript's
+       focus-release callback before the replacement invalidation. A no-op
+       when no transcript surface holds focus. */
+    transcript_focus_release(&host->transcript);
     /* Retry/regenerate/edit-resend reuse turn slots: their stale identity,
        pending updates and selections are dropped so the next render replaces
        the affected surfaces without deferral. */
@@ -1002,9 +1007,45 @@ static bool surface_key(void *user, WPARAM key, bool shift, bool control,
     return false;
 }
 
+/* Ends a scrollbar thumb drag: the final position is reader input, so it
+   runs the qualifying transition (bottom re-enters follow, anything else
+   leaves it) and is captured as the fresh anchor at the next placement --
+   the same path the release event uses, whether the drag ended normally
+   or was cancelled (WM_CANCELMODE). */
+static void end_scroll_drag(ChatHost *host, int position) {
+    transcript_set_drag(&host->transcript, false);
+    int maximum = host->transcript.view_content - host->transcript.view_page;
+    if (maximum < 0) maximum = 0;
+    if (position < 0) position = 0;
+    if (position > maximum) position = maximum;
+    transcript_note_user_scroll(&host->transcript, position);
+    position_turns(host, false);
+}
+
+/* The position a cancelled drag ends at: while the drag owns the position
+   it lives in nTrackPos; otherwise the settled nPos. */
+static int drag_position(HWND window) {
+    SCROLLINFO info;
+    memset(&info, 0, sizeof info);
+    info.cbSize = sizeof info;
+    info.fMask = SIF_ALL;
+    GetScrollInfo(window, SB_VERT, &info);
+    return info.nTrackPos;
+}
+
 static bool composer_submit(void *user) {
     perform_send((ChatHost *)user);
     return true;
+}
+
+/* The transcript's focus-transfer destination: when a surface is about to be
+   hidden, invalidated, rebound, switched away, or torn down, the reader
+   lands in the composer -- ordinary reader flow continues at the input, and
+   no focused child ever disappears under the reader. */
+static void transcript_focus_to_composer(void *user) {
+    ChatHost *host = (ChatHost *)user;
+    if (host->composer.window && IsWindow(host->composer.window))
+        SetFocus(host->composer.window);
 }
 
 static bool field_submit(void *user) {
@@ -1108,19 +1149,43 @@ static LRESULT CALLBACK view_proc(HWND window, UINT message, WPARAM w,
         case SB_LINEDOWN: position += px(host, 28); break;
         case SB_PAGEUP: position -= (int)info.nPage; break;
         case SB_PAGEDOWN: position += (int)info.nPage; break;
-        case SB_THUMBTRACK: case SB_THUMBPOSITION: position = info.nTrackPos; break;
+        case SB_THUMBTRACK:
+            /* The drag owns the position: anchor capture/restore and follow
+                transitions are suspended until the release event. */
+            transcript_set_drag(&host->transcript, true);
+            position = info.nTrackPos;
+            break;
+        case SB_THUMBPOSITION:
+            transcript_set_drag(&host->transcript, false);
+            position = info.nTrackPos;
+            break;
         case SB_TOP: position = info.nMin; break;
         case SB_BOTTOM: position = info.nMax; break;
+        case SB_ENDSCROLL:
+            transcript_set_drag(&host->transcript, false);
+            position = info.nPos;
+            break;
         default: return 0;
         }
         int maximum = host->transcript.view_content - host->transcript.view_page;
         if (maximum < 0) maximum = 0;
         if (position < 0) position = 0;
         if (position > maximum) position = maximum;
-        host->transcript.view_scroll = position;
+        /* Every scrollbar event is reader input: the position is the truth,
+            and only a release landing at the bottom re-enters follow. */
+        transcript_note_user_scroll(&host->transcript, position);
         position_turns(host, false);
         return 0;
     }
+    case WM_CANCELMODE:
+        /* The transcript child can receive the cancellation of its own
+            scrollbar drag: finish it through the same end-of-drag path the
+            release event uses, so the final position is qualified and
+            captured as the fresh anchor instead of leaving the drag
+            suspended. */
+        if (host->transcript.thumb_drag)
+            end_scroll_drag(host, drag_position(window));
+        return 0;
     case WM_MOUSEWHEEL: {
         int delta = GET_WHEEL_DELTA_WPARAM(w);
         /* An expanded reasoning viewport scrolls itself first; once it reaches
@@ -1165,7 +1230,7 @@ static LRESULT CALLBACK view_proc(HWND window, UINT message, WPARAM w,
         if (maximum < 0) maximum = 0;
         if (position < 0) position = 0;
         if (position > maximum) position = maximum;
-        host->transcript.view_scroll = position;
+        transcript_note_user_scroll(&host->transcript, position);
         position_turns(host, false);
         return 0;
     }
@@ -1186,6 +1251,30 @@ static LRESULT CALLBACK view_proc(HWND window, UINT message, WPARAM w,
             return 0;
         }
         if (control && rich_text_handle_notify(control, l)) return 0;
+        break;
+    }
+    case WM_COMMAND: {
+        /* Rich Edit focus notifications (EN_SETFOCUS/EN_KILLFOCUS, sent
+            through WM_COMMAND without any special event mask): the reader's
+            focused transcript surface is tracked here instead of being
+            probed with GetFocus() at decision time, so hiding, invalidating,
+            rebinding, switching and teardown can transfer focus deliberately
+            before they act. */
+        HWND source = (HWND)l;
+        if (!source) break;
+        RichTextControl *control = (RichTextControl *)GetWindowLongPtrW(
+            source, GWLP_USERDATA);
+        if (!control) break;
+        switch (HIWORD(w)) {
+        case EN_SETFOCUS:
+            transcript_focus_notify(&host->transcript, control, true);
+            return 0;
+        case EN_KILLFOCUS:
+            transcript_focus_notify(&host->transcript, control, false);
+            return 0;
+        default:
+            break;
+        }
         break;
     }
     default:
@@ -1224,8 +1313,13 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         if (!host->view) return -1;
         if (!transcript_create(&host->transcript, host->view,
                 &host->rich_theme, host->dpi)) return -1;
+        /* Realization mode from the init-time config: retain-all unless the
+            caller flips the bounded production activation. */
+        transcript_set_bounded(&host->transcript,
+            host->config.bounded_transcript);
         host->transcript.callbacks.surface_key = surface_key;
         host->transcript.callbacks.row_click = turn_row_click;
+        host->transcript.callbacks.focus_release = transcript_focus_to_composer;
         host->transcript.callbacks.user = host;
         host->composer.on_submit = composer_submit;
         host->composer.on_key = surface_key;
@@ -1282,6 +1376,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
     case WM_COMMAND:
         if (!l) { action(host,LOWORD(w)); return 0; }
         break;
+
     case WM_TIMER:
         if (w == CHAT_TIMER_BODY_FLUSH) {
             /* The stream went quiet with text still dirty: render it now. */
@@ -1414,6 +1509,12 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
     case WM_CANCELMODE:
         ui_cancel_input(u);
         if (GetCapture() == window) ReleaseCapture();
+        /* A cancelled scrollbar drag still ends the drag: the release event
+            may never arrive, so the drag is finished through the same
+            end-of-drag path (qualification plus fresh-anchor capture), not
+            merely unflagged. */
+        if (host->transcript.thumb_drag)
+            end_scroll_drag(host, drag_position(host->view));
         flush(host);
         return 0;
     case WM_MOUSEWHEEL: wheel(host, w, l); return 0;
@@ -1481,6 +1582,11 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             chat_ui_set_generation(&host->chat_ui,false,false); EnableWindow(host->field.window,TRUE);
             render_transcript(host); return 0;
         }
+        /* Teardown focus safety: while the whole hierarchy still exists,
+            move keyboard focus to the top-level window. No focused child
+            is destroyed, and the transcript's composer transfer target
+            dies with the window it belongs to. */
+        SetFocus(window);
         DestroyWindow(window);
         return 0;
     case WM_ACTIVATE:
@@ -1493,6 +1599,10 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         KillTimer(window, CHAT_TIMER_BODY_FLUSH);
         chat_search_results_dispose(&host->search_results);
         renderer_drop_target(&host->renderer);
+        /* Transfer focus off any transcript surface before the hierarchy
+            collapses under it: the child teardown never destroys a focused
+            window. */
+        transcript_focus_release(&host->transcript);
         PostQuitMessage(0);
         return 0;
     case WM_NCDESTROY:

@@ -23,7 +23,8 @@ static bool row_for(const TranscriptFeed *feed, const ChatMessage *m,
 /* Placement half of transcript_position (defined with the bounded engine;
     retain-all layout reaches it through transcript_position with a NULL
     feed, which skips realization). */
-static void place_and_scroll(Transcript *t, bool follow);
+static void place_and_scroll(Transcript *t, const TranscriptFeed *feed,
+    bool follow);
 
 typedef struct {
     int rounds;
@@ -31,7 +32,7 @@ typedef struct {
 } RealizeResult;
 
 static void realize_loop(Transcript *t, const TranscriptFeed *feed,
-    bool follow, int forced_index, RealizeResult *out);
+    bool follow, int forced_index, bool forced_reveal, RealizeResult *out);
 
 /* ---- Record/slot plumbing ------------------------------------------------ */
 
@@ -52,6 +53,18 @@ RichTextControl *transcript_surface(Transcript *t, int index,
     RichTextControl *control = &t->slots[rec->slot].surface[surface];
     return control_window_live(control) ? control : NULL;
 }
+
+/* Reader focus transfer (defined with the reader-intent section); declared
+    here because the hide/unbind paths below must transfer focus first. */
+static void focus_release_surface(Transcript *t, HWND window);
+/* Decision-time reader focus (defined with the reader-intent section): the
+    tracked WM_COMMAND state, with GetFocus() as the fallback. */
+static HWND decision_focus(const Transcript *t);
+/* Capacity-governance helpers (defined with the bounded engine); the
+    bind path consults the forced-victim seam when the Tier-B allowance
+    leaves no free or evictable slot. */
+static void fill_bound_items(Transcript *t, const TranscriptFeed *feed,
+    TranscriptPolicyItem *bound);
 
 /* Arena diagnostics (see the header): created counts native windows across
     the pool plus the measurer; bound counts slots currently attached to a
@@ -111,15 +124,21 @@ int transcript_measure_live(Transcript *t, RichTextControl *control,
 }
 
 /* Decision-time debt: pending deferred writes OR a live selection in any
-   bound surface. Every TranscriptPolicyItem built for a production decision
-   (the capacity checkpoint and the dormant victim path) takes debt from
-   here, so an unfocused turn with a live selection is class-protected and
-   can never be chosen for eviction. */
+    bound surface, OR an unrestored reader-state capture (a record whose
+    captured selection or reasoning scroll is still waiting for its
+    restoration still carries reader state). Every TranscriptPolicyItem
+    built for a production decision (the capacity checkpoint and the
+    dormant victim path) takes debt from here, so an unfocused turn with a
+    live selection, deferred writes or an unrestored capture is
+    class-protected (Tier-B) and can never be chosen by pre-eviction. */
 bool transcript_record_debt(Transcript *t, int index) {
     if (!t || index < 0 || index >= CHAT_MAX_MESSAGES) return false;
     TranscriptRecord *rec = &t->records[index];
     if (rec->head_pending || rec->body_pending || rec->meta_pending ||
         rec->reason_pending) return true;
+    if (rec->saved_reason_scroll >= 0) return true;
+    for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++)
+        if (rec->saved_sel_min[k] >= 0) return true;
     for (int s = 0; s < TRANSCRIPT_SURFACE_COUNT; s++) {
         RichTextControl *control = transcript_surface(t, index,
             (TranscriptSurface)s);
@@ -251,10 +270,13 @@ static void clear_slot_selection(Transcript *t, int slot) {
     }
 }
 
-/* Hides one surface if it is realized. */
+/* Hides one surface if it is realized; a focused surface first transfers
+    focus to the container (the host's focus-transfer contract). */
 static void hide_surface(Transcript *t, int index, TranscriptSurface surface) {
     RichTextControl *control = transcript_surface(t, index, surface);
-    if (control) ShowWindow(control->window, SW_HIDE);
+    if (!control) return;
+    focus_release_surface(t, control->window);
+    ShowWindow(control->window, SW_HIDE);
 }
 
 /* Hides every surface of one record and clears its live flags; the slot
@@ -266,8 +288,40 @@ static void hide_turn(Transcript *t, int index) {
     rec->head_live = rec->body_live = rec->reason_live = rec->meta_live = false;
 }
 
+/* Reader state an eviction must preserve lives on the record: deferred debt
+    and the rendered identity are record fields already; each surface's
+    non-empty selection and the reasoning viewport's inner scroll are
+    captured here so the next binding of the same message can restore them.
+    New captures MERGE into the record's existing saved state: a surface
+    that cannot be read (its creation failed after a rebind) keeps its
+    earlier capture, so an eviction of a partially recreated record cannot
+    erase reader state it never saw; only a replacement-class reset
+    (reset_slot) discards captures with the stale identity. */
+static void capture_reader_state(TranscriptRecord *rec,
+    const TranscriptSlot *slot) {
+    for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++) {
+        const RichTextControl *control = &slot->surface[k];
+        if (!control->window || !IsWindow(control->window)) continue;
+        CHARRANGE sel;
+        memset(&sel, 0, sizeof sel);
+        SendMessageW(control->window, EM_EXGETSEL, 0, (LPARAM)&sel);
+        if (sel.cpMax > sel.cpMin) {
+            rec->saved_sel_min[k] = sel.cpMin;
+            rec->saved_sel_max[k] = sel.cpMax;
+        } else {
+            rec->saved_sel_min[k] = -1;
+            rec->saved_sel_max[k] = -1;
+        }
+        if (k == TRANSCRIPT_REASON) {
+            POINT point = { 0, 0 };
+            SendMessageW(control->window, EM_GETSCROLLPOS, 0, (LPARAM)&point);
+            rec->saved_reason_scroll = point.y > 0 ? point.y : -1;
+        }
+    }
+}
+
 /* Detaches a slot from its record: hides every surface and clears the
-   association on both sides. Debt and rendered identity stay on the record.
+    association on both sides. Debt and rendered identity stay on the record.
    Rebinding always creates a NEW association with a fresh binding
    generation, so certification against the retained identity fails for any
    newly acquired surfaces -- same-message debt is preserved and applied by
@@ -278,9 +332,12 @@ static void unbind_slot(Transcript *t, int slot) {
     TranscriptSlot *s = &t->slots[slot];
     if (s->record < 0) return;
     TranscriptRecord *rec = &t->records[s->record];
+    capture_reader_state(rec, s);
     for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++)
-        if (control_window_live(&s->surface[k]))
+        if (control_window_live(&s->surface[k])) {
+            focus_release_surface(t, s->surface[k].window);
             ShowWindow(s->surface[k].window, SW_HIDE);
+        }
     rec->head_live = rec->body_live = rec->reason_live = rec->meta_live = false;
     rec->slot = -1;
     s->record = -1;
@@ -292,7 +349,10 @@ static void unbind_slot(Transcript *t, int slot) {
     pass. Returns -1 (record stays unrealized) only if binding fails closed.
     Bounded: binds through transcript_policy_pick_slot — shape-aware reuse
     and pre-eviction under the overscan-widened must-keep set, with pristine
-    slots consumed only as the final step. */
+    slots consumed only as the final step — strictly within the raise-only
+    governed limit [0, slot_limit): no selection ever considers a slot at or
+    beyond it. Only when that selection returns -1 is a forced Tier-B
+    eviction taken, and even that victim comes from within the limit. */
 static int ensure_slot(Transcript *t, const TranscriptFeed *feed, int index) {
     TranscriptRecord *rec = &t->records[index];
     if (rec->slot >= 0) return rec->slot;
@@ -300,40 +360,45 @@ static int ensure_slot(Transcript *t, const TranscriptFeed *feed, int index) {
     if (t->bounded) {
         TurnState s;
         if (!turn_state(t, feed, index, &s)) return -1;
+        int limit = t->slot_limit;
+        if (limit <= 0) {
+            /* Never raised: no governed selection can run. */
+            ++t->stat.exhaustion_refusals;
+            return -1;   /* fail closed */
+        }
+        if (limit > t->slot_capacity) limit = t->slot_capacity;
         TranscriptPolicyItem bound[CHAT_MAX_MESSAGES];
-        HWND focus = GetFocus();
         int h_min = px(t, 8);
         int pad = px(t, TRANSCRIPT_OVERSCAN_DIPS);
-        for (int p = 0; p < t->slot_capacity; p++) {
-            TranscriptPolicyItem *item = &bound[p];
-            int bound_record = t->slots[p].record;
-            item->index = bound_record;
-            item->created_kinds = slot_created_kinds(t, p);
-            item->y = item->height = 0;
-            item->streaming = item->focused = item->debt = item->expanded = false;
-            item->last_used = 0;
-            if (bound_record < 0) continue;
-            TranscriptRecord *other = &t->records[bound_record];
-            item->y = other->y;
-            item->height = other->height;
-            item->streaming = feed->generating &&
-                feed->request_conversation == feed->chat->active &&
-                bound_record == feed->request_message;
-            item->debt = transcript_record_debt(t, bound_record);
-            item->expanded = other->reason_live;
-            item->last_used = other->last_used;
-            if (focus)
-                for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT &&
-                    !item->focused; k++)
-                    item->focused = control_window_live(
-                        &t->slots[p].surface[k]) &&
-                        t->slots[p].surface[k].window == focus;
-        }
-        slot = transcript_policy_pick_slot(bound, t->slot_capacity,
+        fill_bound_items(t, feed, bound);
+        slot = transcript_policy_pick_slot(bound, limit,
             turn_needed_kinds(&s), t->view_scroll - pad,
             t->view_page + 2 * pad, h_min);
-        if (slot < 0) return -1;         /* fail closed (unreachable while
-                                            pool >= records) */
+        if (slot < 0) {
+            /* The governed limit is genuinely exhausted: no free slot and
+                no evictable (pre-evictable) binding inside [0, limit) —
+                this is the ONLY trigger of forced eviction, never a bound
+                count merely exceeding the Tier-B allowance. The forced
+                victim is the LRU bound record that is neither visible in
+                the window nor Tier-A protected (focused/streaming). Its
+                reader state survives on the record (capture in
+                unbind_slot) and returns at the next binding of the same
+                message. */
+            ++t->stat.limit_saturated;
+            slot = transcript_policy_pick_forced_victim(bound, limit,
+                t->view_scroll - pad, t->view_page + 2 * pad, h_min);
+            if (slot < 0) {
+                /* Every slot inside the limit is visible or Tier-A: the
+                    caller must raise capacity (or fail closed); the record
+                    stays unrealized and the refusal is counted. */
+                ++t->stat.exhaustion_refusals;
+                return -1;   /* fail closed */
+            }
+            unbind_slot(t, slot);
+            ++t->stat.evictions;
+            ++t->stat.forced_evictions;
+            ++t->stat.rebinds;
+        }
         if (t->slots[slot].record >= 0) {
             unbind_slot(t, slot);        /* pre-eviction: departed record */
             ++t->stat.evictions;
@@ -352,7 +417,7 @@ static int ensure_slot(Transcript *t, const TranscriptFeed *feed, int index) {
                record. The slot position is the array index; item.index is the
                represented record. */
             TranscriptPolicyItem bound[CHAT_MAX_MESSAGES];
-            HWND focus = GetFocus();
+            HWND focus = decision_focus(t);
             int h_min = px(t, 8);
             for (int s = 0; s < t->slot_capacity; s++) {
                 TranscriptRecord *other = &t->records[t->slots[s].record];
@@ -376,7 +441,10 @@ static int ensure_slot(Transcript *t, const TranscriptFeed *feed, int index) {
             }
             slot = transcript_policy_pick_victim(bound, t->slot_capacity,
                 t->view_scroll, t->view_page, h_min);
-            if (slot < 0) return -1;
+            if (slot < 0) {
+                ++t->stat.exhaustion_refusals;
+                return -1;
+            }
             unbind_slot(t, slot);
         }
     }
@@ -696,12 +764,454 @@ bool transcript_pinned(const Transcript *t) {
     return t->view_scroll >= maximum - 1;
 }
 
+/* ---- Reader scroll intent: follow mode, anchor, thumb drag ------------- */
+
+bool transcript_following(const Transcript *t) {
+    return t && t->follow == TRANSCRIPT_FOLLOW_BOTTOM;
+}
+
+void transcript_set_follow(Transcript *t, TranscriptFollowMode mode) {
+    if (!t) return;
+    t->follow = mode;
+    /* The anchor exists only while the reader is free; bottom-following has
+        no anchor to restore. */
+    if (mode == TRANSCRIPT_FOLLOW_BOTTOM) t->anchor.valid = false;
+}
+
+void transcript_set_drag(Transcript *t, bool drag) {
+    if (!t) return;
+    t->thumb_drag = drag;
+}
+
+/* ---- Reader focus tracking through WM_COMMAND ---------------------------- */
+
+void transcript_focus_notify(Transcript *t, RichTextControl *control,
+    bool gained) {
+    if (!t) return;
+    if (!gained) {
+        if (control && t->focus_window == control->window)
+            t->focus_window = NULL;
+        return;
+    }
+    if (!control || !control_window_live(control)) return;
+    if (GetAncestor(control->window, GA_ROOT) != GetAncestor(t->view,
+            GA_ROOT)) return;                     /* not ours */
+    t->focus_window = control->window;
+}
+
+void transcript_focus_release(Transcript *t) {
+    if (!t) return;
+    HWND focused = t->focus_window;
+    if (!focused || !IsWindow(focused)) { t->focus_window = NULL; return; }
+    if (GetFocus() != focused) { t->focus_window = NULL; return; }
+    /* The destination is host policy: the callback moves focus somewhere
+        safe (the host focuses the composer) while the surface still
+        exists. The transcript container never decides where focus lands,
+        so it must not transfer to its own view here. */
+    if (t->callbacks.focus_release)
+        t->callbacks.focus_release(t->callbacks.user);
+    ++t->stat.focus_transfers;
+    t->focus_window = NULL;
+}
+
+/* Releases focus only if it sits on exactly this surface; called before the
+    surface is hidden or its slot rebound, so a focused child never
+    disappears under the reader. */
+static void focus_release_surface(Transcript *t, HWND window) {
+    if (!t->focus_window || t->focus_window != window) return;
+    transcript_focus_release(t);
+}
+
+/* Decision-time reader focus: the tracked WM_COMMAND state when present,
+    GetFocus() as the fallback before the first notification or when focus
+    was set through a path that bypassed the Rich Edit notifications. */
+static HWND decision_focus(const Transcript *t) {
+    if (t->focus_window && IsWindow(t->focus_window)) return t->focus_window;
+    return GetFocus();
+}
+
+void transcript_note_user_scroll(Transcript *t, int position) {
+    if (!t) return;
+    if (position < 0) position = 0;
+    t->view_scroll = position;
+    t->user_scroll_pending = true;
+    /* The qualifying transition: only a user scroll that lands at the
+        bottom re-enters follow. During a thumb drag the position is still
+        recorded (the drag owns it) but the transition is suppressed until
+        the release event arrives with the drag cleared. */
+    int maximum = t->view_content - t->view_page;
+    if (maximum < 0) maximum = 0;
+    if (!t->thumb_drag)
+        transcript_set_follow(t, position >= maximum - 1
+            ? TRANSCRIPT_FOLLOW_BOTTOM : TRANSCRIPT_FOLLOW_FREE);
+}
+
+/* Surface geometry accessors over the record's laid-out fields. */
+static int surface_y_of(const TranscriptRecord *rec, TranscriptSurface s) {
+    switch (s) {
+    case TRANSCRIPT_HEAD: return rec->head_y;
+    case TRANSCRIPT_REASON: return rec->reason_y;
+    case TRANSCRIPT_META: return rec->meta_y;
+    default: return rec->body_y;
+    }
+}
+
+static int surface_h_of(const TranscriptRecord *rec, TranscriptSurface s) {
+    switch (s) {
+    case TRANSCRIPT_HEAD: return rec->head_h;
+    case TRANSCRIPT_REASON: return rec->reason_h;
+    case TRANSCRIPT_META: return rec->meta_h;
+    default: return rec->body_h;
+    }
+}
+
+static bool surface_live_of(const TranscriptRecord *rec,
+    TranscriptSurface s) {
+    switch (s) {
+    case TRANSCRIPT_HEAD: return rec->head_live;
+    case TRANSCRIPT_REASON: return rec->reason_live;
+    case TRANSCRIPT_META: return rec->meta_live;
+    default: return rec->body_live;
+    }
+}
+
+/* Captures the reader's position as an anchor, from the final placed
+    scroll. FREE mode only: in BOTTOM mode the anchor is cleared (there is
+    no position to hold). The anchor names the first record whose bottom
+    edge is below the viewport top and, inside it, the live surface whose
+    span contains the viewport top (offset in [0, height)); when the
+    viewport top falls in a gap or above a turn, the nearest live surface
+    below it is named with a negative offset, which restores exactly.
+    Records whose rendered identity is not current cannot name an anchor,
+    so capture refuses rather than pinning a stale identity. */
+static void anchor_capture(Transcript *t) {
+    if (t->follow != TRANSCRIPT_FOLLOW_FREE) { t->anchor.valid = false; return; }
+    int count = t->record_count;
+    if (count < 0) count = 0;
+    if (count > CHAT_MAX_MESSAGES) count = CHAT_MAX_MESSAGES;
+    if (count <= 0) { t->anchor.valid = false; return; }
+    if (t->view_scroll == 0) {
+        /* Top of the transcript: scroll 0 restores to scroll 0. A position
+            inside the top margin above the first turn is NOT the top
+            anchor: it falls through to the surface scan below and is
+            named with a negative offset, which restores exactly. */
+        TranscriptRecord *rec = &t->records[0];
+        if (!rec->rendered_valid) { t->anchor.valid = false; return; }
+        t->anchor.valid = true;
+        t->anchor.top = true;
+        t->anchor.conversation = rec->conversation;
+        t->anchor.message = rec->message;
+        t->anchor.surface = TRANSCRIPT_BODY;
+        t->anchor.offset = 0;
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        TranscriptRecord *rec = &t->records[i];
+        if (rec->y + rec->height <= t->view_scroll) continue;
+        if (!rec->rendered_valid) { t->anchor.valid = false; return; }
+        for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++) {
+            TranscriptSurface s = (TranscriptSurface)k;
+            if (!surface_live_of(rec, s)) continue;
+            int y = surface_y_of(rec, s);
+            int height = surface_h_of(rec, s);
+            if (t->view_scroll >= y && t->view_scroll < y + height) {
+                t->anchor.valid = true;
+                t->anchor.top = false;
+                t->anchor.conversation = rec->conversation;
+                t->anchor.message = rec->message;
+                t->anchor.surface = s;
+                t->anchor.offset = t->view_scroll - y;
+                return;
+            }
+        }
+        /* No containing surface: name the nearest live surface below the
+            viewport top (closest y at or above the scroll). */
+        TranscriptSurface best = TRANSCRIPT_SURFACE_COUNT;
+        for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++) {
+            TranscriptSurface s = (TranscriptSurface)k;
+            if (!surface_live_of(rec, s)) continue;
+            if (surface_y_of(rec, s) < t->view_scroll) continue;
+            if (best == TRANSCRIPT_SURFACE_COUNT ||
+                surface_y_of(rec, s) < surface_y_of(rec, best)) best = s;
+        }
+        if (best == TRANSCRIPT_SURFACE_COUNT) {
+            t->anchor.valid = false;
+            return;
+        }
+        t->anchor.valid = true;
+        t->anchor.top = false;
+        t->anchor.conversation = rec->conversation;
+        t->anchor.message = rec->message;
+        t->anchor.surface = best;
+        t->anchor.offset = t->view_scroll - surface_y_of(rec, best);
+        return;
+    }
+    t->anchor.valid = false;
+}
+
+/* Resolves the anchor to a scroll position against the current geometry.
+    The chat feed resolves first (records may all be invalidated, e.g.
+    right after a conversation switch); record identity resolves second.
+    A stale anchor — its message deleted or replaced — falls back to the
+    nearest earlier surviving message, at its top, so a retry/regenerate
+    that consumed the reader's position lands on the nearest surviving
+    content instead of the bottom. Counts a restore when the resolution
+    moves the scroll and a rejection when the anchor was stale. */
+static bool anchor_resolve_scroll(Transcript *t, const TranscriptFeed *feed,
+    int *scroll) {
+    if (!t->anchor.valid) return false;
+    if (t->anchor.top) {
+        if (*scroll != 0) ++t->stat.anchor_restores;
+        *scroll = 0;
+        return true;
+    }
+    int count = t->record_count;
+    if (count < 0) count = 0;
+    if (count > CHAT_MAX_MESSAGES) count = CHAT_MAX_MESSAGES;
+    int index = -1;
+    const ChatConversation *active = NULL;
+    if (feed && feed->chat && t->anchor.conversation &&
+        feed->chat->active >= 0 &&
+        feed->chat->active < feed->chat->conversation_count &&
+        feed->chat->conversations[feed->chat->active].id ==
+            t->anchor.conversation) {
+        active = &feed->chat->conversations[feed->chat->active];
+        index = chat_message_index_by_id(feed->chat, feed->chat->active,
+            t->anchor.message);
+    }
+    if (index < 0)
+        for (int i = 0; i < count; i++)
+            if (t->records[i].rendered_valid &&
+                t->records[i].conversation == t->anchor.conversation &&
+                t->records[i].message == t->anchor.message) {
+                index = i;
+                break;
+            }
+    if (index < 0 || index >= count) {
+        ++t->stat.anchor_rejected;
+        if (active) {
+            for (size_t i = active->message_count; i > 0; i--)
+                if (active->messages[i - 1].id < t->anchor.message) {
+                    index = (int)(i - 1);
+                    break;
+                }
+        } else {
+            for (int i = count; i > 0; i--)
+                if (t->records[i - 1].rendered_valid &&
+                    t->records[i - 1].conversation == t->anchor.conversation &&
+                    t->records[i - 1].message < t->anchor.message) {
+                    index = i - 1;
+                    break;
+                }
+        }
+        if (index < 0) {
+            if (*scroll != 0) ++t->stat.anchor_restores;
+            *scroll = 0;
+            return true;
+        }
+        TranscriptRecord *rec = &t->records[index];
+        int target = rec->body_live ? rec->body_y : rec->y;
+        if (*scroll != target) ++t->stat.anchor_restores;
+        *scroll = target;
+        return true;
+    }
+    TranscriptRecord *rec = &t->records[index];
+    int target;
+    if (surface_live_of(rec, t->anchor.surface)) {
+        TranscriptSurface s = t->anchor.surface;
+        int y = surface_y_of(rec, s);
+        int height = surface_h_of(rec, s);
+        int offset = t->anchor.offset;
+        /* A positive offset is clamped to the surface's last pixel so a
+            surface that shrank keeps the anchor inside it -- height
+            itself would name the next surface's top, outside
+            [0, height); a negative offset (the viewport top above the
+            surface, in a gap or above a turn) restores exactly and is
+            never clamped. */
+        if (offset >= 0 && height > 0 && offset > height - 1)
+            offset = height - 1;
+        target = y + offset;
+    } else {
+        /* The anchored surface left the layout (e.g. a reasoning viewport
+            collapsed under the reader): the turn's body top is the honest
+            fallback. */
+        target = rec->body_live ? rec->body_y : rec->y;
+    }
+    if (*scroll != target) ++t->stat.anchor_restores;
+    *scroll = target;
+    return true;
+}
+
+/* Pins the anchor to the reader's current position after a reveal: the
+    reveal scroll is the new reading position, so the mode becomes FREE and
+    the anchor is captured from that exact position (whatever record or
+    surface the viewport top lands on, including gaps and the space above
+    the revealed turn, which restore exactly through negative offsets). */
+static void anchor_pin_current(Transcript *t) {
+    t->follow = TRANSCRIPT_FOLLOW_FREE;
+    t->user_scroll_pending = false;
+    anchor_capture(t);
+}
+
+/* ---- Per-conversation anchor table (linear, stable-ID keyed) -------------
+   One entry per conversation id, searched linearly. Conversation ids are
+   monotone store counters with gaps after deletion, so the table is never
+   indexed by id. A switch saves the departing conversation's anchor into
+   the table (transcript_invalidate) and loads the arriving conversation's
+   entry at the next render's switch detection: a valid saved anchor sets
+   FREE and restores it; a missing or stale entry sets BOTTOM and clears
+   the anchor -- a fresh conversation is never blessed with FREE and no
+   anchor. A render also prunes entries whose conversation no longer
+   exists, since a session can mint far more distinct ids than the table
+   holds. */
+
+static TranscriptAnchorEntry *anchor_slot(Transcript *t,
+    uint64_t conversation) {
+    for (int i = 0; i < CHAT_MAX_CONVERSATIONS; i++) {
+        TranscriptAnchorEntry *entry = &t->conversation_anchors[i];
+        if (entry->used && entry->conversation == conversation) return entry;
+    }
+    return NULL;
+}
+
+/* Drops entries whose conversation id is no longer present. Ids are never
+    reused, so a deleted conversation's entry can never be matched again;
+    pruning them keeps the table live across arbitrarily many distinct ids
+    instead of assuming only 128 exist per session. */
+static void anchor_table_prune(Transcript *t, const Chat *chat) {
+    if (!chat || chat->conversation_count < 0) return;
+    for (int i = 0; i < CHAT_MAX_CONVERSATIONS; i++) {
+        TranscriptAnchorEntry *entry = &t->conversation_anchors[i];
+        if (!entry->used) continue;
+        bool present = false;
+        for (int j = 0; j < (int)chat->conversation_count; j++)
+            if (chat->conversations[j].id == entry->conversation) {
+                present = true;
+                break;
+            }
+        if (!present) memset(entry, 0, sizeof *entry);
+    }
+}
+
+/* Stores the active anchor for its own conversation. A reader who left the
+    conversation without a position -- BOTTOM, or an anchor that no longer
+    names this conversation -- has no anchor to store, and any older entry
+    the conversation still holds must be cleared: leaving a stale FREE
+    entry behind would restore the old position on a later return instead
+    of landing BOTTOM. */
+static void anchor_table_save(Transcript *t) {
+    if (!t->active_conversation) return;
+    TranscriptAnchorEntry *entry = anchor_slot(t, t->active_conversation);
+    if (!t->anchor.valid || t->anchor.conversation != t->active_conversation) {
+        if (entry) memset(entry, 0, sizeof *entry);
+        return;
+    }
+    if (!entry) {
+        for (int i = 0; i < CHAT_MAX_CONVERSATIONS; i++) {
+            if (t->conversation_anchors[i].used) continue;
+            entry = &t->conversation_anchors[i];
+            entry->used = true;
+            entry->conversation = t->anchor.conversation;
+            break;
+        }
+    }
+    if (entry) entry->anchor = t->anchor;
+    else { /* unreachable after pruning: live conversations never exceed
+              the table, and the active conversation's entry must exist */
+        t->anchor.valid = false;
+    }
+}
+
+/* True when the saved anchor still names a live message of the arriving
+    conversation. Without the chat the check degrades to the identity
+    fields; with it, an anchor whose message was deleted is stale. */
+static bool anchor_entry_live(const Chat *chat, uint64_t conversation,
+    const TranscriptAnchor *anchor) {
+    if (anchor->conversation != conversation || !anchor->message) return false;
+    if (!chat || chat->active < 0 ||
+        chat->active >= chat->conversation_count ||
+        chat->conversations[chat->active].id != conversation) return true;
+    return chat_message_index_by_id(chat, chat->active,
+        anchor->message) >= 0;
+}
+
+/* Loads the named conversation's anchor as the active one and restores the
+    follow mode to match it: a valid saved anchor re-enters FREE (the
+    reader's position survives the switch); a missing or stale entry --
+    including one whose saved message no longer exists -- sets BOTTOM,
+    clears the anchor and drops the stale entry, so a fresh conversation is
+    never blessed with FREE with nothing to restore and a dead position is
+    never restored. Returns true when a valid anchor was restored. */
+static bool anchor_table_load(Transcript *t, const Chat *chat,
+    uint64_t conversation) {
+    if (!conversation) {
+        transcript_set_follow(t, TRANSCRIPT_FOLLOW_BOTTOM);
+        return false;
+    }
+    TranscriptAnchorEntry *entry = anchor_slot(t, conversation);
+    if (entry && entry->anchor.valid &&
+        anchor_entry_live(chat, conversation, &entry->anchor)) {
+        t->anchor = entry->anchor;
+        transcript_set_follow(t, TRANSCRIPT_FOLLOW_FREE);
+        ++t->stat.conv_anchor_restores;
+        return true;
+    }
+    if (entry) memset(entry, 0, sizeof *entry);   /* stale entry dropped */
+    transcript_set_follow(t, TRANSCRIPT_FOLLOW_BOTTOM);
+    return false;
+}
+
+/* Applies and clears the reader state captured at eviction (restore after
+    rebind): each surface's saved selection and the reasoning viewport's
+    inner scroll are applied to a re-certified bound record and cleared
+    only after their successful application; a surface that is still
+    missing retains its capture for the next render's retry. Called from
+    place_and_scroll AFTER the surfaces are placed, because the placement
+    transactions (SetWindowPos on a hidden-then-reshown viewport) reset a
+    re-shown reasoning viewport's inner scroll -- the restoration must
+    follow them to stick. Programmatic selection changes are suppressed by
+    the applying guard. */
+static void restore_saved_reader_state(Transcript *t, int index) {
+    TranscriptRecord *rec = &t->records[index];
+    if (rec->slot < 0 || !record_certified(t, rec)) return;
+    for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++) {
+        if (rec->saved_sel_min[k] < 0) continue;
+        RichTextControl *control = transcript_surface(t, index,
+            (TranscriptSurface)k);
+        if (!control) continue;   /* retained for a later render's retry */
+        CHARRANGE sel = { rec->saved_sel_min[k], rec->saved_sel_max[k] };
+        t->applying = true;
+        SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&sel);
+        t->applying = false;
+        rec->saved_sel_min[k] = -1;
+        rec->saved_sel_max[k] = -1;
+        ++t->stat.eviction_restores;
+        ++t->stat.selection_restores;
+    }
+    if (rec->saved_reason_scroll >= 0) {
+        RichTextControl *control = transcript_surface(t, index,
+            TRANSCRIPT_REASON);
+        if (control) {
+            POINT point = { 0, rec->saved_reason_scroll };
+            SendMessageW(control->window, EM_SETSCROLLPOS, 0, (LPARAM)&point);
+            rec->saved_reason_scroll = -1;
+            ++t->stat.eviction_restores;
+            ++t->stat.reason_scroll_restores;
+        }
+    }
+}
+
 static void place_turn_control(Transcript *t, RichTextControl *control,
     bool live, int y, int height, int scroll, int page, int inset) {
     if (!control) return;
-    if (!live) { ShowWindow(control->window, SW_HIDE); return; }
+    if (!live) {
+        focus_release_surface(t, control->window);
+        ShowWindow(control->window, SW_HIDE);
+        return;
+    }
     int top = y - scroll;
     if (top >= page || top + height <= 0) {
+        focus_release_surface(t, control->window);
         ShowWindow(control->window, SW_HIDE);
         return;
     }
@@ -716,8 +1226,9 @@ bool transcript_reveal_turn(Transcript *t, const TranscriptFeed *feed,
     if (!t || !t->view || index < 0 || index >= t->record_count) return false;
     if (t->bounded && feed) {
         RealizeResult r;
-        realize_loop(t, feed, false, index, &r);
-        place_and_scroll(t, false);
+        realize_loop(t, feed, false, index, true, &r);
+        anchor_pin_current(t);
+        place_and_scroll(t, feed, false);
     } else {
         TranscriptRecord *rec = &t->records[index];
         int top = rec->y;
@@ -726,6 +1237,7 @@ bool transcript_reveal_turn(Transcript *t, const TranscriptFeed *feed,
         else if (bottom > t->view_scroll + t->view_page)
             t->view_scroll = rec->height > t->view_page
                 ? top : bottom - t->view_page;
+        anchor_pin_current(t);
         transcript_position(t, feed, false);
     }
     return true;
@@ -1161,26 +1673,21 @@ static void prepare_turn(Transcript *t, const TranscriptFeed *feed,
         hide_surface(t, index, TRANSCRIPT_REASON);
         rec->reason_live = false;
     }
+
+    /* Reader state captured at eviction is restored after placement by
+        place_and_scroll (restore_saved_reader_state): the placement
+        transactions reset a re-shown reasoning viewport's inner scroll, so
+        the restoration must follow them, and a surface that is still
+        missing retains its capture for the next render's retry. */
 }
 
-/* The single documented capacity checkpoint. The policy's required slot
-   count is computed every render and asserted against the pool: a P-CAP
-   breach (needed > slot_capacity) is a contract error and fails fast -- it
-   is never clamped away or discarded. Retain-all satisfies the precondition
-   by construction (slot_capacity == CHAT_MAX_MESSAGES >= record count >=
-   |V u P|), so the assertion cannot fire this pass; a future capacity-
-   governed pass activates here and answers a breach by raising capacity (or
-   evicting under the policy's P-CAP), never by leaving a visible record
-   unrealized. Debt is the full decision-time predicate (pending writes OR a
-   live selection), so an unfocused selected turn is protected. Geometry
-   comes from the previous layout, so unmeasured records claim h_min of
-   space -- the same conservative bound the policy documents. */
-static void capacity_checkpoint(Transcript *t, const TranscriptFeed *feed,
-    int count, int pad) {
-    t->bound_count = transcript_bound_slots(t);
-    if (count <= 0) { t->policy_needed = 0; return; }
-    TranscriptPolicyItem items[CHAT_MAX_MESSAGES];
-    HWND focus = GetFocus();
+/* Fills the decision-time policy view of every record: geometry, streaming
+    flag, decision-time debt, expanded reasoning, reader focus and the LRU
+    stamp. Shared by the capacity checkpoint and the capacity-governed
+    enforcement so every production decision reads the same predicates. */
+static void fill_policy_items(Transcript *t, const TranscriptFeed *feed,
+    int count, TranscriptPolicyItem *items) {
+    HWND focus = decision_focus(t);
     for (int i = 0; i < count; i++) {
         TranscriptRecord *rec = &t->records[i];
         items[i].index = i;
@@ -1202,16 +1709,71 @@ static void capacity_checkpoint(Transcript *t, const TranscriptFeed *feed,
                 items[i].focused = control && control->window == focus;
             }
     }
-    /* Bounded mode evaluates the required capacity over the overscan-widened
-       viewport (the window the engine actually realizes); retain-all keeps
-       the strict viewport, so its recorded diagnostic is unchanged. */
-    int needed = transcript_policy_needed_slots(items, count,
-        t->view_scroll - pad, t->view_page + 2 * pad, px(t, 8),
-        TRANSCRIPT_SPARE_SLOTS);
-    /* Fail-fast P-CAP (invariant I10). */
+}
+
+/* The dynamic required capacity of the governed pool, from pixel geometry
+    alone: records that can intersect the strict viewport (at most
+    ceil(page/h_min) + 1, every height read at the h_min floor), the
+    overscan band above and below (ceil(2*overscan/h_min)), two Tier-A
+    protected records anywhere (the streaming turn and the focused
+    record), the Tier-B allowance and the spare headroom — clamped to the
+    512-slot arena. Pure geometry: no per-record scan, so the value is a
+    true upper bound of the padded window's membership and is monotone in
+    the page. */
+static int governed_required(const Transcript *t) {
+    int h_min = px(t, 8);
+    if (h_min < 1) h_min = 1;
+    return transcript_policy_required_slots(t->view_page, h_min,
+        2 * px(t, TRANSCRIPT_OVERSCAN_DIPS), TRANSCRIPT_TIER_B_ALLOWANCE,
+        TRANSCRIPT_SPARE_SLOTS, CHAT_MAX_MESSAGES);
+}
+
+/* Raises the governed slot budget to the current required capacity.
+    Raise-only: the limit never shrinks mid-shape, and every raise is
+    counted. Called each realize-loop round before any selection, so
+    binding always operates inside a limit that already covers the
+    membership window the round is about to use. */
+static void raise_slot_limit(Transcript *t) {
+    int required = governed_required(t);
+    if (required > t->slot_limit) {
+        t->slot_limit = required;
+        ++t->stat.capacity_raises;
+    }
+}
+
+/* The single documented capacity checkpoint. The required slot count is
+    computed every render and asserted against the pool: a P-CAP breach
+    (needed > slot_capacity) is a contract error and fails fast -- it is
+    never clamped away or discarded. Retain-all satisfies the precondition
+    by construction (slot_capacity == CHAT_MAX_MESSAGES >= record count >=
+    |V u P|), so the assertion cannot fire this pass. Bounded computes the
+    same dynamic geometric required capacity that raises slot_limit. Debt
+    is the full decision-time predicate (pending writes OR a live
+    selection), so an unfocused selected turn is protected. Geometry comes
+    from the current layout, so unmeasured records claim h_min of space --
+    the same conservative bound the policy documents. */
+static void capacity_checkpoint(Transcript *t, const TranscriptFeed *feed,
+    int count, int pad) {
+    (void)pad;               /* both evaluations pad internally */
+    t->bound_count = transcript_bound_slots(t);
+    if (count <= 0) { t->policy_needed = 0; return; }
+    int needed;
+    if (t->bounded) {
+        /* Bounded: the dynamic geometric required capacity the governed
+            limit already covers (raise-only; no trim). */
+        needed = governed_required(t);
+    } else {
+        TranscriptPolicyItem items[CHAT_MAX_MESSAGES];
+        fill_policy_items(t, feed, count, items);
+        /* Retain-all keeps the strict-viewport |V u P| diagnostic. */
+        needed = transcript_policy_needed_slots(items, count,
+            t->view_scroll, t->view_page, px(t, 8),
+            TRANSCRIPT_SPARE_SLOTS);
+    }
+    /* Fail-fast P-CAP (invariant I10): the pool always covers the bound
+        set the engine may realize. */
     assert(needed <= t->slot_capacity);
     t->policy_needed = needed;
-    if (needed > t->bound_limit) t->bound_limit = needed;
 }
 
 /* ---- Bounded realization engine -------------------------------------------
@@ -1507,40 +2069,62 @@ static bool creation_attempted(const TranscriptRecord *rec, uint32_t epoch,
         (rec->attempted_kinds & (1u << (int)surface));
 }
 
-/* Realization membership: the overscan-widened viewport union the
-    class-protected records. Protection is computed from record state and
-    geometry at decision time, exactly like the capacity checkpoint. */
-static bool record_in_window(Transcript *t, const TranscriptFeed *feed,
-    int i) {
-    TranscriptRecord *rec = &t->records[i];
-    if (feed->generating &&
-        feed->request_conversation == feed->chat->active &&
-        i == feed->request_message) return true;
-    if (transcript_record_debt(t, i)) return true;
-    if (rec->reason_live) return true;
-    HWND focus = GetFocus();
-    if (focus)
-        for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++) {
-            RichTextControl *control = transcript_surface(t, i,
-                (TranscriptSurface)k);
-            if (control && control->window == focus) return true;
-        }
+/* Realization membership: the overscan-widened viewport union the class-
+    protected records, with Tier-B protection bounded by the allowance
+    (LRU-ranked). The caller passes the round's shared policy view; the
+    scroll/page come from the transcript, whose pixel-space window is the
+    same one the capacity checkpoint computes. */
+static bool record_in_window(const Transcript *t, int i,
+    const TranscriptPolicyItem *items, int count) {
     int h_min = px(t, 8);
     int pad = px(t, TRANSCRIPT_OVERSCAN_DIPS);
-    return transcript_policy_visible(rec->y, rec->height,
-        t->view_scroll - pad, t->view_page + 2 * pad, h_min);
+    return transcript_policy_in_window(items, count, i,
+        t->view_scroll - pad, t->view_page + 2 * pad, h_min,
+        TRANSCRIPT_TIER_B_ALLOWANCE);
 }
 
 /* Retain-all may have filled the pool before the bounded test seam activates.
-   Release only records outside the current padded/protected set so activation
-   immediately resumes viewport-shaped binding without touching reader state. */
-static void release_outside_window(Transcript *t, const TranscriptFeed *feed,
-    int forced_index) {
+    Release only records outside the current padded/protected set so activation
+    immediately resumes viewport-shaped binding without touching reader state. */
+static void release_outside_window(Transcript *t, int forced_index,
+    const TranscriptPolicyItem *items, int count) {
     for (int s = 0; s < t->slot_capacity; s++) {
         int index = t->slots[s].record;
         if (index >= 0 && index != forced_index &&
-            !record_in_window(t, feed, index))
+            !record_in_window(t, index, items, count))
             unbind_slot(t, s);
+    }
+}
+
+/* The per-slot decision view used by victim selection: bound[s].index is the
+    bound record (or -1), with geometry, protection and LRU from the record. */
+static void fill_bound_items(Transcript *t, const TranscriptFeed *feed,
+    TranscriptPolicyItem *bound) {
+    HWND focus = decision_focus(t);
+    for (int p = 0; p < t->slot_capacity; p++) {
+        TranscriptPolicyItem *item = &bound[p];
+        int bound_record = t->slots[p].record;
+        item->index = bound_record;
+        item->created_kinds = slot_created_kinds(t, p);
+        item->y = item->height = 0;
+        item->streaming = item->focused = item->debt = item->expanded = false;
+        item->last_used = 0;
+        if (bound_record < 0) continue;
+        TranscriptRecord *other = &t->records[bound_record];
+        item->y = other->y;
+        item->height = other->height;
+        item->streaming = feed->generating &&
+            feed->request_conversation == feed->chat->active &&
+            bound_record == feed->request_message;
+        item->debt = transcript_record_debt(t, bound_record);
+        item->expanded = other->reason_live;
+        item->last_used = other->last_used;
+        if (focus)
+            for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT && !item->focused;
+                k++)
+                item->focused = control_window_live(
+                    &t->slots[p].surface[k]) &&
+                    t->slots[p].surface[k].window == focus;
     }
 }
 
@@ -1653,13 +2237,12 @@ static bool classify_turn(Transcript *t, const TranscriptFeed *feed, int i,
 }
 
 static bool scan_actionable(Transcript *t, const TranscriptFeed *feed,
-    int forced_index, bool *actionable) {
+    int forced_index, const TranscriptPolicyItem *items, int count,
+    bool *actionable) {
     bool any = false;
-    int count = t->record_count;
-    if (count < 0) count = 0;
-    if (count > CHAT_MAX_MESSAGES) count = CHAT_MAX_MESSAGES;
     for (int i = 0; i < count; i++) {
-        bool in_set = i == forced_index || record_in_window(t, feed, i);
+        bool in_set = i == forced_index || record_in_window(t, i, items,
+            count);
         actionable[i] = classify_turn(t, feed, i, in_set);
         if (actionable[i]) any = true;
     }
@@ -1681,11 +2264,16 @@ static void unbind_dead_records(Transcript *t) {
     only unexpected geometry/membership propagation and fails closed into
     the documented fallback (prepare every strict-visible member, recompute
     geometry if a debt applied, place without a finality claim). `follow`
-    resolves the target scroll inside the loop — bottom-following when
-    pinned — so the realization window is computed where the reader will
-    actually be after placement, not at the stale pre-render scroll. */
+    resolves the target scroll inside the loop — bottom-following when the
+    reader follows — so the realization window is computed where the reader
+    will actually be after placement, not at the stale pre-render scroll.
+    `forced_index` forces that record's realization membership; with
+    `forced_reveal` it also drives the loop's scroll resolution (the search
+    reveal), while without it the record only joins the window — a refresh
+    (reasoning toggle, streaming recovery) must never move a FREE reader,
+    whose scroll the anchor restore owns. */
 static void realize_loop(Transcript *t, const TranscriptFeed *feed,
-    bool follow, int forced_index, RealizeResult *out) {
+    bool follow, int forced_index, bool forced_reveal, RealizeResult *out) {
     int cap = t->diagnostic_round_cap >= 0 ? t->diagnostic_round_cap
         : 2 * t->record_count + 4;
     bool actionable[CHAT_MAX_MESSAGES];
@@ -1711,22 +2299,41 @@ static void realize_loop(Transcript *t, const TranscriptFeed *feed,
         int maximum = t->view_content - page;
         if (maximum < 0) maximum = 0;
         if (follow) t->view_scroll = maximum;
-        else if (forced_index >= 0 && forced_index < count) {
+        else if (forced_reveal && forced_index >= 0 && forced_index < count) {
             TranscriptRecord *target = &t->records[forced_index];
             int bottom = target->y + target->height;
             if (target->y < t->view_scroll) t->view_scroll = target->y;
             else if (bottom > t->view_scroll + page)
                 t->view_scroll = target->height > page
                     ? target->y : bottom - page;
+        } else if (!t->user_scroll_pending && !t->thumb_drag &&
+            t->follow == TRANSCRIPT_FOLLOW_FREE && t->anchor.valid) {
+            /* Anchor restore against this round's fresh geometry, so the
+                realization window forms around where the reader is being
+                kept rather than around the stale pre-mutation scroll --
+                the anchor record is realized by the very rounds this
+                positions the window over. */
+            int scroll = t->view_scroll;
+            if (anchor_resolve_scroll(t, feed, &scroll)) t->view_scroll = scroll;
         }
         if (t->view_scroll > maximum) t->view_scroll = maximum;
         if (t->view_scroll < 0) t->view_scroll = 0;
         t->view_page = page;
+        /* The round's shared policy view is built after the geometry pass,
+            so visibility, protection and the Tier-B LRU ranking read the
+            fresh heights. */
+        TranscriptPolicyItem items[CHAT_MAX_MESSAGES];
+        fill_policy_items(t, feed, count, items);
         if (t->bounded_prune_pending) {
-            release_outside_window(t, feed, forced_index);
+            release_outside_window(t, forced_index, items, count);
             t->bounded_prune_pending = false;
         }
-        bool any_actionable = scan_actionable(t, feed, forced_index, actionable);
+        /* Raise the governed slot budget before any selection this round:
+            binding and forced eviction happen only inside [0, slot_limit),
+            and the limit is raise-only (never trimmed to a target). */
+        raise_slot_limit(t);
+        bool any_actionable = scan_actionable(t, feed, forced_index, items,
+            count, actionable);
         if (!height_changed && !any_actionable) { out->stable = true; break; }
         if (out->rounds >= cap) {
             out->fallback = true;
@@ -1757,16 +2364,32 @@ static void realize_loop(Transcript *t, const TranscriptFeed *feed,
 }
 
 /* Clamps the scroll, syncs the scrollbar, and places every bound record's
-    surfaces — the placement half of the old transcript_position. */
-static void place_and_scroll(Transcript *t, bool follow) {
+    surfaces — the placement half of the old transcript_position. In FREE
+    mode, with no user position pending and no active drag, the anchor is
+    restored against the just-computed geometry so mutations above the
+    reader cannot shift content under them; a pending user position is the
+    truth and is captured as the fresh anchor after placement. */
+static void place_and_scroll(Transcript *t, const TranscriptFeed *feed,
+    bool follow) {
     RECT client;
     GetClientRect(t->view, &client);
     int page = client.bottom;
     int maximum = t->view_content - page;
     if (maximum < 0) maximum = 0;
     if (follow) t->view_scroll = maximum;
-    else if (t->view_scroll > maximum) t->view_scroll = maximum;
-    else if (t->view_scroll < 0) t->view_scroll = 0;
+    else if (t->user_scroll_pending || t->thumb_drag ||
+        t->follow != TRANSCRIPT_FOLLOW_FREE || !t->anchor.valid) {
+        if (t->view_scroll > maximum) t->view_scroll = maximum;
+        else if (t->view_scroll < 0) t->view_scroll = 0;
+    } else {
+        int scroll = t->view_scroll;
+        if (anchor_resolve_scroll(t, feed, &scroll)) {
+            if (scroll > maximum) scroll = maximum;
+            if (scroll < 0) scroll = 0;
+            t->view_scroll = scroll;
+        } else if (t->view_scroll > maximum) t->view_scroll = maximum;
+        else if (t->view_scroll < 0) t->view_scroll = 0;
+    }
     t->view_page = page;
     SCROLLINFO info;
     memset(&info, 0, sizeof info);
@@ -1789,25 +2412,36 @@ static void place_and_scroll(Transcript *t, bool follow) {
             page, t->view_reason_inset);
         place_turn_control(t, transcript_surface(t, i, TRANSCRIPT_BODY),
             rec->body_live, rec->body_y, rec->body_h, t->view_scroll, page, 0);
-        place_turn_control(t, transcript_surface(t, i, TRANSCRIPT_META),
-            rec->meta_live, rec->meta_y, rec->meta_h, t->view_scroll, page, 0);
+    place_turn_control(t, transcript_surface(t, i, TRANSCRIPT_META),
+        rec->meta_live, rec->meta_y, rec->meta_h, t->view_scroll, page, 0);
+    }
+    /* Reader state captured at eviction is applied after the placement
+        transactions, so the restoration survives them (see the helper). */
+    if (t->bounded) {
+        for (int i = 0; i < count; i++) restore_saved_reader_state(t, i);
     }
     /* Moving children does not repaint the background they uncover; the
-       container paints every gap and margin itself. */
+        container paints every gap and margin itself. */
     InvalidateRect(t->view, NULL, FALSE);
+    /* A completed user placement becomes the fresh anchor (FREE mode);
+        during a drag the capture waits for the release event. */
+    if (t->user_scroll_pending && !t->thumb_drag) {
+        anchor_capture(t);
+        t->user_scroll_pending = false;
+    }
 }
 
 void transcript_position(Transcript *t, const TranscriptFeed *feed,
     bool follow) {
     if (!t->view) return;
     /* Funnel: every scroll/wheel/reveal path realizes the window (binds,
-       prepares, debt application, blocked-state recording) before placing,
-       so a visible record can never be unrealized or foreign. */
+        prepares, debt application, blocked-state recording) before placing,
+        so a visible record can never be unrealized or foreign. */
     if (t->bounded && feed) {
         RealizeResult r;
-        realize_loop(t, feed, follow, -1, &r);
+        realize_loop(t, feed, follow, -1, true, &r);
     }
-    place_and_scroll(t, follow);
+    place_and_scroll(t, feed, follow);
 }
 
 void transcript_render(Transcript *t, const TranscriptFeed *feed) {
@@ -1823,26 +2457,37 @@ void transcript_render(Transcript *t, const TranscriptFeed *feed) {
     t->view_width = client.right - 2 * t->view_margin;
     int minimum = px(t, 40);
     if (t->view_width < minimum) t->view_width = minimum;
-    bool pinned = transcript_pinned(t);
     const ChatConversation *c = chat_active(chat);
     int count = c ? (int)c->message_count : 0;
     if (count < 0) count = 0;
     if (count > CHAT_MAX_MESSAGES) count = CHAT_MAX_MESSAGES;
     t->record_count = count;
+    /* Conversation switch detection: the arriving conversation's anchor is
+        loaded from the per-conversation table -- a valid saved anchor
+        restores FREE, a missing or stale one sets BOTTOM (a fresh
+        conversation is never blessed with FREE and no anchor). Dead
+        entries for conversations that no longer exist are pruned first, so
+        the table stays live across arbitrarily many distinct ids. */
+    uint64_t active_id = c ? c->id : 0;
+    if (active_id != t->active_conversation) {
+        anchor_table_prune(t, chat);
+        anchor_table_load(t, chat, active_id);
+        t->active_conversation = active_id;
+    }
     if (t->bounded) {
         /* Bounded: release dead bindings, run the fixed-point realize/
-           measure loop, checkpoint the overscan-widened capacity, place. */
+            measure loop, checkpoint the overscan-widened capacity, place. */
         unbind_dead_records(t);
         RealizeResult r;
-        realize_loop(t, feed, pinned, -1, &r);
+        realize_loop(t, feed, transcript_following(t), -1, true, &r);
         capacity_checkpoint(t, feed, count, px(t, TRANSCRIPT_OVERSCAN_DIPS));
-        place_and_scroll(t, pinned);
+        place_and_scroll(t, feed, transcript_following(t));
         return;
     }
     for (int i = 0; i < count; i++) prepare_turn(t, feed, i);
     for (int i = count; i < CHAT_MAX_MESSAGES; i++) hide_turn(t, i);
     capacity_checkpoint(t, feed, count, 0);
-    transcript_layout_from(t, 0, pinned);
+    transcript_layout_from(t, 0, transcript_following(t));
 }
 
 /* Rebuilds one turn only, so toggling a row never disturbs another turn's
@@ -1854,11 +2499,14 @@ void transcript_refresh_turn(Transcript *t, const TranscriptFeed *feed,
     if (index < 0 || index >= CHAT_MAX_MESSAGES ||
         (size_t)index >= chat->conversations[chat->active].message_count)
         return;
-    bool pinned = transcript_pinned(t);
+    bool pinned = transcript_following(t);
     if (t->bounded) {
+        /* A refresh (reasoning toggle, streaming recovery) must never move
+            a FREE reader: the loop's forced index joins the window without
+            the reveal arithmetic, and the anchor restore owns the scroll. */
         RealizeResult r;
-        realize_loop(t, feed, pinned, index, &r);
-        place_and_scroll(t, pinned);
+        realize_loop(t, feed, pinned, index, false, &r);
+        place_and_scroll(t, feed, pinned);
     } else {
         prepare_turn(t, feed, index);
         transcript_layout_from(t, index, pinned);
@@ -1896,7 +2544,7 @@ bool transcript_stream_body(Transcript *t, const TranscriptFeed *feed,
         rec->blocked_debt = true;
         return true;
     }
-    bool pinned = transcript_pinned(t);
+    bool pinned = transcript_following(t);
     t->applying = true;
     rich_text_set_markdown(body, m->role, chat_message_text(m));
     t->applying = false;
@@ -1905,8 +2553,8 @@ bool transcript_stream_body(Transcript *t, const TranscriptFeed *feed,
     rec->body_revision = m->body_revision;
     if (t->bounded) {
         RealizeResult r;
-        realize_loop(t, feed, pinned, -1, &r);
-        place_and_scroll(t, pinned);
+        realize_loop(t, feed, pinned, -1, true, &r);
+        place_and_scroll(t, feed, pinned);
     } else {
         transcript_layout_from(t, index, pinned);
     }
@@ -1928,13 +2576,26 @@ static void reset_slot(Transcript *t, int index) {
     rec->rendered_valid = false;
     rec->head_pending = rec->body_pending = false;
     rec->meta_pending = rec->reason_pending = false;
+    /* Replacement class: the captured reader state belongs to the departed
+        message instance and must never leak into the replacement. */
+    for (int s = 0; s < TRANSCRIPT_SURFACE_COUNT; s++)
+        rec->saved_sel_min[s] = rec->saved_sel_max[s] = -1;
+    rec->saved_reason_scroll = -1;
 }
 
 void transcript_invalidate(Transcript *t) {
     bool guard = t->applying;
     t->applying = true;
+    transcript_focus_release(t);
     for (int i = 0; i < CHAT_MAX_MESSAGES; i++) reset_slot(t, i);
     t->applying = guard;
+    /* The reader is leaving the conversation: its anchor moves into the
+        per-conversation table (stable-ID keyed) so returning restores the
+        reading position. The active anchor is then cleared -- the follow
+        mode survives and the host's switch sequence (or the next user
+        scroll) decides the landing position. */
+    anchor_table_save(t);
+    t->anchor.valid = false;
 }
 
 void transcript_invalidate_from(Transcript *t, int from) {
@@ -1957,17 +2618,19 @@ void transcript_selection_changed(Transcript *t, const TranscriptFeed *feed,
                 continue;
             if (!rich_text_has_selection(control)) {
                 /* Applied deferred content changes geometry: capture the
-                   reader's pin state first, then relayout from the affected
-                   turn so following positions, view_content and the scrollbar
-                   range follow the new content, keeping bottom-following when
-                   pinned. This is the external selection-change event the
-                   blocked_debt retry contract rides. */
-                bool pinned = transcript_pinned(t);
+                    reader's follow state first, then relayout from the
+                    affected turn so following positions, view_content and
+                    the scrollbar range follow the new content, keeping
+                    bottom-following when the reader follows; a free reader
+                    is anchor-restored instead. This is the external
+                    selection-change event the blocked_debt retry contract
+                    rides. */
+                bool pinned = transcript_following(t);
                 if (catch_up(t, feed, i)) {
                     if (t->bounded) {
                         RealizeResult r;
-                        realize_loop(t, feed, pinned, -1, &r);
-                        place_and_scroll(t, pinned);
+                        realize_loop(t, feed, pinned, -1, true, &r);
+                        place_and_scroll(t, feed, pinned);
                     } else {
                         transcript_layout_from(t, i, pinned);
                     }
@@ -1980,7 +2643,7 @@ void transcript_selection_changed(Transcript *t, const TranscriptFeed *feed,
 
 void transcript_apply_pending(Transcript *t, const TranscriptFeed *feed) {
     if (t->applying) return;
-    bool pinned = transcript_pinned(t);
+    bool pinned = transcript_following(t);
     int first = -1;
     for (int i = 0; i < t->record_count; i++) {
         TranscriptRecord *rec = &t->records[i];
@@ -1993,8 +2656,8 @@ void transcript_apply_pending(Transcript *t, const TranscriptFeed *feed) {
     if (first >= 0) {
         if (t->bounded) {
             RealizeResult r;
-            realize_loop(t, feed, pinned, -1, &r);
-            place_and_scroll(t, pinned);
+            realize_loop(t, feed, pinned, -1, true, &r);
+            place_and_scroll(t, feed, pinned);
         } else {
             transcript_layout_from(t, first, pinned);
         }
@@ -2013,6 +2676,9 @@ bool transcript_create(Transcript *t, HWND view, const RichTextTheme *theme,
         t->records[i].slot = -1;
         t->records[i].rendered_slot = -1;
         t->records[i].attempted_epoch = 0;
+        for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++)
+            t->records[i].saved_sel_min[k] = t->records[i].saved_sel_max[k] = -1;
+        t->records[i].saved_reason_scroll = -1;
     }
     /* Exactly one allocation for the transcript's lifetime: the realized-slot
        pool. Failure leaves the transcript safe but unrealized and fails host

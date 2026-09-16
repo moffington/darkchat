@@ -231,7 +231,8 @@ static int default_suite(void) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
     CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
-    h->config=(ChatHostConfig){ui,chat,L"Host test",1100,720,720,480,NULL};
+    h->config=(ChatHostConfig){ui,chat,L"Host test",1100,720,720,480,NULL,
+        false};
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
@@ -578,8 +579,8 @@ static int default_suite(void) {
       h->transcript.body_render_tick=0;
       handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nFlushed rebuild."));
       CHECK(turn->body_h>before_flush && transcript_pinned(&h->transcript));
-      h->transcript.view_scroll=px(h,30); position_turns(h,false);
-      CHECK(!transcript_pinned(&h->transcript));
+       transcript_note_user_scroll(&h->transcript,px(h,30)); position_turns(h,false);
+       CHECK(!transcript_pinned(&h->transcript));
       int scroll=h->transcript.view_scroll;
       for (int i=0;i<8;i++) {
           handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nMore text while reading above."));
@@ -772,8 +773,8 @@ static int default_suite(void) {
       /* Clearing the selection applies the deferred Markdown rebuild and
          remeasures: the turn grows, the following surface and the scrollbar
          range move, and a pinned transcript still follows the bottom. */
-      h->transcript.view_scroll=0x7fffffff;
-      transcript_position(&h->transcript,feed_arg(h),false);   /* pin to the bottom */
+       transcript_note_user_scroll(&h->transcript,0x7fffffff);
+       transcript_position(&h->transcript,feed_arg(h),false);   /* pin to the bottom */
       int body_before=turn->body_h, height_before=turn->height;
       int content_before=h->transcript.view_content;
       SendMessageW(body,EM_SETSEL,0,0);
@@ -800,15 +801,15 @@ static int default_suite(void) {
       CHECK(h->transcript.records[second].meta_live);
       wchar_t shown[256]; body_text(h,second,shown,256);
       CHECK(wcsstr(shown,L"more")==NULL);   /* terminal render still deferred */
-      h->transcript.view_scroll=0x7fffffff;
-      transcript_position(&h->transcript,feed_arg(h),false);
-      int body_before=turn->body_h, meta_before=turn->meta_y;
-      int content_before=h->transcript.view_content;
-      SendMessageW(body,EM_SETSEL,0,0);
-      CHECK(turn->body_h>body_before);
-      CHECK(turn->meta_y>meta_before);     /* following footer moved down */
-      CHECK(h->transcript.view_content>content_before);
-      CHECK(transcript_pinned(&h->transcript));
+       transcript_note_user_scroll(&h->transcript,0x7fffffff);
+       transcript_position(&h->transcript,feed_arg(h),false);
+       int body_before=turn->body_h, meta_before=turn->meta_y;
+       int content_before=h->transcript.view_content;
+       SendMessageW(body,EM_SETSEL,0,0);
+       CHECK(turn->body_h>body_before);
+       CHECK(turn->meta_y>meta_before);     /* following footer moved down */
+       CHECK(h->transcript.view_content>content_before);
+       CHECK(transcript_pinned(&h->transcript));
       body_text(h,second,shown,256);
       CHECK(wcsstr(shown,L"more")!=NULL); }
     /* Streaming reasoning appends preserve an in-progress selection. */
@@ -883,8 +884,8 @@ static int default_suite(void) {
       CHECK(sel.cpMin==3 && sel.cpMax==7);
       wchar_t shown[256]; body_text(h,second,shown,256);
       CHECK(wcsstr(shown,L"plus more")==NULL);
-      h->transcript.view_scroll=0x7fffffff;
-      transcript_position(&h->transcript,feed_arg(h),false);   /* pin to the bottom */
+       transcript_note_user_scroll(&h->transcript,0x7fffffff);
+       transcript_position(&h->transcript,feed_arg(h),false);   /* pin to the bottom */
       int content_before=h->transcript.view_content;
       SendMessageW(body,EM_SETSEL,0,0);
       CHECK(turn->body_h>body_before);
@@ -979,8 +980,8 @@ static int default_suite(void) {
         handle_event(h,fixture(h,OPENROUTER_DELTA,L" burst line"));
     CHECK(h->body_flush_pending);
     CHECK(h->transcript.view_content>h->transcript.view_page);
-    h->transcript.view_scroll=0;
-    transcript_position(&h->transcript,feed_arg(h),false);       /* reading an older turn */
+     transcript_note_user_scroll(&h->transcript,0);
+     transcript_position(&h->transcript,feed_arg(h),false);       /* reading an older turn */
     CHECK(!transcript_pinned(&h->transcript));
     int scroll=h->transcript.view_scroll;
     double flush_started=now_ms();
@@ -1005,6 +1006,32 @@ static int default_suite(void) {
     printf("long transcript: %d controls (%d visible), full render %.1f ms, "
         "scheduled flush to visible %.1f ms\n",
         realized,visible,render_ms,flush_ms);
+    /* ---- Send while FREE: no force-follow through the whole send path ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        for (int t=0;t<12;t++) add_turn(chat,L"q",L"a",NULL,-1);
+        render_transcript(h);
+        /* Reading an older turn through the real user-scroll path: only a
+            user-driven scroll may leave bottom-follow. */
+        transcript_note_user_scroll(&h->transcript,0);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(!transcript_following(&h->transcript));
+        TranscriptRecord *held=&h->transcript.records[0];
+        uint64_t held_id=chat->conversations[chat->active].messages[0].id;
+        int held_y=held->y, scroll=h->transcript.view_scroll;
+        rich_text_set_text(&h->composer,L"send while reading");
+        perform_send(h);
+        CHECK(!h->generating);   /* no key: the request failed closed */
+        CHECK(chat->conversations[chat->active].message_count==26);
+        CHECK(!transcript_following(&h->transcript));
+        /* Anchored content stationary: the turn above never moved and the
+            reader's scroll was restored, not followed (view_scroll may
+            change to keep anchored content still; here nothing above the
+            anchor changed, so it must be exactly held). */
+        CHECK(held->y==held_y && held->message==held_id);
+        CHECK(h->transcript.view_scroll==scroll);
+        CHECK(h->transcript.stat.anchor_rejected==0);
+    }
     /* ---- Records, slots: rebind, debt survival, protection, P-CAP ---- */
     {
         command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
@@ -1232,7 +1259,7 @@ static int default_suite(void) {
     uint64_t search_b_id=chat->conversations[search_b].id;
     uint64_t search_reason_id=chat->conversations[search_b].messages[search_reason].id;
     render_transcript(h);
-    h->transcript.view_scroll=0;
+    transcript_note_user_scroll(&h->transcript,0);
     transcript_position(&h->transcript,feed_arg(h),false);
     CHECK(h->search.window &&
         (GetWindowLongPtrW(h->search.window,GWL_STYLE)&WS_VISIBLE));
@@ -1243,12 +1270,20 @@ static int default_suite(void) {
     CHECK(chat->conversations[chat->active].id==search_a_id &&
         h->transcript.records[search_body].message==search_body_id);
     { TranscriptRecord *turn=&h->transcript.records[search_body];
-      int expected=turn->height>h->transcript.view_page ? turn->y :
-          turn->y+turn->height-h->transcript.view_page;
+      int before=h->transcript.view_scroll;   /* the switch's BOTTOM landing */
+      int page=h->transcript.view_page;
+      /* The reveal scrolls only enough to make the target visible. From
+         the BOTTOM landing (no saved anchor for a fresh conversation) a
+         short conversation's target is already visible, so the position
+         is held; otherwise it is bottom-aligned at the viewport bottom
+         (or top-aligned when taller than the viewport). */
+      bool already_visible=turn->y+turn->height>before && turn->y<before+page;
+      int expected=turn->height>page ? turn->y :
+          turn->y+turn->height-page;
       if (expected<0) expected=0;
-      CHECK(h->transcript.view_scroll==expected);
+      CHECK(h->transcript.view_scroll==(already_visible?before:expected));
       CHECK(turn->y+turn->height>h->transcript.view_scroll &&
-          turn->y<h->transcript.view_scroll+h->transcript.view_page);
+          turn->y<h->transcript.view_scroll+page);
       int revealed=h->transcript.view_scroll;
       CHECK(transcript_reveal_turn(&h->transcript,feed_arg(h),search_body) &&
           h->transcript.view_scroll==revealed); }
@@ -1700,7 +1735,8 @@ static int seam_toggle_suite(void) {
     CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
     ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
     CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
-    h->config=(ChatHostConfig){ui,chat,L"Seam host",1100,720,720,480,NULL};
+    h->config=(ChatHostConfig){ui,chat,L"Seam host",1100,720,720,480,NULL,
+        false};
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
@@ -1754,7 +1790,8 @@ static int bounded_suite(void) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
     CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
-    h->config=(ChatHostConfig){ui,chat,L"Bounded host",1100,720,720,480,NULL};
+    h->config=(ChatHostConfig){ui,chat,L"Bounded host",1100,720,720,480,NULL,
+        true};
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
@@ -1767,9 +1804,8 @@ static int bounded_suite(void) {
     HWND window=CreateWindowW(cls.lpszClassName,L"Bounded integration",WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
     CHECK(window); KillTimer(window,2);
     CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
-    /* The seam: bounded realization on for this whole fixture; production
-       stays on the retain-all default until the activation pass. */
-    transcript_set_bounded(&h->transcript, true);
+    /* The seam: bounded realization active for this whole fixture through
+        the init-time config field, exactly as production activates it. */
     CHECK(h->transcript.bounded && !h->transcript.measurer_valid);
     CHECK(transcript_created_windows(&h->transcript) == 0);
 
@@ -1783,6 +1819,10 @@ static int bounded_suite(void) {
     int f3_created=transcript_created_windows(&h->transcript);
     CHECK(f3_bound>0 && f3_bound<80);            /* window-shaped, not all */
     CHECK(f3_created<=4*f3_bound+1);             /* arena within bound slots */
+    /* The governed limit is positive, within the arena, and was raised. */
+    CHECK(h->transcript.slot_limit>0 && h->transcript.slot_limit<=512);
+    CHECK(h->transcript.stat.capacity_raises>0);
+    CHECK(f3_created<=4*h->transcript.slot_limit+1);
     CHECK(transcript_created_windows(&h->transcript)==child_controls(h->view,false));
     CHECK(visible_realized(h));
     CHECK(h->transcript.measurer_valid);         /* lazy creation succeeded */
@@ -1823,7 +1863,7 @@ static int bounded_suite(void) {
     /* Pure replacement: B's window rebinds onto A's departed slots with
        matching shapes — zero pristine consumptions, zero new HWNDs. */
     CHECK(transcript_created_windows(&h->transcript)==created_before_r1);
-    CHECK(transcript_created_windows(&h->transcript)<=4*512+1);
+    CHECK(transcript_created_windows(&h->transcript)<=4*h->transcript.slot_limit+1);
     /* A returns intact: switching back re-renders A's own content on the
        recycled slots (A/B/A through real recycling, never foreign). */
     command(h,CHAT_COMMAND_SELECT,conv_a);
@@ -1837,12 +1877,12 @@ static int bounded_suite(void) {
             revisits ---- */
     command(h,CHAT_COMMAND_SELECT,conv_b);
     render_transcript(h);
-    h->transcript.view_scroll=0;
+    transcript_note_user_scroll(&h->transcript,0);
     transcript_position(&h->transcript,feed_arg(h),false);   /* top */
     CHECK(visible_realized(h));
     { wchar_t shown[256]; body_text(h,1,shown,256);
       CHECK(wcsstr(shown,L"B answer 0")!=NULL); }
-    h->transcript.view_scroll=h->transcript.view_content/2;
+    transcript_note_user_scroll(&h->transcript,h->transcript.view_content/2);
     transcript_position(&h->transcript,feed_arg(h),false);   /* middle */
     CHECK(visible_realized(h));
     /* Content assertion: every realized visible body renders its own B
@@ -1863,7 +1903,7 @@ static int bounded_suite(void) {
        not merely stale content from the earlier A conversation. */
     for (int scroll=0;scroll<h->transcript.view_content;
          scroll+=h->transcript.view_page/2) {
-        h->transcript.view_scroll=scroll;
+        transcript_note_user_scroll(&h->transcript,scroll);
         transcript_position(&h->transcript,feed_arg(h),false);
         for (int i=0;i<h->transcript.record_count;i++) {
             TranscriptRecord *rec=&h->transcript.records[i];
@@ -1875,23 +1915,23 @@ static int bounded_suite(void) {
             CHECK(wcsstr(shown,expected)!=NULL);
         }
     }
-    h->transcript.view_scroll=0x7fffffff;
+    transcript_note_user_scroll(&h->transcript,0x7fffffff);
     transcript_position(&h->transcript,feed_arg(h),false);   /* bottom */
     CHECK(visible_realized(h));
     { wchar_t shown[256]; body_text(h,511,shown,256);
       CHECK(wcsstr(shown,L"B answer 255")!=NULL); }   /* bottom content */
     /* Revisits consume no pristine slots: departed bindings were
-       pre-evicted and their HWNDs reused. */
+        pre-evicted and their HWNDs reused. */
     int created_before_revisit=transcript_created_windows(&h->transcript);
-    h->transcript.view_scroll=0;
+    transcript_note_user_scroll(&h->transcript,0);
     transcript_position(&h->transcript,feed_arg(h),false);
     CHECK(visible_realized(h));
-    h->transcript.view_scroll=0x7fffffff;
+    transcript_note_user_scroll(&h->transcript,0x7fffffff);
     transcript_position(&h->transcript,feed_arg(h),false);
     CHECK(visible_realized(h));
     CHECK(transcript_created_windows(&h->transcript)==created_before_revisit);
-    CHECK(transcript_created_windows(&h->transcript)<=4*512+1);
-    CHECK(transcript_bound_slots(&h->transcript)<=512);
+    CHECK(transcript_created_windows(&h->transcript)<=4*h->transcript.slot_limit+1);
+    CHECK(transcript_bound_slots(&h->transcript)<=h->transcript.slot_limit);
     /* A record revisited in a region measured once keeps its exact stamp:
        heights are consumed, not re-measured (round count stays small). */
     CHECK(h->transcript.stat.rounds<=2*512+4);
@@ -2021,7 +2061,10 @@ static int bounded_suite(void) {
         !IsWindow(h->transcript.measurer.window));
     block_fail_id=TRANSCRIPT_MEASURE_ID;
     command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
-    for (int t=0;t<8;t++) add_turn(chat,L"r5b question",L"r5b answer",NULL,-1);
+    /* 40 turns: whatever position the reader holds, records far outside the
+        realization window stay unbound, so a dead measurer must degrade
+        their geometry to flagged estimates rather than live measuring. */
+    for (int t=0;t<40;t++) add_turn(chat,L"r5b question",L"r5b answer",NULL,-1);
     render_transcript(h);                        /* measurer cannot be created */
     CHECK(!h->transcript.measurer_valid);
     bool any_estimated=false;
@@ -2197,13 +2240,619 @@ static int bounded_suite(void) {
         CHECK(h->transcript.records[i].measured_dpi==96.0f &&
             h->transcript.records[i].measured_valid);
 
+    /* ---- Reader anchoring: stationary content through every mutation ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        for (int t=0;t<24;t++)
+            add_turn(chat,L"anchor question",L"anchor answer body",
+                L"anchor reasoning text",42.0);
+        render_transcript(h);
+        /* Anchor inside an older assistant turn's body through the real
+            user-scroll path: only reader input leaves bottom-follow. */
+        TranscriptRecord *target=&h->transcript.records[21];
+        transcript_note_user_scroll(&h->transcript,target->body_y+px(h,8));
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(!transcript_following(&h->transcript));
+        CHECK(h->transcript.anchor.valid && !h->transcript.anchor.top &&
+            h->transcript.anchor.surface==TRANSCRIPT_BODY &&
+            h->transcript.anchor.message==
+                chat->conversations[chat->active].messages[21].id);
+        /* The restore invariant: the anchored surface's top sits exactly
+            `offset` pixels above the viewport top after every mutation
+            pass; view_scroll itself may change to keep it there. */
+        #define ANCHOR_HELD(hh) \
+            ((hh)->transcript.view_scroll - \
+             (hh)->transcript.records[21].body_y == \
+             (hh)->transcript.anchor.offset)
+        int restores_before=h->transcript.stat.anchor_restores;
+        /* Streaming below the anchor: deltas, the throttle and completion
+            never force-follow a free reader. */
+        begin_regenerate(h);
+        int stream_turn=h->request_message;
+        CHECK(stream_turn>21);
+        handle_event(h,fixture(h,OPENROUTER_DELTA,L"streamed"));
+        for (int i=0;i<8;i++)
+            handle_event(h,fixture(h,OPENROUTER_DELTA,L" tail line"));
+        CHECK(!transcript_following(&h->transcript) && ANCHOR_HELD(h));
+        handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+        CHECK(!transcript_following(&h->transcript) && ANCHOR_HELD(h));
+        /* Reasoning toggle on the anchor turn itself: the viewport inserts
+            above the anchored body and the restore tracks the body down, so
+            the anchored content stays on screen. */
+        int body_y_before=target->body_y;
+        click_row(h,21);
+        CHECK(chat->conversations[chat->active].messages[21].reasoning_open);
+        CHECK(target->body_y>body_y_before);   /* viewport inserted above */
+        CHECK(!transcript_following(&h->transcript) && ANCHOR_HELD(h));
+        click_row(h,21);                       /* collapse again */
+        CHECK(!transcript_following(&h->transcript) && ANCHOR_HELD(h));
+        /* Resize storm and settle: each step restores against fresh
+            visible geometry. */
+        SendMessageW(window,WM_ENTERSIZEMOVE,0,0);
+        SetWindowPos(h->view,NULL,0,0,700,430,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
+        CHECK(visible_realized(h) && ANCHOR_HELD(h));
+        SetWindowPos(h->view,NULL,0,0,860,510,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
+        CHECK(visible_realized(h) && ANCHOR_HELD(h));
+        SendMessageW(window,WM_EXITSIZEMOVE,0,0);
+        CHECK(visible_realized(h) && ANCHOR_HELD(h));
+        /* DPI reflow in both directions. */
+        transcript_set_dpi(&h->transcript,120.0f);
+        render_transcript(h);
+        CHECK(visible_realized(h) && ANCHOR_HELD(h));
+        transcript_set_dpi(&h->transcript,96.0f);
+        render_transcript(h);
+        CHECK(visible_realized(h) && ANCHOR_HELD(h));
+        /* Estimate -> exact height correction above the anchor: an edited
+            turn re-measures under the dropped-notification seam, the
+            flagged estimate moves geometry, and the restore tracks it; the
+            exact correction is restored the same way. */
+        h->transcript.diagnostic_drop_measure_notify=true;
+        chat_message_set_text(&chat->conversations[chat->active].messages[2],
+            L"anchor answer body edited longer with a second line");
+        chat_message_touch(&chat->conversations[chat->active].messages[2]);
+        render_transcript(h);
+        bool any_estimated=false;
+        for (int i=0;i<21;i++)
+            if (h->transcript.records[i].measured_estimated) any_estimated=true;
+        CHECK(any_estimated);
+        CHECK(visible_realized(h) && ANCHOR_HELD(h));
+        h->transcript.diagnostic_drop_measure_notify=false;
+        render_transcript(h);
+        CHECK(visible_realized(h) && ANCHOR_HELD(h));
+        CHECK(h->transcript.stat.anchor_restores>restores_before);
+        CHECK(h->transcript.stat.anchor_rejected==0);
+        /* Explicit resumption: only a user scroll landing at the bottom
+            re-enters follow, and the next delta then follows. */
+        transcript_note_user_scroll(&h->transcript,0x7fffffff);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(transcript_following(&h->transcript));
+        begin_regenerate(h);
+        handle_event(h,fixture(h,OPENROUTER_DELTA,L"resume"));
+        CHECK(transcript_following(&h->transcript) &&
+            transcript_pinned(&h->transcript));
+        handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+        CHECK(transcript_following(&h->transcript));
+        /* Boundary: a position inside the top margin (above the first
+            turn) is not the top anchor -- it is named with a negative
+            offset and restores exactly, including across re-renders. */
+        transcript_note_user_scroll(&h->transcript,px(h,5));
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(h->transcript.anchor.valid && !h->transcript.anchor.top);
+        CHECK(h->transcript.anchor.offset<0);
+        CHECK(h->transcript.view_scroll==px(h,5));
+        render_transcript(h);
+        CHECK(h->transcript.view_scroll==px(h,5));
+        /* Boundary: an offset at a surface's last pixel stays inside the
+            surface when it shrinks -- the clamp target is height-1, never
+            height (which would name the next surface's top). */
+        { TranscriptRecord *held=&h->transcript.records[21];
+          CHECK(chat_message_set_text(
+              &chat->conversations[chat->active].messages[21],
+              L"tall body line one\nline two\nline three"));
+          chat_message_touch(&chat->conversations[chat->active].messages[21]);
+          /* Realize the edited turn first so the geometry the anchor is
+              taken against is settled (a far record's heights come from
+              the measurer until its prepare re-measures live). */
+          { TranscriptFeed feed=transcript_feed(h);
+            CHECK(transcript_reveal_turn(&h->transcript,&feed,21)); }
+          transcript_note_user_scroll(&h->transcript,
+              held->body_y+held->body_h-1);
+          transcript_position(&h->transcript,feed_arg(h),false);
+          CHECK(h->transcript.anchor.valid && !h->transcript.anchor.top);
+          CHECK(h->transcript.anchor.surface==TRANSCRIPT_BODY);
+          CHECK(h->transcript.anchor.offset==held->body_h-1);
+          int old_h=held->body_h;
+          CHECK(chat_message_set_text(
+              &chat->conversations[chat->active].messages[21],L"tiny"));
+          chat_message_touch(&chat->conversations[chat->active].messages[21]);
+          render_transcript(h);
+          CHECK(held->body_h<old_h);          /* the surface shrank */
+          CHECK(h->transcript.view_scroll==
+              held->body_y+held->body_h-1);   /* last pixel, not past it */ }
+        #undef ANCHOR_HELD
+    }
+
+    /* ---- Per-conversation anchors: the linear stable-ID table ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int table_a=chat->active;
+        for (int t=0;t<16;t++) add_turn(chat,L"tableA question",
+            L"tableA answer body",NULL,-1);
+        render_transcript(h);
+        TranscriptRecord *held=&h->transcript.records[9];
+        uint64_t held_id=chat->conversations[table_a].messages[9].id;
+        transcript_note_user_scroll(&h->transcript,held->body_y+px(h,8));
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(!transcript_following(&h->transcript));
+        CHECK(h->transcript.anchor.valid &&
+            h->transcript.anchor.message==held_id);
+        int anchor_offset=h->transcript.anchor.offset;
+        /* A fresh conversation has no entry: the switch sets BOTTOM and
+            clears the anchor -- a fresh conversation is never blessed with
+            FREE and nothing to restore. A's stays stored under A's stable
+            id. */
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int table_b=chat->active;
+        for (int t=0;t<6;t++) add_turn(chat,L"tableB question",
+            L"tableB answer body",NULL,-1);
+        render_transcript(h);
+        CHECK(h->transcript.active_conversation==
+            chat->conversations[table_b].id);
+        CHECK(!h->transcript.anchor.valid);
+        CHECK(transcript_following(&h->transcript));
+        /* Switching back restores the saved position: a valid saved anchor
+            re-enters FREE and the anchored content sits exactly where the
+            reader left it. */
+        command(h,CHAT_COMMAND_SELECT,table_a);
+        render_transcript(h);
+        CHECK(h->transcript.active_conversation==
+            chat->conversations[table_a].id);
+        CHECK(!transcript_following(&h->transcript));
+        CHECK(h->transcript.anchor.valid &&
+            h->transcript.anchor.message==held_id);
+        CHECK(h->transcript.records[9].message==held_id);
+        CHECK(h->transcript.view_scroll-h->transcript.records[9].body_y==
+            anchor_offset);
+        CHECK(visible_realized(h));
+        CHECK(h->transcript.stat.conv_anchor_restores>0);
+        /* Leaving A again keeps its entry in the table for the next return
+            (B is BOTTOM, so leaving B stores nothing). */
+        command(h,CHAT_COMMAND_SELECT,table_b);
+        render_transcript(h);
+        command(h,CHAT_COMMAND_SELECT,table_a);
+        render_transcript(h);
+        CHECK(h->transcript.view_scroll-h->transcript.records[9].body_y==
+            anchor_offset);
+        /* Returning to A and scrolling to the bottom leaves no position:
+            the departure must CLEAR A's stored entry, so a later return
+            lands BOTTOM instead of restoring the stale FREE position. */
+        transcript_note_user_scroll(&h->transcript,0x7fffffff);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(transcript_following(&h->transcript));
+        command(h,CHAT_COMMAND_SELECT,table_b);
+        render_transcript(h);
+        command(h,CHAT_COMMAND_SELECT,table_a);
+        render_transcript(h);
+        CHECK(transcript_following(&h->transcript));   /* BOTTOM, not stale */
+        CHECK(!h->transcript.anchor.valid);
+    }
+
+    /* ---- A saved anchor whose message no longer exists is stale ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int stale_conv=chat->active;
+        for (int t=0;t<7;t++)
+            add_turn(chat,L"stale question",L"stale filler answer",NULL,-1);
+        wchar_t tall[2048];
+        wcscpy(tall,L"tall answer");
+        for (int line=0;line<32;line++)
+            wcscat(tall,L"\nfiller answer line text");
+        add_turn(chat,L"stale last question",tall,NULL,-1);
+        int stale_turn=chat->conversations[stale_conv].message_count-1;
+        render_transcript(h);
+        /* Revealing the taller-than-viewport last turn aligns its top, so
+            the pinned anchor names that turn's own message. */
+        { TranscriptFeed feed=transcript_feed(h);
+          CHECK(transcript_reveal_turn(&h->transcript,&feed,stale_turn)); }
+        CHECK(h->transcript.anchor.valid);
+        uint64_t stale_id=
+            chat->conversations[stale_conv].messages[stale_turn].id;
+        CHECK(h->transcript.anchor.message==stale_id);
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);   /* saves the entry */
+        render_transcript(h);
+        command(h,CHAT_COMMAND_SELECT,stale_conv);     /* FREE restored */
+        render_transcript(h);
+        CHECK(!transcript_following(&h->transcript) &&
+            h->transcript.anchor.message==stale_id);
+        /* Regenerate replaces the anchored response with a fresh identity:
+            the saved anchor names a message that no longer exists. The
+            in-conversation resolve falls back to the nearest earlier turn
+            (the documented retry behavior), but the SWITCH back after
+            leaving must not bless the dead position. */
+        begin_regenerate(h);
+        handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+        CHECK(chat->conversations[stale_conv].messages[stale_turn].id!=
+            stale_id);
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);   /* saves dead anchor */
+        render_transcript(h);
+        command(h,CHAT_COMMAND_SELECT,stale_conv);
+        render_transcript(h);
+        CHECK(transcript_following(&h->transcript));   /* BOTTOM, not FREE */
+        CHECK(!h->transcript.anchor.valid);
+    }
+
+    /* ---- Anchor-table lifecycle: entries for deleted conversations are
+            pruned, so a session can mint far more than 128 distinct ids ----
+    */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int life_conv=chat->active;
+        for (int t=0;t<8;t++) add_turn(chat,L"life question",
+            L"life answer body",NULL,-1);
+        render_transcript(h);
+        transcript_note_user_scroll(&h->transcript,
+            h->transcript.records[5].body_y+px(h,8));
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(h->transcript.anchor.valid &&
+            h->transcript.anchor.conversation==
+                chat->conversations[life_conv].id);
+        /* Churn well past the table's 128 slots: create, anchor, delete.
+            Each deleted conversation's entry must be pruned (or reused),
+            so the table never wedges full of dead ids. The chat-level
+            delete plus the production bookkeeping (invalidate, render)
+            reproduces the host's delete sequence without the dialog. A
+            one-turn conversation is shorter than the viewport, so the
+            anchor comes from the reveal path, which pins FREE with a valid
+            top anchor regardless of conversation height. */
+        for (int k=0;k<136;k++) {
+            command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+            add_turn(chat,L"churn question",L"churn answer",NULL,-1);
+            render_transcript(h);
+            { TranscriptFeed feed=transcript_feed(h);
+              CHECK(transcript_reveal_turn(&h->transcript,&feed,1)); }
+            CHECK(h->transcript.anchor.valid);
+            chat_delete(chat);
+            transcript_invalidate(&h->transcript);   /* saves the dead id */
+            render_transcript(h);
+        }
+        CHECK(chat->conversation_count>=1);
+        /* A real conversation after the churn still saves and restores its
+            anchor: the table never wedged full of dead entries. */
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int life_g=chat->active;
+        for (int t=0;t<8;t++) add_turn(chat,L"final question",
+            L"final answer body",NULL,-1);
+        render_transcript(h);
+        transcript_note_user_scroll(&h->transcript,
+            h->transcript.records[5].body_y+px(h,8));
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(h->transcript.anchor.valid);
+        int life_offset=h->transcript.anchor.offset;
+        uint64_t life_id=chat->conversations[life_g].messages[5].id;
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        render_transcript(h);
+        CHECK(transcript_following(&h->transcript) &&
+            !h->transcript.anchor.valid);      /* fresh: BOTTOM, no FREE */
+        command(h,CHAT_COMMAND_SELECT,life_g);
+        render_transcript(h);
+        CHECK(!transcript_following(&h->transcript));
+        CHECK(h->transcript.anchor.valid &&
+            h->transcript.anchor.message==life_id);
+        CHECK(h->transcript.records[5].message==life_id);
+        CHECK(h->transcript.view_scroll-h->transcript.records[5].body_y==
+            life_offset);
+        CHECK(visible_realized(h));
+    }
+
+    /* ---- Send while FREE (bounded): no force-follow through the send path ----
+    */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        for (int t=0;t<12;t++) add_turn(chat,L"send question",
+            L"send answer body",NULL,-1);
+        render_transcript(h);
+        /* Reading an older turn through the real user-scroll path: only a
+            user-driven scroll may leave bottom-follow. */
+        transcript_note_user_scroll(&h->transcript,0);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(!transcript_following(&h->transcript));
+        TranscriptRecord *held=&h->transcript.records[0];
+        uint64_t held_id=chat->conversations[chat->active].messages[0].id;
+        int held_y=held->y, scroll=h->transcript.view_scroll;
+        int rejected_before=h->transcript.stat.anchor_rejected;
+        /* A focused transcript surface must survive the send's turn-slot
+            reset: start_response transfers focus to the composer through
+            the callback before the invalidation. */
+        { HWND focused=body_window(h,2);
+          CHECK(focused);
+          SetFocus(focused);
+          CHECK(h->transcript.focus_window==focused); }
+        rich_text_set_text(&h->composer,L"send while reading");
+        perform_send(h);
+        CHECK(!h->generating);   /* no key: the request failed closed */
+        CHECK(chat->conversations[chat->active].message_count==26);
+        CHECK(!transcript_following(&h->transcript));
+        CHECK(h->transcript.focus_window==NULL);
+        CHECK(GetFocus()==h->composer.window);
+        /* Anchored content stationary: the reader's scroll was restored,
+            not followed (the anchor is the top-of-transcript marker here:
+            nothing above it changed, so the scroll is exactly held). */
+        CHECK(held->y==held_y && held->message==held_id);
+        CHECK(h->transcript.view_scroll==scroll);
+        CHECK(h->transcript.stat.anchor_rejected==rejected_before);
+        CHECK(visible_realized(h));
+    }
+
+    /* ---- A cancelled thumb drag finishes through the end-of-drag path ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        for (int t=0;t<12;t++) add_turn(chat,L"drag question",
+            L"drag answer body",NULL,-1);
+        render_transcript(h);
+        /* Begin a real thumb drag on the container's scrollbar: the drag
+            owns the position and suspends the qualification while held. */
+        SendMessageW(h->view,WM_VSCROLL,MAKEWPARAM(SB_THUMBTRACK,0),0);
+        CHECK(h->transcript.thumb_drag);
+        CHECK(transcript_following(&h->transcript));   /* unchanged mid-drag */
+        /* The cancellation can arrive at the transcript child itself: it
+            must finish the drag (qualification plus fresh-anchor capture),
+            not merely clear the flag. */
+        SendMessageW(h->view,WM_CANCELMODE,0,0);
+        CHECK(!h->transcript.thumb_drag);
+        CHECK(!h->transcript.user_scroll_pending);     /* capture completed */
+        { SCROLLINFO si; memset(&si,0,sizeof si); si.cbSize=sizeof si;
+          si.fMask=SIF_ALL; GetScrollInfo(h->view,SB_VERT,&si);
+          int maximum=h->transcript.view_content-h->transcript.view_page;
+          if (maximum<0) maximum=0;
+          bool at_bottom=si.nPos>=maximum-1;
+          /* The mode matches the drag's end position. */
+          CHECK(transcript_following(&h->transcript)==at_bottom); }
+        /* The same completion through the top-level's cancellation: the
+            reader has left the bottom first, so the drag ends FREE. */
+        SendMessageW(h->view,WM_VSCROLL,MAKEWPARAM(SB_LINEUP,0),0);
+        SendMessageW(h->view,WM_VSCROLL,MAKEWPARAM(SB_LINEUP,0),0);
+        CHECK(!transcript_following(&h->transcript));
+        CHECK(h->transcript.anchor.valid);
+        SendMessageW(h->view,WM_VSCROLL,MAKEWPARAM(SB_THUMBTRACK,0),0);
+        CHECK(h->transcript.thumb_drag);
+        SendMessageW(window,WM_CANCELMODE,0,0);
+        CHECK(!h->transcript.thumb_drag);
+        CHECK(!transcript_following(&h->transcript));
+        CHECK(h->transcript.anchor.valid);
+        /* A thumb release (SB_THUMBPOSITION) ends the drag through the
+            same qualification: the flag clears, the pending capture
+            completes, and the mode matches the release position. */
+        SendMessageW(h->view,WM_VSCROLL,MAKEWPARAM(SB_THUMBTRACK,0),0);
+        CHECK(h->transcript.thumb_drag);
+        SendMessageW(h->view,WM_VSCROLL,MAKEWPARAM(SB_THUMBPOSITION,0),0);
+        CHECK(!h->transcript.thumb_drag);
+        CHECK(!h->transcript.user_scroll_pending);
+        { SCROLLINFO si; memset(&si,0,sizeof si); si.cbSize=sizeof si;
+          si.fMask=SIF_ALL; GetScrollInfo(h->view,SB_VERT,&si);
+          int maximum=h->transcript.view_content-h->transcript.view_page;
+          if (maximum<0) maximum=0;
+          bool at_bottom=si.nPos>=maximum-1;
+          CHECK(transcript_following(&h->transcript)==at_bottom);
+          if (at_bottom) CHECK(transcript_pinned(&h->transcript)); }
+    }
+
+    /* ---- Reader focus tracking through WM_COMMAND ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        for (int t=0;t<12;t++) add_turn(chat,L"focus question",
+            L"focus answer body",NULL,-1);
+        render_transcript(h);
+        /* The switch landed BOTTOM, so an early record is outside the
+            realization window until the reveal realizes it. */
+        { TranscriptFeed feed=transcript_feed(h);
+          CHECK(transcript_reveal_turn(&h->transcript,&feed,2)); }
+        HWND body=body_window(h,2);
+        CHECK(body);
+        SetFocus(body);                          /* real EN_SETFOCUS route */
+        CHECK(h->transcript.focus_window==body);
+        /* The focused record is Tier-A protected at decision time. */
+        CHECK(h->transcript.policy_needed>0);
+        /* Scrolling the focused surface out of the window transfers focus
+            to the host composer through the focus_release callback before
+            the surface is hidden. */
+        int transfers_before=h->transcript.stat.focus_transfers;
+        transcript_note_user_scroll(&h->transcript,0x7fffffff);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(GetFocus()==h->composer.window);
+        CHECK(h->transcript.focus_window==NULL);
+        CHECK(h->transcript.stat.focus_transfers==transfers_before+1);
+        /* Switching conversations also transfers focus, never destroying a
+            focused child. */
+        { TranscriptFeed feed=transcript_feed(h);
+          CHECK(transcript_reveal_turn(&h->transcript,&feed,5)); }
+        HWND body5=body_window(h,5);
+        CHECK(body5);
+        SetFocus(body5);
+        CHECK(GetFocus()==body5);
+        CHECK(h->transcript.focus_window==body5);
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        CHECK(h->transcript.focus_window==NULL);
+        { HWND f=GetFocus();
+          CHECK(f==h->composer.window); }
+        CHECK(h->transcript.stat.focus_transfers==transfers_before+2);
+        render_transcript(h);
+        CHECK(visible_realized(h));
+    }
+
+    /* ---- Forced eviction: the governed limit exhausts, state survives ----
+    */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int evict_conv=chat->active;
+        wchar_t reason[512];
+        for (int t=0;t<256;t++) {
+            swprintf(reason,512,L"evict reasoning line 1\nline 2\nline 3\n"
+                L"line 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10 "
+                L"tail %d",t);
+            add_turn(chat,L"evict question",L"evict answer body",reason,1000);
+        }
+        CHECK(chat->conversations[evict_conv].message_count==512);
+        render_transcript(h);
+        /* The governed limit is geometric, positive, within the 512-slot
+            arena, and was raised (never shrunk). */
+        int limit=h->transcript.slot_limit;
+        CHECK(limit>0 && limit<=512);
+        CHECK(h->transcript.stat.capacity_raises>0);
+        CHECK(transcript_created_windows(&h->transcript)<=4*limit+1);
+        /* The reader moves away from the top through the real user-scroll
+            path, so the early assistant records sit outside the overscan
+            window and their expanded viewports are evictable Tier-B. */
+        transcript_note_user_scroll(&h->transcript,0x7fffffff);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(transcript_following(&h->transcript));
+        /* Expand the first 8 assistant reasoning viewports through the
+            real refresh path: every clicked record is off-window and
+            becomes Tier-B (expanded), beyond the 24-record allowance only
+            once more arrive. Exceeding the allowance alone must NOT evict
+            anything: forced eviction fires only when selection inside
+            [0, slot_limit) fails. */
+        int evictions_before=h->transcript.stat.forced_evictions;
+        for (int i=1;i<16;i+=2) {
+            chat->conversations[evict_conv].messages[i].reasoning_open=true;
+            chat_message_touch(&chat->conversations[evict_conv].messages[i]);
+            refresh_turn(h,i);
+            CHECK(h->transcript.records[i].reason_live);
+        }
+        CHECK(h->transcript.stat.forced_evictions==evictions_before);
+        /* Reader state to preserve across the coming eviction: an inner
+            scroll in record 1's viewport and a selection in record 3's. */
+        POINT saved_pos;
+        { RichTextControl *control=transcript_surface(&h->transcript,1,
+              TRANSCRIPT_REASON);
+          CHECK(control);
+          POINT point={0,px(h,40)};
+          SendMessageW(control->window,EM_SETSCROLLPOS,0,(LPARAM)&point);
+          SendMessageW(control->window,EM_GETSCROLLPOS,0,(LPARAM)&saved_pos);
+          CHECK(saved_pos.y>0); }
+        CHARRANGE saved_sel;
+        { RichTextControl *control=transcript_surface(&h->transcript,3,
+              TRANSCRIPT_REASON);
+          CHECK(control);
+          SendMessageW(control->window,EM_SETSEL,2,7);
+          SendMessageW(control->window,EM_EXGETSEL,0,(LPARAM)&saved_sel);
+          CHECK(saved_sel.cpMax>saved_sel.cpMin); }
+        /* Exhaust the governed limit: every assistant expansion keeps
+            binding a Tier-B record inside [0, slot_limit) -- bindings
+            accumulate, nothing is trimmed -- until the limit is genuinely
+            exhausted and selection returns -1; only then is the oldest LRU
+            Tier-B binding force-evicted. The 512-message conversation
+            holds 256 assistant records, far beyond any page's limit. */
+        for (int i=17;i<512;i+=2) {
+            chat->conversations[evict_conv].messages[i].reasoning_open=true;
+            chat_message_touch(&chat->conversations[evict_conv].messages[i]);
+            refresh_turn(h,i);
+        }
+        render_transcript(h);                    /* settle */
+        CHECK(h->transcript.stat.forced_evictions>evictions_before);
+        /* The saturation was observed and answered, and nothing was
+            silently refused: the diagnostics make acceptance verifiable. */
+        CHECK(h->transcript.stat.limit_saturated>0);
+        CHECK(h->transcript.stat.exhaustion_refusals==0);
+        int bound_after=transcript_bound_slots(&h->transcript);
+        CHECK(bound_after<=limit);               /* bounded by the limit */
+        CHECK(bound_after>0);
+        /* Expansion survives eviction: every clicked turn is still open in
+            state even though most lost their slots. */
+        for (int i=1;i<512;i+=2)
+            CHECK(chat->conversations[evict_conv].messages[i].reasoning_open);
+        CHECK(h->transcript.records[1].slot<0);  /* the LRU was evicted */
+        CHECK(h->transcript.records[3].slot<0);
+        /* The evicted turn re-reveals with its own reasoning, and the
+            viewport's inner scroll and reader selection are restored. */
+        { TranscriptFeed feed=transcript_feed(h);
+          CHECK(transcript_reveal_turn(&h->transcript,&feed,1)); }
+        CHECK(h->transcript.records[1].slot>=0 &&
+            h->transcript.records[1].reason_live);
+        { wchar_t shown[512]; reasoning_text(h,1,shown,512);
+          CHECK(wcsstr(shown,L"tail 0")!=NULL); }
+        POINT restored_pos;
+        { RichTextControl *control=transcript_surface(&h->transcript,1,
+              TRANSCRIPT_REASON);
+          SendMessageW(control->window,EM_GETSCROLLPOS,0,(LPARAM)&restored_pos); }
+        CHECK(restored_pos.y==saved_pos.y);
+        CHECK(h->transcript.stat.eviction_restores>0);
+        CHECK(h->transcript.stat.reason_scroll_restores>0);
+        { TranscriptFeed feed=transcript_feed(h);
+          CHECK(transcript_reveal_turn(&h->transcript,&feed,3)); }
+        CHECK(h->transcript.records[3].reason_live);
+        CHARRANGE restored_sel;
+        { RichTextControl *control=transcript_surface(&h->transcript,3,
+              TRANSCRIPT_REASON);
+          SendMessageW(control->window,EM_EXGETSEL,0,(LPARAM)&restored_sel); }
+        CHECK(restored_sel.cpMin==saved_sel.cpMin &&
+            restored_sel.cpMax==saved_sel.cpMax);
+        CHECK(h->transcript.stat.selection_restores>0);
+        CHECK(visible_realized(h));
+    }
+
+    /* ---- Dynamic overscan capacity: computed, warmed shapes ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        for (int t=0;t<24;t++) add_turn(chat,L"capacity question",
+            L"capacity answer body text",NULL,-1);
+        render_transcript(h);
+        /* Warm every shape at this viewport: top, middle, bottom. The
+            original view geometry is restored exactly afterwards, since an
+            earlier block may have left the view resized. */
+        RECT capacity_original;
+        GetWindowRect(h->view,&capacity_original);
+        transcript_note_user_scroll(&h->transcript,0);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        transcript_note_user_scroll(&h->transcript,
+            h->transcript.view_content/2);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        transcript_note_user_scroll(&h->transcript,0x7fffffff);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        int created_warm=transcript_created_windows(&h->transcript);
+        int bound_warm=transcript_bound_slots(&h->transcript);
+        CHECK(bound_warm>0 && bound_warm<=h->transcript.slot_limit);
+        CHECK(h->transcript.slot_limit>0 && h->transcript.slot_limit<=512);
+        int needed_short=h->transcript.policy_needed;
+        CHECK(needed_short>0);
+        /* Revisiting the warmed shapes consumes no new HWNDs and never
+            grows the bound set past its warmed high-water. */
+        transcript_note_user_scroll(&h->transcript,0);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        transcript_note_user_scroll(&h->transcript,0x7fffffff);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(transcript_created_windows(&h->transcript)==created_warm);
+        CHECK(transcript_bound_slots(&h->transcript)<=bound_warm);
+        /* The computed capacity follows the pixel window: a taller viewport
+            requires more window slots than a shorter one. */
+        SetWindowPos(h->view,NULL,0,0,1100,900,
+            SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
+        render_transcript(h);
+        int needed_tall=h->transcript.policy_needed;
+        CHECK(needed_tall>needed_short);
+        CHECK(visible_realized(h));
+        SetWindowPos(h->view,NULL,0,0,
+            capacity_original.right-capacity_original.left,
+            capacity_original.bottom-capacity_original.top,
+            SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
+        render_transcript(h);
+        CHECK(h->transcript.policy_needed==needed_short);
+        CHECK(visible_realized(h));
+    }
+
     /* Convergence bookkeeping: no cap fallback, no degraded settle. */
     CHECK(h->transcript.stat.fallback_rounds==fallback_before+1);
     CHECK(h->transcript.stat.degraded_rounds==0);
 
-    /* ---- Teardown (same ownership order as the default fixture) ---- */
+    /* ---- Teardown (same ownership order as the default fixture) ----
+        A focused transcript surface first: WM_CLOSE transfers focus to the
+        top-level window immediately before DestroyWindow, so no focused
+        transcript child is ever destroyed, and the kill-focus reaches the
+        tracked state before the hierarchy collapses. */
+    { HWND body=body_window(h,1); CHECK(body); SetFocus(body);
+      CHECK(h->transcript.focus_window==body); }
     SendMessageW(window,WM_CLOSE,0,0);
     CHECK(!IsWindow(window) && !IsWindow(h->view));
+    CHECK(h->transcript.focus_window==NULL);
     saver_shutdown(&h->saver);
     storage_close(&h->storage);
     DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
@@ -2227,6 +2876,6 @@ int main(void) {
     if (failed) return failed;
     failed=bounded_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded fixtures): failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, stable-id conversation search with body/reasoning jumps and stale-result rejection, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen, background snapshot writer (snapshot isolation across an in-flight write, per-handoff completion accounting, failure latch and retry, pre-request flush gate refusing to send, latest-wins coalescing, shutdown drain), slot-pool lifetime ordering with disposal after full child teardown, record/slot rebind that never accepts foreign surfaces as fresh with debt surviving an unrealized interval and unfocused selections protected, binding-generation certification covering ABA slot-number reuse with a stale-generation catch_up refusal and cross-slot debt application, catch_up stale-identity refusal, retain-all P-CAP checkpoint, and the bounded realization engine (pristine window-shaped first render, seam toggling with reuse, A-short/B-long replacement without foreign content, zero-creation jump revisits with cumulative HWND peaks, deferred selected content with displayed-true geometry and applied recovery, per-surface creation-failure retries with bounded attempts and streaming recovery, flagged estimates with measurer loss and EXACT recovery, measuring-surface/live-surface equality on identical content, width, DPI, theme and formatting, resize/DPI storm with qualified I-GAP and settled EXACT stamps) passed");
+    puts("Hidden host (default + bounded fixtures): failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, stable-id conversation search with body/reasoning jumps and stale-result rejection, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen, background snapshot writer (snapshot isolation across an in-flight write, per-handoff completion accounting, failure latch and retry, pre-request flush gate refusing to send, latest-wins coalescing, shutdown drain), slot-pool lifetime ordering with disposal after full child teardown, record/slot rebind that never accepts foreign surfaces as fresh with debt surviving an unrealized interval and unfocused selections protected, binding-generation certification covering ABA slot-number reuse with a stale-generation catch_up refusal and cross-slot debt application, catch_up stale-identity refusal, retain-all P-CAP checkpoint, and the bounded realization engine (pristine window-shaped first render, seam toggling with reuse, A-short/B-long replacement without foreign content, zero-creation jump revisits with cumulative HWND peaks, deferred selected content with displayed-true geometry and applied recovery, per-surface creation-failure retries with bounded attempts and streaming recovery, flagged estimates with measurer loss and EXACT recovery, measuring-surface/live-surface equality on identical content, width, DPI, theme and formatting, resize/DPI storm with qualified I-GAP and settled EXACT stamps, explicit BOTTOM/FREE follow with anchored stationary content through every mutation, an explicit bounded send-while-FREE regression, per-conversation anchors in the linear stable-ID table across switches (FREE restored from a valid saved anchor, BOTTOM on a fresh one, never FREE with no anchor), anchor-table entries pruned across more than 128 distinct ids, a departure without a position clearing the stored entry, a saved message that no longer exists landing BOTTOM with the entry dropped, top-margin negative-offset and last-pixel clamped anchor boundaries, a cancelled thumb drag finishing through the end-of-drag path, reader focus tracking through WM_COMMAND with transfers before hides and switches and the send-path turn reset reaching the host composer through the callback and the top-level window at teardown, forced Tier-B eviction only when selection inside the raise-only governed slot limit fails, with saturation and refusal diagnostics, selections, reasoning expansion and per-surface captures merged across re-eviction, retained across creation failure and counted per restore kind, and dynamic warmed-shape overscan capacity) passed");
     return failed;
 }

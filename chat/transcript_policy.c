@@ -67,6 +67,96 @@ bool transcript_policy_same_message(uint64_t slot_conversation,
         slot_message == record_message;
 }
 
+/* The record's protected class under the capacity-governed tiers: 0 = in the
+    padded window, 1 = Tier-A (streaming or focused, protected wherever it
+    sits), 2 = Tier-B (deferred debt or expanded reasoning, allowance-
+    governed), 3 = plain evictable. */
+static int governed_class(const TranscriptPolicyItem *item, int scroll,
+    int page, int h_min) {
+    if (transcript_policy_visible(item->y, item->height, scroll, page,
+            h_min)) return 0;
+    if (item->streaming || item->focused) return 1;
+    if (item->debt || item->expanded) return 2;
+    return 3;
+}
+
+bool transcript_policy_in_window(const TranscriptPolicyItem *items, int count,
+    int index, int scroll, int page, int h_min, int tier_b_allowance) {
+    if (!items || count <= 0 || index < 0 || index >= count) return false;
+    int self = governed_class(&items[index], scroll, page, h_min);
+    if (self <= 1) return true;
+    if (self == 3) return false;
+    /* Tier-B: ranks among the newest `tier_b_allowance` Tier-B records by
+        last_used (ties by the lower index), so the ordering is total and the
+        stalest Tier-B records fall out of the window first. */
+    int allowance = tier_b_allowance > 0 ? tier_b_allowance : 0;
+    if (allowance <= 0) return false;
+    int younger = 0;      /* Tier-B records that rank before `index` */
+    for (int i = 0; i < count; i++) {
+        if (i == index) continue;
+        if (governed_class(&items[i], scroll, page, h_min) != 2) continue;
+        if (items[i].last_used > items[index].last_used ||
+            (items[i].last_used == items[index].last_used && i < index))
+            ++younger;
+    }
+    return younger < allowance;
+}
+
+int transcript_policy_bounded_capacity(const TranscriptPolicyItem *items,
+    int count, int scroll, int page, int h_min, int tier_b_allowance,
+    int spare_slots) {
+    if (!items || count <= 0) return 0;
+    int window = 0, tier_a = 0, tier_b = 0;
+    for (int i = 0; i < count; i++) {
+        switch (governed_class(&items[i], scroll, page, h_min)) {
+        case 0: ++window; break;
+        case 1: ++tier_a; break;
+        case 2: ++tier_b; break;
+        default: break;
+        }
+    }
+    int must = window + tier_a;
+    if (must > count) must = count;
+    int spare = spare_slots > 0 ? spare_slots : 0;
+    if (spare > count - must) spare = count - must;
+    must += spare;
+    int allowance = tier_b_allowance > 0 ? tier_b_allowance : 0;
+    int room = count - must;
+    if (room < 0) room = 0;
+    if (allowance > room) allowance = room;
+    if (tier_b > allowance) tier_b = allowance;
+    return must + tier_b;
+}
+
+int transcript_policy_required_slots(int page, int h_min, int overscan,
+    int tier_b_allowance, int spare_slots, int arena) {
+    if (h_min < 1) h_min = 1;
+    if (page < 0) page = 0;
+    if (overscan < 0) overscan = 0;
+    if (tier_b_allowance < 0) tier_b_allowance = 0;
+    if (spare_slots < 0) spare_slots = 0;
+    int window = (page + h_min - 1) / h_min + 1;      /* ceil(page/h_min)+1 */
+    int band = (overscan + h_min - 1) / h_min;        /* ceil(overscan/h_min) */
+    int required = window + band + 2 + tier_b_allowance + spare_slots;
+    if (required < 0) required = 0;
+    if (arena >= 0 && required > arena) required = arena;
+    return required;
+}
+
+int transcript_policy_pick_forced_victim(const TranscriptPolicyItem *bound,
+    int slot_count, int scroll, int page, int h_min) {
+    if (!bound || slot_count <= 0) return -1;
+    int victim = -1;
+    for (int s = 0; s < slot_count; s++) {
+        const TranscriptPolicyItem *item = &bound[s];
+        if (item->index < 0) continue;              /* already free */
+        if (governed_class(item, scroll, page, h_min) <= 1) continue;
+        if (victim < 0 || item->last_used < bound[victim].last_used)
+            victim = s;
+    }
+    return victim;
+}
+
 /* Number of set bits in a kind bitmask. */
 static int kinds_overlap(uint32_t kinds, uint32_t needed) {
     int overlap = 0;

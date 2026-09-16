@@ -250,6 +250,19 @@ int chat_index_of_id(const Chat *chat, uint64_t id) {
     return -1;
 }
 
+/* Stable message identity inside one conversation: the transcript anchor
+   resolves its saved (conversation, message) pair through this after records
+   were invalidated, before any record is prepared again. */
+int chat_message_index_by_id(const Chat *chat, int conversation,
+    uint64_t id) {
+    if (!chat || !id || conversation < 0 ||
+        conversation >= chat->conversation_count) return -1;
+    const ChatConversation *c = &chat->conversations[conversation];
+    for (size_t i = 0; i < c->message_count; i++)
+        if (c->messages[i].id == id) return (int)i;
+    return -1;
+}
+
 const ChatConversation *chat_active(const Chat *chat) {
     if (chat->active < 0 || chat->active >= chat->conversation_count) return NULL;
     return &chat->conversations[chat->active];
