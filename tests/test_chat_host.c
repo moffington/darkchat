@@ -768,14 +768,25 @@ static int default_suite(void) {
         L"# Title **bold** and `code` and\nnext **ope"));
     SendMessageW(body_window(h,stream_turn),EM_SETSEL,(WPARAM)-1,(LPARAM)-1);
     h->transcript.body_render_tick=0;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"n** ~~old"));
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"n** ~~old and ``variable"));
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
-      CHECK(!wcscmp(body,L"Title bold and code and\r\nnext open ~~old")); }
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"~~"));
+      CHECK(!wcscmp(body,L"Title bold and code and\r\nnext open ~~old and ``variable")); }
+    CHECK(!wcscmp(pending(h)->text,
+        L"# Title **bold** and `code` and\nnext **open** ~~old and ``variable"));
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"``~~"));
     handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
-      CHECK(!wcscmp(body,L"Title bold and code and\r\nnext open old")); }
+      CHECK(!wcscmp(body,L"Title bold and code and\r\nnext open old and variable"));
+      CHARFORMAT2W f;
+      memset(&f,0,sizeof f); f.cbSize=sizeof f;
+      SendMessageW(body_window(h,stream_turn),EM_SETSEL,
+          (WPARAM)wcslen(L"Title bold and code and\r\nnext open old and "),
+          (LPARAM)(wcslen(L"Title bold and code and\r\nnext open old and ")+1));
+      SendMessageW(body_window(h,stream_turn),EM_GETCHARFORMAT,
+          SCF_SELECTION,(LPARAM)&f);
+      CHECK((f.dwEffects&CFE_STRIKEOUT) && !wcscmp(f.szFaceName,L"Consolas") &&
+          (f.dwMask&CFM_BACKCOLOR)); }
     command(h,CHAT_COMMAND_SELECT,cv);
     /* Compact metadata footer: deduplicated model, grouped tokens, no "stop",
        and unusual finish reasons surfaced. */

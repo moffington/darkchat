@@ -113,6 +113,63 @@ int main(void) {
         check(style_is(code, MD_STYLE_MONO | MD_STYLE_CODE),
             "code run is exactly mono and code");
         markdown_dispose(&d); }
+    { /* Inline code closes only on a later equal-length backtick run. */
+        MdDocument d;
+        render_ok(L"``code with ` inside`` and ``one ``` two``", &d,
+            "variable backtick code renders");
+        text_is(&d, L"code with ` inside and one ``` two",
+            "outer variable delimiters removed exactly");
+        check(style_is(run_over(&d, L"code with ` inside"),
+            MD_STYLE_MONO | MD_STYLE_CODE),
+            "shorter embedded run stays raw code content");
+        check(style_is(run_over(&d, L"one ``` two"),
+            MD_STYLE_MONO | MD_STYLE_CODE),
+            "longer embedded run stays raw code content");
+        markdown_dispose(&d); }
+    { /* Triple backticks are inline delimiters away from the line start. */
+        MdDocument d;
+        render_ok(L"a ```code with `` inside``` b", &d,
+            "triple backtick code renders");
+        text_is(&d, L"a code with `` inside b",
+            "triple delimiters removed exactly");
+        check(style_is(run_over(&d, L"code with `` inside"),
+            MD_STYLE_MONO | MD_STYLE_CODE),
+            "triple code keeps shorter run as content");
+        markdown_dispose(&d); }
+    { /* An unmatched maximal run stays literal and is not split into openers. */
+        MdDocument d;
+        render_ok(L"``open` and ```x", &d, "mismatched backticks render");
+        text_is(&d, L"``open` and ```x",
+            "mismatched backtick runs stay literal");
+        check(d.run_count == 1 && d.runs[0].style == 0,
+            "mismatched backticks have no code style");
+        markdown_dispose(&d);
+        render_ok(L"\\``escaped``", &d, "escaped backtick run renders");
+        text_is(&d, L"``escaped``", "escaped opening backtick stays literal");
+        check(d.run_count == 1 && d.runs[0].style == 0,
+            "escaped backtick run has no code style");
+        markdown_dispose(&d);
+        render_ok(L"\\``code`", &d, "escaped backtick has one-character scope");
+        text_is(&d, L"`code", "only the escaped backtick stays literal");
+        check(style_is(run_over(&d, L"code"), MD_STYLE_MONO | MD_STYLE_CODE),
+            "following backtick can still open code");
+        markdown_dispose(&d);
+        render_ok(L"``open\r\nclose``", &d, "multiline code stays separate");
+        text_is(&d, L"``open\nclose``",
+            "inline code does not cross normalized source lines");
+        check(d.run_count == 1 && d.runs[0].style == 0,
+            "cross-line delimiters have no code style");
+        markdown_dispose(&d); }
+    { /* Variable-length inline code remains raw and composes with outer style. */
+        MdDocument d;
+        render_ok(L"**``*raw* ~~old~~ [x](https://x.io)``**", &d,
+            "nested variable backtick code renders");
+        text_is(&d, L"*raw* ~~old~~ [x](https://x.io)",
+            "variable code shields inline syntax");
+        check(style_is(run_over(&d, L"*raw* ~~old~~ [x](https://x.io)"),
+            MD_STYLE_BOLD | MD_STYLE_MONO | MD_STYLE_CODE),
+            "variable code composes with outer bold only");
+        markdown_dispose(&d); }
     { /* Paired tildes strike non-space content and compose with outer styles. */
         MdDocument d;
         render_ok(L"a ~~old~~ b **~~bold~~** ~~`code`~~ "
@@ -300,7 +357,7 @@ int main(void) {
     markdown_dispose(NULL);
     if (failures) { printf("%d markdown test(s) failed\n", failures); return 1; }
     puts("Markdown parser: flags, coalescing, headings, emphasis, "
-        "strikethrough, code, fences, links, task lists, quotes, escapes, CRLF, "
+        "strikethrough, variable code, fences, links, task lists, quotes, escapes, CRLF, "
         "long input and allocation fallback passed");
     return 0;
 }

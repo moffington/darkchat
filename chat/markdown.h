@@ -4,8 +4,9 @@
 /* DarkChat Markdown renderer. A pure, platform-independent pass that turns
    assistant message text into styled runs a display layer can emit. The
    supported subset is deliberately small: headings 1-3, bold, italic,
-   strikethrough, inline and fenced code, flat lists (including unordered
-   [ ]/[xX] task markers), HTTP(S) links and blockquotes. Unsupported or
+   strikethrough, equal-length inline backtick spans and fenced code, flat
+   lists (including unordered [ ]/[xX] task markers), HTTP(S) links and
+   blockquotes. Unsupported or
    malformed syntax is kept verbatim. Precedence is fenced blocks, then inline
    code, then links, then strikethrough and emphasis. No tables, images, nested
    lists, per-language highlighting or full CommonMark behavior. */

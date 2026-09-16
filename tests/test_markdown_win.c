@@ -102,6 +102,21 @@ int main(void) {
     CHECK(f.crBackColor == theme.background &&
         !wcscmp(f.szFaceName, L"Segoe UI") && !(f.dwEffects & CFE_BOLD));
 
+    /* Equal-length multi-backtick spans receive the complete code format. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"before **``code with ` inside``** after");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"before code with ` inside after"));
+    f = format_at(&probe, 7);                       /* variable-length code */
+    CHECK((f.dwEffects & CFE_BOLD) && !wcscmp(f.szFaceName, L"Consolas") &&
+        f.yHeight == (LONG)(theme.mono_size * 15.0f + 0.5f) &&
+        f.crTextColor == theme.code_text &&
+        f.crBackColor == theme.code_background);
+    f = format_at(&probe, (int)wcslen(L"before code with ` inside "));
+    CHECK(!(f.dwEffects & (CFE_BOLD | CFE_ITALIC | CFE_STRIKEOUT)) &&
+        !wcscmp(f.szFaceName, L"Segoe UI") &&
+        f.crTextColor == theme.text && f.crBackColor == theme.background);
+
     /* Italic and heading sizes. */
     rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"a *em* b");
     read_text(&probe, text, 512);

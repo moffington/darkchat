@@ -312,8 +312,9 @@ bodies are fully literal, fence markers included, and reasoning is never
 reformatted. The supported subset: headings 1–3 (require a space after the
 marker), `**bold**`, `*italic*`/`_italic_` (word-internal underscores and
 asterisks stay literal), `~~strikethrough~~` (paired non-space content only),
-inline and fenced code (fence lines and language tags hidden, monospace on the
-code tint), flat lists (textual `• ` bullets, `☐ `/`☑ ` unordered task
+inline code with equal-length backtick runs on one source line (different-length
+runs stay raw content; unmatched runs stay literal), and fenced code (fence
+lines and language tags hidden, monospace on the code tint), flat lists (textual `• ` bullets, `☐ `/`☑ ` unordered task
 markers, and preserved ordered markers), `[label](http(s)://…)` links rendered as
 `label (url)` so the native URL detector opens them, and blockquotes (muted,
 bar-prefixed). Precedence is fences → inline code → links → strikethrough →

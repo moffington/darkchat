@@ -117,6 +117,25 @@ static size_t find_char(const wchar_t *s, size_t n, size_t from, wchar_t c) {
     return MD_NPOS;
 }
 
+/* Backticks are maximal delimiter runs: a different-length run stays in the
+   code content and cannot partially close the opener. */
+static size_t backtick_run(const wchar_t *s, size_t n, size_t from) {
+    size_t end = from;
+    while (end < n && s[end] == L'`') ++end;
+    return end - from;
+}
+
+static size_t find_close_code(const wchar_t *s, size_t n, size_t from,
+    size_t length) {
+    for (size_t i = from; i < n;) {
+        if (s[i] != L'`') { ++i; continue; }
+        size_t run = backtick_run(s, n, i);
+        if (run == length) return i;
+        i += run;
+    }
+    return MD_NPOS;
+}
+
 /* Only http:// and https:// targets become clickable link output. */
 static bool is_http(const wchar_t *s, size_t n) {
     static const wchar_t *schemes[2] = {L"https://", L"http://"};
@@ -201,17 +220,20 @@ static void parse_inline(MdBuilder *b, const wchar_t *s, size_t n,
             continue;
         }
         if (c == L'`') {
-            size_t close = find_char(s, n, i + 1, L'`');
-            if (close != MD_NPOS && close > i + 1) {
+            size_t opening = backtick_run(s, n, i);
+            size_t close = find_close_code(s, n, i + opening, opening);
+            if (close != MD_NPOS) {
                 if (i > plain) emit(b, s + plain, i - plain, style);
                 MdStyle code = style;
                 code.style |= MD_STYLE_MONO | MD_STYLE_CODE;
-                emit(b, s + i + 1, close - i - 1, code);
-                i = close + 1;
+                emit(b, s + i + opening, close - i - opening, code);
+                i = close + opening;
                 plain = i;
                 continue;
             }
-            ++i;
+            /* Keep the entire unmatched delimiter run literal; its individual
+               backticks cannot become smaller openers on this pass. */
+            i += opening;
             continue;
         }
         if (c == L'[') {
