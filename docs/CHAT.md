@@ -313,8 +313,8 @@ reformatted. The supported subset: headings 1–3 (require a space after the
 marker), `**bold**`, `*italic*`/`_italic_` (word-internal underscores and
 asterisks stay literal), `~~strikethrough~~` (paired non-space content only),
 inline and fenced code (fence lines and language tags hidden, monospace on the
-code tint), flat lists (textual `• ` bullets and preserved ordered markers),
-`[label](http(s)://…)` links rendered as
+code tint), flat lists (textual `• ` bullets, `☐ `/`☑ ` unordered task
+markers, and preserved ordered markers), `[label](http(s)://…)` links rendered as
 `label (url)` so the native URL detector opens them, and blockquotes (muted,
 bar-prefixed). Precedence is fences → inline code → links → strikethrough →
 emphasis; escapes (`\*`) keep punctuation literal; malformed or unsupported

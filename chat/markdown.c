@@ -97,6 +97,16 @@ static void emit_break(MdBuilder *b, unsigned style) {
 
 static bool is_space(wchar_t c) { return c == L' ' || c == L'\t'; }
 
+/* Task markers are only valid immediately after an otherwise-valid unordered
+   list marker, and must end at whitespace or the item boundary. */
+static bool task_marker(const wchar_t *s, size_t n, bool *checked) {
+    if (n < 3 || s[0] != L'[' || s[2] != L']' ||
+        (s[1] != L' ' && s[1] != L'x' && s[1] != L'X') ||
+        (n > 3 && !is_space(s[3]))) return false;
+    *checked = s[1] != L' ';
+    return true;
+}
+
 static bool is_punct(wchar_t c) {
     static const wchar_t *set = L"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
     return c && wcschr(set, c) != NULL;
@@ -336,7 +346,14 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
         size_t from = 1;
         while (from < m && is_space(c[from])) ++from;
         emit_break(b, 0);
-        emit(b, L"\u2022 ", 2, plain);      /* textual bullet, no indent state */
+        bool checked;
+        if (task_marker(c + from, m - from, &checked)) {
+            from += 3;
+            while (from < m && is_space(c[from])) ++from;
+            emit(b, checked ? L"\u2611 " : L"\u2610 ", 2, plain);
+        } else {
+            emit(b, L"\u2022 ", 2, plain);  /* textual bullet, no indent state */
+        }
         parse_inline(b, c + from, m - from, plain);
         return;
     } else {

@@ -188,10 +188,63 @@ int main(void) {
                   L"[bad](https://open", "https expanded, others literal");
         markdown_dispose(&d); }
     { /* Flat lists: textual bullets and preserved ordered markers. */
-        MdDocument d; render_ok(L"- a\n* b\n1. first\n10. tenth\n5.x",
+        MdDocument d; render_ok(L"- a\n* b\n1. first\n10. [x] tenth\n5.x",
             &d, "lists render");
-        text_is(&d, L"\u2022 a\n\u2022 b\n1. first\n10. tenth\n5.x",
-            "bullets synthesized, ordered markers preserved");
+        text_is(&d, L"\u2022 a\n\u2022 b\n1. first\n10. [x] tenth\n5.x",
+            "bullets synthesized, ordered task-looking markers preserved");
+        markdown_dispose(&d); }
+    { /* Valid unordered task markers replace bullets, including empty items. */
+        MdDocument d;
+        render_ok(L"- [ ] todo\n* [x] done\n- [X] complete\n* [ ]\n- ",
+            &d, "task lists render");
+        text_is(&d, L"\u2610 todo\n\u2611 done\n\u2611 complete\n\u2610 \n\u2022 ",
+            "task markers replace bullets and empty items retain marker space");
+        check(style_is(run_over(&d, L"\u2610"), 0),
+            "unchecked marker is plain");
+        check(style_is(run_over(&d, L"\u2611"), 0),
+            "checked marker is plain");
+        markdown_dispose(&d); }
+    { /* Task item content still uses the normal inline parser. */
+        MdDocument d;
+        render_ok(L"- [x] **bold** *italic* ~~strike~~ `code` "
+                   L"[link](https://x.io/a)", &d, "formatted task renders");
+        text_is(&d, L"\u2611 bold italic strike code link (https://x.io/a)",
+            "task marker removed before formatted content");
+        check(style_is(run_over(&d, L"\u2611"), 0),
+            "formatted task marker stays plain");
+        check(style_is(run_over(&d, L"bold"), MD_STYLE_BOLD),
+            "task bold content");
+        check(style_is(run_over(&d, L"italic"), MD_STYLE_ITALIC),
+            "task italic content");
+        check(style_is(run_over(&d, L"strike"), MD_STYLE_STRIKE),
+            "task strike content");
+        check(style_is(run_over(&d, L"code"), MD_STYLE_MONO | MD_STYLE_CODE),
+            "task code content");
+        check(style_is(run_over(&d, L"link (https://x.io/a)"), 0),
+            "task link content");
+        markdown_dispose(&d); }
+    { /* Invalid and misplaced task forms remain ordinary list content. */
+        MdDocument d;
+        render_ok(L"- [y] invalid\n* [x]text\n- [ X ] spaced\n"
+                   L"- later [x]\n[x] paragraph\n+ [x] plus", &d,
+            "invalid task forms render");
+        text_is(&d, L"\u2022 [y] invalid\n\u2022 [x]text\n\u2022 [ X ] spaced\n"
+            L"\u2022 later [x]\n[x] paragraph\n+ [x] plus",
+            "invalid task forms remain literal list content");
+        check(wcsstr(d.text, L"\u2610") == NULL && wcsstr(d.text, L"\u2611") == NULL,
+            "invalid task forms do not synthesize checkboxes");
+        markdown_dispose(&d); }
+    { /* Inline and fenced code shield task-looking text. */
+        MdDocument d;
+        render_ok(L"- `[x]` inline\n```\n- [x] fenced\n```\n- [ ] real",
+            &d, "code shields task markers");
+        text_is(&d, L"\u2022 [x] inline\n- [x] fenced\n\u2610 real",
+            "code task-looking text stays literal");
+        check(style_is(run_over(&d, L"[x]"), MD_STYLE_MONO | MD_STYLE_CODE),
+            "inline task-looking text is code");
+        check(style_is(run_over(&d, L"- [x] fenced"),
+            MD_STYLE_MONO | MD_STYLE_CODE),
+            "fenced task-looking text is code");
         markdown_dispose(&d); }
     { /* Blockquotes: bar prefix, muted content, inline parsing inside. */
         MdDocument d; render_ok(L"> quoted **bold** text", &d, "quote renders");
@@ -247,7 +300,7 @@ int main(void) {
     markdown_dispose(NULL);
     if (failures) { printf("%d markdown test(s) failed\n", failures); return 1; }
     puts("Markdown parser: flags, coalescing, headings, emphasis, "
-        "strikethrough, code, fences, links, lists, quotes, escapes, CRLF, "
+        "strikethrough, code, fences, links, task lists, quotes, escapes, CRLF, "
         "long input and allocation fallback passed");
     return 0;
 }

@@ -153,6 +153,16 @@ int main(void) {
         CHECK(!wcscmp(text, L"\u2022 item one\r\n\u2022 item two"));
     }
 
+    /* Task markers are Unicode text, with formatting limited to item content. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"- [x] **done**\n* [ ] todo");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"\u2611 done\r\n\u2610 todo"));
+    f = format_at(&probe, 0);
+    CHECK(!(f.dwEffects & (CFE_BOLD | CFE_ITALIC | CFE_STRIKEOUT)));
+    f = format_at(&probe, 2);                       /* "done" */
+    CHECK(f.dwEffects & CFE_BOLD);
+
     /* User/system/error bodies are fully literal, fence markers included. */
     rich_text_set_body(&probe, CHAT_ROLE_USER, L"```c\nint x;\n```");
     read_text(&probe, text, 512);
@@ -186,7 +196,7 @@ int main(void) {
     DestroyWindow(parent);
     rich_text_library_close();
     puts("Markdown Rich Edit integration: flags, style ranges, strikethrough, "
-        "background reset, muted text, CRLF, streaming-to-terminal, repeats, "
-        "literal user text, malformed/long input and allocation fallback passed");
+        "background reset, muted text, task lists, CRLF, streaming-to-terminal, "
+        "repeats, literal user text, malformed/long input and allocation fallback passed");
     return 0;
 }

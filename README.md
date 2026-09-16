@@ -17,7 +17,7 @@ It provides streaming responses, per-turn reasoning views, progressive Markdown 
   - Headings
   - Bold, italic, and strikethrough text
   - Inline and fenced code
-  - Flat ordered and unordered lists
+  - Flat ordered and unordered lists, including task markers on unordered items
   - Links
   - Blockquotes
 - Preserve transcript selection and reading position while responses stream.
