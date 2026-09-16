@@ -35,10 +35,21 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   text is not autosaved until sent; ordinary per-conversation drafts are autosaved.
 - Settings menu edits the global system prompt and sidebar width (160–360 DIPs).
   The system prompt is prepended to future requests; changing it does not rewrite
-  old messages. The model field accepts any OpenRouter identifier.
-- Ctrl+Space opens model history, filtered by the field's prefix. If no entry
-  matches, it shows all history. History retains the 16 most recently requested
-  models; it does not fetch OpenRouter's full catalog.
+  old messages. The model field still accepts any OpenRouter identifier typed
+  directly.
+- Ctrl+Space opens the model picker (Settings > Choose model...). It opens
+  immediately with the current model and the recent-model history, then fills in
+  from OpenRouter's catalog when the fetch completes, refreshing in place
+  without losing the filter text or the selected id. The filter matches
+  case-insensitively against a model's id and display name; Up/Down move, Enter
+  or a double-click selects, Escape cancels. The merged list is the current
+  model (when set), then history in most-recent order, then the catalog in API
+  order, deduplicated by id; ids longer than the model field are skipped and
+  counted. The picker never blocks startup: it fetches on first open, caches in
+  memory for one hour, retries on a later open after a failure, and falls back
+  to the current model and history when offline or when OPENROUTER_API_KEY is
+  unset. Only a confirmed selection replaces the model; a model joins history
+  only when a request is sent, and the catalog is never persisted.
 - Ctrl+F focuses the sidebar search field. Enter performs a fresh on-demand
   search over every live message body and reasoning field; F3 and Shift+F3 move
   between retained results. Matching is locale-independent ordinal Unicode
@@ -304,6 +315,8 @@ render cache is kept.
 The key is read from `OPENROUTER_API_KEY` in the process environment, falling back
 to the Windows User environment registry value (so an existing desktop session
 can pick up a newly configured key). Key buffers are cleared before release.
+The same key authenticates the model-catalog fetch (`GET /api/v1/models`); its
+owned header buffer is cleared before release too.
 The key is never part of conversation state or persistence.
 
 ## Lifecycle and history contract
@@ -536,7 +549,8 @@ storage or a cross-machine synchronization format.
 `chat.bat test` runs `test_sse`, `test_json`, `test_chat`, `test_markdown`,
 `test_markdown_win`, `test_transcript_slots`, `test_chat_ui`, `test_lifecycle`,
 `test_context`, `test_transcript_policy`, `test_search`, `test_storage`,
-`test_openrouter` and `test_chat_host`, then the DarkUI toolkit suite through
+`test_openrouter`, `test_model_catalog`, `test_model_catalog_worker` and
+`test_chat_host`, then the DarkUI toolkit suite through
 `build.bat test`. The relevant final-regression inventory is:
 
 - `test_chat`: the 512-message cap, transactional dynamic-array growth,
@@ -640,6 +654,17 @@ The complete coverage includes:
   finish reason and provider errors after partial content, now also the enabled
   reasoning request parameter and reasoning_details/text-summary/plain fallback
   parsing that never fabricates reasoning.
+- Model catalog: pure parse of `data[].id/name/context_length` with required
+  vs optional typing, Unicode names, exact-id dedupe, the retention cap, id
+  length cancellation, malformed roots, an ordinal case-insensitive id/name
+  substring filter, the current/history/catalog merge order, and transactional
+  allocation failures; and the one-shot worker through an injected transport
+  for success, non-2xx, oversized bodies, missing key, allocation failure,
+  duplicate-start rejection, failed completion post and cancel-and-join
+  shutdown. The hidden host exercises the picker seam for exactly one fetch on
+  first open, success refresh, filter/selection preservation across an open
+  refresh, accept/cancel, stale-generation rejection, keyed-offline history
+  fallback with retry, and a close deferred until the modal loop unwinds.
 - Per-turn reasoning ownership (hidden HWND host): two assistant turns keep
   independent rows and viewports; expanding one does not affect another;
   collapsed by default while streaming; explicit expansion streams live; a
@@ -760,7 +785,9 @@ request sends at most the 64 KiB context budget and drops the oldest eligible
 history beyond it; the budget is a local proxy for prompt size, not a model's
 context window. An allocation failure while appending streamed content retains
 the partial response as Interrupted. Conversation search is an on-demand scan
-with no persisted or background index. Full model-catalog autocomplete and
-response variants remain outside this pass. Interactive clipboard/IME behavior,
+with no persisted or background index. The model catalog is fetched on demand in
+one unpaginated request, held in memory only and never persisted, so an offline
+restart falls back to history until a later fetch succeeds; response variants
+remain outside this pass. Interactive clipboard/IME behavior,
 modal-dialog appearance and physical multi-monitor DPI transitions still need a
 manual desktop check; hidden-HWND tests do not substitute for that visual review.

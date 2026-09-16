@@ -147,7 +147,7 @@ bool chat_ui_init(ChatUi *chat_ui, Ui *ui, Chat *chat) {
     width(chat_ui, chat_ui->model, 280);
     height(chat_ui, chat_ui->model, 30);
     ui_set_help_text(ui, chat_ui->model,
-        L"Type any OpenRouter model identifier, for example provider/model, then press Enter.");
+        L"Type any OpenRouter model identifier, for example provider/model, or press Ctrl+Space to browse the model catalog.");
 
     height(chat_ui, add(chat_ui, root, UI_SEPARATOR, L""), 1);
 

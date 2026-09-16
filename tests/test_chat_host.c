@@ -1,5 +1,6 @@
 /* Hidden HWND integration of the real host, lifecycle and storage. */
 #include "../chat/chat_host_win32.c"
+#include <process.h>
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
 /* Client seam: chat.bat test links this suite with -Wl,--wrap=openrouter_request,
@@ -25,6 +26,67 @@ int __wrap_openrouter_request(OpenRouterClient *client, const char *api_key_utf8
     }
     if (openrouter_request_fake_generation) return openrouter_request_fake_generation;
     return __real_openrouter_request(client,api_key_utf8,model,messages,count);
+}
+/* Catalog seams (linked with -Wl,--wrap=model_catalog_request and
+   -Wl,--wrap=model_picker_pump): the fetch is counted but never starts a
+   worker, and the modal pump returns at once so the suite can drive accept,
+   cancel and a mid-open source refresh itself. With lost_worker set the wrapper
+   leaves an already-finished thread handle on the client, exactly as a real
+   worker whose completion could not be posted does. */
+static int catalog_request_calls, catalog_request_generation;
+static bool catalog_request_lost_worker;
+static unsigned __stdcall catalog_fake_worker(void *parameter) {
+    (void)parameter;
+    return 0;
+}
+int __real_model_catalog_request(ModelCatalogClient *client, const char *api_key_utf8);
+int __wrap_model_catalog_request(ModelCatalogClient *client, const char *api_key_utf8) {
+    if (!api_key_utf8 || !api_key_utf8[0]) return 0;
+    ++catalog_request_calls;
+    if (catalog_request_lost_worker) {
+        uintptr_t thread=_beginthreadex(NULL,0,catalog_fake_worker,NULL,0,NULL);
+        if (!thread) return 0;
+        WaitForSingleObject((HANDLE)thread,INFINITE);
+        client->thread=(HANDLE)thread;
+    }
+    return ++catalog_request_generation;
+}
+/* Focused allocation-failure seams for the picker's transactional refresh;
+   disarmed (-1) they forward to the CRT. */
+static long alloc_fail_malloc=-1, alloc_fail_realloc=-1;
+void *__real_malloc(size_t size);
+void *__real_realloc(void *pointer, size_t size);
+void *__wrap_malloc(size_t size) {
+    if (alloc_fail_malloc>=0) {
+        if (alloc_fail_malloc==0) return NULL;
+        --alloc_fail_malloc;
+    }
+    return __real_malloc(size);
+}
+void *__wrap_realloc(void *pointer, size_t size) {
+    if (alloc_fail_realloc>=0) {
+        if (alloc_fail_realloc==0) return NULL;
+        --alloc_fail_realloc;
+    }
+    return __real_realloc(pointer,size);
+}
+static int picker_pump_calls;
+void __real_model_picker_pump(ModelPicker *picker);
+void __wrap_model_picker_pump(ModelPicker *picker) {
+    (void)picker;
+    ++picker_pump_calls;
+}
+static ModelCatalogEvent *catalog_fixture(ChatHost *h, ModelCatalogResult result,
+    const char *json, const wchar_t *error) {
+    ModelCatalogEvent *event=calloc(1,sizeof *event);
+    event->generation=h->catalog_generation;
+    event->result=result;
+    if (json) { size_t size=strlen(json)+1; event->json=malloc(size); memcpy(event->json,json,size); }
+    if (error) {
+        size_t size=(wcslen(error)+1)*sizeof(wchar_t);
+        event->error=malloc(size); memcpy(event->error,error,size);
+    }
+    return event;
 }
 /* Writer seam (linked with -Wl,--wrap=storage_save): counts every
    storage_save call and can pause the writer while it holds an in-flight
@@ -1785,6 +1847,211 @@ static int seam_toggle_suite(void) {
     return 0;
 }
 
+/* ---- Model catalog / picker suite (separate clean fixture) ---------------- */
+
+static const char *catalog_first_json =
+    "{\"data\":["
+    "{\"id\":\"openai/gpt-4\",\"name\":\"GPT-4\"},"
+    "{\"id\":\"anthropic/claude-3\",\"name\":\"Claude 3\"},"
+    "{\"id\":\"meta-llama/llama-3\",\"name\":\"Llama 3\"}]}";
+static const char *catalog_second_json =
+    "{\"data\":["
+    "{\"id\":\"openai/gpt-4\",\"name\":\"GPT-4\"},"
+    "{\"id\":\"google/gemini-2\",\"name\":\"Gemini 2\"},"
+    "{\"id\":\"anthropic/claude-3\",\"name\":\"Claude 3\"}]}";
+static const char *catalog_five_json =
+    "{\"data\":["
+    "{\"id\":\"openai/gpt-4\",\"name\":\"GPT-4\"},"
+    "{\"id\":\"anthropic/claude-3\",\"name\":\"Claude 3\"},"
+    "{\"id\":\"meta-llama/llama-3\",\"name\":\"Llama 3\"},"
+    "{\"id\":\"google/gemini-2\",\"name\":\"Gemini 2\"},"
+    "{\"id\":\"mistral/mistral-large\",\"name\":\"Mistral Large\"}]}";
+
+static int catalog_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Catalog host",1100,720,720,480,"test-key",false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-catalog-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Catalog integration",WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+    catalog_request_calls=0; catalog_request_generation=0; picker_pump_calls=0;
+
+    /* apply_model: rejects empty/over-capacity ids, updates Chat and the field
+       together, and dirties only on a real change. It never touches history. */
+    h->dirty=false;
+    CHECK(!apply_model(h,chat->model));
+    CHECK(!h->dirty);
+    CHECK(apply_model(h,L"custom/model"));
+    CHECK(h->dirty && !wcscmp(chat->model,L"custom/model"));
+    { wchar_t shown[CHAT_MODEL_TEXT]; rich_text_get_text(&h->field,shown,CHAT_MODEL_TEXT);
+      CHECK(!wcscmp(shown,L"custom/model")); }
+    CHECK(!apply_model(h,L""));
+    { wchar_t long_id[200]; for (int i=0;i<150;i++) long_id[i]=L'a'; long_id[150]=0;
+      CHECK(!apply_model(h,long_id)); }
+    CHECK(apply_model(h,L"openai/gpt-4o-mini"));
+    CHECK(!chat->model_history_count);
+
+    /* One Ctrl+Space open starts exactly one fetch; a browse applies nothing. */
+    catalog_request_calls=0; picker_pump_calls=0;
+    action(h,ACTION_MODELS);
+    CHECK(picker_pump_calls==1 && catalog_request_calls==1);
+    CHECK(h->catalog_loading && h->catalog_generation>0 && !h->open_picker);
+    CHECK(!wcscmp(chat->model,L"openai/gpt-4o-mini"));
+    CHECK(!h->model_applied);
+
+    /* Success replaces catalog state and clears loading. */
+    catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_first_json,NULL));
+    CHECK(!h->catalog_loading && h->catalog_loaded && h->catalog.count==3);
+    CHECK(h->catalog_generation==0);
+
+    /* A live picker gets the merged list; a refresh while open preserves the
+       filter text and the selected id. The current model is one of the catalog
+       entries, so it deduplicates instead of adding a fourth row. */
+    CHECK(apply_model(h,L"openai/gpt-4"));
+    begin_model_picker(h);
+    CHECK(h->open_picker && catalog_request_calls==1);
+    CHECK(model_picker_match_count(h->open_picker)==3);
+    model_picker_set_filter(h->open_picker,L"gpt");
+    CHECK(model_picker_match_count(h->open_picker)==1);
+    CHECK(!wcscmp(model_picker_match_id(h->open_picker,0),L"openai/gpt-4"));
+    catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_second_json,NULL));
+    CHECK(h->open_picker);
+    CHECK(!wcscmp(model_picker_filter(h->open_picker),L"gpt"));
+    CHECK(model_picker_match_count(h->open_picker)==1);
+    model_picker_set_filter(h->open_picker,L"");
+    model_picker_set_selected(h->open_picker,L"openai/gpt-4");
+    catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_first_json,NULL));
+    CHECK(!wcscmp(model_picker_selected_id(h->open_picker),L"openai/gpt-4"));
+
+    /* A source refresh is transactional across the snapshot and the filter
+       array: an allocation failure at either step keeps the old source and a
+       fully usable old list, with no out-of-capacity pointer. */
+    {
+        ChatModelCatalog big;
+        chat_model_catalog_init(&big);
+        ChatModelParseStats stats;
+        CHECK(chat_model_catalog_parse(&big,catalog_five_json,&stats));
+        size_t before=model_picker_match_count(h->open_picker);
+        CHECK(before==3);
+        alloc_fail_realloc=0;
+        model_picker_source_updated(h->open_picker,&big,L"oom");
+        alloc_fail_realloc=-1;
+        CHECK(model_picker_match_count(h->open_picker)==before);
+        CHECK(model_picker_match_id(h->open_picker,before-1)!=NULL);
+        CHECK(model_picker_match_id(h->open_picker,99)==NULL);
+        alloc_fail_malloc=0;
+        model_picker_source_updated(h->open_picker,&big,L"oom");
+        alloc_fail_malloc=-1;
+        CHECK(model_picker_match_count(h->open_picker)==before);
+        CHECK(model_picker_match_id(h->open_picker,before-1)!=NULL);
+        chat_model_catalog_dispose(&big);
+    }
+
+    /* Accepting applies the id to both values and marks dirty once. */
+    model_picker_set_selected(h->open_picker,L"anthropic/claude-3");
+    h->dirty=false;
+    model_picker_accept(h->open_picker);
+    end_model_picker(h);
+    CHECK(!h->open_picker && h->model_applied && h->dirty);
+    CHECK(!wcscmp(chat->model,L"anthropic/claude-3"));
+    { wchar_t shown[CHAT_MODEL_TEXT]; rich_text_get_text(&h->field,shown,CHAT_MODEL_TEXT);
+      CHECK(!wcscmp(shown,L"anthropic/claude-3")); }
+
+    /* Cancelling applies nothing. */
+    begin_model_picker(h);
+    CHECK(h->open_picker && catalog_request_calls==1);
+    model_picker_cancel(h->open_picker);
+    h->dirty=false;
+    end_model_picker(h);
+    CHECK(!h->model_applied && !h->dirty);
+    CHECK(!wcscmp(chat->model,L"anthropic/claude-3"));
+
+    /* A stale generation is ignored and cannot replace the catalog. */
+    {
+        size_t before=h->catalog.count;
+        ModelCatalogEvent *stale=catalog_fixture(h,MODEL_CATALOG_OK,
+            catalog_second_json,NULL);
+        stale->generation=h->catalog_generation+77;
+        catalog_event(h,stale);
+        CHECK(h->catalog.count==before);
+    }
+
+    /* Without a catalog, a failed refresh keeps the history fallback, and a
+       later open retries the fetch. */
+    chat_model_catalog_dispose(&h->catalog);
+    h->catalog_loaded=false; h->catalog_failed=false;
+    h->catalog_loading=false; h->catalog_generation=0;
+    wcscpy(chat->model_history[0],L"history/model"); chat->model_history_count=1;
+    CHECK(apply_model(h,L"typed/model"));
+    catalog_request_calls=0;
+    begin_model_picker(h);
+    CHECK(catalog_request_calls==1 && h->open_picker);
+    catalog_event(h,catalog_fixture(h,MODEL_CATALOG_NETWORK_ERROR,NULL,L"offline"));
+    CHECK(h->catalog_failed && !h->catalog_loading && h->catalog.count==0);
+    CHECK(h->open_picker && model_picker_match_count(h->open_picker)>=2);
+    CHECK(!wcscmp(model_picker_match_id(h->open_picker,0),L"typed/model"));
+    model_picker_cancel(h->open_picker);
+    end_model_picker(h);
+    catalog_request_calls=0;
+    begin_model_picker(h);
+    CHECK(catalog_request_calls==1 && h->open_picker);
+    model_picker_cancel(h->open_picker);
+    end_model_picker(h);
+
+    /* A worker whose completion was lost (the event could not be allocated or
+       posted) must be reaped so the next open starts a fresh request, without
+       any manual model_catalog_complete. The wrapper leaves an already-finished
+       thread handle, exactly as that worker does. */
+    chat_model_catalog_dispose(&h->catalog);
+    h->catalog_loaded=false; h->catalog_failed=false;
+    h->catalog_loading=false; h->catalog_generation=0;
+    catalog_request_lost_worker=true;
+    catalog_request_calls=0;
+    begin_model_picker(h);
+    CHECK(catalog_request_calls==1 && h->catalog_loading && h->open_picker);
+    CHECK(h->catalog_client.thread!=NULL);   /* lost completion still held */
+    model_picker_cancel(h->open_picker);
+    end_model_picker(h);
+    begin_model_picker(h);
+    CHECK(catalog_request_calls==2 && h->catalog_loading && h->open_picker);
+    CHECK(h->catalog_client.thread!=NULL);   /* request #2's worker is unjoined */
+    model_picker_cancel(h->open_picker);
+    end_model_picker(h);
+    catalog_request_lost_worker=false;
+
+    /* A close arriving while the picker is live is deferred until the picker
+       has unwound, so the parent is never destroyed under the modal loop. */
+    begin_model_picker(h);
+    CHECK(h->open_picker);
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(IsWindow(window) && h->close_pending && !h->generating);
+    end_model_picker(h);
+    pump_messages(30);
+    CHECK(!IsWindow(window));
+    CHECK(!h->open_picker && !h->close_pending);
+
+    saver_shutdown(&h->saver); storage_close(&h->storage);
+    model_catalog_shutdown(&h->catalog_client);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
+    transcript_dispose(&h->transcript); rich_text_library_close();
+    chat_model_catalog_dispose(&h->catalog); chat_model_catalog_dispose(&h->picker_source);
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
 static int bounded_suite(void) {
     CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -2876,6 +3143,8 @@ int main(void) {
     if (failed) return failed;
     failed=bounded_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded fixtures): failures, oversized request-context failure that never invokes the client, a successful omitted-history send through the client seam with a request-scoped omission status, stale events, switch, cancel/DONE race, empty reply, per-turn reasoning ownership, metadata footer, revision-tracked updates with preserved selections, deferred markdown under a streaming selection, scheduled flush on burst-then-pause, flush fallback when arming fails, selection across a scheduled flush, live reasoning collapse/reopen, stable-id conversation search with body/reasoning jumps and stale-result rejection, reasoning isolation across A/B/A switching while hidden, cross-conversation selection isolation, completion while reading an older turn with bounded long-transcript controls, edit/draft and close/reopen, background snapshot writer (snapshot isolation across an in-flight write, per-handoff completion accounting, failure latch and retry, pre-request flush gate refusing to send, latest-wins coalescing, shutdown drain), slot-pool lifetime ordering with disposal after full child teardown, record/slot rebind that never accepts foreign surfaces as fresh with debt surviving an unrealized interval and unfocused selections protected, binding-generation certification covering ABA slot-number reuse with a stale-generation catch_up refusal and cross-slot debt application, catch_up stale-identity refusal, retain-all P-CAP checkpoint, and the bounded realization engine (pristine window-shaped first render, seam toggling with reuse, A-short/B-long replacement without foreign content, zero-creation jump revisits with cumulative HWND peaks, deferred selected content with displayed-true geometry and applied recovery, per-surface creation-failure retries with bounded attempts and streaming recovery, flagged estimates with measurer loss and EXACT recovery, measuring-surface/live-surface equality on identical content, width, DPI, theme and formatting, resize/DPI storm with qualified I-GAP and settled EXACT stamps, explicit BOTTOM/FREE follow with anchored stationary content through every mutation, an explicit bounded send-while-FREE regression, per-conversation anchors in the linear stable-ID table across switches (FREE restored from a valid saved anchor, BOTTOM on a fresh one, never FREE with no anchor), anchor-table entries pruned across more than 128 distinct ids, a departure without a position clearing the stored entry, a saved message that no longer exists landing BOTTOM with the entry dropped, top-margin negative-offset and last-pixel clamped anchor boundaries, a cancelled thumb drag finishing through the end-of-drag path, reader focus tracking through WM_COMMAND with transfers before hides and switches and the send-path turn reset reaching the host composer through the callback and the top-level window at teardown, forced Tier-B eviction only when selection inside the raise-only governed slot limit fails, with saturation and refusal diagnostics, selections, reasoning expansion and per-surface captures merged across re-eviction, retained across creation failure and counted per restore kind, and dynamic warmed-shape overscan capacity) passed");
+    failed=catalog_suite();
+    if (failed) return failed;
+    puts("Hidden host (default + bounded + catalog fixtures) passed");
     return failed;
 }

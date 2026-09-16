@@ -98,7 +98,7 @@ HMENU chat_actions_menu(void) {
     AppendMenuW(response,MF_STRING,ACTION_SELECTION,L"Copy transcript &selection");
     AppendMenuW(settings,MF_STRING,ACTION_SYSTEM,L"&System prompt...");
     AppendMenuW(settings,MF_STRING,ACTION_SIDEBAR,L"Sidebar &width...");
-    AppendMenuW(settings,MF_STRING,ACTION_MODELS,L"&Model history / complete prefix (Ctrl+Space)");
+    AppendMenuW(settings,MF_STRING,ACTION_MODELS,L"&Choose model... (Ctrl+Space)");
     AppendMenuW(bar,MF_POPUP,(UINT_PTR)conversation,L"&Conversation");
     AppendMenuW(bar,MF_POPUP,(UINT_PTR)response,L"&Response");
     AppendMenuW(bar,MF_POPUP,(UINT_PTR)settings,L"&Settings");

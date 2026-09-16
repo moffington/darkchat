@@ -8,12 +8,16 @@
 #include "storage.h"
 #include "saver.h"
 #include "actions_win32.h"
+#include "model_catalog.h"
+#include "model_catalog_winhttp.h"
+#include "model_picker_win32.h"
 #include "../platform/renderer.h"
 #include "../platform/accessibility.h"
 #include <windowsx.h>
 #include <richedit.h>
 #include <dwmapi.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -65,6 +69,19 @@ typedef struct {
     /* Latest sidebar remap change report, translated into UIA notifications
        by the host (chat_ui.c itself knows nothing about accessibility). */
     ChatUiRemapReport remap;
+    /* Transient model catalog: the last-good parsed list, a merged view built
+       for the picker, and the one-shot fetch worker. Never persisted. When no
+       catalog is available the picker falls back to the model history. */
+    ChatModelCatalog catalog, picker_source;
+    ChatModelParseStats catalog_stats;
+    ModelCatalogClient catalog_client;
+    int catalog_generation;
+    ULONGLONG catalog_success_tick;
+    bool catalog_loaded, catalog_loading, catalog_failed;
+    wchar_t catalog_error[CHAT_STATUS_TEXT];
+    ModelPicker *open_picker;
+    bool picker_pumping;
+    bool close_pending, model_applied;
 
 } ChatHost;
 
@@ -302,6 +319,211 @@ static bool save_sync(ChatHost *host) {
 static void mark_dirty(ChatHost *host) {
     host->dirty = true;
     ++host->mutations;
+}
+
+/* ---- Model catalog and picker ----------------------------------------- */
+
+/* Writes the selected id into Chat and the visible field atomically. Rejects
+   empty and over-capacity ids. The model is added to history only when a
+   request actually begins (chat_begin_response), never here, and manual entry
+   through the field remains a fully supported secondary path. */
+static bool apply_model(ChatHost *host, const wchar_t *id) {
+    if (!id || !id[0] || wcslen(id) >= CHAT_MODEL_TEXT) return false;
+    Chat *chat = host->config.chat;
+    bool changed = wcscmp(chat->model, id) != 0;
+    if (changed) {
+        wcsncpy(chat->model, id, CHAT_MODEL_TEXT - 1);
+        chat->model[CHAT_MODEL_TEXT - 1] = 0;
+        mark_dirty(host);
+    }
+    /* The visible field always mirrors the stored model, changed or not. */
+    rich_text_set_text(&host->field, chat->model);
+    return changed;
+}
+
+/* Concise, nonfatal status for the picker's status line. */
+static void picker_status(ChatHost *host, wchar_t *out, size_t capacity) {
+    if (!out || !capacity) return;
+    out[0] = 0;
+    if (host->catalog_failed && host->catalog.count)
+        wcsncpy(out, L"Refresh failed; showing cached catalog.", capacity - 1);
+    else if (host->catalog_failed) {
+        if (host->catalog_error[0])
+            _snwprintf(out, capacity,
+                L"Catalog unavailable: %ls. Showing recent models.",
+                host->catalog_error);
+        else
+            wcsncpy(out, L"Catalog unavailable; showing recent models.",
+                capacity - 1);
+    } else if (host->catalog_loading && !host->catalog.count)
+        wcsncpy(out, L"Loading OpenRouter models\u2026", capacity - 1);
+    else if (host->catalog_stats.too_long)
+        _snwprintf(out, capacity, L"%lu models hidden (id too long).",
+            (unsigned long)host->catalog_stats.too_long);
+    else if (host->catalog_stats.truncated)
+        _snwprintf(out, capacity, L"%lu models omitted (catalog limit).",
+            (unsigned long)host->catalog_stats.truncated);
+    else if (host->catalog_loaded)
+        _snwprintf(out, capacity, L"%lu models",
+            (unsigned long)host->catalog.count);
+    out[capacity - 1] = 0;
+}
+
+static bool should_fetch_catalog(ChatHost *host) {
+    if (!host->config.api_key_utf8 || !host->config.api_key_utf8[0])
+        return false;
+    if (host->catalog.count == 0 || host->catalog_failed) return true;
+    return GetTickCount64() - host->catalog_success_tick >= 3600000ULL;
+}
+
+/* Rebuilds the merged picker list (current, history, catalog) into its own
+   storage; the previous view is kept if the rebuild cannot allocate. */
+static void build_picker_source(ChatHost *host) {
+    Chat *chat = host->config.chat;
+    ChatModelCatalog merged;
+    chat_model_catalog_init(&merged);
+    if (chat_model_catalog_merged(&host->catalog, chat->model,
+            chat->model_history, chat->model_history_count, &merged)) {
+        chat_model_catalog_dispose(&host->picker_source);
+        host->picker_source = merged;
+    } else {
+        chat_model_catalog_dispose(&merged);
+    }
+}
+
+/* True when a catalog completion is already queued for the host window: it will
+   clear catalog_loading when dispatched and must not be mistaken for a lost
+   completion. */
+static bool catalog_event_pending(const ChatHost *host) {
+    MSG message;
+    return PeekMessageW(&message, host->window, CHAT_WM_CATALOG_EVENT,
+        CHAT_WM_CATALOG_EVENT, PM_NOREMOVE) != FALSE;
+}
+
+/* Opens the picker: builds the merged view, starts at most one fetch, and
+   creates the popup. The caller drives the pump. */
+static void begin_model_picker(ChatHost *host) {
+    if (host->open_picker) return;
+    if (!host->config.api_key_utf8 || !host->config.api_key_utf8[0]) {
+        host->catalog_failed = true;
+        wcsncpy(host->catalog_error,
+            L"Set OPENROUTER_API_KEY to load the model catalog.",
+            CHAT_STATUS_TEXT - 1);
+        host->catalog_error[CHAT_STATUS_TEXT - 1] = 0;
+    } else {
+        if (host->catalog_loading && !catalog_event_pending(host) &&
+            !model_catalog_busy(&host->catalog_client)) {
+            /* The worker finished without its completion being handled (a
+               failed post). Treat it as a retryable failure. */
+            host->catalog_loading = false;
+            host->catalog_failed = true;
+            wcsncpy(host->catalog_error,
+                L"The model catalog request did not complete.",
+                CHAT_STATUS_TEXT - 1);
+            host->catalog_error[CHAT_STATUS_TEXT - 1] = 0;
+        }
+        if (should_fetch_catalog(host) && !host->catalog_loading &&
+            !model_catalog_busy(&host->catalog_client)) {
+            int generation = model_catalog_request(&host->catalog_client,
+                host->config.api_key_utf8);
+            if (generation) {
+                host->catalog_generation = generation;
+                host->catalog_loading = true;
+                host->catalog_failed = false;
+            } else {
+                host->catalog_failed = true;
+                wcsncpy(host->catalog_error,
+                    L"Could not start the catalog request.",
+                    CHAT_STATUS_TEXT - 1);
+                host->catalog_error[CHAT_STATUS_TEXT - 1] = 0;
+            }
+        }
+    }
+    build_picker_source(host);
+    wchar_t status[CHAT_STATUS_TEXT];
+    picker_status(host, status, CHAT_STATUS_TEXT);
+    host->open_picker = model_picker_create(host->window, &host->picker_source,
+        status, host->config.chat->model);
+    if (!host->open_picker) set_status(host, L"Could not open the model picker.");
+}
+
+/* Applies the picker's result, destroys it, and reposts a close that arrived
+   while the modal loop was live. */
+static void end_model_picker(ChatHost *host) {
+    ModelPicker *picker = host->open_picker;
+    if (!picker) return;
+    bool accepted = model_picker_accepted(picker);
+    wchar_t id[CHAT_MODEL_TEXT];
+    wcscpy(id, accepted ? model_picker_selected_id(picker) : L"");
+    model_picker_destroy(picker);
+    host->open_picker = NULL;
+    bool changed = accepted && apply_model(host, id);
+    host->model_applied = changed;
+    if (changed) {
+        save(host);
+        chat_ui_sync(&host->chat_ui);
+    }
+    flush(host);
+    if (host->close_pending) {
+        host->close_pending = false;
+        PostMessageW(host->window, WM_CLOSE, 0, 0);
+    }
+}
+
+static void open_model_picker(ChatHost *host) {
+    begin_model_picker(host);
+    if (host->open_picker) {
+        host->picker_pumping = true;
+        model_picker_pump(host->open_picker);
+        host->picker_pumping = false;
+    }
+    end_model_picker(host);
+}
+
+/* Interprets one fetch completion. Stale generations are freed and dropped;
+   success replaces the catalog, failure keeps the last good one and records a
+   nonfatal reason. An open picker is refreshed in place with its filter and
+   selection preserved. */
+static void catalog_event(ChatHost *host, ModelCatalogEvent *event) {
+    if (!event) return;
+    if (event->generation != host->catalog_generation) {
+        model_catalog_event_free(event);
+        return;
+    }
+    host->catalog_loading = false;
+    if (event->result == MODEL_CATALOG_OK && event->json) {
+        ChatModelParseStats stats;
+        if (chat_model_catalog_parse(&host->catalog, event->json, &stats)) {
+            host->catalog_stats = stats;
+            host->catalog_loaded = true;
+            host->catalog_failed = false;
+            host->catalog_error[0] = 0;
+            host->catalog_success_tick = GetTickCount64();
+        } else {
+            host->catalog_failed = true;
+            wcsncpy(host->catalog_error,
+                L"The catalog response could not be parsed.",
+                CHAT_STATUS_TEXT - 1);
+            host->catalog_error[CHAT_STATUS_TEXT - 1] = 0;
+        }
+    } else {
+        host->catalog_failed = true;
+        wcsncpy(host->catalog_error,
+            event->error ? event->error : L"Model catalog request failed.",
+            CHAT_STATUS_TEXT - 1);
+        host->catalog_error[CHAT_STATUS_TEXT - 1] = 0;
+    }
+    int generation = event->generation;
+    model_catalog_event_free(event);
+    model_catalog_complete(&host->catalog_client, generation);
+    host->catalog_generation = 0;
+    if (host->open_picker) {
+        build_picker_source(host);
+        wchar_t status[CHAT_STATUS_TEXT];
+        picker_status(host, status, CHAT_STATUS_TEXT);
+        model_picker_source_updated(host->open_picker, &host->picker_source,
+            status);
+    }
 }
 
 /* Ends the visible-reasoning window and records its duration once. */
@@ -969,19 +1191,10 @@ static void action(ChatHost *host, int code) {
             else set_status(host,L"Sidebar width must be 160-360");
         }
     } else if (code==ACTION_MODELS) {
-        wchar_t prefix[CHAT_MODEL_TEXT]; rich_text_get_text(&host->field,prefix,CHAT_MODEL_TEXT);
-        HMENU menu=CreatePopupMenu(); int matches=0;
-        for (int i=0;i<chat->model_history_count;i++) if (!prefix[0] || !wcsncmp(chat->model_history[i],prefix,wcslen(prefix))) {
-            AppendMenuW(menu,MF_STRING,1000+i,chat->model_history[i]); ++matches;
-        }
-        if (!matches) for (int i=0;i<chat->model_history_count;i++) AppendMenuW(menu,MF_STRING,1000+i,chat->model_history[i]);
-        if (!chat->model_history_count) AppendMenuW(menu,MF_GRAYED,0,L"Model history is empty; send using a model first.");
-        RECT r; GetWindowRect(host->field.window,&r);
-        int selected=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_NONOTIFY,r.left,r.bottom,0,host->window,NULL);
-        DestroyMenu(menu);
-        if (selected>=1000 && selected<1000+chat->model_history_count) {
-            wcscpy(chat->model,chat->model_history[selected-1000]); rich_text_set_text(&host->field,chat->model);
-        }
+        /* The picker owns its own conditional save so a mere browse never
+           marks the session dirty; returning here skips the common tail. */
+        open_model_picker(host);
+        return;
     }
     mark_dirty(host); save(host); chat_ui_sync(&host->chat_ui); flush(host);
 }
@@ -1332,6 +1545,10 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         host->search.on_key = surface_key;
         host->search.user = host;
         openrouter_init(&host->client, window, CHAT_WM_OPENROUTER_EVENT);
+        model_catalog_client_init(&host->catalog_client, window,
+            CHAT_WM_CATALOG_EVENT);
+        chat_model_catalog_init(&host->catalog);
+        chat_model_catalog_init(&host->picker_source);
         if (!ui_accessible_name(u, u->root)[0])
             ui_set_accessible_name(u, u->root, host->config.title);
         host->accessibility = ui_accessibility_create(window, u);
@@ -1547,6 +1764,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
     case CHAT_WM_OPENROUTER_EVENT:
         handle_event(host, (OpenRouterEvent *)l);
         return 0;
+    case CHAT_WM_CATALOG_EVENT:
+        catalog_event(host, (ModelCatalogEvent *)l);
+        return 0;
     case CHAT_WM_SAVER_RESULT:
         /* wParam carries the result bit and this job's attempt id; lParam
            the mutation counter captured at that handoff. The completion is
@@ -1556,6 +1776,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         saver_completed(host,(w&1)!=0,(uint64_t)w>>1,(uint64_t)l);
         return 0;
     case WM_CLOSE:
+        /* A close that lands while the modal picker is live must not destroy
+           the parent under the nested loop. Close the picker, park the close,
+           and repost it once the picker call has unwound. */
+        if (host->open_picker) {
+            host->close_pending = true;
+            model_picker_cancel(host->open_picker);
+            return 0;
+        }
         capture_settings(host);
         cancel_body_flush(host);
         if (host->generating) {
@@ -1574,6 +1802,16 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             while (PeekMessageW(&queued, window, CHAT_WM_OPENROUTER_EVENT,
                 CHAT_WM_OPENROUTER_EVENT, PM_REMOVE))
                 openrouter_event_free((OpenRouterEvent *)queued.lParam);
+        }
+        /* Join and drain the catalog worker while the main window still
+           exists, so a late completion is freed here instead of leaking into a
+           queue whose window is gone. */
+        model_catalog_shutdown(&host->catalog_client);
+        {
+            MSG queued;
+            while (PeekMessageW(&queued, window, CHAT_WM_CATALOG_EVENT,
+                CHAT_WM_CATALOG_EVENT, PM_REMOVE))
+                model_catalog_event_free((ModelCatalogEvent *)queued.lParam);
         }
         /* Final flush-and-wait: the close prompt must describe real
            durability, not a handoff still in flight. */
@@ -1597,6 +1835,17 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         KillTimer(window, 1);
         KillTimer(window, 2);
         KillTimer(window, CHAT_TIMER_BODY_FLUSH);
+        /* Never free a picker underneath its active nested pump: cancel it so
+           the pump unwinds, and let its completion path destroy it. Only a
+           picker with no live pump is safe to destroy here. */
+        if (host->open_picker) {
+            if (host->picker_pumping) {
+                model_picker_cancel(host->open_picker);
+            } else {
+                model_picker_destroy(host->open_picker);
+                host->open_picker = NULL;
+            }
+        }
         chat_search_results_dispose(&host->search_results);
         renderer_drop_target(&host->renderer);
         /* Transfer focus off any transcript surface before the hierarchy
@@ -1710,6 +1959,19 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
 cleanup:
     /* Never exit under a running worker: it still owns its request snapshot. */
     openrouter_shutdown(&host->client);
+    /* Cancel and join the catalog fetch, then drain any completion it managed
+       to post before the window went away, so no event body leaks. */
+    model_catalog_shutdown(&host->catalog_client);
+    {
+        MSG queued;
+        while (PeekMessageW(&queued, host->window, CHAT_WM_CATALOG_EVENT,
+            CHAT_WM_CATALOG_EVENT, PM_REMOVE))
+            model_catalog_event_free((ModelCatalogEvent *)queued.lParam);
+    }
+    if (host->open_picker) {
+        model_picker_destroy(host->open_picker);
+        host->open_picker = NULL;
+    }
     /* Join the snapshot writer before the storage lock is released: it alone
        uses the ChatStorage after startup, and pending jobs must be drained
        (or disposed) while the store is still valid. */
@@ -1726,6 +1988,8 @@ cleanup:
        reachable. Only now may the slot pool be freed; never dispose from the
        parent window procedure, whose WM_DESTROY runs while children exist. */
     transcript_dispose(&host->transcript);
+    chat_model_catalog_dispose(&host->catalog);
+    chat_model_catalog_dispose(&host->picker_source);
     rich_text_library_close();
     storage_close(&host->storage);
     free(host);
