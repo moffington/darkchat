@@ -113,6 +113,10 @@ Persistence uses a checksummed UTF-8 JSONL format with:
 - Strict validation before loaded data is adopted
 - An exclusive directory lock to prevent two instances from overwriting one another
 
+Current writes use format 3. DarkChat loads formats 1 through 3 and rewrites
+older valid snapshots as format 3 on the next save; an unsupported newer format
+fails closed without overwriting it from a backup.
+
 State is autosaved roughly once per second while dirty and immediately after important lifecycle actions such as sending, stopping, completing, deleting, or closing.
 
 A running assistant message is persisted before the network request begins. If the application closes or crashes during generation, the partial response is retained and recovered as Interrupted rather than silently marked successful.
@@ -126,7 +130,7 @@ DarkChat now represents most of the active development in this repository.
 | Chat model | `chat/chat.*` | Conversations, messages, request lifecycle, IDs, metadata, drafts, retry/regenerate/edit behavior |
 | Windows host | `chat/chat_host_win32.*` | Application window, worker coordination, timers, persistence scheduling, native event routing |
 | Application UI | `chat/chat_ui.*`, `chat/actions_win32.*` | Sidebar, composer, menus, settings, commands, and visible application state |
-| Transcript | `chat/transcript_win32.*`, `chat/rich_text_win32.*` | Per-turn native controls, scrolling, selection preservation, reasoning viewports, incremental updates |
+| Transcript | `chat/transcript_win32.*`, `chat/rich_text_win32.*` | Bounded, recycled native Rich Edit slots; scrolling, selection preservation, reasoning viewports, incremental updates |
 | Markdown | `chat/markdown.*` | Transactional, platform-independent Markdown subset parser |
 | OpenRouter | `chat/openrouter_winhttp.*`, `chat/sse.*`, `chat/json.*` | Request encoding, WinHTTP streaming, SSE framing, response decoding |
 | Storage | `chat/storage.*` | Checksummed JSONL snapshots, atomic replacement, backup and recovery |
@@ -168,7 +172,7 @@ Coverage includes:
 - Progressive Markdown rendering
 - Selection-preserving transcript updates
 - Scheduled streaming flushes
-- Long-transcript control stability
+- Bounded transcript realization, slot recycling, reader-state restoration, and native-control limits
 - Persistence round trips, checksums, backup recovery, and failed writes
 - Direct2D/DirectWrite renderer integration
 - Retained UI layout, input, scrolling, and UI Automation behavior
@@ -192,10 +196,10 @@ The automated suite does not require an API key or make live OpenRouter requests
 
 - Windows only
 - One active request at a time
-- 128 conversations (snapshots from older 16-conversation builds still load;
-  older builds refuse this format's snapshots)
+- 128 conversations
 - 512 messages per conversation
-- 16,383 UTF-16 code units each for answer and reasoning text
+- Message text and reasoning use 255-code-unit inline residues, then heap storage;
+  they have no fixed per-message length cap
 - 128 MB maximum persisted snapshot
 - 16 recently used model identifiers
 - No full model-catalog browser
@@ -205,7 +209,9 @@ The automated suite does not require an API key or make live OpenRouter requests
   persisted or background index
 - Markdown tables, images, nested lists, and other unsupported syntax remain literal
 
-Responses that reach the local text limit are retained and marked Interrupted rather than incorrectly reported as complete.
+An allocation failure while receiving a response retains the partial response and
+marks it Interrupted. The 128 MB snapshot limit is a serialized-file limit, not
+a total in-memory-content limit.
 
 Interactive clipboard and IME behavior, modal appearance, physical multi-monitor DPI transitions, and live provider behavior still require manual desktop verification. Hidden-window tests cover the underlying contracts but are not a replacement for visual review.
 

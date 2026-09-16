@@ -74,26 +74,20 @@ by value (conversation id, message id, per-message revision and answer-text
 revision), the deferred-write debt per surface, the visibility state, the
 geometry and a measurement stamp, plus the index of the realized slot bound
 to it. A realized slot (`TranscriptSlot`) owns the native Rich Edit surfaces:
-an assistant turn can own a header/reasoning-row block, an optional reasoning
-viewport, an answer block and a terminal metadata footer; other turns use a
-single block. A slot binds at most one record and a record at most one slot;
-control ids are slot-based (`100 + slot*4 + surface`), which with this pass's
-permanent binding produces the same numeric ids as before. A turn's surfaces
-are created once when first needed and then retained for the life of the
-process: the container measures, positions and shows only the turns that
-intersect the viewport and hides the rest, so off-screen controls are not
-destroyed or recycled. An unchanged historical surface keeps its selection
-because its content write is skipped; an expanded reasoning viewport keeps
-its own inner scroll position because it is never rebuilt while live. The
-container owns the one outer scroll for the whole
-conversation and repositions each realized turn's controls as it scrolls. An
-expanded reasoning viewport is inset, tinted
+an assistant shape can require a header/reasoning-row block, an optional
+reasoning viewport, an answer block and a terminal metadata footer; other
+shapes require only a body. A slot binds at most one record and a record at
+most one slot. Control ids are slot-based (`100 + slot*4 + surface`), and a
+fresh binding generation prevents a recycled slot number from certifying a
+different message. In the shipped bounded mode, a slot and its HWND cells are
+reused as records enter and leave the realization window; logical identity,
+layout, deferred-write debt and saved reader state remain record-owned. The
+container owns one outer scroll for the conversation and positions only live
+surfaces. An expanded reasoning viewport is inset, tinted
 (`UI_PANEL`) and separated by an 8 DIP gap above and below, so it reads as its
 own sub-panel rather than part of the answer, and it scrolls independently: the
 wheel scrolls the viewport first and chains to the transcript at its ends, so
-the target never depends on which control holds focus. No control is shared
-between turns, so historical assistant turns keep their own reasoning affordance
-and content across switching, reload and restart.
+the target never depends on which control holds focus.
 
 Which records must be realized, how many slots are required, and which slot a
 new binding takes are pure policy decisions (`chat/transcript_policy.h` — no
@@ -102,64 +96,48 @@ unmeasured heights read at the minimum height), class protection (streaming,
 focused, selection/debt-bearing, expanded reasoning), rank/index realization
 ordering with the LRU stamp reserved for eviction only, the dynamic required
 slot capacity, fail-closed victim selection, and exact message-instance
-identity validation. In the retain-all pool mode the required capacity is
-|visible ∪ protected| plus two spare slots, recorded at a single documented
-checkpoint. The pool is created with exactly one allocation and its
-exhaustion fails startup closed; `transcript_dispose` frees it exactly once
-per host from the ownership layer, after the window hierarchy is fully
-destroyed — never from the parent window procedure, whose `WM_DESTROY` runs
-while child surfaces still exist and reference the pool through their
-`GWLP_USERDATA`.
+identity validation. The 512-slot arena is created in one allocation; native
+surfaces remain lazy. `transcript_dispose` frees the arena exactly once per
+host from the ownership layer after the complete window hierarchy is destroyed,
+not from the parent `WM_DESTROY` path while child surfaces can still reference
+their `GWLP_USERDATA`.
 
-Realization runs in one of two modes, selected per transcript by
-`transcript_set_bounded` (legal at any time; the default is the retain-all
-mode above, so production behavior is unchanged until the activation pass):
+Realization is selected per transcript by `transcript_set_bounded`. A zeroed or
+directly initialized `Transcript` retains the compatible retain-all behavior:
+every record prepares on each render and the policy capacity is diagnostic only.
+`chat_main.c` explicitly enables bounded realization for the shipped
+application.
 
-- Retain-all (default): every record prepares every render and layout measures
-  every live surface unconditionally, exactly as in earlier passes. The
-  capacity checkpoint records (never enforces) the policy's required count.
-- Bounded (test infrastructure for the activation pass): a fixed-point
-  realize/measure loop binds and prepares only actionable records inside an
-  overscan-widened viewport (`TRANSCRIPT_OVERSCAN_DIPS` beyond the strict
-  viewport) union the class-protected records, through the shape-aware
-  `transcript_policy_pick_slot` tiers (exact-kind free reuse, pre-eviction of
-  evictable kind matches, best-overlap reuse, pristine consumption last), so
-  the native-window arena stays viewport-shaped and a revisit consumes no new
-  HWNDs. Binding operates inside a raise-only governed slot budget
-  (`slot_limit`): each round first raises the limit to the dynamic required
-  capacity — `ceil(page/h_min)+1` strict-window records plus
-  `ceil(2*overscan/h_min)` overscan records, two Tier-A slots, the 24-record
-  Tier-B allowance and two spares, clamped to the 512-slot arena — counting
-  each raise and never shrinking, and every selection happens only within
-  `[0, slot_limit)`. The bound set is never trimmed toward a target:
-  Tier-B bindings beyond the allowance keep their slots, and forced
-  eviction of the oldest LRU non-window, non-Tier-A binding occurs only
-  when selection inside the limit returns `-1` (the allowance caps the
-  window's membership ranking, not a continuous binding count). Heights are
-  stamped per record and consumed only while the stamp is
-  exact (never an estimate), certified against the current width/DPI/theme/
-  identity, and debt-free; every scroll, reveal and selection path funnels
-  through the same realize loop before placing, so a visible record can never
-  be unrealized. During an interactive resize storm off-screen re-measurement
-  is deferred (last-known heights, stamps left stale for the strict-viewport-
-  invisible records) while visible records keep live-measuring each step, and
-  the `WM_EXITSIZEMOVE` settle render restores exact geometry. Per-surface
-  creation failures block exactly one attempt per render (attempt stamps),
-  surface-liveness reconciliation treats a live-claimed family whose window is
-  gone like a never-created one, and a still-missing streaming body is retried
-   by the re-armed one-shot flush timer plus the 1 Hz sweep, the next delta and
-   the next render. Counters (`TranscriptStats`) record binds, rebinds,
-   evictions, raw HWND creation successes, exact/estimated measurements, retries,
-   rounds and the degraded/fallback exits as diagnostics, never as wall-clock
-   thresholds — and the governed capacity's own bookkeeping: capacity raises,
-   forced evictions, the selection-saturation events a full limit produced
-   (`limit_saturated`), bind requests the engine refused with the record left
-   unrealized (`exhaustion_refusals`), and per-kind reader-state restorations
-   (selection, reasoning scroll, conversation anchor). Arena cells are the
-   monotone set of slot/surface positions that
-   have ever owned a HWND plus the measurer (at most `4 * 512 + 1`); a destroyed
-   HWND recreates its existing cell. Current HWND count and its peak are derived
-   from live handles, so recreation cannot inflate either arena diagnostic.
+In bounded mode, the fixed-point realize/measure loop binds actionable records
+in the strict viewport plus the 300-DIP overscan band, then protects Tier-A
+streaming or focused records anywhere and admits the newest 24 Tier-B
+debt-bearing or expanded-reasoning records. Shape-aware selection prefers
+matching reusable slots and consumes pristine slots last. `slot_limit` starts
+at zero and only rises to the governed requirement:
+`ceil(page/h_min)+1 + ceil((2*overscan)/h_min) + 2 Tier-A + 24 Tier-B + 2
+spares`, clamped to the 512-slot arena. Every bounded selection stays inside
+that limit. Existing bound slots are not continuously trimmed merely because a
+Tier-B record falls outside the 24-record membership allowance. Only a failed
+selection at the raised limit can force-evict the oldest LRU off-window,
+non-Tier-A binding; viewport and Tier-A bindings are not forced victims.
+
+Heights are consumed as exact only when their stamp still matches width, DPI,
+theme epoch, identity, shape, binding certification and debt state. Estimates
+never certify geometry and are retried. All scroll, reveal and selection paths
+run the realization loop before placement, so strict-visible records are
+realized. While interactive resizing is active, strictly off-screen records
+keep their previous heights with stale stamps, strict-visible records continue
+to measure, and `WM_EXITSIZEMOVE` performs the settling render. A surface gets
+at most one creation or destructive-write attempt per render epoch; missing
+surfaces retry on later rendering, a streaming delta, the re-armed one-shot
+flush and the one-second sweep. A missing resize notification uses a flagged
+line-count estimate, and a missing measurer uses an arithmetic estimate, both
+followed by later exact retries. `TranscriptStats` exposes bind, reuse,
+eviction, HWND, measurement, retry, convergence, capacity and reader-state
+diagnostics; it is not a wall-clock acceptance limit. At most `4 * 512 + 1`
+arena cells can ever have HWNDs (four cells per slot plus the measurer); live
+and peak counts derive from live handles, so a recreated handle does not grow
+that arena accounting.
 
 ### Reader position: follow mode, anchors and switching
 
@@ -209,6 +187,21 @@ successful restoration — applied after the placement transactions, which
 reset a re-shown reasoning viewport's inner scroll — so a failed surface
 creation retains them for the next render's retry.
 
+### Recycling state boundaries
+
+Ordinary unbinding and reuse preserve the record's rendered identity,
+measurement state, deferred-write debt and session view state; a nonempty
+surface selection and a live reasoning viewport's inner scroll are captured
+before eviction and restored after the same message instance is rebound.
+Forced eviction uses the same record-owned captures, including across a failed
+rebind, and never changes `reasoning_open`. A replacement message or a switch
+to a different conversation invalidates the old surface identity and does not
+transfer its deferred writes, selection or reasoning content to the new
+message. Empty selections and a non-live reasoning viewport have no capture.
+Reasoning content, duration and message identities are persisted; selections,
+inner reasoning scroll, follow anchors, search results and reasoning expansion
+are session view state and are not persisted across restart.
+
 Reader focus is tracked through the Rich Edit `EN_SETFOCUS`/`EN_KILLFOCUS`
 notifications arriving over `WM_COMMAND` (no event-mask bit is required).
 When a focused surface is about to be hidden, invalidated, rebound,
@@ -220,8 +213,8 @@ teardown transfers focus to the top-level window in `WM_CLOSE`
 immediately before `DestroyWindow`, so no transcript child is ever
 destroyed while it holds keyboard focus.
 
-Off-screen geometry is measured exactly through one shared measurement
-surface: a read-only Rich Edit block, child of the transcript container, kept
+Off-screen geometry is measured through one shared measurement surface: a
+read-only Rich Edit block, child of the transcript container, kept
 `WS_VISIBLE` but parked at `TRANSCRIPT_MEASURE_OFFX` beyond the client's right
 edge so the container clips it away entirely. A truly hidden Rich Edit stops
 re-laying-out its text — `EM_REQUESTRESIZE` then answers from the stale,
@@ -273,10 +266,10 @@ sweep and the next render are the additional retry paths.
 A scheduled flush that fires while the body holds a selection is deferred
 through the pending-write path instead of destroying the range. Incomplete
 syntax renders literally while it streams. A rebuild relayouts only from the
-streaming turn and follows the transcript scroll only while the reader stays
-pinned to the bottom. Terminal metadata updates its own surface without
-rewriting the body, and unchanged child windows are not repositioned or shown
-again.
+streaming turn and follows only when the stored follow mode is `BOTTOM`.
+Terminal metadata updates its own surface without rewriting the body. Skipping
+a destructive content write does not skip placement or visibility
+reconciliation for a live surface.
 
 Metadata is a terminal-state footer only: a compact muted line
 (`Complete · TTFT 18.0s · 19.4s · 44 in / 1,365 out · $0.00165`) with the model
@@ -326,7 +319,7 @@ Deltas update that assistant response in place. Late events are discarded.
 | --- | --- |
 | Complete | `[DONE]` received, nonempty text, no provider error. Provider `length` remains Complete with its finish reason visible. |
 | Cancelled | User requested Stop, including when a queued DONE races with Stop. Partial text is retained. |
-| Interrupted | Window closed, a running response was recovered after a crash, connection ended during a response, `[DONE]` was missing, or the local text limit was reached. |
+| Interrupted | Window closed, a running response was recovered after a crash, connection ended during a response, `[DONE]` was missing, or appending streamed content failed. |
 | Failed | Request could not start, API/provider/decoding error, missing terminal event, or completed without text. Partial text is retained. |
 
 Retry is available for the latest failed/cancelled/interrupted response (or a user
@@ -521,10 +514,10 @@ corruption, not a resource condition, and fails the whole snapshot. Any
 present-but-invalid id — zero, negative, fractional, a string, above the
 stored counter, duplicated or globally colliding — is corruption and rejects
 the snapshot, which then falls back to the backup/complete-temporary recovery
-below; there is no tolerant or self-repairing interpretation. A downgrade
-(removing `"id"` fields and rewriting the checksum) is always loadable again,
-but the identity values are gone and a fresh migration assigns new ids above
-the stored counter.
+below; there is no tolerant or self-repairing interpretation. An accepted
+id-less snapshot (for example, one whose message `"id"` fields were removed and
+whose checksum was recomputed) receives fresh IDs above the stored counter;
+this is identity migration, not compatibility with an older executable.
 Decoding reserves backing storage for each
 conversation's declared message count, but a slot counts as live only once it
 has been zeroed and construction has begun, so the quarantine disposes exactly
@@ -540,8 +533,30 @@ storage or a cross-machine synchronization format.
 
 ## Verification
 
-`chat.bat test` runs the chat/UI/Unicode/SSE split-boundary tests listed below,
-then the DarkUI toolkit suite (`build.bat test`). It includes:
+`chat.bat test` runs `test_sse`, `test_json`, `test_chat`, `test_markdown`,
+`test_markdown_win`, `test_transcript_slots`, `test_chat_ui`, `test_lifecycle`,
+`test_context`, `test_transcript_policy`, `test_search`, `test_storage`,
+`test_openrouter` and `test_chat_host`, then the DarkUI toolkit suite through
+`build.bat test`. The relevant final-regression inventory is:
+
+- `test_chat`: the 512-message cap, transactional dynamic-array growth,
+  inline-to-overflow boundaries and failures, replacement at the cap, and
+  deep snapshot copy/isolation.
+- `test_storage`: format-1/2 migration, format-3 512-message and long-overflow
+  round trips, over-cap rejection, ID validation/migration, recovery and
+  unsupported-version fail-closed behavior.
+- `test_transcript_policy` and `test_transcript_slots`: visibility/protection,
+  shape-aware slot and forced-victim policy, raise-only capacity formula and
+  limits, plus the one-allocation slot arena lifecycle.
+- `test_chat_host` (`default_suite`, `seam_toggle_suite`, `bounded_suite`):
+  real hidden-HWND integration for recycling, foreign-content prevention,
+  exact/estimated measurement and retries, resize/DPI settling, streaming and
+  deferred writes, BOTTOM/FREE anchoring, search reveal, focus transfer, and
+  forced-eviction restoration. The bounded suite asserts visible realization,
+  bound slots no greater than `slot_limit`, created HWNDs no greater than
+  `4 * slot_limit + 1`, and zero exhaustion refusals in its saturation case.
+
+The complete coverage includes:
 
 - Lifecycle state transitions, retry/regenerate/edit replacement, full-capacity
   retries, stable IDs after rename/clear/delete, and bounded model history.
@@ -649,13 +664,12 @@ then the DarkUI toolkit suite (`build.bat test`). It includes:
   selections are preserved, destructive reformatting of selected text is
   deferred until the selection clears, and switching conversations replaces
   content immediately. Streaming reasoning appends preserve a selection.
-- A maximum-length 512-message transcript renders with a bounded, stable
-  number of native controls: re-rendering and streaming one turn realize no
-  additional
-  controls, off-screen controls are hidden rather than recycled, and an unchanged
-  historical turn keeps its content and selection through the stream, the
-  scheduled flush and the terminal render. Render time and control counts are
-  recorded by the test, not asserted as a wall-clock threshold.
+- The retain-all compatibility fixture verifies a maximum-length 512-message
+  transcript's stable controls and selection through streaming, the scheduled
+  flush and terminal rendering. The bounded fixture verifies a window-shaped
+  realization set, recycled slots/HWND cells, bounded native-control counts,
+  revisit reuse and reader-state restoration. Render time and control counts are
+  recorded by tests, not asserted as wall-clock thresholds.
 - A scheduled flush renders a burst that then pauses without another delta,
   defers (without destroying the range) when the body holds a selection and
   applies it when the range clears, does not force-follow a reader scrolled up
@@ -727,14 +741,15 @@ isolated directories under `build`, not the user's conversation store. Search
 matching, snippets, invalidation, stable-ID resolution and hidden-host jumps are
 also covered.
 
-Remaining limits: 128 conversations, 512 messages each, and a 128 MB on-disk
+Remaining limits: 128 conversations, 512 messages each, and a 128 MB serialized
 snapshot bound. The conversation cap fails closed — the New button disables and
 creation is refused; nothing is ever evicted. Snapshots declaring more than 128
 conversations are rejected as corruption (the backup recovery path still
 applies). The composer, drafts and the system prompt are bounded at 16,383
 UTF-16 code units; each message keeps only a 255-unit inline residue, and
 message text past it (streamed replies) lives in heap-backed overflow storage,
-so its ceiling is memory and the snapshot bound rather than a fixed count. A
+so it has no fixed per-message length cap. The on-disk snapshot limit constrains
+successful persistence, not live heap usage. A
 fixed-residue amplification gate bounds the structural copies a save can hold
 (live, pending, in-flight and constructing) at the 512-message bound
 to ≤ 1 GiB of fixed struct/slack cost; heap-backed live text is excluded.
@@ -743,9 +758,9 @@ no index): a maximum store of 65,536 messages can require roughly 2.15 billion
 prior-id comparisons, a known scaling risk deferred to a future pass. A
 request sends at most the 64 KiB context budget and drops the oldest eligible
 history beyond it; the budget is a local proxy for prompt size, not a model's
-context window. Responses past the local limit stop as Interrupted without
-silently claiming success. Conversation search is an on-demand scan with no
-persisted or background index. Full model-catalog autocomplete and response
-variants remain outside this pass. Interactive clipboard/IME behavior,
+context window. An allocation failure while appending streamed content retains
+the partial response as Interrupted. Conversation search is an on-demand scan
+with no persisted or background index. Full model-catalog autocomplete and
+response variants remain outside this pass. Interactive clipboard/IME behavior,
 modal-dialog appearance and physical multi-monitor DPI transitions still need a
 manual desktop check; hidden-HWND tests do not substitute for that visual review.
