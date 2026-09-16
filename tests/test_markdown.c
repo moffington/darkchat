@@ -31,16 +31,36 @@ static void render_ok(const wchar_t *src, MdDocument *d, const char *what) {
     check(markdown_render(src, d), what);
 }
 
+static bool style_is(const MdRun *run, unsigned style) {
+    return run && run->style == style;
+}
+
 int main(void) {
+    check((MD_STYLE_MONO & MD_STYLE_CODE) == 0,
+        "mono and code flags do not overlap");
     { /* Plain text stays one coalesced run, newlines included. */
         MdDocument d; render_ok(L"Hello world", &d, "plain renders");
         text_is(&d, L"Hello world", "plain text unchanged");
-        check(d.run_count == 1, "plain is a single run");
+        check(d.run_count == 1 && d.runs[0].style == 0,
+            "plain is a single unstyled run");
         markdown_dispose(&d);
     }
     { MdDocument d; render_ok(L"a\nb\r\n\rc", &d, "newline forms render");
         text_is(&d, L"a\nb\n\nc", "CRLF/CR normalized to LF");
-        check(d.run_count == 1, "breaks coalesce into the plain run");
+        check(d.run_count == 1 && d.runs[0].style == 0,
+            "breaks coalesce into the plain run");
+        markdown_dispose(&d); }
+    { /* Identical adjacent styles coalesce; differing complete styles do not. */
+        MdDocument d; render_ok(L"**a****b**~~c~~", &d,
+            "adjacent style runs render");
+        text_is(&d, L"abc", "adjacent markers removed");
+        check(d.run_count == 2, "only identical adjacent styles coalesce");
+        check(d.run_count == 2 && d.runs[0].length == 2 &&
+            d.runs[0].style == MD_STYLE_BOLD,
+            "adjacent bold runs coalesce exactly");
+        check(d.run_count == 2 && d.runs[1].length == 1 &&
+            d.runs[1].style == MD_STYLE_STRIKE,
+            "different style value starts a new run");
         markdown_dispose(&d); }
     { /* Empty and NULL sources succeed with an empty document. */
         MdDocument d; render_ok(L"", &d, "empty renders");
@@ -58,9 +78,11 @@ int main(void) {
         const MdRun *h1 = run_over(&d, L"One");
         const MdRun *h3 = run_over(&d, L"Three");
         const MdRun *h4 = run_over(&d, L"Four");
-        check(h1 && h1->bold && h1->heading == 1, "h1 bold level 1");
-        check(h3 && h3->bold && h3->heading == 3, "h3 bold level 3");
-        check(h4 && !h4->bold && h4->heading == 0, "h4 literal");
+        check(style_is(h1, MD_STYLE_BOLD) && h1->heading == 1,
+            "h1 bold level 1");
+        check(style_is(h3, MD_STYLE_BOLD) && h3->heading == 3,
+            "h3 bold level 3");
+        check(style_is(h4, 0) && h4->heading == 0, "h4 literal");
         markdown_dispose(&d); }
     { /* Emphasis, with word-internal delimiters staying literal. */
         MdDocument d;
@@ -73,22 +95,23 @@ int main(void) {
         const MdRun *it = run_over(&d, L"it");
         const MdRun *ul = run_over(&d, L"ul");
         const MdRun *snake = run_over(&d, L"snake_case_name");
-        check(bold && bold->bold && !bold->italic, "bold run");
-        check(it && it->italic && !it->bold, "italic run");
-        check(ul && ul->italic && !ul->bold, "underscore italic run");
-        check(snake && !snake->italic && !snake->bold, "identifier literal");
+        check(style_is(bold, MD_STYLE_BOLD), "bold run");
+        check(style_is(it, MD_STYLE_ITALIC), "italic run");
+        check(style_is(ul, MD_STYLE_ITALIC), "underscore italic run");
+        check(style_is(snake, 0), "identifier literal");
         markdown_dispose(&d); }
     { /* Malformed emphasis is preserved verbatim. */
         MdDocument d; render_ok(L"a **bold b *open c", &d, "malformed renders");
         text_is(&d, L"a **bold b *open c", "malformed kept literally");
-        check(d.run_count == 1, "malformed is one plain run");
+        check(d.run_count == 1 && d.runs[0].style == 0,
+            "malformed is one plain run");
         markdown_dispose(&d); }
     { /* Inline code wins over emphasis and keeps its content raw. */
         MdDocument d; render_ok(L"x `*a*` y", &d, "code renders");
         text_is(&d, L"x *a* y", "code content raw");
         const MdRun *code = run_over(&d, L"*a*");
-        check(code && code->mono && code->code && !code->italic,
-            "code run mono, not italic");
+        check(style_is(code, MD_STYLE_MONO | MD_STYLE_CODE),
+            "code run is exactly mono and code");
         markdown_dispose(&d); }
     { /* Paired tildes strike non-space content and compose with outer styles. */
         MdDocument d;
@@ -100,11 +123,12 @@ int main(void) {
         const MdRun *bold = run_over(&d, L"bold");
         const MdRun *code = run_over(&d, L"code");
         const MdRun *link = run_over(&d, L"link (https://x.io/a)");
-        check(old && old->strike && !old->bold, "plain strike run");
-        check(bold && bold->strike && bold->bold, "bold strike run");
-        check(code && code->strike && code->mono && code->code,
+        check(style_is(old, MD_STYLE_STRIKE), "plain strike run");
+        check(style_is(bold, MD_STYLE_BOLD | MD_STYLE_STRIKE),
+            "bold strike run");
+        check(style_is(code, MD_STYLE_STRIKE | MD_STYLE_MONO | MD_STYLE_CODE),
             "code inside strike keeps styles");
-        check(link && link->strike, "link inside strike keeps style");
+        check(style_is(link, MD_STYLE_STRIKE), "link inside strike keeps style");
         markdown_dispose(&d); }
     { /* Unmatched, spaced and escaped paired tildes stay literal. */
         MdDocument d;
@@ -112,17 +136,17 @@ int main(void) {
             "literal tildes render");
         text_is(&d, L"~one~ ~~ open~~",
             "invalid strike syntax literal");
-        check(d.run_count == 1 && !d.runs[0].strike,
+        check(d.run_count == 1 && d.runs[0].style == 0,
             "invalid strike has no style");
         markdown_dispose(&d);
         render_ok(L"~~open ~~", &d, "trailing-space strike renders");
         text_is(&d, L"~~open ~~", "trailing-space strike literal");
-        check(d.run_count == 1 && !d.runs[0].strike,
+        check(d.run_count == 1 && d.runs[0].style == 0,
             "trailing-space strike has no style");
         markdown_dispose(&d);
         render_ok(L"\\~~escaped~~", &d, "escaped strike renders");
         text_is(&d, L"~~escaped~~", "escaped strike literal");
-        check(d.run_count == 1 && !d.runs[0].strike,
+        check(d.run_count == 1 && d.runs[0].style == 0,
             "escaped strike has no style");
         markdown_dispose(&d); }
     { /* Inline and fenced code shield tildes from strikethrough parsing. */
@@ -132,10 +156,10 @@ int main(void) {
         text_is(&d, L"~~inline~~\n~~fenced~~", "code tildes retained");
         const MdRun *inline_code = run_over(&d, L"~~inline~~");
         const MdRun *fenced_code = run_over(&d, L"~~fenced~~");
-        check(inline_code && inline_code->mono && !inline_code->strike,
+        check(style_is(inline_code, MD_STYLE_MONO | MD_STYLE_CODE),
             "inline code is not struck");
-        check(fenced_code && fenced_code->mono && fenced_code->code &&
-            !fenced_code->strike, "fenced code is not struck");
+        check(style_is(fenced_code, MD_STYLE_MONO | MD_STYLE_CODE),
+            "fenced code is not struck");
         markdown_dispose(&d); }
     { /* Fenced code: markers and language tag hidden, content literal. */
         MdDocument d; render_ok(L"before\n```c\nint x; // *not*\n```\nafter",
@@ -143,16 +167,18 @@ int main(void) {
         text_is(&d, L"before\nint x; // *not*\nafter",
             "fence lines removed, content raw");
         const MdRun *code = run_over(&d, L"int x;");
-        check(code && code->mono && code->code, "fence run mono+code");
+        check(style_is(code, MD_STYLE_MONO | MD_STYLE_CODE),
+            "fence run mono+code");
         const MdRun *after = run_over(&d, L"after");
-        check(after && !after->mono && !after->code, "text after fence plain");
+        check(style_is(after, 0), "text after fence plain");
         check(wcsstr(d.text, L"c\n") == NULL, "language tag hidden");
         markdown_dispose(&d); }
     { /* Unterminated fence keeps the rest as literal code. */
         MdDocument d; render_ok(L"```js\nlet x = 1;", &d, "open fence renders");
         text_is(&d, L"let x = 1;", "open fence content kept");
         const MdRun *code = run_over(&d, L"let x = 1;");
-        check(code && code->mono && code->code, "open fence run mono+code");
+        check(style_is(code, MD_STYLE_MONO | MD_STYLE_CODE),
+            "open fence run mono+code");
         markdown_dispose(&d); }
     { /* HTTP(S) links become "label (url)"; other schemes stay literal. */
         MdDocument d;
@@ -171,26 +197,27 @@ int main(void) {
         MdDocument d; render_ok(L"> quoted **bold** text", &d, "quote renders");
         text_is(&d, L"\u258C quoted bold text", "quote bar and content");
         const MdRun *q = run_over(&d, L"quoted ");
-        check(q && q->muted, "quote run muted");
+        check(style_is(q, MD_STYLE_MUTED), "quote run muted");
         const MdRun *bold = run_over(&d, L"bold");
-        check(bold && bold->bold && bold->muted, "quote inline styles nest");
+        check(style_is(bold, MD_STYLE_BOLD | MD_STYLE_MUTED),
+            "quote inline styles nest");
         markdown_dispose(&d); }
     { /* Escapes keep punctuation literal. */
         MdDocument d; render_ok(L"\\*not emphasis\\* and \\`code\\`",
             &d, "escapes render");
         text_is(&d, L"*not emphasis* and `code`", "escaped markers literal");
         const MdRun *r = run_over(&d, L"not emphasis");
-        check(r && !r->italic, "escaped star not emphasis");
+        check(style_is(r, 0), "escaped star not emphasis");
         markdown_dispose(&d); }
     { /* Emphasis nests around code and links. */
         MdDocument d;
         render_ok(L"**bold `code` and [l](https://x.io/a) tail**",
             &d, "nesting renders");
         const MdRun *code = run_over(&d, L"code");
-        check(code && code->mono && code->code && code->bold,
+        check(style_is(code, MD_STYLE_BOLD | MD_STYLE_MONO | MD_STYLE_CODE),
             "code inside bold keeps both");
         const MdRun *l = run_over(&d, L"l (https://x.io/a)");
-        check(l && l->bold, "link inside bold");
+        check(style_is(l, MD_STYLE_BOLD), "link inside bold");
         markdown_dispose(&d); }
     { /* Long input completes with linear work. */
         size_t n = 100000;
@@ -203,7 +230,7 @@ int main(void) {
             MdDocument d; render_ok(src, &d, "long renders");
             check(d.length == n + 2, "long length exact");
             const MdRun *bold = run_over(&d, L"b");
-            check(bold && bold->bold, "long tail bold");
+            check(style_is(bold, MD_STYLE_BOLD), "long tail bold");
             markdown_dispose(&d);
             free(src);
         } }
@@ -219,8 +246,8 @@ int main(void) {
         markdown_dispose(&d); }
     markdown_dispose(NULL);
     if (failures) { printf("%d markdown test(s) failed\n", failures); return 1; }
-    puts("Markdown parser: headings, emphasis, strikethrough, code, fences, "
-        "links, lists, quotes, escapes, CRLF, long input and allocation "
-        "fallback passed");
+    puts("Markdown parser: flags, coalescing, headings, emphasis, "
+        "strikethrough, code, fences, links, lists, quotes, escapes, CRLF, "
+        "long input and allocation fallback passed");
     return 0;
 }

@@ -67,8 +67,8 @@ void rich_text_theme(RichTextTheme *theme, const UiTheme *ui) {
     theme->small_size = ui->font_size[UI_SMALL];
 }
 
-static void apply_format(RichTextControl *control, WPARAM scope, bool bold,
-    bool italic, bool strike, bool mono, COLORREF color, bool code, float size) {
+static void apply_format(RichTextControl *control, WPARAM scope, unsigned style,
+    COLORREF color, float size) {
     const RichTextTheme *theme = &control->theme;
     CHARFORMAT2W format;
     memset(&format, 0, sizeof format);
@@ -78,20 +78,22 @@ static void apply_format(RichTextControl *control, WPARAM scope, bool bold,
        text. */
     format.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE | CFM_BOLD | CFM_WEIGHT |
         CFM_ITALIC | CFM_STRIKEOUT | CFM_BACKCOLOR;
-    format.dwEffects = (bold ? CFE_BOLD : 0) | (italic ? CFE_ITALIC : 0) |
-        (strike ? CFE_STRIKEOUT : 0);
-    format.wWeight = (WORD)(bold ? 700 : 400);
+    format.dwEffects = (style & MD_STYLE_BOLD ? CFE_BOLD : 0) |
+        (style & MD_STYLE_ITALIC ? CFE_ITALIC : 0) |
+        (style & MD_STYLE_STRIKE ? CFE_STRIKEOUT : 0);
+    format.wWeight = (WORD)(style & MD_STYLE_BOLD ? 700 : 400);
     format.crTextColor = color;
     /* yHeight is in twips (1/1440 inch), a physical unit the control already
        converts for the monitor DPI. Express the theme's DIP size as twips
        (1 DIP = 0.75 pt = 15 twips) so native text matches DarkUI at any DPI. */
     format.yHeight = (LONG)(size * 15.0f + 0.5f);
     if (format.yHeight < 1) format.yHeight = 1;
-    const wchar_t *face = mono ? theme->mono_family : theme->ui_family;
+    const wchar_t *face = style & MD_STYLE_MONO ? theme->mono_family :
+        theme->ui_family;
     wcsncpy(format.szFaceName, face, LF_FACESIZE - 1);
     format.szFaceName[LF_FACESIZE - 1] = 0;
     format.bCharSet = DEFAULT_CHARSET;
-    format.crBackColor = code ? theme->code_background :
+    format.crBackColor = style & MD_STYLE_CODE ? theme->code_background :
         control->surface_background;
     SendMessageW(control->window, EM_SETCHARFORMAT, scope, (LPARAM)&format);
 }
@@ -102,18 +104,17 @@ static void caret_end(HWND window) {
 }
 
 /* Inserts text at the caret using an explicit point size. */
-static void run_at(RichTextControl *control, const wchar_t *text, bool bold,
-    bool mono, COLORREF color, bool code, float size) {
-    apply_format(control, SCF_SELECTION, bold, false, false, mono, color, code,
-        size);
+static void run_at(RichTextControl *control, const wchar_t *text, unsigned style,
+    COLORREF color, float size) {
+    apply_format(control, SCF_SELECTION, style, color, size);
     SendMessageW(control->window, EM_REPLACESEL, FALSE, (LPARAM)text);
 }
 
 /* Inserts text at the caret using the default face for its role. */
-static void run(RichTextControl *control, const wchar_t *text, bool bold,
-    bool mono, COLORREF color, bool code) {
-    run_at(control, text, bold, mono, color, code,
-        mono ? control->theme.mono_size : control->theme.ui_size);
+static void run(RichTextControl *control, const wchar_t *text, unsigned style,
+    COLORREF color) {
+    run_at(control, text, style, color,
+        style & MD_STYLE_MONO ? control->theme.mono_size : control->theme.ui_size);
 }
 
 static LRESULT CALLBACK rich_proc(HWND window, UINT message, WPARAM w,
@@ -210,8 +211,7 @@ static bool create_control(RichTextControl *control, HWND parent, int id,
     SendMessageW(control->window, EM_SETEDITSTYLE, SES_EXTENDBACKCOLOR,
         SES_EXTENDBACKCOLOR);
     if (multiline) SendMessageW(control->window, EM_SETTARGETDEVICE, 0, 0);
-    apply_format(control, SCF_DEFAULT, false, false, false, false, theme->text,
-        false, theme->ui_size);
+    apply_format(control, SCF_DEFAULT, 0, theme->text, theme->ui_size);
     set_margin(control, multiline ? 10 : 8, multiline ? 10 : 8);
     return true;
 }
@@ -253,8 +253,8 @@ bool rich_text_create_field_limit(RichTextControl *control, HWND parent, int id,
 void rich_text_set_dpi(RichTextControl *control, float dpi) {
     if (!control->window || dpi <= 0) return;
     control->dpi = dpi;
-    apply_format(control, SCF_DEFAULT, false, false, false, false,
-        control->theme.text, false, control->theme.ui_size);
+    apply_format(control, SCF_DEFAULT, 0, control->theme.text,
+        control->theme.ui_size);
     set_margin(control, control->multiline ? 10 : 8, control->multiline ? 10 : 8);
 }
 
@@ -359,12 +359,12 @@ static void write_literal(RichTextControl *control, const wchar_t *text,
         const wchar_t *end = line;
         while (*end && *end != L'\n' && *end != L'\r') ++end;
         size_t length = (size_t)(end - line);
-        if (!first) run(control, L"\n", false, false, color, false);
+        if (!first) run(control, L"\n", 0, color);
         wchar_t *buffer = (wchar_t *)malloc((length + 1) * sizeof(wchar_t));
         if (buffer) {
             if (length) wmemcpy(buffer, line, length);
             buffer[length] = 0;
-            run(control, buffer, false, false, color, false);
+            run(control, buffer, 0, color);
             free(buffer);
         }
         first = false;
@@ -397,14 +397,13 @@ void rich_text_set_markdown(RichTextControl *control, ChatRole role,
             range.cpMin = (LONG)r->offset;
             range.cpMax = (LONG)(r->offset + r->length);
             SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&range);
-            COLORREF color = r->code ? theme->code_text :
-                r->muted ? theme->muted : body;
-            float size = r->mono ? theme->mono_size :
+            COLORREF color = r->style & MD_STYLE_CODE ? theme->code_text :
+                r->style & MD_STYLE_MUTED ? theme->muted : body;
+            float size = r->style & MD_STYLE_MONO ? theme->mono_size :
                 r->heading == 1 ? theme->ui_size + 3.0f :
                 r->heading == 2 ? theme->ui_size + 2.0f :
                 r->heading == 3 ? theme->ui_size + 1.0f : theme->ui_size;
-            apply_format(control, SCF_SELECTION, r->bold, r->italic, r->strike,
-                r->mono, color, r->code, size);
+            apply_format(control, SCF_SELECTION, r->style, color, size);
         }
         markdown_dispose(&document);
         caret_end(control->window);
@@ -427,10 +426,10 @@ void rich_text_set_head(RichTextControl *control, ChatRole role,
     if (!control || !control->window) return;
     const RichTextTheme *theme = &control->theme;
     begin_write(control);
-    run(control, role_label(role), true, false, role_color(theme, role), false);
+    run(control, role_label(role), MD_STYLE_BOLD, role_color(theme, role));
     if (row && row[0]) {
-        run(control, L"\n", false, false, theme->text, false);
-        run(control, row, false, false, theme->muted, false);
+        run(control, L"\n", 0, theme->text);
+        run(control, row, 0, theme->muted);
     }
     end_write(control);
 }
@@ -440,9 +439,9 @@ void rich_text_set_block(RichTextControl *control, ChatRole role,
     if (!control || !control->window) return;
     const RichTextTheme *theme = &control->theme;
     begin_write(control);
-    run(control, role_label(role), true, false, role_color(theme, role), false);
+    run(control, role_label(role), MD_STYLE_BOLD, role_color(theme, role));
     if (text && text[0]) {
-        run(control, L"\n", false, false, theme->text, false);
+        run(control, L"\n", 0, theme->text);
         write_literal(control, text,
             role == CHAT_ROLE_ERROR ? theme->error : theme->text);
     }
@@ -457,7 +456,7 @@ void rich_text_append_body(RichTextControl *control, const wchar_t *text) {
     SendMessageW(window, WM_SETREDRAW, FALSE, 0);
     SendMessageW(window, EM_SETREADONLY, FALSE, 0);
     caret_end(window);
-    run(control, text, false, false, control->theme.text, false);
+    run(control, text, 0, control->theme.text);
     SendMessageW(window, EM_SETREADONLY, control->readonly ? TRUE : FALSE, 0);
     control->has_content = true;
     /* The transcript owns answer scrolling. Keep the block at its origin and
@@ -474,14 +473,12 @@ void rich_text_set_meta(RichTextControl *control, const wchar_t *text,
     if (!control || !control->window) return;
     begin_write(control);
     if (text && text[0])
-        run_at(control, text, false, false, control->theme.muted, false,
-            control->theme.small_size);
+        run_at(control, text, 0, control->theme.muted, control->theme.small_size);
     if (error && error[0]) {
         if (text && text[0])
-            run_at(control, L"\n", false, false, control->theme.text, false,
+            run_at(control, L"\n", 0, control->theme.text,
                 control->theme.small_size);
-        run_at(control, error, false, false, control->theme.error, false,
-            control->theme.small_size);
+        run_at(control, error, 0, control->theme.error, control->theme.small_size);
     }
     end_write(control);
 }
@@ -492,7 +489,7 @@ void rich_text_set_reasoning(RichTextControl *control, const wchar_t *text) {
     SendMessageW(window, EM_SETREADONLY, FALSE, 0);
     SetWindowTextW(window, L"");
     caret_end(window);
-    run(control, text ? text : L"", false, false, control->theme.muted, false);
+    run(control, text ? text : L"", 0, control->theme.muted);
     SendMessageW(window, EM_SETREADONLY, control->readonly ? TRUE : FALSE, 0);
     control->has_content = text && text[0];
     rich_text_scroll_to_end(control);
@@ -507,7 +504,7 @@ void rich_text_append_reasoning(RichTextControl *control, const wchar_t *text) {
     bool pinned = rich_text_pinned(control);
     SendMessageW(window, EM_SETREADONLY, FALSE, 0);
     caret_end(window);
-    run(control, text, false, false, control->theme.muted, false);
+    run(control, text, 0, control->theme.muted);
     SendMessageW(window, EM_SETREADONLY, control->readonly ? TRUE : FALSE, 0);
     control->has_content = true;
     /* Follow the stream only while the reader stays pinned to the bottom;

@@ -24,7 +24,7 @@ void markdown_dispose(MdDocument *doc) {
 }
 
 typedef struct {
-    bool bold, italic, strike, mono, code, muted;
+    unsigned style;
     int heading;
 } MdStyle;
 
@@ -69,10 +69,7 @@ static void emit(MdBuilder *b, const wchar_t *text, size_t length, MdStyle s) {
     if (b->run_count) {
         MdRun *last = &b->runs[b->run_count - 1];
         if (last->offset + last->length == b->length &&
-            last->bold == s.bold && last->italic == s.italic &&
-            last->strike == s.strike && last->mono == s.mono &&
-            last->code == s.code &&
-            last->muted == s.muted && last->heading == s.heading) {
+            last->style == s.style && last->heading == s.heading) {
             wmemcpy(b->text + b->length, text, length);
             b->length += length;
             last->length += length;
@@ -84,21 +81,17 @@ static void emit(MdBuilder *b, const wchar_t *text, size_t length, MdStyle s) {
     MdRun *run = &b->runs[b->run_count++];
     run->offset = b->length;
     run->length = length;
-    run->bold = s.bold;
-    run->italic = s.italic;
-    run->strike = s.strike;
-    run->mono = s.mono;
-    run->code = s.code;
-    run->muted = s.muted;
+    run->style = s.style;
     run->heading = s.heading;
     b->length += length;
 }
 
 /* One paragraph break, styled with the surrounding context so code blocks
    coalesce across their lines. Skipped at the start of the document. */
-static void emit_break(MdBuilder *b, bool mono, bool code) {
+static void emit_break(MdBuilder *b, unsigned style) {
     if (!b->length) return;
-    MdStyle s = {false, false, false, mono, code, false, 0};
+    MdStyle s = {0};
+    s.style = style;
     emit(b, L"\n", 1, s);
 }
 
@@ -202,8 +195,7 @@ static void parse_inline(MdBuilder *b, const wchar_t *s, size_t n,
             if (close != MD_NPOS && close > i + 1) {
                 if (i > plain) emit(b, s + plain, i - plain, style);
                 MdStyle code = style;
-                code.mono = true;
-                code.code = true;
+                code.style |= MD_STYLE_MONO | MD_STYLE_CODE;
                 emit(b, s + i + 1, close - i - 1, code);
                 i = close + 1;
                 plain = i;
@@ -241,7 +233,7 @@ static void parse_inline(MdBuilder *b, const wchar_t *s, size_t n,
             if (close != MD_NPOS) {
                 if (i > plain) emit(b, s + plain, i - plain, style);
                 MdStyle inner = style;
-                inner.strike = true;
+                inner.style |= MD_STYLE_STRIKE;
                 parse_inline(b, s + i + 2, close - i - 2, inner);
                 i = close + 2;
                 plain = i;
@@ -259,8 +251,8 @@ static void parse_inline(MdBuilder *b, const wchar_t *s, size_t n,
                 if (close != MD_NPOS) {
                     if (i > plain) emit(b, s + plain, i - plain, style);
                     MdStyle inner = style;
-                    inner.bold = true;
-                    inner.italic = inner.italic || triple;
+                    inner.style |= MD_STYLE_BOLD;
+                    if (triple) inner.style |= MD_STYLE_ITALIC;
                     parse_inline(b, s + i + skip, close - i - skip, inner);
                     i = close + skip;
                     plain = i;
@@ -271,7 +263,7 @@ static void parse_inline(MdBuilder *b, const wchar_t *s, size_t n,
                 if (close != MD_NPOS) {
                     if (i > plain) emit(b, s + plain, i - plain, style);
                     MdStyle inner = style;
-                    inner.italic = true;
+                    inner.style |= MD_STYLE_ITALIC;
                     parse_inline(b, s + i + 1, close - i - 1, inner);
                     i = close + 1;
                     plain = i;
@@ -295,13 +287,14 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
     const wchar_t *c = line + indent;
     size_t m = n - indent;
     bool marker = m >= 3 && c[0] == L'`' && c[1] == L'`' && c[2] == L'`';
-    MdStyle plain = {false, false, false, false, false, false, 0};
+    MdStyle plain = {0};
     if (*fence) {
         if (marker) {
             *fence = false;                 /* closing fence is hidden */
         } else {
-            MdStyle code = {false, false, false, true, true, false, 0};
-            emit_break(b, true, true);
+            MdStyle code = {0};
+            code.style = MD_STYLE_MONO | MD_STYLE_CODE;
+            emit_break(b, code.style);
             emit(b, c, m, code);
         }
         return;
@@ -313,7 +306,7 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
     bool blank = true;
     for (size_t i = 0; i < m; i++) if (!is_space(c[i])) { blank = false; break; }
     if (blank) {
-        emit_break(b, false, false);
+        emit_break(b, 0);
         return;
     }
     if (c[0] == L'#') {
@@ -323,24 +316,26 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
             ((size_t)level == m || is_space(c[level]))) {
             size_t from = (size_t)level;
             while (from < m && is_space(c[from])) ++from;
-            emit_break(b, false, false);
-            MdStyle heading = {true, false, false, false, false, false, level};
+            emit_break(b, 0);
+            MdStyle heading = {0};
+            heading.style = MD_STYLE_BOLD;
+            heading.heading = level;
             parse_inline(b, c + from, m - from, heading);
             return;
         }
     } else if (c[0] == L'>' && (m == 1 || is_space(c[1]))) {
         size_t from = m == 1 ? m : 1;
         while (from < m && is_space(c[from])) ++from;
-        emit_break(b, false, false);
+        emit_break(b, 0);
         emit(b, L"\u258C ", 2, plain);      /* quote bar, muted content */
         MdStyle quoted = plain;
-        quoted.muted = true;
+        quoted.style |= MD_STYLE_MUTED;
         parse_inline(b, c + from, m - from, quoted);
         return;
     } else if ((c[0] == L'-' || c[0] == L'*') && m >= 2 && is_space(c[1])) {
         size_t from = 1;
         while (from < m && is_space(c[from])) ++from;
-        emit_break(b, false, false);
+        emit_break(b, 0);
         emit(b, L"\u2022 ", 2, plain);      /* textual bullet, no indent state */
         parse_inline(b, c + from, m - from, plain);
         return;
@@ -353,13 +348,13 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
             digits + 1 < m && is_space(c[digits + 1])) {
             size_t from = digits + 1;
             while (from < m && is_space(c[from])) ++from;
-            emit_break(b, false, false);
+            emit_break(b, 0);
             emit(b, c, digits + 2, plain);  /* ordered marker kept verbatim */
             parse_inline(b, c + from, m - from, plain);
             return;
         }
     }
-    emit_break(b, false, false);
+    emit_break(b, 0);
     parse_inline(b, c, m, plain);
 }
 

@@ -50,7 +50,7 @@ int main(void) {
         SWP_NOZORDER | SWP_NOACTIVATE);
     wchar_t text[512];
 
-    /* Style ranges: bold, mono face, code background, and italic unused. */
+    /* Style ranges: bold, mono face/size, code color/background, and italic. */
     rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
         L"Intro **bold** `code`");
     read_text(&probe, text, 512);
@@ -63,6 +63,8 @@ int main(void) {
     CHECK(!wcscmp(f.szFaceName, L"Segoe UI"));
     f = format_at(&probe, 12);                      /* "code" */
     CHECK(!wcscmp(f.szFaceName, L"Consolas"));
+    CHECK(f.yHeight == (LONG)(theme.mono_size * 15.0f + 0.5f));
+    CHECK(f.crTextColor == theme.code_text);
     CHECK((f.dwMask & CFM_BACKCOLOR) && f.crBackColor == theme.code_background);
 
     /* Strikethrough is set on its exact run and cleared after it. */
@@ -85,9 +87,9 @@ int main(void) {
         !wcscmp(f.szFaceName, L"Consolas") &&
         f.crBackColor == theme.code_background);
     f = format_at(&probe, 5);                       /* plain suffix */
-    CHECK(!(f.dwEffects & CFE_STRIKEOUT) &&
+    CHECK(!(f.dwEffects & (CFE_BOLD | CFE_ITALIC | CFE_STRIKEOUT)) &&
         !wcscmp(f.szFaceName, L"Segoe UI") &&
-        f.crBackColor == theme.background);
+        f.crBackColor == theme.background && f.crTextColor == theme.text);
 
     /* Background reset: text after a code run restores the surface. */
     rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"a `c` b");
@@ -112,6 +114,15 @@ int main(void) {
     f = format_at(&probe, 0);
     CHECK((f.dwEffects & CFE_BOLD) &&
         f.yHeight == (LONG)(13.0f * 15.0f + 0.5f)); /* h1 = ui_size + 3 */
+
+    /* Markdown muted content changes color without affecting the quote bar. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"> quote");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"\u258C quote"));
+    f = format_at(&probe, 0);
+    CHECK(f.crTextColor == theme.text);
+    f = format_at(&probe, 2);
+    CHECK(f.crTextColor == theme.muted);
 
     /* CRLF source: one paragraph break per pair, not two. */
     rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"one\r\n\r\ntwo");
@@ -174,8 +185,8 @@ int main(void) {
     DestroyWindow(probe.window);
     DestroyWindow(parent);
     rich_text_library_close();
-    puts("Markdown Rich Edit integration: style ranges, strikethrough, "
-        "background reset, CRLF, streaming-to-terminal, repeats, literal user "
-        "text, malformed/long input and allocation fallback passed");
+    puts("Markdown Rich Edit integration: flags, style ranges, strikethrough, "
+        "background reset, muted text, CRLF, streaming-to-terminal, repeats, "
+        "literal user text, malformed/long input and allocation fallback passed");
     return 0;
 }

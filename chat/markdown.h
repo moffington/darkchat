@@ -13,11 +13,20 @@
 #include <stddef.h>
 #include <wchar.h>
 
+typedef enum {
+    MD_STYLE_BOLD   = 1u << 0,
+    MD_STYLE_ITALIC = 1u << 1,
+    MD_STYLE_STRIKE = 1u << 2,
+    MD_STYLE_MONO   = 1u << 3,
+    MD_STYLE_CODE   = 1u << 4,
+    MD_STYLE_MUTED  = 1u << 5
+} MdStyleFlags;
+
 /* One styled span. Text lives in the document's own buffer; offset and length
    address it, so a run owns no memory of its own. */
 typedef struct {
     size_t offset, length;
-    bool bold, italic, strike, mono, code, muted;
+    unsigned style;
     int heading;        /* 0 = body text, 1..3 = heading */
 } MdRun;
 
