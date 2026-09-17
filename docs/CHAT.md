@@ -339,8 +339,11 @@ whitespace verbatim, tabs included, while a ninth quote or list level, a
 four-space indented root marker or any other unsupported prefix leaves the whole
 line literal; ordinary leading whitespace is preserved as text. Lazy
 continuation, indented code blocks, `+` bullets and fences inside quotes are not
-recognized. `[label](http(s)://…)` links render as `label (url)` so the native URL
-detector opens them. Precedence is
+recognized. `[label](http(s)://…)` links render as `label` with the destination
+recorded beside the styled runs and applied as link formatting; the display opens
+that stored destination from `EN_LINK`, while a bare URL the native detector
+recognizes still opens from its visible range. Malformed or non-HTTP(S) links
+stay verbatim. Precedence is
 fences → inline code → links → strikethrough → emphasis; escapes (`\*`) keep
 punctuation literal; malformed or unsupported
 syntax (tables, images, deeper rules) is preserved verbatim.

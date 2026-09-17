@@ -12,6 +12,12 @@
 #ifndef EM_AUTOURLDETECT
 #define EM_AUTOURLDETECT (WM_USER + 91)
 #endif
+/* Re-enabling detection without an initial document scan keeps link effects
+   this module already applied; the flag is documented but absent from older
+   headers. */
+#ifndef AURL_NOINITIALSCAN
+#define AURL_NOINITIALSCAN 256
+#endif
 #ifndef SES_EXTENDBACKCOLOR
 #define SES_EXTENDBACKCOLOR 0x00400000
 #endif
@@ -98,6 +104,23 @@ static void apply_format(RichTextControl *control, WPARAM scope, unsigned style,
     SendMessageW(control->window, EM_SETCHARFORMAT, scope, (LPARAM)&format);
 }
 
+/* Marks one label range as a link. The effect is set on its own mask, so the
+   run formatting that precedes it cannot clear it; the destination is resolved
+   through the control's transferred metadata when EN_LINK arrives. */
+static void apply_link(RichTextControl *control, LONG cpMin, LONG cpMax) {
+    CHARFORMAT2W format;
+    memset(&format, 0, sizeof format);
+    format.cbSize = sizeof format;
+    format.dwMask = CFM_LINK;
+    format.dwEffects = CFE_LINK;
+    CHARRANGE range;
+    range.cpMin = cpMin;
+    range.cpMax = cpMax;
+    SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&range);
+    SendMessageW(control->window, EM_SETCHARFORMAT, SCF_SELECTION,
+        (LPARAM)&format);
+}
+
 /* Layout columns to twips. Twips are DIP * 15 (the unit yHeight already uses),
    so the control converts them for the monitor DPI; one column is half an em,
    roughly the advance of the synthesized marker glyphs. */
@@ -166,11 +189,28 @@ static void run(RichTextControl *control, const wchar_t *text, unsigned style,
         style & MD_STYLE_MONO ? control->theme.mono_size : control->theme.ui_size);
 }
 
+/* Releases the control's Markdown link metadata. Every content mutation calls
+   it so stale ranges or destinations can never survive a write, and
+   WM_NCDESTROY calls it so nothing outlives the window. */
+static void clear_links(RichTextControl *control) {
+    free(control->links);
+    free(control->link_targets);
+    control->links = NULL;
+    control->link_count = 0;
+    control->link_targets = NULL;
+    control->link_targets_length = 0;
+}
+
 static LRESULT CALLBACK rich_proc(HWND window, UINT message, WPARAM w,
     LPARAM l) {
     RichTextControl *control =
         (RichTextControl *)GetWindowLongPtrW(window, GWLP_USERDATA);
     if (!control) return DefWindowProcW(window, message, w, l);
+    if (message == WM_NCDESTROY) {
+        clear_links(control);
+        control->window = NULL;
+        return CallWindowProcW(control->previous, window, message, w, l);
+    }
     if (message == WM_GETDLGCODE) return DLGC_WANTALLKEYS | DLGC_WANTCHARS;
     /* Read-only transcript blocks never consume the wheel: the transcript
        container decides whether to scroll a reasoning viewport or itself, so
@@ -316,9 +356,57 @@ void rich_text_get_text(const RichTextControl *control, wchar_t *out,
 }
 
 void rich_text_set_text(RichTextControl *control, const wchar_t *text) {
-    if (control->window) SetWindowTextW(control->window, text ? text : L"");
+    if (control->window) {
+        clear_links(control);
+        SetWindowTextW(control->window, text ? text : L"");
+    }
 }
 
+static void open_url_default(const wchar_t *url) {
+    ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+}
+
+/* Launch seam: production uses the shell; the integration suite substitutes a
+   capture so EN_LINK can be driven without starting a browser. */
+static void (*open_url_hook)(const wchar_t *url) = open_url_default;
+
+void rich_text_test_set_open(void (*open)(const wchar_t *url)) {
+    open_url_hook = open ? open : open_url_default;
+}
+
+/* Only HTTP(S) destinations are ever handed to the shell. */
+static bool is_http_url(const wchar_t *s, size_t n) {
+    static const wchar_t *schemes[2] = {L"https://", L"http://"};
+    for (int k = 0; k < 2; k++) {
+        size_t length = wcslen(schemes[k]);
+        if (n < length) continue;
+        size_t i = 0;
+        for (; i < length; i++) {
+            wchar_t c = s[i];
+            if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+            if (c != schemes[k][i]) break;
+        }
+        if (i == length) return true;
+    }
+    return false;
+}
+
+/* Opens one stored destination through its NUL-terminated arena entry. The
+   arena holds no length limit, so a long semantic URL stays usable; the range
+   is bounds-checked against the stored arena length and the scheme revalidated
+   before the shell is asked to open it. */
+static void open_target(const RichTextControl *control, const MdLink *link) {
+    size_t offset = link->target_offset;
+    size_t length = link->target_length;
+    if (length + 1 > control->link_targets_length) return;
+    if (offset > control->link_targets_length - (length + 1)) return;
+    const wchar_t *target = control->link_targets + offset;
+    if (target[length] != L'\0' || !is_http_url(target, length)) return;
+    open_url_hook(target);
+}
+
+/* Fallback for links the control detected itself (EM_AUTOURLDETECT): the URL
+   is visible text, so the range is read back and opened verbatim. */
 static void open_link(HWND window, const CHARRANGE *range) {
     int length = (int)(range->cpMax - range->cpMin);
     if (length <= 0 || length > 2048) return;
@@ -329,7 +417,7 @@ static void open_link(HWND window, const CHARRANGE *range) {
     text_range.lpstrText = buffer;
     SendMessageW(window, EM_GETTEXTRANGE, 0, (LPARAM)&text_range);
     buffer[length] = 0;
-    ShellExecuteW(NULL, L"open", buffer, NULL, NULL, SW_SHOWNORMAL);
+    open_url_hook(buffer);
     free(buffer);
 }
 
@@ -382,9 +470,14 @@ static COLORREF role_color(const RichTextTheme *theme, ChatRole role) {
 /* Clears the control and leaves it writable with the insertion point at the
    start, ready for a batch of runs. */
 static void begin_write(RichTextControl *control) {
+    clear_links(control);
     SendMessageW(control->window, WM_SETREDRAW, FALSE, 0);
     SendMessageW(control->window, EM_SETREADONLY, FALSE, 0);
     SetWindowTextW(control->window, L"");
+    /* Restore normal auto-URL scanning for the text about to be inserted: a
+       previous Markdown write may have re-enabled detection with no initial
+       scan, which skips recognizing URLs in later insertions. */
+    SendMessageW(control->window, EM_AUTOURLDETECT, TRUE, 0);
     caret_end(control->window);
     /* Paragraph defaults are cleared only after the control is empty: the one
        paragraph that remains is the one later text inherits from. */
@@ -424,6 +517,22 @@ static void write_literal(RichTextControl *control, const wchar_t *text,
         line = end + 1;
         if (*end == L'\r' && *line == L'\n') ++line;
     }
+}
+
+/* Takes ownership of a rendered document's link metadata: the label ranges and
+   the single destination arena move to the control, so the document no longer
+   owns them when it is disposed. */
+static void take_links(RichTextControl *control, MdDocument *document) {
+    control->links = document->links;
+    control->link_count = document->link_count;
+    control->link_targets = document->targets;
+    control->link_targets_length = document->targets_length;
+    document->links = NULL;
+    document->link_count = 0;
+    document->link_capacity = 0;
+    document->targets = NULL;
+    document->targets_length = 0;
+    document->targets_capacity = 0;
 }
 
 /* Terminal assistant body: parse once, insert the normalized document, then
@@ -466,6 +575,19 @@ void rich_text_set_markdown(RichTextControl *control, ChatRole role,
                 r->heading == 3 ? theme->ui_size + 1.0f : theme->ui_size;
             apply_format(control, SCF_SELECTION, r->style, color, size);
         }
+        if (document.link_count) {
+            /* Detection would strip a link effect that is not an autoURL, so
+               custom labels are applied with detection off and it is restored
+               without re-scanning, leaving both the labels and any bare URL
+               the insertion recognized. */
+            SendMessageW(control->window, EM_AUTOURLDETECT, FALSE, 0);
+            for (int i = 0; i < document.link_count; i++)
+                apply_link(control, (LONG)document.links[i].offset,
+                    (LONG)(document.links[i].offset + document.links[i].length));
+            SendMessageW(control->window, EM_AUTOURLDETECT,
+                (WPARAM)(AURL_ENABLEURL | AURL_NOINITIALSCAN), 0);
+        }
+        take_links(control, &document);
         markdown_dispose(&document);
         caret_end(control->window);
     }
@@ -511,6 +633,8 @@ void rich_text_set_block(RichTextControl *control, ChatRole role,
 
 void rich_text_append_body(RichTextControl *control, const wchar_t *text) {
     if (!control || !control->window || !text || !text[0]) return;
+    /* Appending only extends the end, so existing label ranges stay valid and
+       the transferred metadata is kept; the appended text starts no link. */
     HWND window = control->window;
     CHARRANGE selection;
     SendMessageW(window, EM_EXGETSEL, 0, (LPARAM)&selection);
@@ -546,6 +670,7 @@ void rich_text_set_meta(RichTextControl *control, const wchar_t *text,
 
 void rich_text_set_reasoning(RichTextControl *control, const wchar_t *text) {
     if (!control || !control->window) return;
+    clear_links(control);
     HWND window = control->window;
     SendMessageW(window, EM_SETREADONLY, FALSE, 0);
     SetWindowTextW(window, L"");
@@ -559,6 +684,7 @@ void rich_text_set_reasoning(RichTextControl *control, const wchar_t *text) {
 
 void rich_text_append_reasoning(RichTextControl *control, const wchar_t *text) {
     if (!control || !control->window || !text || !text[0]) return;
+    /* Appending only extends the end, so existing metadata stays valid. */
     HWND window = control->window;
     CHARRANGE selection;
     SendMessageW(window, EM_EXGETSEL, 0, (LPARAM)&selection);
@@ -574,11 +700,28 @@ void rich_text_append_reasoning(RichTextControl *control, const wchar_t *text) {
     SendMessageW(window, EM_EXSETSEL, 0, (LPARAM)&selection);
     RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
 }
+/* Resolves a notification range to a stored Markdown destination, or NULL when
+   the control detected the link itself (bare URL) and the visible text is the
+   destination. */
+static const MdLink *link_at(const RichTextControl *control,
+    const CHARRANGE *range) {
+    for (int i = 0; i < control->link_count; i++) {
+        const MdLink *link = &control->links[i];
+        if ((LONG)link->offset == range->cpMin &&
+            (LONG)(link->offset + link->length) == range->cpMax) return link;
+    }
+    return NULL;
+}
+
 bool rich_text_handle_notify(RichTextControl *control, LPARAM lparam) {
     NMHDR *header = (NMHDR *)lparam;
     if (header->code == EN_LINK) {
         ENLINK *link = (ENLINK *)lparam;
-        if (link->msg == WM_LBUTTONUP) open_link(control->window, &link->chrg);
+        if (link->msg == WM_LBUTTONUP) {
+            const MdLink *stored = link_at(control, &link->chrg);
+            if (stored) open_target(control, stored);
+            else open_link(control->window, &link->chrg);
+        }
         return true;
     }
     if (header->code == EN_VSCROLL) return true;

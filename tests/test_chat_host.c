@@ -844,6 +844,27 @@ static int default_suite(void) {
       SendMessageW(window,EM_SETSEL,0,1);
       SendMessageW(window,EM_GETPARAFORMAT,0,(LPARAM)&pf);
       CHECK(pf.dxStartIndent==0 && pf.dxOffset>0); }   /* bars hang the text */
+    /* ---- Link markdown streams through the same throttle: the fragmented
+       destination reassembles at the render, the live body shows the label
+       only, and the surface owns the link effect and destination. ---- */
+    add_turn(chat,L"seed",L"seed answer",NULL,-1);
+    begin_regenerate(h);
+    int link_turn=h->request_message;
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"[site](https://exa"));
+    { wchar_t body[128]; body_text(h,link_turn,body,128);
+      CHECK(!wcscmp(body,L"[site](https://exa")); }  /* incomplete: literal */
+    h->transcript.body_render_tick=0;
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"mple.com) tail"));
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    { wchar_t body[128]; body_text(h,link_turn,body,128);
+      CHECK(!wcscmp(body,L"site tail")); }
+    { RichTextControl *body=transcript_surface(&h->transcript,link_turn,
+          TRANSCRIPT_BODY);
+      CHECK(body && body->link_count==1);
+      CHARFORMAT2W f; memset(&f,0,sizeof f); f.cbSize=sizeof f;
+      SendMessageW(body->window,EM_SETSEL,0,1);
+      SendMessageW(body->window,EM_GETCHARFORMAT,SCF_SELECTION,(LPARAM)&f);
+      CHECK(f.dwEffects & CFE_LINK); }
     command(h,CHAT_COMMAND_SELECT,cv);
     /* Compact metadata footer: deduplicated model, grouped tokens, no "stop",
        and unusual finish reasons surfaced. */
@@ -2373,7 +2394,7 @@ static int bounded_suite(void) {
       CHECK(body);
       block_fail_id=100+h->transcript.records[r4].slot*4+(int)TRANSCRIPT_BODY;
       DestroyWindow(body->window);
-      CHECK(body->window && !IsWindow(body->window)); }
+      CHECK(!body->window);   /* WM_NCDESTROY cleared the destroyed handle */ }
     handle_event(h,fixture(h,OPENROUTER_DELTA,L"first"));
     handle_event(h,fixture(h,OPENROUTER_DELTA,L" second"));
     CHECK(h->body_flush_pending);                /* armed by the missing body */
@@ -2394,7 +2415,7 @@ static int bounded_suite(void) {
       CHECK(head);
       block_fail_id=100+h->transcript.records[r4].slot*4+(int)TRANSCRIPT_HEAD;
       DestroyWindow(head->window);
-      CHECK(head->window && !IsWindow(head->window)); }
+      CHECK(!head->window);   /* WM_NCDESTROY cleared the destroyed handle */ }
     render_transcript(h);
     CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_HEAD)==NULL);
     CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_BODY)!=NULL);
@@ -2410,7 +2431,7 @@ static int bounded_suite(void) {
       CHECK(meta);
       block_fail_id=100+h->transcript.records[r4].slot*4+(int)TRANSCRIPT_META;
       DestroyWindow(meta->window);
-      CHECK(meta->window && !IsWindow(meta->window)); }
+      CHECK(!meta->window);   /* WM_NCDESTROY cleared the destroyed handle */ }
     render_transcript(h);
     CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_META)==NULL);
     CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_BODY)!=NULL);
@@ -2446,8 +2467,7 @@ static int bounded_suite(void) {
             !h->transcript.records[i].measured_estimated);
     CHECK(h->transcript.measurer_valid);
     DestroyWindow(h->transcript.measurer.window);
-    CHECK(h->transcript.measurer.window &&
-        !IsWindow(h->transcript.measurer.window));
+    CHECK(!h->transcript.measurer.window);  /* WM_NCDESTROY cleared the handle */
     block_fail_id=TRANSCRIPT_MEASURE_ID;
     command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
     /* 40 turns: whatever position the reader holds, records far outside the
@@ -2572,6 +2592,22 @@ static int bounded_suite(void) {
         CHECK(qm==TRANSCRIPT_MEASURE_EXACT && ql==TRANSCRIPT_MEASURE_EXACT);
         CHECK(hm==hl);
         CHECK(tr->records[eq].body_h==hl);       /* cached == live */
+        /* markdown link body: the label replaces the URL on both surfaces,
+           both own the destination, and both still measure identically */
+        CHECK(chat_message_set_text(&chat->conversations[chat->active].messages[eq],
+            L"see [the link](https://example.com/a) for details"));
+        refresh_turn(h,eq);
+        m=&chat->conversations[chat->active].messages[eq];
+        rich_text_set_markdown(meas,m->role,chat_message_text(m));
+        hm=transcript_measure_live(tr,meas,&qm);
+        RichTextControl *link_body=transcript_surface(tr,eq,TRANSCRIPT_BODY);
+        hl=transcript_measure_live(tr,link_body,&ql);
+        CHECK(qm==TRANSCRIPT_MEASURE_EXACT && ql==TRANSCRIPT_MEASURE_EXACT);
+        CHECK(hm==hl);
+        CHECK(tr->records[eq].body_h==hl);       /* cached == live */
+        CHECK(meas->link_count==1 && link_body->link_count==1);
+        { wchar_t shown[128]; body_text(h,eq,shown,128);
+          CHECK(!wcscmp(shown,L"see the link for details")); }
         /* head label */
         rich_text_set_head(meas,m->role,NULL);
         hm=transcript_measure_live(tr,meas,&qm);

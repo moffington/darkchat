@@ -4,14 +4,16 @@
 #include <wctype.h>
 
 /* The renderer builds one document buffer (source text plus synthesized
-   bullets, quote bars and link URLs) and appends runs linearly, so memory is
-   O(input) and adjacent runs with identical style coalesce into one. Every
-   failure aborts the whole document; the caller falls back to verbatim text. */
+   bullets and quote bars), a side arena of link destinations and runs, so
+   memory is O(input) and adjacent runs with identical style coalesce into one.
+   Every failure aborts the whole document; the caller falls back to verbatim
+   text. */
 
 #define MD_NPOS ((size_t)-1)
 
 static bool test_fail_allocations;
 static bool test_fail_blocks;
+static bool test_fail_links;
 
 void markdown_test_fail_allocations(bool enable) {
     test_fail_allocations = enable;
@@ -21,11 +23,17 @@ void markdown_test_fail_blocks(bool enable) {
     test_fail_blocks = enable;
 }
 
+void markdown_test_fail_links(bool enable) {
+    test_fail_links = enable;
+}
+
 void markdown_dispose(MdDocument *doc) {
     if (!doc) return;
     free(doc->text);
     free(doc->runs);
     free(doc->blocks);
+    free(doc->links);
+    free(doc->targets);
     memset(doc, 0, sizeof *doc);
 }
 
@@ -41,6 +49,10 @@ typedef struct {
     int run_count, run_capacity;
     MdBlock *blocks;
     int block_count, block_capacity;
+    MdLink *links;
+    int link_count, link_capacity;
+    wchar_t *targets;
+    size_t targets_length, targets_capacity;
     bool failed;
 } MdBuilder;
 
@@ -79,6 +91,50 @@ static bool grow_blocks(MdBuilder *b) {
     b->blocks = grown;
     b->block_capacity = capacity;
     return true;
+}
+
+static bool grow_links(MdBuilder *b) {
+    if (b->failed) return false;
+    if (test_fail_allocations || test_fail_links) { b->failed = true; return false; }
+    if (b->link_count < b->link_capacity) return true;
+    int capacity = b->link_capacity ? b->link_capacity * 2 : 16;
+    MdLink *grown = (MdLink *)realloc(b->links, (size_t)capacity * sizeof *grown);
+    if (!grown) { b->failed = true; return false; }
+    b->links = grown;
+    b->link_capacity = capacity;
+    return true;
+}
+
+static bool grow_targets(MdBuilder *b, size_t extra) {
+    if (b->failed) return false;
+    if (test_fail_allocations || test_fail_links) { b->failed = true; return false; }
+    if (b->targets_length + extra <= b->targets_capacity) return true;
+    size_t capacity = b->targets_capacity ? b->targets_capacity : 64;
+    while (capacity < b->targets_length + extra) capacity *= 2;
+    wchar_t *grown = (wchar_t *)realloc(b->targets, capacity * sizeof *grown);
+    if (!grown) { b->failed = true; return false; }
+    b->targets = grown;
+    b->targets_capacity = capacity;
+    return true;
+}
+
+/* Records one valid link whose label has just been emitted. The destination,
+   NUL-terminated, is copied into the arena first, so a link entry never
+   references missing text and the display can hand it to the shell directly
+   without a length limit. */
+static void emit_link(MdBuilder *b, size_t offset, size_t length,
+    const wchar_t *target, size_t target_length) {
+    size_t target_offset = b->targets_length;
+    if (!grow_targets(b, target_length + 1)) return;
+    if (target_length) wmemcpy(b->targets + b->targets_length, target, target_length);
+    b->targets_length += target_length;
+    b->targets[b->targets_length++] = L'\0';
+    if (!grow_links(b)) return;
+    MdLink *link = &b->links[b->link_count++];
+    link->offset = offset;
+    link->length = length;
+    link->target_offset = target_offset;
+    link->target_length = target_length;
 }
 
 /* Appends text carrying one style, extending the trailing run when it is
@@ -284,12 +340,14 @@ static void parse_inline(MdBuilder *b, const wchar_t *s, size_t n,
                 if (url_end != MD_NPOS && url_end > url &&
                     is_http(s + url, url_end - url)) {
                     if (i > plain) emit(b, s + plain, i - plain, style);
-                    /* The label keeps the current style; the URL follows in
-                       parentheses so the display's URL detector opens it. */
-                    emit(b, s + i + 1, label_end - i - 1, style);
-                    emit(b, L" (", 2, style);
-                    emit(b, s + url, url_end - url, style);
-                    emit(b, L")", 1, style);
+                    /* The label keeps the current style and is the only text
+                       shown; the display layer opens the recorded target. */
+                    size_t label_length = label_end - i - 1;
+                    size_t label_offset = b->length;
+                    emit(b, s + i + 1, label_length, style);
+                    if (!b->failed)
+                        emit_link(b, label_offset, label_length, s + url,
+                            url_end - url);
                     i = url_end + 1;
                     plain = i;
                     continue;
@@ -712,6 +770,8 @@ bool markdown_render(const wchar_t *source, MdDocument *doc) {
         free(b.text);
         free(b.runs);
         free(b.blocks);
+        free(b.links);
+        free(b.targets);
         return false;                       /* *doc stays zeroed */
     }
     b.text[b.length] = L'\0';
@@ -723,5 +783,11 @@ bool markdown_render(const wchar_t *source, MdDocument *doc) {
     doc->blocks = b.blocks;
     doc->block_count = b.block_count;
     doc->block_capacity = b.block_capacity;
+    doc->links = b.links;
+    doc->link_count = b.link_count;
+    doc->link_capacity = b.link_capacity;
+    doc->targets = b.targets;
+    doc->targets_length = b.targets_length;
+    doc->targets_capacity = b.targets_capacity;
     return true;
 }

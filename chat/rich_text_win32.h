@@ -16,6 +16,7 @@
 #include <windows.h>
 #include "../ui/ui.h"
 #include "chat.h"
+#include "markdown.h"
 
 /* Colors and type derived from the DarkUI theme. */
 typedef struct {
@@ -41,6 +42,15 @@ struct RichTextControl {
     COLORREF surface_background;
     float dpi;
     bool readonly, multiline, scrollable, has_content;
+    /* Link metadata for the current Markdown body, transferred from the
+       document that produced it and owned by the control: MdLink label ranges
+       address control characters, and every destination lives in the single
+       link_targets arena. Cleared on every content mutation and freed on
+       WM_NCDESTROY. */
+    MdLink *links;
+    int link_count;
+    wchar_t *link_targets;      /* arena: NUL-terminated destinations */
+    size_t link_targets_length; /* wchar units in link_targets, NULs included */
     /* Enter without Shift. Return true to consume the key. */
     bool (*on_submit)(void *user);
     /* Down/up translation of any key. Return true to consume it. */
@@ -115,5 +125,9 @@ bool rich_text_has_selection(const RichTextControl *control);
 /* Handles EN_LINK (opens the target) and EN_VSCROLL. Returns true if consumed.
    lparam is the WM_NOTIFY lParam; the caller checks the source handle. */
 bool rich_text_handle_notify(RichTextControl *control, LPARAM lparam);
+
+/* Test-only hook: substitutes URL launching so the integration suite can drive
+   EN_LINK without starting the shell. Pass NULL to restore shell launching. */
+void rich_text_test_set_open(void (*open)(const wchar_t *url));
 
 #endif

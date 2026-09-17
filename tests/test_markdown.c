@@ -59,6 +59,33 @@ static void block_is(const MdBlock *k, int kind, unsigned char quote,
         what);
 }
 
+/* The destination of the stored link whose label covers needle, or NULL. */
+static const wchar_t *link_over(const MdDocument *d, const wchar_t *needle,
+    size_t *length) {
+    const wchar_t *at = d->text ? wcsstr(d->text, needle) : NULL;
+    if (!at) return NULL;
+    size_t offset = (size_t)(at - d->text);
+    size_t end = offset + wcslen(needle);
+    for (int i = 0; i < d->link_count; i++) {
+        const MdLink *l = &d->links[i];
+        if (l->offset <= offset && end <= l->offset + l->length) {
+            if (length) *length = l->target_length;
+            return d->targets + l->target_offset;
+        }
+    }
+    return NULL;
+}
+
+static void link_is(const MdDocument *d, const wchar_t *label,
+    const wchar_t *target, const char *what) {
+    size_t length = 0;
+    const wchar_t *found = link_over(d, label, &length);
+    check(found != NULL, what);
+    if (!found) return;
+    check(length == wcslen(target) && !wmemcmp(found, target, length), what);
+    check(found[length] == L'\0', what);   /* arena entry is NUL-terminated */
+}
+
 /* Blocks are ordered, disjoint, non-empty, hold no paragraph separator and
     never indent content before the line's first column. */
 static void blocks_sane(const MdDocument *d, const char *what) {
@@ -209,23 +236,25 @@ int main(void) {
         check(style_is(run_over(&d, L"*raw* ~~old~~ [x](https://x.io)"),
             MD_STYLE_BOLD | MD_STYLE_MONO | MD_STYLE_CODE),
             "variable code composes with outer bold only");
+        check(d.link_count == 0, "code shields links from metadata");
         markdown_dispose(&d); }
     { /* Paired tildes strike non-space content and compose with outer styles. */
         MdDocument d;
         render_ok(L"a ~~old~~ b **~~bold~~** ~~`code`~~ "
                   L"~~[link](https://x.io/a)~~", &d, "strike renders");
-        text_is(&d, L"a old b bold code link (https://x.io/a)",
-            "strike markers removed");
+        text_is(&d, L"a old b bold code link",
+            "strike markers and link target removed");
         const MdRun *old = run_over(&d, L"old");
         const MdRun *bold = run_over(&d, L"bold");
         const MdRun *code = run_over(&d, L"code");
-        const MdRun *link = run_over(&d, L"link (https://x.io/a)");
+        const MdRun *link = run_over(&d, L"link");
         check(style_is(old, MD_STYLE_STRIKE), "plain strike run");
         check(style_is(bold, MD_STYLE_BOLD | MD_STYLE_STRIKE),
             "bold strike run");
         check(style_is(code, MD_STYLE_STRIKE | MD_STYLE_MONO | MD_STYLE_CODE),
             "code inside strike keeps styles");
         check(style_is(link, MD_STYLE_STRIKE), "link inside strike keeps style");
+        link_is(&d, L"link", L"https://x.io/a", "struck link target recorded");
         markdown_dispose(&d); }
     { /* Unmatched, spaced and escaped paired tildes stay literal. */
         MdDocument d;
@@ -331,12 +360,54 @@ int main(void) {
         check(style_is(run_over(&d, L"```\n~~~~\n```` text"),
             MD_STYLE_MONO | MD_STYLE_CODE), "unterminated strict fence is code");
         markdown_dispose(&d); }
-    { /* HTTP(S) links become "label (url)"; other schemes stay literal. */
+    { /* HTTP(S) links render as their label with the target recorded; other
+         schemes and malformed links stay literal and record nothing. */
         MdDocument d;
         render_ok(L"[site](https://example.com/x) [f](ftp://y.io/a) "
                   L"[bad](https://open", &d, "links render");
-        text_is(&d, L"site (https://example.com/x) [f](ftp://y.io/a) "
-                  L"[bad](https://open", "https expanded, others literal");
+        text_is(&d, L"site [f](ftp://y.io/a) [bad](https://open",
+            "https label only, others literal");
+        check(d.link_count == 1, "only the HTTP(S) link is recorded");
+        link_is(&d, L"site", L"https://example.com/x", "link target recorded");
+        markdown_dispose(&d);
+        render_ok(L"[up](HTTP://Upper.example) and [x](mailto:a@b.c)", &d,
+            "case-insensitive scheme renders");
+        text_is(&d, L"up and [x](mailto:a@b.c)",
+            "uppercase HTTP(S) label only, other scheme literal");
+        check(d.link_count == 1, "non-HTTP(S) scheme records no link");
+        link_is(&d, L"up", L"HTTP://Upper.example", "target keeps original case");
+        markdown_dispose(&d); }
+    { /* Multiple links keep order and exact label ranges; identical adjacent
+         styles still coalesce into one run across them. */
+        MdDocument d;
+        render_ok(L"[one](https://a.io/1) & [two](http://b.io/2)", &d,
+            "multiple links render");
+        text_is(&d, L"one & two", "both labels shown, targets hidden");
+        check(d.link_count == 2, "both links recorded");
+        link_is(&d, L"one", L"https://a.io/1", "first target");
+        link_is(&d, L"two", L"http://b.io/2", "second target");
+        check(d.run_count == 1 && d.runs[0].length == d.length,
+            "identical adjacent styles coalesce across links");
+        markdown_dispose(&d); }
+    { /* An empty label does not qualify; an empty link set leaves the arena
+         empty. */
+        MdDocument d;
+        render_ok(L"[](https://x.io) and [](notaurl)", &d, "empty labels render");
+        text_is(&d, L"[](https://x.io) and [](notaurl)",
+            "empty labels stay literal");
+        check(d.link_count == 0 && d.targets == NULL,
+            "empty labels record no link or arena");
+        markdown_dispose(&d); }
+    { /* A quoted list-item link composes block layout, run styling and link
+         metadata over the same synthesized prefix. */
+        MdDocument d;
+        render_ok(L"> - [site](https://example.com)", &d, "quoted link renders");
+        text_is(&d, L"\u258C \u2022 site", "quoted link shows label only");
+        block_is(&d.blocks[0], MD_BLOCK_ITEM, 1, 1, 0, 0, 4,
+            "quoted link block layout");
+        check(style_is(run_over(&d, L"site"), MD_STYLE_MUTED),
+            "quoted link keeps the quote style");
+        link_is(&d, L"site", L"https://example.com", "quoted link target");
         markdown_dispose(&d); }
     { /* Flat lists: textual bullets and preserved ordered markers. */
         MdDocument d; render_ok(L"- a\n* b\n1. first\n10. [x] tenth\n5.x",
@@ -359,7 +430,7 @@ int main(void) {
         MdDocument d;
         render_ok(L"- [x] **bold** *italic* ~~strike~~ `code` "
                    L"[link](https://x.io/a)", &d, "formatted task renders");
-        text_is(&d, L"\u2611 bold italic strike code link (https://x.io/a)",
+        text_is(&d, L"\u2611 bold italic strike code link",
             "task marker removed before formatted content");
         check(style_is(run_over(&d, L"\u2611"), 0),
             "formatted task marker stays plain");
@@ -371,8 +442,8 @@ int main(void) {
             "task strike content");
         check(style_is(run_over(&d, L"code"), MD_STYLE_MONO | MD_STYLE_CODE),
             "task code content");
-        check(style_is(run_over(&d, L"link (https://x.io/a)"), 0),
-            "task link content");
+        check(style_is(run_over(&d, L"link"), 0), "task link content");
+        link_is(&d, L"link", L"https://x.io/a", "task link target recorded");
         markdown_dispose(&d); }
     { /* Invalid and misplaced task forms remain ordinary list content. */
         MdDocument d;
@@ -415,13 +486,14 @@ int main(void) {
         markdown_dispose(&d); }
     { /* Emphasis nests around code and links. */
         MdDocument d;
-        render_ok(L"**bold `code` and [l](https://x.io/a) tail**",
+        render_ok(L"**bold `code` and [link](https://x.io/a) tail**",
             &d, "nesting renders");
         const MdRun *code = run_over(&d, L"code");
         check(style_is(code, MD_STYLE_BOLD | MD_STYLE_MONO | MD_STYLE_CODE),
             "code inside bold keeps both");
-        const MdRun *l = run_over(&d, L"l (https://x.io/a)");
+        const MdRun *l = run_over(&d, L"link");
         check(style_is(l, MD_STYLE_BOLD), "link inside bold");
+        link_is(&d, L"link", L"https://x.io/a", "bold link target recorded");
         markdown_dispose(&d); }
     { /* Flat paragraphs describe their own layout; nesting arrives later. */
         MdDocument d;
@@ -707,10 +779,28 @@ int main(void) {
         check(d.block_count == 2, "post-failure blocks recorded");
         blocks_sane(&d, "post-failure blocks are sane");
         markdown_dispose(&d); }
+    { /* Link metadata growth alone is transactional: unlinked text needs no
+         link allocation, while any valid link discards the whole document. */
+        MdDocument d;
+        markdown_test_fail_links(true);
+        render_ok(L"", &d, "empty document needs no link metadata");
+        check(d.link_count == 0, "empty document has no links");
+        markdown_dispose(&d);
+        check(!markdown_render(L"see [x](https://x.io)", &d),
+            "link failure reported");
+        check(d.text == NULL && d.runs == NULL && d.blocks == NULL &&
+            d.links == NULL && d.targets == NULL && d.run_count == 0 &&
+            d.block_count == 0 && d.link_count == 0 && d.length == 0,
+            "link failure document zeroed");
+        markdown_test_fail_links(false);
+        render_ok(L"see [x](https://x.io)", &d, "render works after link failure");
+        text_is(&d, L"see x", "post-failure link render correct");
+        link_is(&d, L"x", L"https://x.io", "post-failure link recorded");
+        markdown_dispose(&d); }
     markdown_dispose(NULL);
     if (failures) { printf("%d markdown test(s) failed\n", failures); return 1; }
     puts("Markdown parser: flags, coalescing, headings, emphasis, "
-        "strikethrough, variable code, fences, links, task lists, quotes, escapes, CRLF, "
-        "long input and allocation fallback passed");
+        "strikethrough, variable code, fences, link labels/targets, task lists, "
+        "quotes, escapes, CRLF, long input and allocation fallback passed");
     return 0;
 }

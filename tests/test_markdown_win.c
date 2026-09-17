@@ -8,6 +8,34 @@
 
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
+/* Launch seam: the control's link handlers run for real, but the opened URL is
+   captured instead of starting the shell. The buffer exceeds the visible-range
+   limit so a long stored destination can be observed whole. */
+#define OPENED_URL_CAP 8192
+static wchar_t opened_url[OPENED_URL_CAP];
+static int opened_count;
+static void capture_open(const wchar_t *url) {
+    ++opened_count;
+    if (url) {
+        wcsncpy(opened_url, url, OPENED_URL_CAP - 1);
+        opened_url[OPENED_URL_CAP - 1] = 0;
+    } else opened_url[0] = 0;
+}
+
+/* Drives the real EN_LINK notification path for one range. */
+static void click_link(const RichTextControl *control, LONG cpMin, LONG cpMax) {
+    ENLINK link;
+    memset(&link, 0, sizeof link);
+    link.nmhdr.hwndFrom = control->window;
+    link.nmhdr.code = EN_LINK;
+    link.msg = WM_LBUTTONUP;
+    link.chrg.cpMin = cpMin;
+    link.chrg.cpMax = cpMax;
+    opened_count = 0;
+    opened_url[0] = 0;
+    rich_text_handle_notify((RichTextControl *)control, (LPARAM)&link);
+}
+
 /* Character format at one character position. */
 static CHARFORMAT2W format_at(const RichTextControl *c, int cp) {
     CHARFORMAT2W f;
@@ -40,6 +68,7 @@ static void read_text(const RichTextControl *c, wchar_t *out, size_t cap) {
 
 int main(void) {
     CHECK(rich_text_library_open());
+    rich_text_test_set_open(capture_open);
     WNDCLASSW cls = {0};
     cls.lpfnWndProc = DefWindowProcW;
     cls.lpszClassName = L"DarkChat.Markdown.Test";
@@ -208,6 +237,132 @@ int main(void) {
     f = format_at(&probe, 2);                       /* "done" */
     CHECK(f.dwEffects & CFE_BOLD);
 
+    /* An HTTP(S) link renders its label only, marks exactly the label range as
+       a link, and opens the recorded destination through EN_LINK. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"go [site](https://example.com/x) now");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"go site now"));
+    CHECK(probe.link_count == 1 && probe.link_targets != NULL);
+    f = format_at(&probe, 3);                       /* "site" */
+    CHECK(f.dwEffects & CFE_LINK);
+    f = format_at(&probe, 0);                       /* "go" */
+    CHECK(!(f.dwEffects & CFE_LINK));
+    f = format_at(&probe, 8);                       /* "now" */
+    CHECK(!(f.dwEffects & CFE_LINK));
+    click_link(&probe, 3, 7);
+    CHECK(opened_count == 1 && !wcscmp(opened_url, L"https://example.com/x"));
+
+    /* Link formatting composes with the label's own run style. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"**[x](https://bold.example)**");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"x"));
+    f = format_at(&probe, 0);
+    CHECK((f.dwEffects & CFE_LINK) && (f.dwEffects & CFE_BOLD));
+    click_link(&probe, 0, 1);
+    CHECK(opened_count == 1 && !wcscmp(opened_url, L"https://bold.example"));
+
+    /* Non-HTTP(S) and malformed links stay literal and record no metadata. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"[x](notaurl) and [y](ftp://z.io/a)");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"[x](notaurl) and [y](ftp://z.io/a)"));
+    CHECK(probe.link_count == 0 && probe.links == NULL &&
+        probe.link_targets == NULL);
+
+    /* Bare URLs detected by the control keep the visible-range fallback. */
+    rich_text_set_body(&probe, CHAT_ROLE_ASSISTANT,
+        L"see https://bare.example/p");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"see https://bare.example/p"));
+    CHECK(probe.link_count == 0);
+    click_link(&probe, 4, 4 + (LONG)wcslen(L"https://bare.example/p"));
+    CHECK(opened_count == 1 && !wcscmp(opened_url, L"https://bare.example/p"));
+
+    /* A bare URL inside a Markdown body is still recognized while a custom
+       label on the same surface is preserved; each opens its own text. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"[site](https://example.com/x) and https://bare.example/p");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"site and https://bare.example/p"));
+    CHECK(probe.link_count == 1);
+    f = format_at(&probe, 0);                       /* custom label */
+    CHECK(f.dwEffects & CFE_LINK);
+    LONG bare = (LONG)wcslen(L"site and ");
+    f = format_at(&probe, bare);                    /* auto-detected URL */
+    CHECK(f.dwEffects & CFE_LINK);
+    click_link(&probe, 0, 4);
+    CHECK(opened_count == 1 && !wcscmp(opened_url, L"https://example.com/x"));
+    click_link(&probe, bare, bare + (LONG)wcslen(L"https://bare.example/p"));
+    CHECK(opened_count == 1 && !wcscmp(opened_url, L"https://bare.example/p"));
+
+    /* A semantic URL longer than the visible-range limit still opens whole
+       from the NUL-terminated arena; the visible-range limit does not apply. */
+    {
+        wchar_t *long_link = (wchar_t *)malloc((4096 + 64) * sizeof(wchar_t));
+        CHECK(long_link);
+        wcscpy(long_link, L"[site](https://example.com/");
+        for (int i = 0; i < 3000; i++) wcscat(long_link, L"a");
+        wcscat(long_link, L")");
+        rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, long_link);
+        read_text(&probe, text, 512);
+        CHECK(!wcscmp(text, L"site"));
+        CHECK(probe.link_count == 1);
+        click_link(&probe, 0, 4);
+        CHECK(opened_count == 1);
+        CHECK(!wcsncmp(opened_url, L"https://example.com/", 20));
+        CHECK(wcslen(opened_url) == 20 + 3000);
+        free(long_link);
+    }
+
+    /* Quoted link item: block layout, run styling and link metadata coexist. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"> - [site](https://example.com)");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"\u258C \u2022 site"));
+    f = format_at(&probe, 4);                       /* "site" */
+    CHECK((f.dwEffects & CFE_LINK) != 0);
+    click_link(&probe, 4, 8);
+    CHECK(opened_count == 1 && !wcscmp(opened_url, L"https://example.com"));
+    PARAFORMAT2 link_pf = paragraph_at(&probe, 0);
+    CHECK(link_pf.dxOffset == columns_twips(&probe, 4));
+
+    /* A content mutation clears the metadata and the link effect. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"[site](https://example.com/x)");
+    CHECK(probe.link_count == 1);
+    rich_text_set_body(&probe, CHAT_ROLE_ASSISTANT, L"plain");
+    CHECK(probe.link_count == 0 && probe.links == NULL &&
+        probe.link_targets == NULL);
+    f = format_at(&probe, 0);
+    CHECK(!(f.dwEffects & CFE_LINK));
+
+    /* Streaming appends verbatim, then the terminal pass records the link. */
+    rich_text_set_body(&probe, CHAT_ROLE_ASSISTANT, L"");
+    rich_text_append_body(&probe, L"[partial](https://ex");
+    CHECK(probe.link_count == 0);
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"[done](https://example.com/done)");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"done"));
+    CHECK(probe.link_count == 1);
+    click_link(&probe, 0, 4);
+    CHECK(opened_count == 1 && !wcscmp(opened_url, L"https://example.com/done"));
+
+    /* Appending keeps the existing metadata and link effect, so the old label
+       still opens its stored destination rather than its visible text. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"[site](https://example.com)");
+    rich_text_append_body(&probe, L" tail");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"site tail"));
+    CHECK(probe.link_count == 1);
+    f = format_at(&probe, 0);
+    CHECK(f.dwEffects & CFE_LINK);
+    click_link(&probe, 0, 4);
+    CHECK(opened_count == 1 && !wcscmp(opened_url, L"https://example.com"));
+
     /* User/system/error bodies are fully literal, fence markers included. */
     rich_text_set_body(&probe, CHAT_ROLE_USER, L"```c\nint x;\n```");
     read_text(&probe, text, 512);
@@ -313,11 +468,19 @@ int main(void) {
     read_text(&probe, text, 512);
     CHECK(!wcscmp(text, L"x tail"));
 
+    /* Destruction frees the transferred metadata (WM_NCDESTROY). */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"[x](https://example.com/x)");
+    CHECK(probe.link_count == 1);
     DestroyWindow(probe.window);
+    CHECK(probe.links == NULL && probe.link_count == 0 &&
+        probe.link_targets == NULL);
     DestroyWindow(parent);
+    rich_text_test_set_open(NULL);
     rich_text_library_close();
     puts("Markdown Rich Edit integration: flags, style ranges, strikethrough, "
-        "background reset, muted text, task lists, CRLF, streaming-to-terminal, "
-        "repeats, literal user text, malformed/long input and allocation fallback passed");
+        "link labels/EN_LINK/lifecycle, background reset, muted text, task lists, "
+        "CRLF, streaming-to-terminal, repeats, literal user text, malformed/long "
+        "input and allocation fallback passed");
     return 0;
 }

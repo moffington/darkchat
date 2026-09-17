@@ -7,8 +7,9 @@
    deliberately small: headings 1-3, bold, italic, strikethrough, equal-length
    inline backtick spans and backtick/tilde fenced code, lists (including
    unordered [ ]/[xX] task markers) nested up to MD_MAX_DEPTH with mixed
-   markers, blockquotes nested up to MD_MAX_DEPTH, HTTP(S) links and
-   blockquotes. Unsupported or malformed syntax is kept verbatim. Precedence is
+   markers, blockquotes nested up to MD_MAX_DEPTH, and HTTP(S) links rendered
+   as their label with the destination recorded separately for the display
+   layer. Unsupported or malformed syntax is kept verbatim. Precedence is
    fenced blocks, then inline code, then links, then strikethrough and
    emphasis. No tables, images, indented code blocks, lazy continuation,
    per-language highlighting or full CommonMark behavior. */
@@ -68,6 +69,16 @@ typedef struct {
                                            lines begin, >= first_indent */
 } MdBlock;
 
+/* One valid HTTP(S) link. The displayed label is a contiguous range in the
+   document text; the destination it opens lives in the document's target
+   arena, addressed by offset and length. Each arena entry is NUL-terminated,
+   so a destination of any length can be opened directly. Malformed links and
+   links with any other scheme are never recorded. */
+typedef struct {
+    size_t offset, length;               /* label range in text */
+    size_t target_offset, target_length; /* destination in the arena, no NUL */
+} MdLink;
+
 typedef struct {
     wchar_t *text;      /* document-owned, NUL-terminated; newlines are LF */
     size_t length;      /* wchar units, excluding the terminator */
@@ -75,6 +86,10 @@ typedef struct {
     int run_count, run_capacity;
     MdBlock *blocks;
     int block_count, block_capacity;
+    MdLink *links;      /* valid links, in document order */
+    int link_count, link_capacity;
+    wchar_t *targets;   /* arena: every NUL-terminated destination, back to back */
+    size_t targets_length, targets_capacity;
 } MdDocument;
 
 /* Transactional: on success returns true and *doc owns the rendered
@@ -89,5 +104,8 @@ void markdown_test_fail_allocations(bool enable);
 /* Test-only hook: while enabled only block-array growth fails, so the block
     path is exercised on its own. */
 void markdown_test_fail_blocks(bool enable);
+/* Test-only hook: while enabled only link metadata growth fails, so the link
+    path is exercised on its own. */
+void markdown_test_fail_links(bool enable);
 
 #endif
