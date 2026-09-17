@@ -80,6 +80,9 @@ int main(void) {
             CHECK(t.records[i].slot == -1);
             CHECK(t.records[i].rendered_slot == -1);
             CHECK(!t.records[i].measured_valid && !t.records[i].measured_estimated);
+            CHECK(t.records[i].body_layout_width == 0 &&
+                t.records[i].body_layout_dpi == 0.0f &&
+                t.records[i].body_layout_theme == 0);
             CHECK(!t.records[i].blocked_debt && !t.records[i].blocked_resource);
             CHECK(t.records[i].saved_sel_min[TRANSCRIPT_HEAD] == -1 &&
                 t.records[i].saved_sel_min[TRANSCRIPT_BODY] == -1 &&

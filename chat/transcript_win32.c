@@ -206,7 +206,11 @@ static bool turn_state(Transcript *t, const TranscriptFeed *feed, int index,
         (!s->running || rec->content_started == feed->content_started) &&
         (s->has_row ? !wcscmp(rec->row, s->row) : !rec->row[0]);
     s->body_current = same && rec->body_revision == m->body_revision &&
-        rec->role == m->role;
+        rec->role == m->role &&
+        (m->role != CHAT_ROLE_ASSISTANT ||
+         (rec->body_layout_width == t->view_width &&
+          rec->body_layout_dpi == t->dpi &&
+          rec->body_layout_theme == t->theme_epoch));
     s->meta_current = same && rec->revision == m->revision &&
         rec->state == m->generation.state;
     s->reason_current = same && rec->revision == m->revision &&
@@ -1316,12 +1320,20 @@ static bool rendered_current(const TranscriptRecord *rec, uint64_t conversation,
 
 /* True when the record's body already holds exactly this message's answer
     text. Keyed on the text-only revision so a metadata-only generation
-    update (or a reasoning append) does not rewrite the body. */
-static bool body_current(const TranscriptRecord *rec, uint64_t conversation,
-    uint64_t message, uint64_t body_revision, ChatRole role) {
-    return rec->rendered_valid && rec->conversation == conversation &&
+    update (or a reasoning append) does not rewrite the body. Assistant
+    Markdown bodies additionally depend on their layout currency (width, DPI
+    and theme epoch), which only a successful assistant body write stamps; a
+    verbatim non-assistant body is never made stale by a layout change. */
+static bool body_current(const Transcript *t, const TranscriptRecord *rec,
+    uint64_t conversation, uint64_t message, uint64_t body_revision,
+    ChatRole role) {
+    if (!(rec->rendered_valid && rec->conversation == conversation &&
         rec->message == message && rec->body_revision == body_revision &&
-        rec->role == role;
+        rec->role == role)) return false;
+    if (role != CHAT_ROLE_ASSISTANT) return true;
+    return rec->body_layout_width == t->view_width &&
+        rec->body_layout_dpi == t->dpi &&
+        rec->body_layout_theme == t->theme_epoch;
 }
 
 /* Writes one surface, deferring the destructive write while it holds a
@@ -1370,14 +1382,27 @@ static bool write_body(Transcript *t, TranscriptRecord *rec, int index,
         return false;
     }
     t->applying = true;
+    bool ok = true;
     if (role == CHAT_ROLE_ASSISTANT)
-        rich_text_set_markdown(control, role, text);
+        ok = rich_text_set_markdown_width(control, role, text, t->view_width);
     else
         rich_text_set_block(control, role, text);
     t->applying = false;
+    if (!ok) {
+        /* The write did not land: keep the debt so a later pass retries, and
+           certify nothing -- no revision, no layout currency, no measurement
+           success. */
+        rec->body_pending = true;
+        return false;
+    }
     rec->body_pending = false;
     rec->measured_valid = false;
     rec->measured_estimated = false;
+    if (role == CHAT_ROLE_ASSISTANT) {
+        rec->body_layout_width = t->view_width;
+        rec->body_layout_dpi = t->dpi;
+        rec->body_layout_theme = t->theme_epoch;
+    }
     if (t->render_active) ++t->round_transitions;
     return true;
 }
@@ -1551,7 +1576,7 @@ static void prepare_turn(Transcript *t, const TranscriptFeed *feed,
         feed->content_started, m->reasoning_open, has_row, row);
     /* The answer body is keyed on its text alone, so a terminal metadata
        update refreshes the footer without rebuilding the body. */
-    bool body_fresh = certified && body_current(rec, c->id, m->id,
+    bool body_fresh = certified && body_current(t, rec, c->id, m->id,
         m->body_revision, m->role);
     /* Does the surface still represent this exact message instance? The
        instance-level comparison goes through the pure policy seam. Captured
@@ -1996,14 +2021,26 @@ static void height_of_turn(Transcript *t, const TranscriptFeed *feed, int i,
             t->view_width, &q);
         if (q != TRANSCRIPT_MEASURE_EXACT) all_exact = false;
     }
+    bool body_written = true;
     if (s.assistant)
-        rich_text_set_markdown(&t->measurer, s.m->role,
-            chat_message_text(s.m));
+        body_written = rich_text_set_markdown_width(&t->measurer, s.m->role,
+            chat_message_text(s.m), t->view_width);
     else
         rich_text_set_block(&t->measurer, s.m->role, chat_message_text(s.m));
-    g->h[TRANSCRIPT_BODY] = measure_control_q(t, &t->measurer, t->view_width,
-        &q);
-    if (q != TRANSCRIPT_MEASURE_EXACT) all_exact = false;
+    if (body_written) {
+        g->h[TRANSCRIPT_BODY] = measure_control_q(t, &t->measurer,
+            t->view_width, &q);
+        if (q != TRANSCRIPT_MEASURE_EXACT) all_exact = false;
+    } else {
+        /* The write did not land (width assertion failed or the verbatim
+           fallback was incomplete): the measurer still holds stale or empty
+           content, so never measure it and never stamp that as exact. Record
+           an explicit estimate and leave the stamp retryable. */
+        g->h[TRANSCRIPT_BODY] = estimate_text_height(t,
+            chat_message_text(s.m), t->theme.ui_size);
+        all_exact = false;
+        ++t->stat.estimates;
+    }
     if (g->live[TRANSCRIPT_META]) {
         wchar_t info[768];
         format_stats(&s.m->generation, info, 768);
@@ -2546,11 +2583,28 @@ bool transcript_stream_body(Transcript *t, const TranscriptFeed *feed,
     }
     bool pinned = transcript_following(t);
     t->applying = true;
-    rich_text_set_markdown(body, m->role, chat_message_text(m));
+    bool ok = true;
+    if (m->role == CHAT_ROLE_ASSISTANT)
+        ok = rich_text_set_markdown_width(body, m->role, chat_message_text(m),
+            t->view_width);
+    else
+        rich_text_set_block(body, m->role, chat_message_text(m));
     t->applying = false;
+    if (!ok) {
+        /* The rebuild did not land: keep the debt and certify nothing so the
+           caller's armed flush (or the next render) retries. */
+        rec->body_pending = true;
+        return false;
+    }
     rec->body_pending = false;
-    /* This path bypasses prepare_turn(); keep the recorded revision in step. */
+    /* This path bypasses prepare_turn(); keep the recorded revision and the
+       assistant layout currency in step. */
     rec->body_revision = m->body_revision;
+    if (m->role == CHAT_ROLE_ASSISTANT) {
+        rec->body_layout_width = t->view_width;
+        rec->body_layout_dpi = t->dpi;
+        rec->body_layout_theme = t->theme_epoch;
+    }
     if (t->bounded) {
         RealizeResult r;
         realize_loop(t, feed, pinned, -1, true, &r);

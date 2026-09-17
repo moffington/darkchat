@@ -103,12 +103,22 @@ void rich_text_set_body(RichTextControl *control, ChatRole role,
 void rich_text_append_body(RichTextControl *control, const wchar_t *text);
 /* Body text only, rendered as Markdown: headings 1-3, bold, italic,
    strikethrough, inline and fenced code, nested lists with unordered task
-   markers, nested blockquotes and HTTP(S) links. Paragraph indentation and
-   hanging indentation come from the parser's paragraph records and are cleared
-   before every write, so a verbatim or failed body never inherits an indent.
-   Falls back to verbatim text when parsing or allocation fails. */
+   markers, nested blockquotes, HTTP(S) links and GFM tables. Paragraph
+   indentation and hanging indentation come from the parser's paragraph
+   records and are cleared before every write, so a verbatim or failed body
+   never inherits an indent. Tables flatten into physical lines that drive Rich
+   Edit tab stops; when a table cannot fit, only that table falls back to
+   literal source, and any document-wide plan failure writes the whole body
+   verbatim. Falls back to verbatim text when parsing or allocation fails. */
 void rich_text_set_markdown(RichTextControl *control, ChatRole role,
     const wchar_t *text);
+/* Authoritative Markdown body write at an explicit control width. Asserts the
+   HWND width before content, derives the usable width after scaled margins,
+   builds and inserts a complete transactional flatten plan, and returns false
+   only when the control/window is unavailable (a completed verbatim fallback
+   still returns true). Production transcript paths use this. */
+bool rich_text_set_markdown_width(RichTextControl *control, ChatRole role,
+    const wchar_t *text, int control_width_px);
 /* Compact terminal-state metadata footer (status, timings, tokens, cost,
    model), rendered in the small muted face. */
 void rich_text_set_meta(RichTextControl *control, const wchar_t *text,
@@ -129,5 +139,14 @@ bool rich_text_handle_notify(RichTextControl *control, LPARAM lparam);
 /* Test-only hook: substitutes URL launching so the integration suite can drive
    EN_LINK without starting the shell. Pass NULL to restore shell launching. */
 void rich_text_test_set_open(void (*open)(const wchar_t *url));
+
+/* Test-only hook: makes the Nth (0-based) transaction-plan allocation and every
+   allocation after it fail, so the whole-body fallback and recovery can be
+   exercised through every arena. Pass a negative value to disable. */
+void markdown_plan_test_fail_after(int allocation_index);
+
+/* Test-only hook: while enabled the styled-span measurement adapter reports a
+   failure, forcing the document-wide transactional fallback. */
+void rich_text_test_fail_metrics(bool enable);
 
 #endif

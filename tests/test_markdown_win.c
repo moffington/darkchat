@@ -1,6 +1,7 @@
 /* Rich Edit integration of the Markdown body renderer (hidden windows). */
 #include "../chat/rich_text_win32.h"
 #include "../chat/markdown.h"
+#include "../chat/table_layout.h"
 #include <richedit.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,6 +60,17 @@ static PARAFORMAT2 paragraph_at(const RichTextControl *c, int cp) {
 /* Layout columns in twips, the unit the renderer budgets them in. */
 static LONG columns_twips(const RichTextControl *c, int columns) {
     return (LONG)(columns * c->theme.ui_size * 15.0f * 0.5f + 0.5f);
+}
+
+/* Character position of a substring in control coordinates (LF-only, where
+   get-text reports CRLF), so link ranges can be addressed exactly. */
+static LONG find_cp(const RichTextControl *c, const wchar_t *needle) {
+    FINDTEXTW find;
+    memset(&find, 0, sizeof find);
+    find.chrg.cpMin = 0;
+    find.chrg.cpMax = -1;
+    find.lpstrText = needle;
+    return (LONG)SendMessageW(c->window, EM_FINDTEXTW, 1, (LPARAM)&find);
 }
 
 static void read_text(const RichTextControl *c, wchar_t *out, size_t cap) {
@@ -463,12 +475,253 @@ int main(void) {
     CHECK(!wcscmp(text, L"- **x** tail"));
     pf = paragraph_at(&probe, 0);
     CHECK(pf.dxStartIndent == 0 && pf.dxOffset == 0);  /* fallback is flush */
-    markdown_test_fail_allocations(false);
+        markdown_test_fail_allocations(false);
     rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"**x** tail");
     read_text(&probe, text, 512);
     CHECK(!wcscmp(text, L"x tail"));
 
+    /* ---- GFM tables (TABLES_PLAN.md Phase 3) ----------------------------- */
+
+    /* A table flattens to tab-separated physical lines with no pipe syntax.
+       The plan is LF-only, so WM_GETTEXTLENGTH counts one unit per paragraph
+       and char ranges equal plan offsets. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"| a | b |\n| --- | ---: |\n| c | d |");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"a\tb\r\nc\td"));
+    CHECK(wcsstr(text, L"|") == NULL && wcsstr(text, L"---") == NULL);
+    CHECK(SendMessageW(probe.window, WM_GETTEXTLENGTH, 0, 0) ==
+        (LRESULT)wcslen(L"a\tb\r\nc\td"));
+    CHECK(SendMessageW(probe.window, EM_GETLINECOUNT, 0, 0) == 2);
+    PARAFORMAT2 table_pf = paragraph_at(&probe, 0);
+    CHECK(table_pf.cTabCount == 2);
+    CHECK(((table_pf.rgxTabs[0] >> 24) & 0xF) == MD_ALIGN_LEFT);
+    CHECK(((table_pf.rgxTabs[1] >> 24) & 0xF) == MD_ALIGN_RIGHT);
+    CHECK((table_pf.rgxTabs[0] & 0x00FFFFFFL) <=
+        (table_pf.rgxTabs[1] & 0x00FFFFFFL));
+    CHECK(table_pf.dxStartIndent == 0 && table_pf.dxOffset == 0);
+    PARAFORMAT2 row_pf = paragraph_at(&probe, 3);   /* body row */
+    CHECK(row_pf.cTabCount == 2);
+    CHECK((row_pf.rgxTabs[0] & 0x00FFFFFFL) ==
+        (table_pf.rgxTabs[0] & 0x00FFFFFFL));
+    /* Header spans are bold; body rows are not. */
+    CHECK(format_at(&probe, 0).dwEffects & CFE_BOLD);
+    CHECK(!(format_at(&probe, 3).dwEffects & CFE_BOLD));
+
+    /* Column alignment colons map to tab-stop alignment nibbles; a
+       right-aligned column zero receives a leading tab. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"| l | c | r |\n| :--- | :---: | ---: |\n| 1 | 2 | 3 |");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"l\tc\tr\r\n1\t2\t3"));
+    table_pf = paragraph_at(&probe, 0);
+    CHECK(table_pf.cTabCount == 3);
+    CHECK(((table_pf.rgxTabs[0] >> 24) & 0xF) == MD_ALIGN_LEFT);
+    CHECK(((table_pf.rgxTabs[1] >> 24) & 0xF) == MD_ALIGN_CENTER);
+    CHECK(((table_pf.rgxTabs[2] >> 24) & 0xF) == MD_ALIGN_RIGHT);
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"| x |\n| ---: |");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"\tx"));                   /* tab before right-aligned 0 */
+    table_pf = paragraph_at(&probe, 0);
+    CHECK(table_pf.cTabCount == 1);
+    CHECK(((table_pf.rgxTabs[0] >> 24) & 0xF) == MD_ALIGN_RIGHT);
+
+    /* Ordinary paragraphs around a table own no tab stops (I6). */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"before\n\n| a | b |\n| --- | --- |\n\n[after](https://example.com)");
+    read_text(&probe, text, 512);
+    CHECK(wcsstr(text, L"before") != NULL && wcsstr(text, L"after") != NULL &&
+        wcsstr(text, L"|") == NULL);
+    CHECK(paragraph_at(&probe, 0).cTabCount == 0);
+    CHECK(paragraph_at(&probe, 0).dxStartIndent == 0);
+    CHECK(paragraph_at(&probe, 0).dxOffset == 0);
+
+    /* A link inside a table cell is recorded and opens its destination. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"| [site](https://example.com/x) |\n| --- |");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"site"));
+    CHECK(probe.link_count == 1);
+    f = format_at(&probe, 0);
+    CHECK((f.dwEffects & CFE_LINK) && (f.dwEffects & CFE_BOLD));
+    click_link(&probe, 0, 4);
+    CHECK(opened_count == 1 && !wcscmp(opened_url, L"https://example.com/x"));
+
+    /* A zero-length (all-empty header) table writes cleanly and keeps the
+       surrounding text. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"pre\n\n| |\n| - |\n\npost");
+    read_text(&probe, text, 512);
+    CHECK(wcsstr(text, L"pre") != NULL && wcsstr(text, L"post") != NULL &&
+        wcsstr(text, L"|") == NULL);
+
+    /* A standalone all-empty table writes cleanly with no stray content and no
+       link metadata; its single column still owns one tab stop. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"| |\n| - |");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L""));
+    CHECK(probe.link_count == 0 && probe.links == NULL &&
+        probe.link_targets == NULL);
+    table_pf = paragraph_at(&probe, 0);
+    CHECK(table_pf.cTabCount == 1);
+    CHECK(table_pf.dxStartIndent == 0 && table_pf.dxOffset == 0);
+
+    /* A table whose minimum column layout cannot fit falls back to literal
+       source for that table only; surrounding Markdown and a later semantic
+       link still render. */
+    {
+        wchar_t wide[1024];
+        wcscpy(wide, L"Lead **bold**\n\n|");
+        for (int c = 0; c < 12; c++) wcscat(wide, L" h |");
+        wcscat(wide, L"\n|");
+        for (int c = 0; c < 12; c++) wcscat(wide, L" --- |");
+        wcscat(wide, L"\n|");
+        for (int c = 0; c < 12; c++) wcscat(wide, L" v |");
+        wcscat(wide, L"\n\nTail [x](https://example.com/lit)");
+        rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, wide);
+        read_text(&probe, text, 512);
+        /* The whole table stayed literal source. */
+        CHECK(wcsstr(text,
+            L"| h | h | h | h | h | h | h | h | h | h | h | h |") != NULL);
+        CHECK(wcsstr(text, L"| --- | --- | --- |") != NULL);
+        CHECK(wcsstr(text, L"| v | v | v | v | v | v | v | v | v | v | v | v |")
+            != NULL);
+        CHECK(wcsstr(text, L"Lead") != NULL && wcsstr(text, L"Tail") != NULL);
+        CHECK(format_at(&probe, 5).dwEffects & CFE_BOLD);   /* "bold" */
+        CHECK(probe.link_count == 1);
+        const wchar_t *target = wcsstr(text, L"Tail x");
+        CHECK(target != NULL);
+        LONG link_cp = find_cp(&probe, L"Tail x") + 5;      /* "x" */
+        click_link(&probe, link_cp, link_cp + 1);
+        CHECK(opened_count == 1 && !wcscmp(opened_url, L"https://example.com/lit"));
+    }
+
+    /* Wrapped column-zero styled content keeps its style on every physical
+       line. Table emission walks a row column by column, so later lines of a
+       wrapped cell are revisited out of source order; a forward-only run
+       cursor would strip their styles. */
+    rich_text_set_markdown_width(&probe, CHAT_ROLE_ASSISTANT,
+        L"| k | v |\n| --- | --- |\n"
+        L"| **aaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbb cccccccccccccccc** | x |", 200);
+    read_text(&probe, text, 512);
+    CHECK(wcsstr(text, L"|") == NULL && wcsstr(text, L"\t") != NULL);
+    CHECK(SendMessageW(probe.window, EM_GETLINECOUNT, 0, 0) > 2);
+    f = format_at(&probe, 0);
+    CHECK(f.dwEffects & CFE_BOLD);                 /* header */
+    LONG later = find_cp(&probe, L"cccccccccccccccc");
+    CHECK(later >= 0);
+    f = format_at(&probe, later);
+    CHECK(f.dwEffects & CFE_BOLD);                 /* style survived the wrap */
+
+    /* Every plan arena allocation fails in turn; each failure writes the whole
+       original body verbatim (exact source, no links, no table formatting),
+       and the plan recovers once the seam is cleared. */
+    {
+        const wchar_t *table =
+            L"| name | value |\n| :--- | ---: |\n"
+            L"| [alpha](https://example.com/a) | 1 |\n| beta | 22 |";
+        const wchar_t *verbatim =
+            L"| name | value |\r\n| :--- | ---: |\r\n"
+            L"| [alpha](https://example.com/a) | 1 |\r\n| beta | 22 |";
+        const wchar_t *flattened =
+            L"name\tvalue\r\nalpha\t1\r\nbeta\t22";
+        int arena = 0;
+        for (; arena < 4000; arena++) {
+            markdown_plan_test_fail_after(arena);
+            rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, table);
+            read_text(&probe, text, 512);
+            if (!wcscmp(text, flattened)) break;  /* all allocations succeeded */
+            CHECK(!wcscmp(text, verbatim));     /* exact complete source */
+            CHECK(probe.link_count == 0);       /* no links transferred */
+            PARAFORMAT2 fail_pf = paragraph_at(&probe, 0);
+            CHECK(fail_pf.cTabCount == 0);      /* no table formatting */
+            CHECK(fail_pf.dxStartIndent == 0 && fail_pf.dxOffset == 0);
+        }
+        CHECK(arena < 4000);
+        markdown_plan_test_fail_after(-1);
+        rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, table);
+        read_text(&probe, text, 512);
+        CHECK(!wcscmp(text, flattened));
+        CHECK(probe.link_count == 1);
+    }
+
+    /* A forced GDI measurement failure is a document-wide transactional
+       failure: the complete small source is written verbatim, with no links
+       and no table formatting. */
+    rich_text_test_fail_metrics(true);
+    CHECK(rich_text_set_markdown_width(&probe, CHAT_ROLE_ASSISTANT,
+        L"| a | b |\n| --- | --- |\n| [x](https://example.com/m) | y |", 600));
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text,
+        L"| a | b |\r\n| --- | --- |\r\n| [x](https://example.com/m) | y |"));
+    CHECK(probe.link_count == 0);
+    CHECK(paragraph_at(&probe, 0).cTabCount == 0);
+    rich_text_test_fail_metrics(false);
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"| a | b |\n| --- | --- |\n| x | y |");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"a\tb\r\nx\ty"));
+
+    /* Document-wide flatten overflow (MD_MAX_FLATTEN_CHARS) cancels the plan:
+       the whole original body is verbatim (full internal length, exact head and
+       all-'z' tail), no links transfer, and no table formatting is applied. */
+    {
+        size_t big = (size_t)MD_MAX_FLATTEN_CHARS + 64;
+        wchar_t *huge = (wchar_t *)malloc((big + 128) * sizeof(wchar_t));
+        CHECK(huge);
+        const wchar_t *prefix =
+            L"| a | b |\n| --- | --- |\n\n[x](https://example.com/cap)\n\n";
+        wcscpy(huge, prefix);
+        size_t at = wcslen(prefix);
+        for (size_t i = at; i < big; i++) huge[i] = L'z';
+        huge[big] = 0;
+        size_t source_len = big;
+        rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, huge);
+        /* Full internal length: one code unit per source code unit. */
+        GETTEXTLENGTHEX measure;
+        measure.flags = GTL_NUMCHARS;
+        measure.codepage = 1200;
+        LONG internal = (LONG)SendMessageW(probe.window, EM_GETTEXTLENGTHEX,
+            (WPARAM)&measure, 0);
+        CHECK(internal == (LONG)source_len);
+        /* Beginning content is the exact literal prefix (CRLF-expanded). */
+        read_text(&probe, text, 512);
+        const wchar_t *head =
+            L"| a | b |\r\n| --- | --- |\r\n\r\n[x](https://example.com/cap)\r\n\r\n";
+        CHECK(!wcsncmp(text, head, wcslen(head)));
+        /* Every trailing code unit is the literal 'z' tail. */
+        CHARRANGE tail;
+        tail.cpMin = internal - 32;
+        tail.cpMax = internal;
+        SendMessageW(probe.window, EM_EXSETSEL, 0, (LPARAM)&tail);
+        wchar_t tailbuf[64];
+        memset(tailbuf, 0, sizeof tailbuf);
+        LRESULT got = SendMessageW(probe.window, EM_GETSELTEXT, 0,
+            (LPARAM)tailbuf);
+        CHECK(got == 32);
+        for (int i = 0; i < 32; i++) CHECK(tailbuf[i] == L'z');
+        CHECK(probe.link_count == 0);             /* no links transferred */
+        CHECK(paragraph_at(&probe, 0).cTabCount == 0);
+        free(huge);
+    }
+
+    /* Whole-body fallback preserves LF, CRLF and lone CR exactly, one
+       paragraph break each (allocation-free literal writer). */
+    rich_text_set_body(&probe, CHAT_ROLE_USER, L"a\nb\r\nc\rd");
+    CHECK(SendMessageW(probe.window, EM_GETLINECOUNT, 0, 0) == 4);
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"a\r\nb\r\nc\r\nd"));
+    markdown_test_fail_allocations(true);
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"x\ny\r\nz\rw");
+    markdown_test_fail_allocations(false);
+    CHECK(SendMessageW(probe.window, EM_GETLINECOUNT, 0, 0) == 4);
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"x\r\ny\r\nz\r\nw"));
+
     /* Destruction frees the transferred metadata (WM_NCDESTROY). */
+
+
     rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
         L"[x](https://example.com/x)");
     CHECK(probe.link_count == 1);

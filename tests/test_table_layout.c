@@ -126,8 +126,8 @@ static void expect_lossless(Fixture *f, int row, int column, int width_px,
 int main(void) {
     check(TABLE_MIN_COLUMN_DIP == 48, "minimum column DIP is calibrated");
     check(TABLE_GUTTER_DIP == 16, "gutter DIP is calibrated");
-    check(TABLE_MAX_PHYSICAL_LINES == 4096, "physical-line cap provisional");
-    check(MD_MAX_FLATTEN_CHARS == 262144, "flatten char cap provisional");
+    check(TABLE_MAX_PHYSICAL_LINES == 512, "physical-line cap finalized");
+    check(MD_MAX_FLATTEN_CHARS == 262144, "flatten char cap finalized");
 
     { /* Preferred layout fits: slack stays unused, single column. */
         Fixture f;
@@ -517,6 +517,40 @@ int main(void) {
         reset(&f, MD_MAX_TABLE_COLUMNS + 1);
         check(!table_layout_columns(&f.in, 100, 16, 8, fake_width, NULL, &cols),
             "too many columns rejected");
+
+        /* Negative aggregate counts are rejected before any bounds arithmetic,
+           by both the whole-table and the per-cell entry points. */
+        f = (Fixture){0};
+        reset(&f, 2);
+        add_cell(&f, L"aa", 0);
+        add_cell(&f, L"bb", 0);
+        add_row(&f, 2);
+        sync_fixture(&f);
+        f.in.row_count = -1;
+        check(!table_layout_columns(&f.in, 100, 16, 8, fake_width, NULL, &cols),
+            "negative row count rejected by columns");
+        check(table_layout_cell_breaks(&f.in, 0, 0, 40, fake_width, NULL,
+            lines, 4) == 0, "negative row count rejected by breaks");
+        check(table_layout_cell_lines(&f.in, 0, 0, 40, fake_width, NULL) == 0,
+            "negative row count rejected by lines");
+        f.in.row_count = 1;
+        f.in.cell_count = -1;
+        check(table_layout_cell_breaks(&f.in, 0, 0, 40, fake_width, NULL,
+            lines, 4) == 0, "negative cell count rejected by breaks");
+        f.in.cell_count = 2;
+        f.in.span_count = -1;
+        check(table_layout_cell_breaks(&f.in, 0, 0, 40, fake_width, NULL,
+            lines, 4) == 0, "negative span count rejected by breaks");
+        check(table_layout_cell_lines(&f.in, 0, 0, 40, fake_width, NULL) == 0,
+            "negative span count rejected by lines");
+        f.in.span_count = 2;
+        f.cells[0].span_count = -1;
+        check(table_layout_cell_breaks(&f.in, 0, 0, 40, fake_width, NULL,
+            lines, 4) == 0, "negative cell span count rejected");
+        f.cells[0].span_count = 1;
+        f.cells[0].first_span = -1;
+        check(table_layout_cell_breaks(&f.in, 0, 0, 40, fake_width, NULL,
+            lines, 4) == 0, "negative cell span start rejected");
     }
 
     { /* Degenerate: huge widths must not overflow the apportionment. */

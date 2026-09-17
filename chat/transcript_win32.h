@@ -122,6 +122,14 @@ typedef struct {
     uint64_t conversation, message, revision, body_revision;
     ChatRole role;
     ChatGenerationState state;
+    /* Assistant Markdown body layout currency: the width/DPI/theme epoch the
+       bound body's flattened text was produced at. Stamped only after a
+       successful assistant body write into the bound surface, never by the
+       hidden measurer, and consulted only for assistant bodies (a verbatim
+       user/system body does not depend on width). */
+    int body_layout_width;
+    float body_layout_dpi;
+    uint32_t body_layout_theme;
     bool running, content_started, reasoning_open;
     wchar_t row[48];                    /* rendered reasoning-row text */
     /* Destructive writes deferred while a selection is held in a surface. */

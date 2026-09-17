@@ -15,16 +15,16 @@
 #include <wchar.h>
 #include "markdown.h"
 
-/* Calibrated by the Phase 0 spike (tests/test_richedit_tabs.c) and provisional
-   until Phase 3 benchmarks the real flattening path. The two DIP values are
+/* Calibrated by the Phase 0 spike (tests/test_richedit_tabs.c) and finalized by
+   the Phase 3 benchmark of the real flattening path. The two DIP values are
    configuration: the adapter scales them before calling this module (I11).
-   TABLE_MAX_PHYSICAL_LINES is a per-cell guard only; it is NOT the final table
-   resource limit. Phase 3 must enforce the limit across the whole table by
-   summing, per row, the maximum cell-line count over that row's columns, and
-   render the table literally when the total exceeds the cap. */
+   TABLE_MAX_PHYSICAL_LINES is the per-cell wrap guard; the Win32 adapter also
+   enforces it across each whole table (summing, per row, the maximum cell-line
+   count over that row's columns) and falls back to literal when exceeded, so a
+   pathological table never measures or emits unbounded work. */
 #define TABLE_MIN_COLUMN_DIP       48
 #define TABLE_GUTTER_DIP           16
-#define TABLE_MAX_PHYSICAL_LINES   4096
+#define TABLE_MAX_PHYSICAL_LINES   512
 #define MD_MAX_FLATTEN_CHARS       262144
 
 /* One styled substring of a cell. `text` points into the caller's buffer and

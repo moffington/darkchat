@@ -3278,6 +3278,145 @@ static int bounded_suite(void) {
         CHECK(visible_realized(h));
     }
 
+    /* ---- R7: GFM table flattening and assistant layout currency ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        wchar_t r7_table[512];
+        {
+            wchar_t cell[96], cell2[96];
+            for (int i=0;i<80;i++) cell[i]=(wchar_t)(L'a'+(i%20));
+            cell[80]=0;
+            for (int i=0;i<80;i++) cell2[i]=(wchar_t)(L'A'+(i%20));
+            cell2[80]=0;
+            swprintf(r7_table,512,
+                L"| %ls | %ls |\n| ---: | :--- |\n| %ls | %ls |",
+                cell,cell2,cell2,cell);
+        }
+        int r7=add_turn(chat,L"r7 table question",r7_table,NULL,-1);
+        render_transcript(h);
+        CHECK(transcript_reveal_turn(&h->transcript,feed_arg(h),r7));
+        CHECK(transcript_surface(&h->transcript,r7,TRANSCRIPT_BODY)!=NULL);
+        TranscriptRecord *r7rec=&h->transcript.records[r7];
+        { wchar_t shown[1024]; body_text(h,r7,shown,1024);
+          CHECK(wcsstr(shown,L"|")==NULL && wcsstr(shown,L"\t")!=NULL); }
+        int r7_wide_h=r7rec->body_h;
+        int r7_wide_width=h->transcript.view_width;
+        CHECK(r7_wide_width>0 && r7_wide_h>0);
+        CHECK(r7rec->body_layout_width==r7_wide_width);
+        CHECK(r7rec->body_layout_dpi==h->transcript.dpi);
+        CHECK(r7rec->body_layout_theme==h->transcript.theme_epoch);
+        uint64_t r7_rev=r7rec->body_revision;
+        RichTextTheme r7_saved_theme=h->transcript.theme;
+        RECT r7_original; GetWindowRect(h->view,&r7_original);
+
+        /* (1) A narrower control width re-flattens the table to a taller
+               line structure and restamps the assistant currency. */
+        SetWindowPos(h->view,NULL,0,0,420,
+            r7_original.bottom-r7_original.top,
+            SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
+        render_transcript(h);
+        CHECK(h->transcript.view_width<r7_wide_width);
+        CHECK(r7rec->body_layout_width==h->transcript.view_width);
+        CHECK(r7rec->body_h>r7_wide_h);
+        { wchar_t shown[1024]; body_text(h,r7,shown,1024);
+          CHECK(wcsstr(shown,L"|")==NULL && wcsstr(shown,L"\t")!=NULL); }
+
+        /* (2) A selection defers the width-driven re-flatten: the displayed
+               text and its currency stay until the selection clears, then the
+               current-width layout is applied. */
+        int r7_displayed_width=r7rec->body_layout_width;
+        SendMessageW(body_window(h,r7),EM_SETSEL,0,3);
+        SetWindowPos(h->view,NULL,0,0,300,
+            r7_original.bottom-r7_original.top,
+            SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
+        render_transcript(h);
+        CHECK(r7rec->body_pending && r7rec->blocked_debt);
+        CHECK(r7rec->body_layout_width==r7_displayed_width);
+        CHECK(r7rec->body_layout_width!=h->transcript.view_width);
+        CHECK(r7rec->body_revision==r7_rev);
+        { wchar_t shown[1024]; body_text(h,r7,shown,1024);
+          CHECK(wcsstr(shown,L"|")==NULL && wcsstr(shown,L"\t")!=NULL); }
+        SendMessageW(body_window(h,r7),EM_SETSEL,0,0);
+        CHECK(!r7rec->body_pending);
+        CHECK(r7rec->body_layout_width==h->transcript.view_width);
+
+        /* (3) A DPI change with an unchanged message revision re-flattens and
+               restamps; the theme epoch participates in the same currency. */
+        SetWindowPos(h->view,NULL,0,0,
+            r7_original.right-r7_original.left,
+            r7_original.bottom-r7_original.top,
+            SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
+        render_transcript(h);
+        CHECK(r7rec->body_revision==r7_rev);
+        transcript_set_dpi(&h->transcript,120.0f);
+        render_transcript(h);
+        CHECK(r7rec->body_layout_dpi==120.0f);
+        CHECK(r7rec->body_layout_width==h->transcript.view_width);
+        CHECK(r7rec->body_revision==r7_rev);
+        transcript_set_dpi(&h->transcript,96.0f);
+        render_transcript(h);
+        CHECK(r7rec->body_layout_dpi==96.0f);
+        uint32_t r7_epoch=h->transcript.theme_epoch;
+        RichTextTheme r7_changed=h->transcript.theme;
+        r7_changed.ui_size+=1.0f;
+        transcript_set_theme(&h->transcript,&r7_changed);
+        render_transcript(h);
+        CHECK(h->transcript.theme_epoch!=r7_epoch);
+        CHECK(r7rec->body_layout_theme==h->transcript.theme_epoch);
+
+        /* (3b) A DPI change while the reader holds a selection is deferred
+               exactly like a width change: the displayed layout and its
+               currency stay, then the new DPI layout applies once the
+               selection clears. */
+        int r7_dpi_before=(int)r7rec->body_layout_dpi;
+        uint64_t r7_dpi_rev=r7rec->body_revision;
+        SendMessageW(body_window(h,r7),EM_SETSEL,0,3);
+        transcript_set_dpi(&h->transcript,120.0f);
+        render_transcript(h);
+        CHECK(r7rec->body_pending && r7rec->blocked_debt);
+        CHECK((int)r7rec->body_layout_dpi==r7_dpi_before);
+        CHECK(r7rec->body_revision==r7_dpi_rev);
+        SendMessageW(body_window(h,r7),EM_SETSEL,0,0);
+        CHECK(!r7rec->body_pending);
+        CHECK((int)r7rec->body_layout_dpi==120);
+        transcript_set_dpi(&h->transcript,96.0f);
+        render_transcript(h);
+        CHECK((int)r7rec->body_layout_dpi==96);
+
+        /* (3c) A theme change under selection is likewise deferred and only
+               restamps after the selection clears. */
+        uint32_t r7_theme_before=r7rec->body_layout_theme;
+        RichTextTheme r7_theme2=h->transcript.theme;
+        r7_theme2.ui_size+=1.0f;
+        SendMessageW(body_window(h,r7),EM_SETSEL,0,3);
+        transcript_set_theme(&h->transcript,&r7_theme2);
+        render_transcript(h);
+        CHECK(r7rec->body_pending && r7rec->blocked_debt);
+        CHECK(r7rec->body_layout_theme==r7_theme_before);
+        CHECK(r7rec->body_layout_theme!=h->transcript.theme_epoch);
+        SendMessageW(body_window(h,r7),EM_SETSEL,0,0);
+        CHECK(!r7rec->body_pending);
+        CHECK(r7rec->body_layout_theme==h->transcript.theme_epoch);
+
+        /* (4) An unchanged non-assistant body is never perpetually stale:
+               currency does not apply, so a selection there is never deferred
+               and no destructive rewrite is attempted. */
+        int r7_user=r7-1;
+        TranscriptRecord *r7u=&h->transcript.records[r7_user];
+        CHECK(r7u->role==CHAT_ROLE_USER);
+        CHECK(r7u->body_layout_width==0);
+        CHECK(transcript_surface(&h->transcript,r7_user,TRANSCRIPT_BODY)!=NULL);
+        SendMessageW(body_window(h,r7_user),EM_SETSEL,0,2);
+        for (int rep=0;rep<3;rep++) render_transcript(h);
+        CHECK(!r7u->body_pending && !r7u->blocked_debt);
+        SendMessageW(body_window(h,r7_user),EM_SETSEL,0,0);
+        render_transcript(h);
+
+        /* Restore the shared theme for the remaining checks. */
+        transcript_set_theme(&h->transcript,&r7_saved_theme);
+        render_transcript(h);
+    }
+
     /* Convergence bookkeeping: no cap fallback, no degraded settle. */
     CHECK(h->transcript.stat.fallback_rounds==fallback_before+1);
     CHECK(h->transcript.stat.degraded_rounds==0);

@@ -246,14 +246,39 @@ int table_layout_anchor(const TableColumns *columns, int column,
     }
 }
 
+/* O(requested cell) validation for the per-cell entry points. Validating the
+   whole table on every cell would make a caller that walks every cell
+   quadratic in the table size; this checks only the ranges the requested row
+   and column actually dereference, with the same rejections. */
+static bool cell_input_valid(const TableLayoutInput *in, int row, int column) {
+    if (!in || !in->align) return false;
+    if (in->columns < 1 || in->columns > MD_MAX_TABLE_COLUMNS) return false;
+    /* Reject negative aggregate counts before any bounds arithmetic. */
+    if (in->row_count < 0 || in->cell_count < 0 || in->span_count < 0)
+        return false;
+    if (!in->rows || row < 0 || row >= in->row_count) return false;
+    const TableLayoutRow *entry = &in->rows[row];
+    if (entry->first_cell < 0 || entry->cell_count < 0) return false;
+    if (!in->cells || entry->first_cell > in->cell_count - entry->cell_count)
+        return false;
+    if (column < 0 || column >= in->columns || column >= entry->cell_count)
+        return false;
+    const TableLayoutCell *cell = &in->cells[entry->first_cell + column];
+    if (cell->first_span < 0 || cell->span_count < 0) return false;
+    if (cell->span_count > 0 && !in->spans) return false;
+    if (cell->first_span > in->span_count - cell->span_count) return false;
+    for (int k = 0; k < cell->span_count; k++) {
+        const TableSpan *span = &in->spans[cell->first_span + k];
+        if (span->length > 0 && !span->text) return false;
+    }
+    return true;
+}
+
 int table_layout_cell_breaks(const TableLayoutInput *in, int row, int column,
     int width_px, TableSpanWidth measure, void *user, TableCellLine *lines,
     int capacity) {
-    if (!measure || !input_valid(in)) return 0;
-    if (row < 0 || row >= in->row_count) return 0;
-    if (column < 0 || column >= in->columns) return 0;
+    if (!measure || !cell_input_valid(in, row, column)) return 0;
     const TableLayoutRow *entry = &in->rows[row];
-    if (column >= entry->cell_count) return 0;
     const TableLayoutCell *cell = &in->cells[entry->first_cell + column];
     int length = cell_length(in, cell);
     if (length == 0) {

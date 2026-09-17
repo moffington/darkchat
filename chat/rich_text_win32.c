@@ -1,12 +1,24 @@
 #include "rich_text_win32.h"
 #include "markdown.h"
+#include "table_layout.h"
 #include <richedit.h>
 #include <shellapi.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* Rich Edit 4.1+ ships in Msftedit.dll. */
 #define DARKCHAT_RICH_CLASS L"RICHEDIT50W"
+
+/* The paragraph format owns at most 32 tab stops; the table subset never
+   exceeds MD_MAX_TABLE_COLUMNS (24). */
+#ifndef MAX_TAB_STOPS
+#define MAX_TAB_STOPS 32
+#endif
+#ifndef PFM_TABSTOPS
+#define PFM_TABSTOPS 0x00008000
+#endif
 
 /* Older headers may not define these; the values are stable. */
 #ifndef EM_AUTOURLDETECT
@@ -131,20 +143,57 @@ static LONG indent_twips(const RichTextControl *control, int columns) {
 /* Paragraph format for the current selection. Every field is set on every
    call, mirroring apply_format, so a paragraph never inherits a stale indent.
    dxStartIndent moves the first line; a positive dxOffset moves the following
-   lines further in, which is the hanging indent a synthesized marker needs. */
-static void apply_paragraph(RichTextControl *control, int first, int hanging) {
+   lines further in, which is the hanging indent a synthesized marker needs.
+   Tab stops are always part of the mask: a flattened table paragraph owns the
+   complete monotonic stop array for its table, and every ordinary paragraph
+   explicitly clears its stops (cTabCount = 0) so a previous table's stops can
+   never survive into following text (TABLES_PLAN.md I6). */
+typedef struct {
+    int column_count;
+    int x[MD_MAX_TABLE_COLUMNS];        /* pixel anchors, device px */
+    unsigned char align[MD_MAX_TABLE_COLUMNS];
+} MdTableFormat;
+
+static void apply_paragraph_tabs(RichTextControl *control, int first,
+    int hanging, const MdTableFormat *table, int dpi) {
     PARAFORMAT2 format;
     memset(&format, 0, sizeof format);
     format.cbSize = sizeof format;
-    format.dwMask = PFM_STARTINDENT | PFM_OFFSET | PFM_RIGHTINDENT;
+    format.dwMask = PFM_STARTINDENT | PFM_OFFSET | PFM_RIGHTINDENT |
+        PFM_TABSTOPS;
     format.dxStartIndent = indent_twips(control, first);
     format.dxOffset = indent_twips(control, hanging);
     format.dxRightIndent = 0;
+    format.cTabCount = 0;
+    if (table) {
+        /* A table paragraph has no indentation; its tab stops are the layout. */
+        format.dxStartIndent = 0;
+        format.dxOffset = 0;
+        int count = table->column_count;
+        if (count < 0) count = 0;
+        if (count > MAX_TAB_STOPS) count = MAX_TAB_STOPS;
+        int used = 0;
+        for (int i = 0; i < count; i++) {
+            LONG twip = (LONG)MulDiv(table->x[i], 1440, dpi);
+            /* The stop position must fit the low 24 bits; the alignment nibble
+               occupies bits 24-27 and the leader bits 28-31 stay zero. */
+            if (twip < 0 || twip > 0x00FFFFFFL) break;
+            format.rgxTabs[i] = twip |
+                (((LONG)table->align[i] & 0xF) << 24);
+            used++;
+        }
+        format.cTabCount = (WORD)used;
+    }
     SendMessageW(control->window, EM_SETPARAFORMAT, 0, (LPARAM)&format);
 }
 
+static void apply_paragraph(RichTextControl *control, int first, int hanging) {
+    apply_paragraph_tabs(control, first, hanging, NULL, 96);
+}
+
 /* Clears the paragraph format of the whole current selection: a verbatim body,
-   a literal fallback or a rebuilt document must never inherit an indent. */
+   a literal fallback or a rebuilt document must never inherit an indent or a
+   stale tab-stop array. */
 static void reset_paragraphs(RichTextControl *control) {
     apply_paragraph(control, 0, 0);
 }
@@ -171,7 +220,13 @@ static void apply_blocks(RichTextControl *control, const MdDocument *document) {
 }
 
 static void caret_end(HWND window) {
-    int length = GetWindowTextLengthW(window);
+    /* EM_SETSEL positions count one unit per paragraph mark, so the internal
+       length (not the CRLF-expanded GetWindowTextLengthW) is the caret end. */
+    GETTEXTLENGTHEX measure;
+    measure.flags = GTL_NUMCHARS;
+    measure.codepage = 1200;
+    LONG length = (LONG)SendMessageW(window, EM_GETTEXTLENGTHEX,
+        (WPARAM)&measure, 0);
     SendMessageW(window, EM_SETSEL, (WPARAM)length, (LPARAM)length);
 }
 
@@ -492,31 +547,100 @@ static void end_write(RichTextControl *control) {
     RedrawWindow(control->window, NULL, NULL, RDW_INVALIDATE);
 }
 
-/* Writes text verbatim, one line at a time; CR LF pairs become one paragraph
-   break. No markdown interpretation of any kind: user, system and error
-   messages and running assistant output stay exactly as stored, including
-   fence markers. */
-static void write_literal(RichTextControl *control, const wchar_t *text,
-    COLORREF color) {
-    bool first = true;
-    const wchar_t *line = text ? text : L"";
-    for (;;) {
-        const wchar_t *end = line;
-        while (*end && *end != L'\n' && *end != L'\r') ++end;
-        size_t length = (size_t)(end - line);
-        if (!first) run(control, L"\n", 0, color);
-        wchar_t *buffer = (wchar_t *)malloc((length + 1) * sizeof(wchar_t));
-        if (buffer) {
-            if (length) wmemcpy(buffer, line, length);
-            buffer[length] = 0;
-            run(control, buffer, 0, color);
-            free(buffer);
+/* Number of code units a literal write deposits: every LF, CRLF or lone CR
+   becomes exactly one paragraph break (LF), every other code unit is kept. */
+static size_t literal_code_units(const wchar_t *text) {
+    size_t count = 0;
+    const wchar_t *p = text ? text : L"";
+    while (*p) {
+        if (*p == L'\r') {
+            ++count;
+            ++p;
+            if (*p == L'\n') ++p;
+        } else {
+            ++count;
+            ++p;
         }
-        first = false;
-        if (!*end) break;
-        line = end + 1;
-        if (*end == L'\r' && *line == L'\n') ++line;
     }
+    return count;
+}
+
+/* Internal Rich Edit character count (one unit per paragraph mark), the
+   coordinate space EM_SETSEL and link ranges use. GetWindowTextLengthW would
+   expand every break to CRLF and is not that space. */
+static LONG text_length(HWND window) {
+    GETTEXTLENGTHEX measure;
+    measure.flags = GTL_NUMCHARS;
+    measure.codepage = 1200;
+    return (LONG)SendMessageW(window, EM_GETTEXTLENGTHEX, (WPARAM)&measure, 0);
+}
+
+/* Writes text verbatim, one logical line per paragraph; LF, CRLF and lone CR
+   each become one paragraph break. No markdown interpretation of any kind:
+   user, system and error messages and running assistant output stay exactly as
+   stored, including fence markers.
+
+   Allocation-free and complete: the normalized stream is built into a fixed
+   stack chunk and flushed in large pieces, so a failed heap allocation can
+   never drop content and many small insertions cannot make the write
+   quadratic. Returns true only when the whole normalized source landed. */
+static bool write_literal(RichTextControl *control, const wchar_t *text,
+    COLORREF color) {
+    HWND window = control->window;
+    LONG start = text_length(window);
+    const wchar_t *p = text ? text : L"";
+    wchar_t chunk[2048];
+    size_t used = 0;
+    const size_t capacity = sizeof chunk / sizeof *chunk - 2;
+    while (*p) {
+        wchar_t character;
+        if (*p == L'\r') {
+            character = L'\n';
+            ++p;
+            if (*p == L'\n') ++p;
+        } else if (*p == L'\n') {
+            character = L'\n';
+            ++p;
+        } else {
+            character = *p++;
+        }
+        chunk[used++] = character;
+        if (used == capacity) {
+            wchar_t held = 0;
+            size_t flush = used;
+            /* Never split a surrogate pair across insertions. */
+            if (chunk[used - 1] >= (wchar_t)0xD800 &&
+                chunk[used - 1] <= (wchar_t)0xDBFF) {
+                held = chunk[used - 1];
+                flush = used - 1;
+            }
+            chunk[flush] = 0;
+            if (flush) SendMessageW(window, EM_REPLACESEL, FALSE, (LPARAM)chunk);
+            if (held) {
+                chunk[0] = held;
+                used = 1;
+            } else {
+                used = 0;
+            }
+        }
+    }
+    if (used) {
+        chunk[used] = 0;
+        SendMessageW(window, EM_REPLACESEL, FALSE, (LPARAM)chunk);
+    }
+    LONG finish = text_length(window);
+    if (finish > start) {
+        CHARRANGE range;
+        range.cpMin = start;
+        range.cpMax = finish;
+        SendMessageW(window, EM_EXSETSEL, 0, (LPARAM)&range);
+        apply_format(control, SCF_SELECTION, 0, color, control->theme.ui_size);
+        /* Leave an empty selection at the end, exactly like the other
+           writers: a lingering selection would make the surface read as
+           reader-selected and defer every later rebuild. */
+        caret_end(window);
+    }
+    return (size_t)(finish - start) == literal_code_units(text);
 }
 
 /* Takes ownership of a rendered document's link metadata: the label ranges and
@@ -535,69 +659,955 @@ static void take_links(RichTextControl *control, MdDocument *document) {
     document->targets_capacity = 0;
 }
 
-/* Terminal assistant body: parse once, insert the normalized document, then
-   style each run's exact range. Every character belongs to a run, so no
-   format survives past its run. */
-void rich_text_set_markdown(RichTextControl *control, ChatRole role,
-    const wchar_t *text) {
-    if (!control || !control->window) return;
+/* Face size (DIPs) for one run, shared by the direct path and the table plan so
+   a measured span and its rendered run always agree. */
+static float run_size(const RichTextTheme *theme, unsigned style, int heading) {
+    if (style & MD_STYLE_MONO) return theme->mono_size;
+    if (heading == 1) return theme->ui_size + 3.0f;
+    if (heading == 2) return theme->ui_size + 2.0f;
+    if (heading == 3) return theme->ui_size + 1.0f;
+    return theme->ui_size;
+}
+
+static COLORREF run_color(const RichTextTheme *theme, unsigned style,
+    COLORREF body) {
+    if (style & MD_STYLE_CODE) return theme->code_text;
+    if (style & MD_STYLE_MUTED) return theme->muted;
+    return body;
+}
+
+/* Applies a rendered document's runs, paragraphs and links over the text most
+   recently inserted (the no-table direct path). Every character belongs to a
+   run, so no format survives past its run. */
+static void apply_document(RichTextControl *control, const MdDocument *document,
+    COLORREF body) {
+    const RichTextTheme *theme = &control->theme;
+    CHARRANGE whole;
+    whole.cpMin = 0;
+    whole.cpMax = (LONG)document->length;
+    SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&whole);
+    reset_paragraphs(control);
+    apply_blocks(control, document);
+    for (int i = 0; i < document->run_count; i++) {
+        const MdRun *r = &document->runs[i];
+        if (!r->length) continue;
+        CHARRANGE range;
+        range.cpMin = (LONG)r->offset;
+        range.cpMax = (LONG)(r->offset + r->length);
+        SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&range);
+        apply_format(control, SCF_SELECTION, r->style,
+            run_color(theme, r->style, body),
+            run_size(theme, r->style, r->heading));
+    }
+    if (document->link_count) {
+        /* Detection would strip a link effect that is not an autoURL, so
+           custom labels are applied with detection off and it is restored
+           without re-scanning, leaving both the labels and any bare URL the
+           insertion recognized. */
+        SendMessageW(control->window, EM_AUTOURLDETECT, FALSE, 0);
+        for (int i = 0; i < document->link_count; i++)
+            apply_link(control, (LONG)document->links[i].offset,
+                (LONG)(document->links[i].offset + document->links[i].length));
+        SendMessageW(control->window, EM_AUTOURLDETECT,
+            (WPARAM)(AURL_ENABLEURL | AURL_NOINITIALSCAN), 0);
+    }
+    caret_end(control->window);
+}
+
+/* ---- Transactional flatten plan (TABLES_PLAN.md 3.2, 4, 5) --------------- */
+
+typedef struct {
+    size_t offset, length;              /* paragraph range in plan text */
+    unsigned char first_indent, continuation_indent;
+    int table_format;                   /* index into formats[], or -1 */
+} MdParagraph;
+
+typedef struct {
+    size_t src, length;                 /* source range copied verbatim */
+    size_t plan;                        /* plan offset the range maps to */
+} PlanSegment;
+
+typedef struct {
+    wchar_t *text; size_t length, text_capacity;
+    MdRun *runs; int run_count, run_capacity;
+    MdParagraph *paragraphs; int paragraph_count, paragraph_capacity;
+    MdTableFormat *table_formats; int table_format_count, table_format_capacity;
+    MdLink *links; int link_count, link_capacity;   /* control coords */
+    PlanSegment *segments; int segment_count, segment_capacity;
+    wchar_t *link_targets;              /* adopted document target arena */
+    size_t link_targets_length;
+    bool owns_targets;
+    bool failed, overflow;
+    int dpi;                            /* rounded device DPI */
+} MarkdownPlan;
+
+/* Test-only allocation seam: every permanent and temporary plan allocation
+   (text, runs, paragraphs, formats, links, spans, cell geometry, wrapped
+   lines) goes through these. `allocation_index` 0 fails the first attempt and
+   every attempt after it, so a countdown walk exercises each failure point. */
+static int plan_fail_after = -1;
+static int plan_alloc_index;
+
+void markdown_plan_test_fail_after(int allocation_index) {
+    plan_fail_after = allocation_index;
+}
+
+/* Test-only metric seam: forces the GDI measurement adapter to report a
+   failure, so the document-wide transactional fallback can be exercised. */
+static bool test_fail_metrics;
+
+void rich_text_test_fail_metrics(bool enable) {
+    test_fail_metrics = enable;
+}
+
+static bool plan_should_fail(void) {
+    int index = plan_alloc_index++;
+    return plan_fail_after >= 0 && index >= plan_fail_after;
+}
+
+static void *plan_malloc(size_t bytes) {
+    if (bytes == 0) bytes = 1;
+    if (plan_should_fail()) return NULL;
+    return malloc(bytes);
+}
+
+static void *plan_realloc(void *memory, size_t bytes) {
+    if (bytes == 0) bytes = 1;
+    if (plan_should_fail()) return NULL;
+    return realloc(memory, bytes);
+}
+
+static bool plan_reserve_text(MarkdownPlan *p, size_t need) {
+    if (need <= p->text_capacity) return true;
+    size_t capacity = p->text_capacity ? p->text_capacity : 256;
+    while (capacity < need) {
+        if (capacity > (SIZE_MAX / 2)) { capacity = need; break; }
+        capacity *= 2;
+    }
+    wchar_t *grown = (wchar_t *)plan_realloc(p->text,
+        capacity * sizeof(wchar_t));
+    if (!grown) { p->failed = true; return false; }
+    p->text = grown;
+    p->text_capacity = capacity;
+    return true;
+}
+
+static bool plan_append(MarkdownPlan *p, const wchar_t *source, size_t length) {
+    if (p->failed) return false;
+    if (length == 0) return true;
+    /* Document-wide flatten cap: overflow renders the whole body verbatim. */
+    if (length > (size_t)MD_MAX_FLATTEN_CHARS ||
+        p->length > (size_t)MD_MAX_FLATTEN_CHARS - length) {
+        p->overflow = true;
+        p->failed = true;
+        return false;
+    }
+    if (!plan_reserve_text(p, p->length + length + 1)) return false;
+    memcpy(p->text + p->length, source, length * sizeof(wchar_t));
+    p->length += length;
+    p->text[p->length] = 0;
+    return true;
+}
+
+static bool plan_append_run(MarkdownPlan *p, size_t offset, size_t length,
+    unsigned style, int heading) {
+    if (p->failed || length == 0) return true;
+    /* Coalesce adjacent identical runs: synthesized tabs and line breaks then
+       merge with the plain text they touch, while still covering every
+       emitted code unit (TABLES_PLAN.md requirement 2). */
+    if (p->run_count > 0) {
+        MdRun *last = &p->runs[p->run_count - 1];
+        if (last->offset + last->length == offset && last->style == style &&
+            last->heading == heading) {
+            last->length += length;
+            return true;
+        }
+    }
+    if (p->run_count == p->run_capacity) {
+        int capacity = p->run_capacity ? p->run_capacity * 2 : 64;
+        MdRun *grown = (MdRun *)plan_realloc(p->runs,
+            (size_t)capacity * sizeof(MdRun));
+        if (!grown) { p->failed = true; return false; }
+        p->runs = grown;
+        p->run_capacity = capacity;
+    }
+    MdRun *run = &p->runs[p->run_count++];
+    run->offset = offset;
+    run->length = length;
+    run->style = style;
+    run->heading = heading;
+    return true;
+}
+
+static bool plan_append_paragraph(MarkdownPlan *p, size_t offset, size_t length,
+    unsigned char first, unsigned char continuation, int format) {
+    if (p->failed) return false;
+    if (p->paragraph_count == p->paragraph_capacity) {
+        int capacity = p->paragraph_capacity ? p->paragraph_capacity * 2 : 64;
+        MdParagraph *grown = (MdParagraph *)plan_realloc(p->paragraphs,
+            (size_t)capacity * sizeof(MdParagraph));
+        if (!grown) { p->failed = true; return false; }
+        p->paragraphs = grown;
+        p->paragraph_capacity = capacity;
+    }
+    MdParagraph *paragraph = &p->paragraphs[p->paragraph_count++];
+    paragraph->offset = offset;
+    paragraph->length = length;
+    paragraph->first_indent = first;
+    paragraph->continuation_indent = continuation;
+    paragraph->table_format = format;
+    return true;
+}
+
+static bool plan_append_format(MarkdownPlan *p, const MdTableFormat *format,
+    int *out_index) {
+    if (p->failed) return false;
+    if (p->table_format_count == p->table_format_capacity) {
+        int capacity = p->table_format_capacity ? p->table_format_capacity * 2
+            : 8;
+        MdTableFormat *grown = (MdTableFormat *)plan_realloc(p->table_formats,
+            (size_t)capacity * sizeof(MdTableFormat));
+        if (!grown) { p->failed = true; return false; }
+        p->table_formats = grown;
+        p->table_format_capacity = capacity;
+    }
+    p->table_formats[p->table_format_count] = *format;
+    *out_index = p->table_format_count;
+    p->table_format_count++;
+    return true;
+}
+
+static bool plan_append_link(MarkdownPlan *p, const MdLink *link) {
+    if (p->failed) return false;
+    if (p->link_count == p->link_capacity) {
+        int capacity = p->link_capacity ? p->link_capacity * 2 : 8;
+        MdLink *grown = (MdLink *)plan_realloc(p->links,
+            (size_t)capacity * sizeof(MdLink));
+        if (!grown) { p->failed = true; return false; }
+        p->links = grown;
+        p->link_capacity = capacity;
+    }
+    p->links[p->link_count++] = *link;
+    return true;
+}
+
+static bool plan_append_segment(MarkdownPlan *p, size_t src, size_t length,
+    size_t plan) {
+    if (p->failed) return false;
+    if (p->segment_count == p->segment_capacity) {
+        int capacity = p->segment_capacity ? p->segment_capacity * 2 : 64;
+        PlanSegment *grown = (PlanSegment *)plan_realloc(p->segments,
+            (size_t)capacity * sizeof(PlanSegment));
+        if (!grown) { p->failed = true; return false; }
+        p->segments = grown;
+        p->segment_capacity = capacity;
+    }
+    PlanSegment *segment = &p->segments[p->segment_count++];
+    segment->src = src;
+    segment->length = length;
+    segment->plan = plan;
+    return true;
+}
+
+static void plan_dispose(MarkdownPlan *p) {
+    if (!p) return;
+    free(p->text);
+    free(p->runs);
+    free(p->paragraphs);
+    free(p->table_formats);
+    free(p->links);
+    free(p->segments);
+    if (p->owns_targets) free(p->link_targets);
+    memset(p, 0, sizeof *p);
+}
+
+/* ---- Metric adapter (TABLES_PLAN.md 5.2, I8) ------------------------------ */
+
+typedef struct {
+    wchar_t family[LF_FACESIZE];
+    LONG twips;
+    int weight;
+    bool italic;
+    HFONT font;
+} MetricFont;
+
+typedef struct {
+    RichTextControl *control;
+    HDC dc;
+    int dpi;                            /* rounded device DPI */
+    MetricFont fonts[32];
+    int font_count;
+    HFONT selected;                     /* font currently selected in `dc` */
+    HGDIOBJ previous;                   /* the DC's own font, restored at end */
+    bool metric_failed;
+} MetricCtx;
+
+static void metric_begin(MetricCtx *ctx, RichTextControl *control) {
+    memset(ctx, 0, sizeof *ctx);
+    ctx->control = control;
+    int dpi = (int)(control->dpi + 0.5f);
+    ctx->dpi = dpi > 0 ? dpi : 96;
+    if (test_fail_metrics) {
+        ctx->metric_failed = true;
+        return;
+    }
+    /* GetDC is paired with ReleaseDC in metric_end on every exit path. */
+    ctx->dc = GetDC(control->window);
+    if (!ctx->dc) ctx->metric_failed = true;
+}
+
+static void metric_end(MetricCtx *ctx) {
+    if (ctx->dc && ctx->selected)
+        SelectObject(ctx->dc, ctx->previous);       /* deselect before delete */
+    for (int i = 0; i < ctx->font_count; i++)
+        if (ctx->fonts[i].font) DeleteObject(ctx->fonts[i].font);
+    ctx->font_count = 0;
+    if (ctx->dc && ctx->control) ReleaseDC(ctx->control->window, ctx->dc);
+    ctx->dc = NULL;
+}
+
+/* Selects (creating lazily) the face matching the span's metric-relevant
+   style. The cache is per plan, keyed by copied family, twips, weight and
+   italic; theme_epoch is deliberately not a key. */
+static HFONT metric_font(MetricCtx *ctx, const TableSpan *span) {
+    const RichTextTheme *theme = &ctx->control->theme;
+    bool mono = (span->style & MD_STYLE_MONO) != 0;
+    const wchar_t *family = mono ? theme->mono_family : theme->ui_family;
+    float dip = run_size(theme, span->style, span->heading);
+    LONG twips = (LONG)(dip * 15.0f + 0.5f);
+    int weight = (span->style & MD_STYLE_BOLD) ? 700 : 400;
+    bool italic = (span->style & MD_STYLE_ITALIC) != 0;
+    for (int i = 0; i < ctx->font_count; i++) {
+        MetricFont *entry = &ctx->fonts[i];
+        if (entry->twips == twips && entry->weight == weight &&
+            entry->italic == italic && !wcscmp(entry->family, family))
+            return entry->font;
+    }
+    if (ctx->font_count >= (int)(sizeof ctx->fonts / sizeof *ctx->fonts)) {
+        ctx->metric_failed = true;
+        return NULL;
+    }
+    LOGFONTW logfont;
+    memset(&logfont, 0, sizeof logfont);
+    logfont.lfHeight = -(LONG)MulDiv((int)twips, ctx->dpi, 1440);
+    if (logfont.lfHeight == 0) logfont.lfHeight = -1;
+    logfont.lfWeight = weight;
+    logfont.lfItalic = italic ? TRUE : FALSE;
+    logfont.lfCharSet = DEFAULT_CHARSET;
+    logfont.lfQuality = DEFAULT_QUALITY;
+    wcsncpy(logfont.lfFaceName, family, LF_FACESIZE - 1);
+    HFONT font = CreateFontIndirectW(&logfont);
+    if (!font) { ctx->metric_failed = true; return NULL; }
+    MetricFont *entry = &ctx->fonts[ctx->font_count++];
+    wcsncpy(entry->family, family, LF_FACESIZE - 1);
+    entry->family[LF_FACESIZE - 1] = 0;
+    entry->twips = twips;
+    entry->weight = weight;
+    entry->italic = italic;
+    entry->font = font;
+    return font;
+}
+
+/* TableSpanWidth: text-only width of one styled substring. Gutters are owned
+   solely by table_layout, so nothing is added here. */
+static int metric_span_width(void *user, const TableSpan *span) {
+    MetricCtx *ctx = (MetricCtx *)user;
+    if (!ctx || ctx->metric_failed || !ctx->dc || !span || span->length == 0)
+        return 0;
+    if (span->length > (size_t)INT_MAX) { ctx->metric_failed = true; return 0; }
+    HFONT font = metric_font(ctx, span);
+    if (!font) return 0;
+    if (ctx->selected != font) {
+        HGDIOBJ previous = SelectObject(ctx->dc, font);
+        if (!previous || previous == HGDI_ERROR) {
+            ctx->metric_failed = true;
+            return 0;
+        }
+        if (!ctx->selected) ctx->previous = previous;   /* the DC's own font */
+        ctx->selected = font;
+    }
+    SIZE size;
+    memset(&size, 0, sizeof size);
+    if (!GetTextExtentPoint32W(ctx->dc, span->text, (int)span->length, &size)) {
+        ctx->metric_failed = true;
+        return 0;
+    }
+    return (int)size.cx;
+}
+
+/* ---- Flatten emission ----------------------------------------------------- */
+
+typedef struct {
+    const MdDocument *document;
+    MarkdownPlan *plan;
+} PlanEmit;
+
+/* First source run whose end lies past `src` (runs are ordered by offset).
+   A per-slice lookup, not a forward-only cursor: table emission emits the
+   wrapped lines of one row column by column, so source ranges are revisited
+   out of order and a monotonic cursor would skip their styles. */
+static int first_run_past(const MdDocument *document, size_t src) {
+    int low = 0, high = document->run_count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        const MdRun *run = &document->runs[mid];
+        if (run->offset + run->length <= src) low = mid + 1;
+        else high = mid;
+    }
+    return low;
+}
+
+/* Copies a source range into the plan and remaps every intersecting source-run
+   slice, so plan formatting is deterministic over every emitted code unit.
+   Gaps, the final tail, ordinary blocks and table cell slices all go through
+   here. */
+static void emit_source_span(PlanEmit *emit, size_t src, size_t length) {
+    MarkdownPlan *p = emit->plan;
+    const MdDocument *document = emit->document;
+    if (p->failed || length == 0) return;
+    size_t base = p->length;
+    if (!plan_append(p, document->text + src, length)) return;
+    if (!plan_append_segment(p, src, length, base)) return;
+    size_t end = src + length;
+    int i = first_run_past(document, src);
+    size_t covered = 0;
+    while (i < document->run_count) {
+        const MdRun *run = &document->runs[i];
+        if (run->offset >= end) break;
+        size_t low = run->offset > src ? run->offset : src;
+        size_t high = run->offset + run->length;
+        if (high > end) high = end;
+        if (low < high) {
+            if (low > src + covered)
+                plan_append_run(p, base + covered, low - (src + covered), 0, 0);
+            plan_append_run(p, base + (low - src), high - low, run->style,
+                run->heading);
+            covered = high - src;
+        }
+        if (run->offset + run->length <= end) i++;
+        else break;                         /* continues into the next span */
+    }
+    if (covered < length)
+        plan_append_run(p, base + covered, length - covered, 0, 0);
+}
+
+/* Synthesized table characters (tabs and line breaks) carry an explicit plain
+   run so no surrounding style can bleed onto them. */
+static void emit_plain_char(PlanEmit *emit, wchar_t character) {
+    MarkdownPlan *p = emit->plan;
+    if (p->failed) return;
+    size_t base = p->length;
+    if (!plan_append(p, &character, 1)) return;
+    plan_append_run(p, base, 1, 0, 0);
+}
+
+/* A failed table is rendered literally from its stored normalized source slice:
+   plain runs and ordinary paragraphs with table_format = -1. */
+static bool emit_table_literal(PlanEmit *emit, const MdTable *table) {
+    MarkdownPlan *p = emit->plan;
+    const wchar_t *source = emit->document->literals + table->literal_offset;
+    size_t length = table->literal_length;
+    size_t base = p->length;
+    if (!plan_append(p, source, length)) return false;
+    if (length) plan_append_run(p, base, length, 0, 0);
+    size_t line = 0;
+    for (;;) {
+        size_t end = line;
+        while (end < length && source[end] != L'\n') end++;
+        if (!plan_append_paragraph(p, base + line, end - line, 0, 0, -1))
+            return false;
+        if (end >= length) break;
+        line = end + 1;
+    }
+    return !p->failed;
+}
+
+/* Fills each cell's wrapped flat line ranges into one flat array, reusing the
+   line counts already computed by the fit pass (no redundant wrapping). */
+static bool table_cell_lines(const TableLayoutInput *input,
+    const TableColumns *columns, TableSpanWidth measure, void *user,
+    const int *counts, int *firsts, TableCellLine *lines, long total_entries) {
+    int cell = 0;
+    long cursor = 0;
+    for (int r = 0; r < input->row_count; r++) {
+        for (int c = 0; c < input->columns; c++, cell++) {
+            int count = counts[cell];
+            firsts[cell] = (int)cursor;
+            if (cursor + count > total_entries) return false;
+            int written = count > 0 ? table_layout_cell_breaks(input, r, c,
+                columns->width[c], measure, user, lines + cursor, count) : 0;
+            if (written != count) return false;
+            cursor += count;
+        }
+    }
+    return true;
+}
+
+/* Builds the TableLayoutInput overlays for one table from the document's
+   run/cell/row metadata. All temporary arrays are plan allocations so the
+   failure seam covers them. */
+static bool build_table_input(const MdDocument *document, const MdTable *table,
+    TableLayoutInput *input, TableLayoutRow **rows_out,
+    TableLayoutCell **cells_out, TableSpan **spans_out) {
+    int row_count = table->row_count;
+    int cell_count = table->cell_count;
+    if (row_count <= 0 || cell_count <= 0) return false;
+    TableLayoutRow *rows = (TableLayoutRow *)plan_malloc(
+        (size_t)row_count * sizeof(TableLayoutRow));
+    TableLayoutCell *cells = (TableLayoutCell *)plan_malloc(
+        (size_t)cell_count * sizeof(TableLayoutCell));
+    size_t span_cap = (size_t)document->run_count + (size_t)cell_count + 1;
+    TableSpan *spans = (TableSpan *)plan_malloc(span_cap * sizeof(TableSpan));
+    if (!rows || !cells || !spans) {
+        /* Free every partial allocation: a failed call must not leak. */
+        free(rows);
+        free(cells);
+        free(spans);
+        return false;
+    }
+
+    int span_count = 0;
+    int cell = 0;
+    int run_cursor = 0;                 /* runs are ordered: never rescan them */
+    for (int r = 0; r < row_count; r++) {
+        const MdTableRow *source_row = &document->rows[table->first_row + r];
+        rows[r].first_cell = cell;
+        rows[r].cell_count = table->columns;
+        for (int c = 0; c < table->columns; c++) {
+            cells[cell].first_span = span_count;
+            if (c < source_row->cell_count) {
+                const MdTableCell *source_cell =
+                    &document->cells[source_row->first_cell + c];
+                size_t from = source_cell->offset;
+                size_t to = source_cell->offset + source_cell->length;
+                while (run_cursor < document->run_count &&
+                    document->runs[run_cursor].offset +
+                        document->runs[run_cursor].length <= from)
+                    run_cursor++;
+                int ri = run_cursor;
+                while (ri < document->run_count && from < to) {
+                    const MdRun *run = &document->runs[ri];
+                    size_t run_from = run->offset;
+                    size_t run_to = run->offset + run->length;
+                    if (run_from >= to) break;
+                    size_t low = run_from > from ? run_from : from;
+                    size_t high = run_to < to ? run_to : to;
+                    if (low < high && (size_t)span_count < span_cap) {
+                        TableSpan *span = &spans[span_count++];
+                        span->text = document->text + low;
+                        span->length = high - low;
+                        unsigned style = run->style &
+                            (MD_STYLE_MONO | MD_STYLE_BOLD | MD_STYLE_ITALIC);
+                        /* Header spans are bold before measurement (I8). */
+                        if (r == 0) style |= MD_STYLE_BOLD;
+                        span->style = (unsigned char)style;
+                        span->heading = (unsigned char)run->heading;
+                    }
+                    from = high;
+                    if (run_to <= to) ri++;         /* fully consumed */
+                    else break;                     /* spans this cell and on */
+                }
+                run_cursor = ri;
+            }
+            cells[cell].span_count = span_count - cells[cell].first_span;
+            cell++;
+        }
+    }
+    input->spans = spans;
+    input->span_count = span_count;
+    input->cells = cells;
+    input->cell_count = cell_count;
+    input->rows = rows;
+    input->row_count = row_count;
+    input->columns = table->columns;
+    input->align = table->align;
+    *rows_out = rows;
+    *cells_out = cells;
+    *spans_out = spans;
+    return true;
+}
+
+/* Emits one table: resolves columns, wraps every cell, and writes physical
+   lines with tab stops. Fit failure, table-wide line overflow or an
+   out-of-range tab anchor renders only this table literally. Any allocation
+   failure fails the whole plan (whole-body verbatim). */
+static bool emit_table(PlanEmit *emit, MetricCtx *ctx, int control_width_px,
+    const MdTable *table) {
+    const MdDocument *document = emit->document;
+    MarkdownPlan *p = emit->plan;
+    /* Every row is at least one physical line, so a table already over the
+       line cap can fall back to literal without measuring a single cell. */
+    if (table->row_count > TABLE_MAX_PHYSICAL_LINES)
+        return emit_table_literal(emit, table);
+    TableLayoutInput input;
+    TableLayoutRow *rows = NULL;
+    TableLayoutCell *cells = NULL;
+    TableSpan *spans = NULL;
+    int *counts = NULL;
+    int *firsts = NULL;
+    TableCellLine *lines = NULL;
+    bool fatal = false;                     /* whole-body fallback */
+    bool literal = false;                   /* this table only */
+
+    if (!build_table_input(document, table, &input, &rows, &cells, &spans)) {
+        fatal = true;
+        goto done;
+    }
+    counts = (int *)plan_malloc((size_t)input.cell_count * sizeof(int));
+    firsts = (int *)plan_malloc((size_t)input.cell_count * sizeof(int));
+    if (!counts || !firsts) { fatal = true; goto done; }
+
+    int dpi = ctx->dpi > 0 ? ctx->dpi : 96;
+    int minimum_px = MulDiv(TABLE_MIN_COLUMN_DIP, dpi, 96);
+    int gutter_px = MulDiv(TABLE_GUTTER_DIP, dpi, 96);
+    int margin = (int)(10.0f * ctx->control->dpi / 96.0f + 0.5f);
+    int available = control_width_px - 2 * margin;
+    if (minimum_px < 1) minimum_px = 1;
+    if (gutter_px < 0) gutter_px = 0;
+    if (available < 0) available = 0;
+
+    TableColumns columns;
+    if (!table_layout_columns(&input, available, minimum_px, gutter_px,
+            metric_span_width, ctx, &columns))
+        literal = true;
+
+    long total_entries = 0;
+    long physical = 0;
+    if (!literal) {
+        for (int r = 0; r < input.row_count; r++) {
+            int row_lines = 1;
+            for (int c = 0; c < input.columns; c++) {
+                int index = r * input.columns + c;
+                int count = table_layout_cell_breaks(&input, r, c,
+                    columns.width[c], metric_span_width, ctx, NULL, 0);
+                if (count < 0) { literal = true; break; }
+                counts[index] = count;
+                if (count > row_lines) row_lines = count;
+                total_entries += count;
+            }
+            if (literal) break;
+            physical += row_lines;
+            /* Table-wide physical-line cap: only this table falls back (4.2). */
+            if (physical > TABLE_MAX_PHYSICAL_LINES) { literal = true; break; }
+        }
+    }
+    if (ctx->metric_failed) { fatal = true; goto done; }
+
+    if (!literal && total_entries > 0) {
+        lines = (TableCellLine *)plan_malloc((size_t)total_entries *
+            sizeof(TableCellLine));
+        if (!lines) { fatal = true; goto done; }
+        if (!table_cell_lines(&input, &columns, metric_span_width, ctx,
+                counts, firsts, lines, total_entries)) {
+            if (ctx->metric_failed) { fatal = true; goto done; }
+            literal = true;
+        }
+    }
+    if (ctx->metric_failed) { fatal = true; goto done; }
+
+    int format_index = -1;
+    if (!literal) {
+        MdTableFormat format;
+        memset(&format, 0, sizeof format);
+        format.column_count = table->columns;
+        for (int c = 0; c < table->columns; c++) {
+            format.align[c] = table->align[c];
+            int anchor = table_layout_anchor(&columns, c, table->align[c]);
+            LONG twip = (LONG)MulDiv(anchor, 1440, dpi);
+            if (anchor < 0 || twip < 0 || twip > 0x00FFFFFFL) literal = true;
+            format.x[c] = anchor;
+        }
+        if (!literal && !plan_append_format(p, &format, &format_index)) {
+            fatal = true;
+            goto done;
+        }
+    }
+    if (literal) goto done;
+
+    bool first_line = true;
+    for (int r = 0; r < input.row_count && !p->failed; r++) {
+        int index = r * input.columns;
+        int row_lines = 1;
+        for (int c = 0; c < input.columns; c++)
+            if (counts[index + c] > row_lines) row_lines = counts[index + c];
+        const MdTableRow *source_row = &document->rows[table->first_row + r];
+        for (int l = 0; l < row_lines; l++) {
+            if (!first_line) emit_plain_char(emit, L'\n');
+            first_line = false;
+            size_t paragraph_start = p->length;
+            for (int c = 0; c < input.columns; c++) {
+                unsigned char align = table->align[c];
+                /* Tab rule (I6): before a cell iff column > 0 or the cell is
+                   not left-aligned. Empty cells still emit their tab. */
+                if (c > 0 || align != MD_ALIGN_LEFT)
+                    emit_plain_char(emit, L'\t');
+                int cell_index = r * input.columns + c;
+                if (l >= counts[cell_index]) continue;
+                const TableCellLine *line = &lines[firsts[cell_index] + l];
+                if (line->end <= line->start) continue;
+                int doc_cell = source_row->first_cell + c;
+                if (c >= source_row->cell_count ||
+                    doc_cell >= document->cell_count) continue;
+                const MdTableCell *source_cell = &document->cells[doc_cell];
+                emit_source_span(emit,
+                    source_cell->offset + (size_t)line->start,
+                    (size_t)(line->end - line->start));
+            }
+            if (!plan_append_paragraph(p, paragraph_start,
+                    p->length - paragraph_start, 0, 0, format_index))
+                break;
+        }
+    }
+    if (p->failed) fatal = true;
+
+done:
+    free(cells);
+    free(rows);
+    free(spans);
+    free(counts);
+    free(firsts);
+    free(lines);
+    if (fatal) {
+        p->failed = true;
+        return false;
+    }
+    if (literal) return emit_table_literal(emit, table);
+    return !p->failed;
+}
+
+/* Builds the transactional flatten plan. Returns false for every
+   document-wide failure (allocation, metric, character overflow): the caller
+   then writes the entire original source verbatim. A per-table failure is
+   handled inside emit_table and never fails the whole plan. */
+static bool build_plan(RichTextControl *control, const MdDocument *document,
+    int control_width_px, MarkdownPlan *plan) {
+    memset(plan, 0, sizeof *plan);
+    plan_alloc_index = 0;
+    int dpi = (int)(control->dpi + 0.5f);
+    plan->dpi = dpi > 0 ? dpi : 96;
+    MetricCtx ctx;
+    metric_begin(&ctx, control);
+
+    PlanEmit emit;
+    emit.document = document;
+    emit.plan = plan;
+
+    size_t cursor = 0;
+    for (int i = 0; i < document->block_count && !plan->failed; i++) {
+        const MdBlock *block = &document->blocks[i];
+        if (block->offset > cursor)
+            emit_source_span(&emit, cursor, block->offset - cursor);
+        cursor = block->offset;
+        if (block->kind == MD_BLOCK_TABLE && block->table_index >= 0 &&
+            block->table_index < document->table_count) {
+            if (!emit_table(&emit, &ctx, control_width_px,
+                    &document->tables[block->table_index]))
+                break;
+        } else {
+            size_t base = plan->length;
+            emit_source_span(&emit, block->offset, block->length);
+            plan_append_paragraph(plan, base, plan->length > base
+                ? plan->length - base : 0, block->first_indent,
+                block->continuation_indent, -1);
+        }
+        cursor += block->length;
+    }
+    if (!plan->failed && document->length > cursor)
+        emit_source_span(&emit, cursor, document->length - cursor);
+
+    /* Map every document link through the emitted segments; a link spanning a
+       wrapped slice becomes one plan link per slice, sharing its target. */
+    if (!plan->failed) {
+        for (int i = 0; i < document->link_count && !plan->failed; i++) {
+            const MdLink *link = &document->links[i];
+            size_t from = link->offset;
+            size_t to = link->offset + link->length;
+            for (int s = 0; s < plan->segment_count && !plan->failed; s++) {
+                const PlanSegment *segment = &plan->segments[s];
+                size_t seg_from = segment->src;
+                size_t seg_to = segment->src + segment->length;
+                size_t low = from > seg_from ? from : seg_from;
+                size_t high = to < seg_to ? to : seg_to;
+                if (low >= high) continue;
+                MdLink mapped;
+                mapped.offset = segment->plan + (low - seg_from);
+                mapped.length = high - low;
+                mapped.target_offset = link->target_offset;
+                mapped.target_length = link->target_length;
+                plan_append_link(plan, &mapped);
+            }
+        }
+    }
+
+    if (ctx.metric_failed) plan->failed = true;
+    metric_end(&ctx);
+    return !plan->failed && !plan->overflow;
+}
+
+/* ---- Plan application ----------------------------------------------------- */
+
+static void apply_plan_paragraphs(RichTextControl *control,
+    const MarkdownPlan *plan) {
+    for (int i = 0; i < plan->paragraph_count;) {
+        const MdParagraph *first = &plan->paragraphs[i];
+        int j = i + 1;
+        while (j < plan->paragraph_count &&
+            plan->paragraphs[j].first_indent == first->first_indent &&
+            plan->paragraphs[j].continuation_indent ==
+                first->continuation_indent &&
+            plan->paragraphs[j].table_format == first->table_format) j++;
+        const MdParagraph *last = &plan->paragraphs[j - 1];
+        CHARRANGE range;
+        range.cpMin = (LONG)first->offset;
+        range.cpMax = (LONG)(last->offset + last->length);
+        if (range.cpMax < range.cpMin) range.cpMax = range.cpMin;
+        SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&range);
+        const MdTableFormat *format = first->table_format >= 0 &&
+            first->table_format < plan->table_format_count
+            ? &plan->table_formats[first->table_format] : NULL;
+        apply_paragraph_tabs(control, first->first_indent,
+            first->continuation_indent - first->first_indent, format,
+            plan->dpi);
+        i = j;
+    }
+}
+
+static void take_plan_links(RichTextControl *control, MarkdownPlan *plan) {
+    control->links = plan->links;
+    control->link_count = plan->link_count;
+    control->link_targets = plan->link_targets;
+    control->link_targets_length = plan->link_targets_length;
+    plan->links = NULL;
+    plan->link_count = 0;
+    plan->link_capacity = 0;
+    plan->link_targets = NULL;
+    plan->link_targets_length = 0;
+    plan->owns_targets = false;
+}
+
+/* Formats the plan text already inserted at the control's caret into the
+   control's current selection. The insertion and its completeness check are
+   the caller's job, so a partial insert is never formatted or linked. */
+static void apply_plan_format(RichTextControl *control, MarkdownPlan *plan,
+    COLORREF body) {
+    const RichTextTheme *theme = &control->theme;
+    CHARRANGE whole;
+    whole.cpMin = 0;
+    whole.cpMax = (LONG)plan->length;
+    SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&whole);
+    reset_paragraphs(control);
+    apply_plan_paragraphs(control, plan);
+    for (int i = 0; i < plan->run_count; i++) {
+        const MdRun *run = &plan->runs[i];
+        if (!run->length) continue;
+        CHARRANGE range;
+        range.cpMin = (LONG)run->offset;
+        range.cpMax = (LONG)(run->offset + run->length);
+        SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&range);
+        apply_format(control, SCF_SELECTION, run->style,
+            run_color(theme, run->style, body),
+            run_size(theme, run->style, run->heading));
+    }
+    if (plan->link_count) {
+        SendMessageW(control->window, EM_AUTOURLDETECT, FALSE, 0);
+        for (int i = 0; i < plan->link_count; i++)
+            apply_link(control, (LONG)plan->links[i].offset,
+                (LONG)(plan->links[i].offset + plan->links[i].length));
+        SendMessageW(control->window, EM_AUTOURLDETECT,
+            (WPARAM)(AURL_ENABLEURL | AURL_NOINITIALSCAN), 0);
+    }
+    caret_end(control->window);
+}
+
+/* True when the control now holds exactly `expected` internal code units; the
+   insertion succeeded whole. Any shortfall means the write is incomplete and
+   must be replaced by the verbatim source. */
+static bool inserted_whole(const RichTextControl *control, size_t expected) {
+    return (size_t)text_length(control->window) == expected;
+}
+
+/* Terminal assistant body at an explicit control width. The width is asserted
+   before content so the plan's usable-width arithmetic matches the surface the
+   reader sees; the plan is built off-control and inserted only when complete,
+   and the inserted length is verified before any formatting is applied.
+   Returns false only when the control/window is unavailable or cannot be
+   sized, or when the verbatim fallback itself is incomplete (a completed
+   verbatim fallback still returns true). */
+bool rich_text_set_markdown_width(RichTextControl *control, ChatRole role,
+    const wchar_t *text, int control_width_px) {
+    if (!control || !control->window) return false;
+    if (control_width_px > 0) {
+        RECT bounds;
+        if (!GetWindowRect(control->window, &bounds)) return false;
+        if (bounds.right - bounds.left != control_width_px) {
+            if (!SetWindowPos(control->window, NULL, 0, 0, control_width_px,
+                    bounds.bottom - bounds.top,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
+                return false;               /* width not assertable */
+        }
+    }
     const RichTextTheme *theme = &control->theme;
     COLORREF body = role == CHAT_ROLE_ERROR ? theme->error : theme->text;
     begin_write(control);
     MdDocument document;
+    bool ok = true;
     if (!markdown_render(text, &document)) {
-        /* Transactional failure: fall back to the verbatim body. */
-        write_literal(control, text, body);
-    } else if (document.table_count > 0) {
-        /* Recognized tables are not rendered yet: keep the whole body verbatim
-           so the table source, pipes included, is what the reader sees. Phase 3
-           replaces this gate with the transactional table renderer. */
-        markdown_dispose(&document);
-        write_literal(control, text, body);
-    } else {
+        /* Transactional parser failure: the whole body is written verbatim. */
+        ok = write_literal(control, text, body);
+    } else if (document.table_count == 0) {
         SendMessageW(control->window, EM_REPLACESEL, FALSE,
             (LPARAM)document.text);
-        /* Defaults are re-asserted across the inserted document, since inserted
-           text inherits the format at the caret; nothing depends on the order
-           of the two writes above. */
-        CHARRANGE whole;
-        whole.cpMin = 0;
-        whole.cpMax = (LONG)document.length;
-        SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&whole);
-        reset_paragraphs(control);
-        apply_blocks(control, &document);
-        for (int i = 0; i < document.run_count; i++) {
-            const MdRun *r = &document.runs[i];
-            if (!r->length) continue;
-            CHARRANGE range;
-            range.cpMin = (LONG)r->offset;
-            range.cpMax = (LONG)(r->offset + r->length);
-            SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&range);
-            COLORREF color = r->style & MD_STYLE_CODE ? theme->code_text :
-                r->style & MD_STYLE_MUTED ? theme->muted : body;
-            float size = r->style & MD_STYLE_MONO ? theme->mono_size :
-                r->heading == 1 ? theme->ui_size + 3.0f :
-                r->heading == 2 ? theme->ui_size + 2.0f :
-                r->heading == 3 ? theme->ui_size + 1.0f : theme->ui_size;
-            apply_format(control, SCF_SELECTION, r->style, color, size);
+        if (!inserted_whole(control, document.length)) {
+            /* A partial insert is never formatted or linked: replace it with
+               the complete original source. */
+            begin_write(control);
+            ok = write_literal(control, text, body);
+        } else {
+            apply_document(control, &document, body);
+            take_links(control, &document);
         }
-        if (document.link_count) {
-            /* Detection would strip a link effect that is not an autoURL, so
-               custom labels are applied with detection off and it is restored
-               without re-scanning, leaving both the labels and any bare URL
-               the insertion recognized. */
-            SendMessageW(control->window, EM_AUTOURLDETECT, FALSE, 0);
-            for (int i = 0; i < document.link_count; i++)
-                apply_link(control, (LONG)document.links[i].offset,
-                    (LONG)(document.links[i].offset + document.links[i].length));
-            SendMessageW(control->window, EM_AUTOURLDETECT,
-                (WPARAM)(AURL_ENABLEURL | AURL_NOINITIALSCAN), 0);
+    } else {
+        MarkdownPlan plan;
+        if (!build_plan(control, &document, control_width_px, &plan)) {
+            /* Plan/layout/allocation/metric failure: whole body verbatim,
+               no links transferred. */
+            plan_dispose(&plan);
+            ok = write_literal(control, text, body);
+        } else {
+            if (plan.link_count > 0) {
+                plan.link_targets = document.targets;
+                plan.link_targets_length = document.targets_length;
+                plan.owns_targets = true;
+                document.targets = NULL;
+                document.targets_length = 0;
+                document.targets_capacity = 0;
+            }
+            SendMessageW(control->window, EM_REPLACESEL, FALSE,
+                (LPARAM)(plan.text ? plan.text : L""));
+            if (!inserted_whole(control, plan.length)) {
+                begin_write(control);
+                ok = write_literal(control, text, body);
+            } else {
+                apply_plan_format(control, &plan, body);
+                take_plan_links(control, &plan);
+            }
+            plan_dispose(&plan);
         }
-        take_links(control, &document);
-        markdown_dispose(&document);
-        caret_end(control->window);
     }
+    markdown_dispose(&document);
     end_write(control);
+    return ok;
+}
+
+/* Compatibility wrapper: renders at the control's current width. Production
+   transcript paths use the explicit-width writer. */
+void rich_text_set_markdown(RichTextControl *control, ChatRole role,
+    const wchar_t *text) {
+    if (!control || !control->window) return;
+    RECT bounds;
+    int width = GetWindowRect(control->window, &bounds)
+        ? bounds.right - bounds.left : 0;
+    rich_text_set_markdown_width(control, role, text, width);
 }
 
 void rich_text_set_body(RichTextControl *control, ChatRole role,
@@ -733,6 +1743,3 @@ bool rich_text_handle_notify(RichTextControl *control, LPARAM lparam) {
     if (header->code == EN_VSCROLL) return true;
     return false;
 }
-
-
-
