@@ -33,6 +33,10 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_markdown_win.exe
     if errorlevel 1 exit /b 1
+    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_richedit_tabs.c -o build\test_richedit_tabs.exe -lgdi32 -luser32
+    if errorlevel 1 exit /b 1
+    build\test_richedit_tabs.exe
+    if errorlevel 1 exit /b 1
     gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_transcript_slots.c chat\transcript_win32.c chat\transcript_policy.c chat\rich_text_win32.c chat\chat.c chat\markdown.c chat\json.c -o build\test_transcript_slots.exe -lgdi32 -lshell32 -luser32 -Wl,--wrap=calloc
     if errorlevel 1 exit /b 1
     build\test_transcript_slots.exe
