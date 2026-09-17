@@ -865,6 +865,36 @@ static int default_suite(void) {
       SendMessageW(body->window,EM_SETSEL,0,1);
       SendMessageW(body->window,EM_GETCHARFORMAT,SCF_SELECTION,(LPARAM)&f);
       CHECK(f.dwEffects & CFE_LINK); }
+    /* ---- Table markdown streams through the same throttle: the header alone
+       stays literal until its delimiter row arrives, then the table flattens
+       to tab-separated physical lines, and the terminal render completes it
+       with the paragraph's tab stops. ---- */
+    add_turn(chat,L"seed",L"seed answer",NULL,-1);
+    begin_regenerate(h);
+    int table_stream_turn=h->request_message;
+    h->transcript.body_render_tick=0;
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"| a | b |\n"));
+    { wchar_t body[256]; body_text(h,table_stream_turn,body,256);
+      CHECK(wcsstr(body,L"| a | b |")!=NULL); }   /* header alone: literal */
+    h->transcript.body_render_tick=0;
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"| --- | --- |\n"));
+    { wchar_t body[256]; body_text(h,table_stream_turn,body,256);
+      CHECK(wcsstr(body,L"|")==NULL && wcsstr(body,L"\t")!=NULL); }
+    h->transcript.body_render_tick=0;
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"| c | d |"));
+    { wchar_t body[256]; body_text(h,table_stream_turn,body,256);
+      CHECK(!wcscmp(body,L"a\tb\r\nc\td")); }
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
+    { wchar_t body[256]; body_text(h,table_stream_turn,body,256);
+      CHECK(!wcscmp(body,L"a\tb\r\nc\td"));
+      HWND window=body_window(h,table_stream_turn);
+      CHECK(window);
+      PARAFORMAT2 pf; memset(&pf,0,sizeof pf); pf.cbSize=sizeof pf;
+      SendMessageW(window,EM_SETSEL,0,1);
+      SendMessageW(window,EM_GETPARAFORMAT,0,(LPARAM)&pf);
+      CHECK(pf.cTabCount==2);
+      CHECK(((pf.rgxTabs[1] >> 24) & 0xF)==MD_ALIGN_LEFT); }
     command(h,CHAT_COMMAND_SELECT,cv);
     /* Compact metadata footer: deduplicated model, grouped tokens, no "stop",
        and unusual finish reasons surfaced. */
@@ -2622,6 +2652,31 @@ static int bounded_suite(void) {
             transcript_surface(tr,eq,TRANSCRIPT_META),&ql);
         CHECK(ql==TRANSCRIPT_MEASURE_EXACT);
         CHECK(tr->records[eq].meta_h==hl);
+        /* table body: the hidden measurer and the live surface must flatten
+           to code-unit-identical text at identical layout inputs, and both
+           must measure EXACT with the cached height equal to the live one */
+        CHECK(chat_message_set_text(&chat->conversations[chat->active].messages[eq],
+            L"| left | right |\n| :--- | ---: |\n"
+            L"| alpha alpha alpha alpha | beta beta beta beta |\n"
+            L"| gamma gamma | delta delta delta |"));
+        refresh_turn(h,eq);
+        m=&chat->conversations[chat->active].messages[eq];
+        CHECK(rich_text_set_markdown_width(meas,m->role,
+            chat_message_text(m),tr->view_width));
+        hm=transcript_measure_live(tr,meas,&qm);
+        RichTextControl *table_body=transcript_surface(tr,eq,TRANSCRIPT_BODY);
+        hl=transcript_measure_live(tr,table_body,&ql);
+        CHECK(qm==TRANSCRIPT_MEASURE_EXACT && ql==TRANSCRIPT_MEASURE_EXACT);
+        CHECK(hm==hl);
+        CHECK(tr->records[eq].body_h==hl);       /* cached == live */
+        {
+            wchar_t meas_text[512], live_text[512];
+            rich_text_get_text(meas,meas_text,512);
+            rich_text_get_text(table_body,live_text,512);
+            CHECK(!wcscmp(meas_text,live_text));  /* code-unit-identical */
+            CHECK(wcsstr(live_text,L"|")==NULL && wcsstr(live_text,L"\t")!=NULL);
+            CHECK(meas->link_count==table_body->link_count);
+        }
         /* restore the turn's own content and certify the restoration */
         CHECK(chat_message_set_text(&chat->conversations[chat->active].messages[eq],
             L"r5 answer"));
@@ -3124,11 +3179,17 @@ static int bounded_suite(void) {
         command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
         int evict_conv=chat->active;
         wchar_t reason[512];
+        /* Record 1 (the first assistant turn) carries a table body, so the
+           forced-eviction and rebinding cycle below can prove that a
+           rebinding reproduces the same flattened table. */
+        const wchar_t *table_answer=
+            L"| name | qty |\n| :--- | ---: |\n| alpha | 1 |\n| beta | 22 |";
         for (int t=0;t<256;t++) {
             swprintf(reason,512,L"evict reasoning line 1\nline 2\nline 3\n"
                 L"line 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10 "
                 L"tail %d",t);
-            add_turn(chat,L"evict question",L"evict answer body",reason,1000);
+            add_turn(chat,L"evict question",
+                t==0 ? table_answer : L"evict answer body",reason,1000);
         }
         CHECK(chat->conversations[evict_conv].message_count==512);
         render_transcript(h);
@@ -3209,6 +3270,19 @@ static int bounded_suite(void) {
             h->transcript.records[1].reason_live);
         { wchar_t shown[512]; reasoning_text(h,1,shown,512);
           CHECK(wcsstr(shown,L"tail 0")!=NULL); }
+        /* Rebinding equivalence: the re-realized table body is the same
+           flattened text, and the hidden measurer at the same width produces
+           code-unit-identical text. */
+        { RichTextControl *tb=transcript_surface(&h->transcript,1,
+              TRANSCRIPT_BODY);
+          CHECK(tb);
+          wchar_t bound[512]; rich_text_get_text(tb,bound,512);
+          CHECK(!wcscmp(bound,L"name\tqty\r\nalpha\t1\r\nbeta\t22"));
+          const ChatMessage *tm=&chat->conversations[evict_conv].messages[1];
+          CHECK(rich_text_set_markdown_width(&h->transcript.measurer,tm->role,
+              chat_message_text(tm),h->transcript.view_width));
+          wchar_t mt[512]; rich_text_get_text(&h->transcript.measurer,mt,512);
+          CHECK(!wcscmp(mt,bound)); }
         POINT restored_pos;
         { RichTextControl *control=transcript_surface(&h->transcript,1,
               TRANSCRIPT_REASON);
@@ -3281,6 +3355,7 @@ static int bounded_suite(void) {
     /* ---- R7: GFM table flattening and assistant layout currency ---- */
     {
         command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int r7_conv=chat->active;
         wchar_t r7_table[512];
         {
             wchar_t cell[96], cell2[96];
@@ -3415,6 +3490,70 @@ static int bounded_suite(void) {
         /* Restore the shared theme for the remaining checks. */
         transcript_set_theme(&h->transcript,&r7_saved_theme);
         render_transcript(h);
+
+        /* (5) Conversation switching: leaving and returning to the table's
+               conversation leaves the flattened body current at the same
+               width, with no outstanding debt. */
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        add_turn(chat,L"switch away",L"switch away answer",NULL,-1);
+        render_transcript(h);
+        command(h,CHAT_COMMAND_SELECT,r7_conv);
+        render_transcript(h);
+        CHECK(r7rec->body_layout_width==h->transcript.view_width);
+        CHECK(!r7rec->body_pending);
+        { wchar_t shown[2048]; body_text(h,r7,shown,2048);
+          CHECK(wcsstr(shown,L"|")==NULL && wcsstr(shown,L"\t")!=NULL); }
+    }
+
+    /* ---- R8: a mixed body whose over-wide table falls back to literal keeps
+            the surrounding Markdown and a later semantic link (regression 5).
+            The default view is wide enough that only the 24-column maximum
+            cannot satisfy its minimum layout. ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        wchar_t mixed[2048];
+        wcscpy(mixed,L"Lead **bold**\n\n|");
+        for (int c=0;c<24;c++) wcscat(mixed,L" h |");
+        wcscat(mixed,L"\n|");
+        for (int c=0;c<24;c++) wcscat(mixed,L" --- |");
+        wcscat(mixed,L"\n|");
+        for (int c=0;c<24;c++) wcscat(mixed,L" v |");
+        wcscat(mixed,L"\n\nTail [x](https://example.com/host)");
+        int r8=add_turn(chat,L"r8 question",mixed,NULL,-1);
+        render_transcript(h);
+        CHECK(transcript_reveal_turn(&h->transcript,feed_arg(h),r8));
+        RichTextControl *body=transcript_surface(&h->transcript,r8,TRANSCRIPT_BODY);
+        CHECK(body);
+        wchar_t shown[4096]; body_text(h,r8,shown,4096);
+        CHECK(wcsstr(shown,L"| h | h | h | h |")!=NULL);  /* table literal */
+        CHECK(wcsstr(shown,L"Lead")!=NULL && wcsstr(shown,L"Tail x")!=NULL);
+        CHECK(body->link_count==1);               /* later semantic link kept */
+        FINDTEXTW find;
+        memset(&find,0,sizeof find);
+        find.chrg.cpMin=0; find.chrg.cpMax=-1;
+        find.lpstrText=L"| h | h |";
+        LONG table_cp=(LONG)SendMessageW(body->window,EM_FINDTEXTW,1,
+            (LPARAM)&find);
+        CHECK(table_cp>=0);
+        PARAFORMAT2 pf; memset(&pf,0,sizeof pf); pf.cbSize=sizeof pf;
+        SendMessageW(body->window,EM_SETSEL,table_cp,table_cp+1);
+        SendMessageW(body->window,EM_GETPARAFORMAT,0,(LPARAM)&pf);
+        CHECK(pf.cTabCount==0);                   /* literal: ordinary paragraph */
+        memset(&find,0,sizeof find);
+        find.chrg.cpMin=0; find.chrg.cpMax=-1;
+        find.lpstrText=L"Tail x";
+        LONG link_cp=(LONG)SendMessageW(body->window,EM_FINDTEXTW,1,
+            (LPARAM)&find);
+        CHECK(link_cp>=0);
+        link_cp+=5;                               /* "x" */
+        CHARFORMAT2W cf; memset(&cf,0,sizeof cf); cf.cbSize=sizeof cf;
+        SendMessageW(body->window,EM_SETSEL,link_cp,link_cp+1);
+        SendMessageW(body->window,EM_GETCHARFORMAT,SCF_SELECTION,(LPARAM)&cf);
+        CHECK(cf.dwEffects & CFE_LINK);
+        memset(&cf,0,sizeof cf); cf.cbSize=sizeof cf;
+        SendMessageW(body->window,EM_SETSEL,5,6);  /* "bold" */
+        SendMessageW(body->window,EM_GETCHARFORMAT,SCF_SELECTION,(LPARAM)&cf);
+        CHECK(cf.dwEffects & CFE_BOLD);
     }
 
     /* Convergence bookkeeping: no cap fallback, no degraded settle. */

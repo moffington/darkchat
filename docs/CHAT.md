@@ -346,7 +346,29 @@ recognizes still opens from its visible range. Malformed or non-HTTP(S) links
 stay verbatim. Precedence is
 fences → inline code → links → strikethrough → emphasis; escapes (`\*`) keep
 punctuation literal; malformed or unsupported
-syntax (tables, images, deeper rules) is preserved verbatim.
+syntax (images, deeper rules) is preserved verbatim.
+
+GFM-style tables are supported at recognition: a header line whose next source
+line is a valid delimiter row (`:?-+:?` per cell, the colons choosing left,
+center or right alignment) opens a table that continues through non-blank lines
+until a blank line or another block-level construct. `\|` keeps a literal pipe
+inside a cell (including inside a code span), edge pipes are optional, and rows
+are padded or truncated to the header's column count. Cell content is parsed as
+inline Markdown with bold headers, so emphasis and HTTP(S) links work inside
+cells; tables are root-level only, and a quote/list-prefixed, oversized
+(> 24-column) or malformed candidate header stays literal. A table is rendered
+in-body in the same Rich Edit surface: the pure `chat/table_layout.c` primitive
+resolves deterministic column widths (a 48-DIP minimum column and 16-DIP gutter,
+proportional shrink toward the minimum, surrogate-safe wrapping) and the Win32
+layer flattens the table into tab-separated physical lines whose paragraphs own
+the full monotonic Rich Edit tab-stop array. When a table's minimum layout
+cannot fit, only that table falls back to its original source; a document-wide
+plan, allocation or measurement failure (or the character cap) writes the whole
+original body verbatim. An assistant body's flattened text is currency-stamped
+by width, DPI and theme epoch, so a resize, DPI or theme change re-flattens it
+(a destructive re-flatten is deferred while the body holds a selection). The
+parser records table metadata (`MdTable`/`MdTableRow`/`MdTableCell`) and the
+display layer decides when it renders.
 
 Each paragraph also records layout metadata — quote depth, list depth, item
 flags and the two indent columns — next to the styled runs. Rich Edit applies
@@ -624,10 +646,16 @@ storage or a cross-machine synchronization format.
 - `test_chat_host` (`default_suite`, `seam_toggle_suite`, `bounded_suite`):
   real hidden-HWND integration for recycling, foreign-content prevention,
   exact/estimated measurement and retries, resize/DPI settling, streaming and
-  deferred writes, BOTTOM/FREE anchoring, search reveal, focus transfer, and
-  forced-eviction restoration. The bounded suite asserts visible realization,
-  bound slots no greater than `slot_limit`, created HWNDs no greater than
-  `4 * slot_limit + 1`, and zero exhaustion refusals in its saturation case.
+  deferred writes, BOTTOM/FREE anchoring, search reveal, focus transfer, table
+  flattening, and forced-eviction restoration. The bounded suite asserts visible
+  realization, bound slots no greater than `slot_limit`, created HWNDs no
+  greater than `4 * slot_limit + 1`, and zero exhaustion refusals in its
+  saturation case.
+- `test_markdown_win`: Rich Edit integration of the renderer, including GFM
+  tables (tab-separated physical lines, tab-stop count/positions/alignment,
+  bold headers, cell links through `EN_LINK`, wrapped-cell style preservation,
+  the standalone empty table, per-arena allocation-failure fallback and
+  recovery, forced metric failure, and the document character cap).
 
 The complete coverage includes:
 
@@ -757,6 +785,25 @@ The complete coverage includes:
   selections are preserved, destructive reformatting of selected text is
   deferred until the selection clears, and switching conversations replaces
   content immediately. Streaming reasoning appends preserve a selection.
+- GFM tables (parser `test_markdown` metadata, pure `test_table_layout`
+  column/wrap policy, Rich Edit `test_markdown_win`, and the hidden host): a
+  table flattens to tab-separated physical lines with no pipe syntax, its
+  paragraphs own the complete tab-stop array (per-column alignment, a leading
+  tab for a non-left column zero, cleared stops on ordinary paragraphs), the
+  header is bold, cells keep inline styles across wrapping, and a cell link
+  opens through `EN_LINK`. A table streams: the header alone stays literal
+  until its delimiter row arrives, then the accumulated message flattens and
+  the terminal event completes it. The hidden measurer and the live surface
+  flatten to code-unit-identical text at identical layout inputs, and cached
+  heights equal the live measurement. An over-wide table falls back to literal
+  source for that table only, leaving surrounding Markdown and a later semantic
+  link intact. Assistant body layout currency is restamped on width, DPI and
+  theme changes (including after a selection-held deferral and across a
+  conversation switch), the hidden measurer never stamps it, and a rebinding
+  after forced eviction reproduces the same flattened table and the same
+  measurer text. Every plan allocation, a forced GDI metric failure, and the
+  document character cap fall back to the complete verbatim source with no
+  links transferred and no table formatting.
 - The retain-all compatibility fixture verifies a maximum-length 512-message
   transcript's stable controls and selection through streaming, the scheduled
   flush and terminal rendering. The bounded fixture verifies a window-shaped

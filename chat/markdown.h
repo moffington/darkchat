@@ -7,12 +7,15 @@
    deliberately small: headings 1-3, bold, italic, strikethrough, equal-length
    inline backtick spans and backtick/tilde fenced code, lists (including
    unordered [ ]/[xX] task markers) nested up to MD_MAX_DEPTH with mixed
-   markers, blockquotes nested up to MD_MAX_DEPTH, and HTTP(S) links rendered
-   as their label with the destination recorded separately for the display
-   layer. Unsupported or malformed syntax is kept verbatim. Precedence is
-   fenced blocks, then inline code, then links, then strikethrough and
-   emphasis. No tables, images, indented code blocks, lazy continuation,
-   per-language highlighting or full CommonMark behavior. */
+   markers, blockquotes nested up to MD_MAX_DEPTH, HTTP(S) links rendered as
+   their label with the destination recorded separately for the display
+   layer, and root-level GFM tables (header plus delimiter row, alignment
+   colons, escaped pipes, optional edge pipes, ragged rows normalized to the
+   header column count) recorded as MdTable/MdTableRow/MdTableCell metadata
+   for the display layer to lay out. Unsupported or malformed syntax is kept
+   verbatim. Precedence is fenced blocks, then inline code, then links, then
+   strikethrough and emphasis. No images, indented code blocks, lazy
+   continuation, per-language highlighting or full CommonMark behavior. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <wchar.h>
