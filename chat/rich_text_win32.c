@@ -548,6 +548,12 @@ void rich_text_set_markdown(RichTextControl *control, ChatRole role,
     if (!markdown_render(text, &document)) {
         /* Transactional failure: fall back to the verbatim body. */
         write_literal(control, text, body);
+    } else if (document.table_count > 0) {
+        /* Recognized tables are not rendered yet: keep the whole body verbatim
+           so the table source, pipes included, is what the reader sees. Phase 3
+           replaces this gate with the transactional table renderer. */
+        markdown_dispose(&document);
+        write_literal(control, text, body);
     } else {
         SendMessageW(control->window, EM_REPLACESEL, FALSE,
             (LPARAM)document.text);

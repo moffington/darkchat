@@ -102,6 +102,38 @@ static void blocks_sane(const MdDocument *d, const char *what) {
     check(reached <= d->length, what);
 }
 
+/* The cell at (table, row, column), or NULL when out of range. */
+static const MdTableCell *cell_at(const MdDocument *d, int table, int row,
+    int column) {
+    if (table < 0 || table >= d->table_count) return NULL;
+    const MdTable *t = &d->tables[table];
+    if (row < 0 || row >= t->row_count) return NULL;
+    const MdTableRow *r = &d->rows[t->first_row + row];
+    if (column < 0 || column >= r->cell_count) return NULL;
+    return &d->cells[r->first_cell + column];
+}
+
+static void cell_is(const MdDocument *d, int table, int row, int column,
+    const wchar_t *expect, const char *what) {
+    const MdTableCell *c = cell_at(d, table, row, column);
+    check(c != NULL, what);
+    if (!c) return;
+    check(c->length == wcslen(expect) &&
+        !wmemcmp(d->text + c->offset, expect, c->length), what);
+}
+
+/* The run covering a cell's whole range, or NULL. */
+static const MdRun *cell_run(const MdDocument *d, const MdTableCell *c) {
+    if (!c) return NULL;
+    for (int i = 0; i < d->run_count; i++) {
+        const MdRun *r = &d->runs[i];
+        if (r->offset <= c->offset &&
+            c->offset + c->length <= r->offset + r->length) return r;
+    }
+    return NULL;
+}
+
+
 int main(void) {
     check((MD_STYLE_MONO & MD_STYLE_CODE) == 0,
         "mono and code flags do not overlap");
@@ -752,6 +784,277 @@ int main(void) {
             markdown_dispose(&d);
             free(src);
         } }
+    { /* GFM tables: recognition, alignment, cells, literal slice and blocks. */
+        MdDocument d;
+        render_ok(L"before\n| a | b |\n| :- | -: |\n| 1 | 2 |\n\nafter", &d,
+            "table renders");
+        check(d.table_count == 1, "one table recorded");
+        check(d.block_count == 3, "table is one block between paragraphs");
+        check(d.blocks[0].kind == MD_BLOCK_PARAGRAPH, "prose before the table");
+        check(d.blocks[1].kind == MD_BLOCK_TABLE &&
+            d.blocks[1].table_index == 0, "table block names its table");
+        check(d.blocks[2].kind == MD_BLOCK_PARAGRAPH, "prose after the table");
+        const MdTable *t = &d.tables[0];
+        check(t->columns == 2, "two columns");
+        check(t->row_count == 2, "header plus one body row");
+        check(t->cell_count == 4, "four cells");
+        check(t->align[0] == MD_ALIGN_LEFT && t->align[1] == MD_ALIGN_RIGHT,
+            "alignment comes from the colons");
+        cell_is(&d, 0, 0, 0, L"a", "header cell 0");
+        cell_is(&d, 0, 0, 1, L"b", "header cell 1");
+        cell_is(&d, 0, 1, 0, L"1", "body cell 0");
+        cell_is(&d, 0, 1, 1, L"2", "body cell 1");
+        check(style_is(cell_run(&d, cell_at(&d, 0, 0, 0)), MD_STYLE_BOLD),
+            "header cells are bold");
+        check(style_is(cell_run(&d, cell_at(&d, 0, 1, 0)), 0),
+            "body cells are plain");
+        check(t->literal_offset == 0 &&
+            t->literal_length ==
+                wcslen(L"| a | b |\n| :- | -: |\n| 1 | 2 |"),
+            "literal slice length");
+        check(!wmemcmp(d.literals + t->literal_offset,
+            L"| a | b |\n| :- | -: |\n| 1 | 2 |", t->literal_length),
+            "literal slice is the normalized source");
+        markdown_dispose(&d); }
+    { /* Every alignment form. */
+        MdDocument d;
+        render_ok(L"| a | b | c | d |\n| :- | :-: | -: | --- |", &d,
+            "alignments render");
+        check(d.table_count == 1 && d.tables[0].columns == 4,
+            "four-column table");
+        check(d.tables[0].align[0] == MD_ALIGN_LEFT &&
+            d.tables[0].align[1] == MD_ALIGN_CENTER &&
+            d.tables[0].align[2] == MD_ALIGN_RIGHT &&
+            d.tables[0].align[3] == MD_ALIGN_LEFT, "all four alignment forms");
+        markdown_dispose(&d); }
+    { /* Escaped pipes, including inside a code span. */
+        MdDocument d;
+        render_ok(L"| a \\| b | `\\|` |\n| - | - |", &d,
+            "escaped pipes render");
+        check(d.table_count == 1, "escaped-pipe table recorded");
+        cell_is(&d, 0, 0, 0, L"a | b", "escaped pipe becomes a literal pipe");
+        cell_is(&d, 0, 0, 1, L"|", "escaped pipe inside a code span");
+        const MdRun *code_cell = cell_run(&d, cell_at(&d, 0, 0, 1));
+        check(code_cell &&
+            (code_cell->style & (MD_STYLE_MONO | MD_STYLE_CODE)) ==
+                (MD_STYLE_MONO | MD_STYLE_CODE), "code span style in a cell");
+        markdown_dispose(&d); }
+    { /* Edge pipes are optional; cell whitespace is trimmed. */
+        MdDocument d;
+        render_ok(L"|   a   |   b   |\n| - | - |\n  c | d", &d,
+            "edge pipes render");
+        check(d.table_count == 1 && d.tables[0].columns == 2,
+            "two-column table");
+        check(d.tables[0].row_count == 2, "header and one body row");
+        cell_is(&d, 0, 0, 0, L"a", "trimmed header cell 0");
+        cell_is(&d, 0, 0, 1, L"b", "trimmed header cell 1");
+        cell_is(&d, 0, 1, 0, L"c", "edge-pipe-less body cell 0");
+        cell_is(&d, 0, 1, 1, L"d", "edge-pipe-less body cell 1");
+        markdown_dispose(&d); }
+    { /* Ragged rows pad missing cells and truncate excess ones. */
+        MdDocument d;
+        render_ok(L"| a | b |\n| - | - |\nvalue", &d, "short row renders");
+        check(d.tables[0].row_count == 2 && d.tables[0].cell_count == 4,
+            "short row padded to full width");
+        cell_is(&d, 0, 1, 0, L"value", "short row keeps its cell");
+        const MdTableCell *pad = cell_at(&d, 0, 1, 1);
+        check(pad && pad->length == 0, "missing cell padded empty");
+        check(pad && pad->offset == d.length, "padded cell sits at the end");
+        markdown_dispose(&d);
+        render_ok(L"| a | b |\n| - | - |\n| 1 | 2 | 3 |", &d,
+            "excess row renders");
+        check(d.tables[0].row_count == 2 && d.tables[0].cell_count == 4,
+            "excess cells truncated");
+        cell_is(&d, 0, 1, 1, L"2", "truncation keeps the header columns");
+        markdown_dispose(&d); }
+    { /* A table ends at a blank line and at a following block start. */
+        MdDocument d;
+        render_ok(L"| a |\n| - |\nx\n\nafter", &d, "blank ends the table");
+        check(d.table_count == 1 && d.tables[0].row_count == 2,
+            "one body row then a blank line");
+        check(block_over(&d, L"after") != NULL &&
+            d.blocks[d.block_count - 1].kind == MD_BLOCK_PARAGRAPH,
+            "prose after the blank line");
+        markdown_dispose(&d);
+        render_ok(L"| a |\n| - |\nx\n# head", &d, "block start ends the table");
+        check(d.table_count == 1 && d.tables[0].row_count == 2,
+            "heading does not join the table");
+        const MdBlock *h = block_over(&d, L"head");
+        check(h && h->kind == MD_BLOCK_PARAGRAPH, "heading rendered after");
+        markdown_dispose(&d); }
+    { /* An all-empty header still records its table and a zero-length block. */
+        MdDocument d;
+        render_ok(L"| |\n| - |", &d, "empty header renders");
+        check(d.table_count == 1 && d.tables[0].columns == 1,
+            "empty-header table has one column");
+        check(d.tables[0].row_count == 1, "header row only");
+        const MdTableCell *c = cell_at(&d, 0, 0, 0);
+        check(c && c->length == 0, "empty header cell");
+        check(d.block_count == 1 && d.blocks[0].kind == MD_BLOCK_TABLE &&
+            d.blocks[0].table_index == 0 && d.blocks[0].length == 0,
+            "zero-length table block recorded");
+        markdown_dispose(&d); }
+    { /* Malformed, oversized and prefixed headers stay literal. */
+        MdDocument d;
+        render_ok(L"| a |\n| x |", &d, "invalid delimiter renders");
+        check(d.table_count == 0, "invalid delimiter is not a table");
+        text_is(&d, L"| a |\n| x |", "malformed table stays literal");
+        markdown_dispose(&d);
+        wchar_t header[600] = {0}, delim[600] = {0}, source[1300];
+        for (int i = 0; i < MD_MAX_TABLE_COLUMNS + 1; i++) {
+            wcscat(header, L"| a ");
+            wcscat(delim, L"| - ");
+        }
+        wcscat(header, L"|");
+        wcscat(delim, L"|");
+        wcscpy(source, header);
+        wcscat(source, L"\n");
+        wcscat(source, delim);
+        render_ok(source, &d, "oversized table renders");
+        check(d.table_count == 0, "too many columns is not a table");
+        markdown_dispose(&d);
+        render_ok(L"> | a |\n> | - |", &d, "quote-prefixed table renders");
+        check(d.table_count == 0, "quoted header is not a root table");
+        markdown_dispose(&d);
+        render_ok(L"- | a |\n- | - |", &d, "list-prefixed table renders");
+        check(d.table_count == 0, "list header is not a root table");
+        markdown_dispose(&d); }
+    { /* Streaming: the header alone stays a paragraph until the delimiter. */
+        MdDocument d;
+        render_ok(L"| a | b |", &d, "header alone renders");
+        check(d.table_count == 0, "header alone is not yet a table");
+        check(block_over(&d, L"| a | b |") != NULL,
+            "header alone is an ordinary paragraph");
+        markdown_dispose(&d);
+        render_ok(L"| a | b |\n| - | - |", &d, "header plus delimiter renders");
+        check(d.table_count == 1 && d.tables[0].row_count == 1,
+            "delimiter confirms the table");
+        markdown_dispose(&d); }
+    { /* CRLF source normalizes to LF in the literal slice. */
+        MdDocument d;
+        render_ok(L"| a | b |\r\n| - | - |\r\n| 1 | 2 |\r\n", &d,
+            "CRLF table renders");
+        check(d.table_count == 1 && d.tables[0].row_count == 2,
+            "CRLF table rows");
+        const MdTable *t = &d.tables[0];
+        check(t->literal_length == wcslen(L"| a | b |\n| - | - |\n| 1 | 2 |") &&
+            !wmemcmp(d.literals + t->literal_offset,
+                L"| a | b |\n| - | - |\n| 1 | 2 |", t->literal_length),
+            "CRLF literal slice normalized to LF");
+        markdown_dispose(&d); }
+    { /* A fenced block shields table-looking lines from recognition. */
+        MdDocument d;
+        render_ok(L"```\n| a |\n| - |\n```", &d, "fenced table-looking text");
+        check(d.table_count == 0, "fenced lines are not a table");
+        check(style_is(run_over(&d, L"| a |\n| - |"),
+            MD_STYLE_MONO | MD_STYLE_CODE), "fenced table-looking text is code");
+        markdown_dispose(&d); }
+    { /* Inline styles and links inside cells. */
+        MdDocument d;
+        render_ok(L"| **b** | [x](https://e.io) |\n| - | - |\n| *i* | `c` |",
+            &d, "inline cell content renders");
+        check(d.table_count == 1, "styled table recorded");
+        cell_is(&d, 0, 0, 0, L"b", "bold cell text");
+        check(style_is(cell_run(&d, cell_at(&d, 0, 0, 0)), MD_STYLE_BOLD),
+            "header bold survives inline bold");
+        cell_is(&d, 0, 1, 0, L"i", "italic cell text");
+        check(style_is(cell_run(&d, cell_at(&d, 0, 1, 0)), MD_STYLE_ITALIC),
+            "italic body cell");
+        cell_is(&d, 0, 1, 1, L"c", "code cell text");
+        check(style_is(cell_run(&d, cell_at(&d, 0, 1, 1)),
+            MD_STYLE_MONO | MD_STYLE_CODE), "code body cell");
+        link_is(&d, L"x", L"https://e.io", "link inside a cell recorded");
+        markdown_dispose(&d); }
+    { /* Each table block names its own table, in order. */
+        MdDocument d;
+        render_ok(L"| a |\n| - |\n\n| b |\n| - |", &d, "two tables render");
+        check(d.table_count == 2 && d.block_count == 2, "two table blocks");
+        check(d.blocks[0].kind == MD_BLOCK_TABLE &&
+            d.blocks[0].table_index == 0, "first table link");
+        check(d.blocks[1].kind == MD_BLOCK_TABLE &&
+            d.blocks[1].table_index == 1, "second table link");
+        cell_is(&d, 0, 0, 0, L"a", "first table cell");
+        cell_is(&d, 1, 0, 0, L"b", "second table cell");
+        markdown_dispose(&d); }
+    { /* An indented table-looking continuation under an open list stays list
+         content: root-only tables must not hijack it. */
+        MdDocument d;
+        render_ok(L"- item\n  | a |\n  | - |", &d, "indented table under list");
+        check(d.table_count == 0, "a list continuation is not a root table");
+        block_is(&d.blocks[0], MD_BLOCK_ITEM, 0, 1, 0, 0, 2,
+            "the item stays");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 0, 1, MD_FLAG_CONTINUATION, 0, 2,
+            "the indented header is a list continuation");
+        check(d.block_count == 3, "the remaining line stays one block");
+        text_is(&d, L"\u2022 item\n  | a |\n  | - |",
+            "the table-looking lines stay literal list content");
+        markdown_dispose(&d); }
+    { /* A flush root table ends the open list, so later indented prose is not
+         misclassified as a continuation. */
+        MdDocument d;
+        render_ok(L"- item\n| a |\n| - |\n\n  ordinary text", &d,
+            "root table after a list");
+        check(d.table_count == 1, "the flush table is recognized");
+        const MdBlock *prose = block_over(&d, L"ordinary text");
+        check(prose && prose->kind == MD_BLOCK_PARAGRAPH &&
+            prose->flags == 0, "indented prose after the table is a paragraph");
+        text_is(&d, L"\u2022 item\na\n\n  ordinary text",
+            "table cells emitted and list state reset");
+        markdown_dispose(&d); }
+    { /* Cell normalization reuses one grown scratch buffer, not one buffer per
+         cell. */
+        MdDocument d;
+        markdown_test_reset_scratch_allocations();
+        render_ok(L"| aaaa | bbbb | cccc | dddd |\n"
+                  L"| ---- | ---- | ---- | ---- |\n"
+                  L"| eeee | ffff | gggg | hhhh |", &d, "uniform table renders");
+        check(markdown_test_scratch_allocations() == 1 && d.cell_count == 8,
+            "equally wide cells need exactly one scratch allocation");
+        markdown_dispose(&d);
+        wchar_t wide[320];
+        for (int i = 0; i < 300; i++) wide[i] = L'x';
+        wide[300] = 0;
+        wchar_t source[512];
+        wcscpy(source, L"| a | b |\n| - | - |\n| c | d |\n| ");
+        wcscat(source, wide);
+        wcscat(source, L" | e |");
+        markdown_test_reset_scratch_allocations();
+        render_ok(source, &d, "varying-width table renders");
+        check(markdown_test_scratch_allocations() == 2 && d.cell_count == 6,
+            "growing cells reuse the amortized scratch buffer");
+        markdown_dispose(&d); }
+    { /* Each table arena is transactional on its own. */
+        MdDocument d;
+        const wchar_t *table_src = L"| a | b |\n| - | - |\n| 1 | 2 |";
+        markdown_test_fail_cells(true);
+        check(!markdown_render(table_src, &d), "cell failure reported");
+        check(d.text == NULL && d.cells == NULL && d.tables == NULL &&
+            d.table_count == 0, "cell failure document zeroed");
+        markdown_test_fail_cells(false);
+        render_ok(table_src, &d, "render works after cell failure");
+        check(d.table_count == 1 && d.cell_count == 4,
+            "post-failure table correct");
+        markdown_dispose(&d);
+        markdown_test_fail_rows(true);
+        check(!markdown_render(table_src, &d), "row failure reported");
+        check(d.rows == NULL && d.table_count == 0, "row failure zeroed");
+        markdown_test_fail_rows(false);
+        markdown_test_fail_tables(true);
+        check(!markdown_render(table_src, &d), "table failure reported");
+        check(d.tables == NULL, "table failure zeroed");
+        markdown_test_fail_tables(false);
+        markdown_test_fail_literals(true);
+        check(!markdown_render(table_src, &d), "literal failure reported");
+        check(d.literals == NULL && d.table_count == 0, "literal failure zeroed");
+        markdown_test_fail_literals(false);
+        markdown_test_fail_blocks(true);
+        check(!markdown_render(table_src, &d), "table block failure reported");
+        check(d.blocks == NULL, "table block failure zeroed");
+        markdown_test_fail_blocks(false);
+        render_ok(table_src, &d, "render works after table failure hooks");
+        check(d.table_count == 1 && d.block_count == 1,
+            "post-failure table block correct");
+        markdown_dispose(&d); }
     { /* Transactional allocation failure leaves a zeroed document. */
         MdDocument d;
         markdown_test_fail_allocations(true);

@@ -48,7 +48,8 @@ typedef enum {
     MD_BLOCK_PARAGRAPH = 0,
     MD_BLOCK_CODE,
     MD_BLOCK_QUOTE,
-    MD_BLOCK_ITEM
+    MD_BLOCK_ITEM,
+    MD_BLOCK_TABLE
 } MdBlockKind;
 
 typedef enum {
@@ -67,7 +68,34 @@ typedef struct {
     unsigned char first_indent;         /* column where the visible prefix begins */
     unsigned char continuation_indent;  /* column where content and wrapped
                                            lines begin, >= first_indent */
+    int table_index;                    /* MD_BLOCK_TABLE -> tables[]; else -1 */
 } MdBlock;
+
+/* GFM-style tables. A recognized table is recorded as one MD_BLOCK_TABLE block
+   plus an MdTable, one MdTableRow per source row and one MdTableCell per
+   column. Recognized tables emit parsed cell contents into the document buffer
+   and record their original normalized source separately in the literals
+   arena, so a caller that inspects only the emitted text does not see the
+   original source. Callers must inspect the table metadata; until table
+   rendering is activated, the display layer deliberately renders the original
+   body verbatim. */
+#define MD_MAX_TABLE_COLUMNS 24
+
+typedef enum { MD_ALIGN_LEFT = 0, MD_ALIGN_CENTER, MD_ALIGN_RIGHT } MdAlign;
+
+typedef struct { size_t offset, length; } MdTableCell;   /* content range in text */
+
+typedef struct {
+    int first_cell, cell_count;     /* range in cells[], exactly `columns` wide */
+} MdTableRow;
+
+typedef struct {
+    int first_row, row_count;       /* range in rows[], header row included */
+    int first_cell, cell_count;     /* range in cells[], all rows back to back */
+    int columns;                    /* 1..MD_MAX_TABLE_COLUMNS */
+    unsigned char align[MD_MAX_TABLE_COLUMNS];
+    size_t literal_offset, literal_length;  /* normalized source slice */
+} MdTable;
 
 /* One valid HTTP(S) link. The displayed label is a contiguous range in the
    document text; the destination it opens lives in the document's target
@@ -90,6 +118,14 @@ typedef struct {
     int link_count, link_capacity;
     wchar_t *targets;   /* arena: every NUL-terminated destination, back to back */
     size_t targets_length, targets_capacity;
+    MdTableCell *cells;
+    int cell_count, cell_capacity;
+    MdTableRow *rows;
+    int row_count, row_capacity;
+    MdTable *tables;    /* recognized tables, in document order */
+    int table_count, table_capacity;
+    wchar_t *literals;  /* arena: normalized source slice of each table */
+    size_t literals_length, literals_capacity;
 } MdDocument;
 
 /* Transactional: on success returns true and *doc owns the rendered
@@ -107,5 +143,15 @@ void markdown_test_fail_blocks(bool enable);
 /* Test-only hook: while enabled only link metadata growth fails, so the link
     path is exercised on its own. */
 void markdown_test_fail_links(bool enable);
+/* Test-only hooks for the table arenas: while enabled the matching growth
+    fails, so each table path is exercised on its own. */
+void markdown_test_fail_cells(bool enable);
+void markdown_test_fail_rows(bool enable);
+void markdown_test_fail_tables(bool enable);
+void markdown_test_fail_literals(bool enable);
+/* Test-only seam: the number of times the reusable cell-normalization buffer
+    had to grow. A table with many equally wide cells needs few allocations. */
+void markdown_test_reset_scratch_allocations(void);
+int markdown_test_scratch_allocations(void);
 
 #endif

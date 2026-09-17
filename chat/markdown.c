@@ -14,6 +14,11 @@
 static bool test_fail_allocations;
 static bool test_fail_blocks;
 static bool test_fail_links;
+static bool test_fail_cells;
+static bool test_fail_rows;
+static bool test_fail_tables;
+static bool test_fail_literals;
+static int test_scratch_allocations;
 
 void markdown_test_fail_allocations(bool enable) {
     test_fail_allocations = enable;
@@ -27,6 +32,33 @@ void markdown_test_fail_links(bool enable) {
     test_fail_links = enable;
 }
 
+void markdown_test_fail_cells(bool enable) {
+    test_fail_cells = enable;
+}
+
+void markdown_test_fail_rows(bool enable) {
+    test_fail_rows = enable;
+}
+
+void markdown_test_fail_tables(bool enable) {
+    test_fail_tables = enable;
+}
+
+void markdown_test_fail_literals(bool enable) {
+    test_fail_literals = enable;
+}
+
+/* Test-only: how many times the per-cell normalization scratch buffer had to
+   grow since the last reset. Reuse means one render needs only a handful of
+   allocations, never one per cell. */
+void markdown_test_reset_scratch_allocations(void) {
+    test_scratch_allocations = 0;
+}
+
+int markdown_test_scratch_allocations(void) {
+    return test_scratch_allocations;
+}
+
 void markdown_dispose(MdDocument *doc) {
     if (!doc) return;
     free(doc->text);
@@ -34,6 +66,10 @@ void markdown_dispose(MdDocument *doc) {
     free(doc->blocks);
     free(doc->links);
     free(doc->targets);
+    free(doc->cells);
+    free(doc->rows);
+    free(doc->tables);
+    free(doc->literals);
     memset(doc, 0, sizeof *doc);
 }
 
@@ -53,6 +89,16 @@ typedef struct {
     int link_count, link_capacity;
     wchar_t *targets;
     size_t targets_length, targets_capacity;
+    MdTableCell *cells;
+    int cell_count, cell_capacity;
+    MdTableRow *rows;
+    int row_count, row_capacity;
+    MdTable *tables;
+    int table_count, table_capacity;
+    wchar_t *literals;
+    size_t literals_length, literals_capacity;
+    wchar_t *scratch;                   /* reused per-cell normalization buffer */
+    size_t scratch_capacity;
     bool failed;
 } MdBuilder;
 
@@ -115,6 +161,76 @@ static bool grow_targets(MdBuilder *b, size_t extra) {
     if (!grown) { b->failed = true; return false; }
     b->targets = grown;
     b->targets_capacity = capacity;
+    return true;
+}
+
+static bool grow_cells(MdBuilder *b) {
+    if (b->failed) return false;
+    if (test_fail_allocations || test_fail_cells) { b->failed = true; return false; }
+    if (b->cell_count < b->cell_capacity) return true;
+    int capacity = b->cell_capacity ? b->cell_capacity * 2 : 32;
+    MdTableCell *grown = (MdTableCell *)realloc(b->cells,
+        (size_t)capacity * sizeof *grown);
+    if (!grown) { b->failed = true; return false; }
+    b->cells = grown;
+    b->cell_capacity = capacity;
+    return true;
+}
+
+static bool grow_rows(MdBuilder *b) {
+    if (b->failed) return false;
+    if (test_fail_allocations || test_fail_rows) { b->failed = true; return false; }
+    if (b->row_count < b->row_capacity) return true;
+    int capacity = b->row_capacity ? b->row_capacity * 2 : 16;
+    MdTableRow *grown = (MdTableRow *)realloc(b->rows,
+        (size_t)capacity * sizeof *grown);
+    if (!grown) { b->failed = true; return false; }
+    b->rows = grown;
+    b->row_capacity = capacity;
+    return true;
+}
+
+static bool grow_tables(MdBuilder *b) {
+    if (b->failed) return false;
+    if (test_fail_allocations || test_fail_tables) { b->failed = true; return false; }
+    if (b->table_count < b->table_capacity) return true;
+    int capacity = b->table_capacity ? b->table_capacity * 2 : 8;
+    MdTable *grown = (MdTable *)realloc(b->tables,
+        (size_t)capacity * sizeof *grown);
+    if (!grown) { b->failed = true; return false; }
+    b->tables = grown;
+    b->table_capacity = capacity;
+    return true;
+}
+
+static bool grow_literals(MdBuilder *b, size_t extra) {
+    if (b->failed) return false;
+    if (test_fail_allocations || test_fail_literals) { b->failed = true; return false; }
+    if (b->literals_length + extra <= b->literals_capacity) return true;
+    size_t capacity = b->literals_capacity ? b->literals_capacity : 128;
+    while (capacity < b->literals_length + extra) capacity *= 2;
+    wchar_t *grown = (wchar_t *)realloc(b->literals, capacity * sizeof *grown);
+    if (!grown) { b->failed = true; return false; }
+    b->literals = grown;
+    b->literals_capacity = capacity;
+    return true;
+}
+
+/* Grows the builder's single reusable cell-normalization buffer. One buffer is
+   reused across every cell of every table, so a reparse costs a handful of
+   allocations rather than rows x columns. Growth honors the allocation-failure
+   hook; an empty cell needs no buffer at all. */
+static bool grow_scratch(MdBuilder *b, size_t needed) {
+    if (b->failed) return false;
+    if (b->scratch_capacity >= needed) return true;
+    if (test_fail_allocations) { b->failed = true; return false; }
+    size_t capacity = b->scratch_capacity ? b->scratch_capacity : 128;
+    while (capacity < needed) capacity *= 2;
+    wchar_t *grown = (wchar_t *)realloc(b->scratch, capacity * sizeof *grown);
+    if (!grown) { b->failed = true; return false; }
+    b->scratch = grown;
+    b->scratch_capacity = capacity;
+    ++test_scratch_allocations;
     return true;
 }
 
@@ -188,6 +304,25 @@ static void close_block(MdBuilder *b, size_t start, int kind, unsigned char quot
     block->flags = flags;
     block->first_indent = first;
     block->continuation_indent = continuation;
+    block->table_index = -1;
+}
+
+/* Records one table block unconditionally, including a zero-length range: an
+   all-empty header still names its table. Ordinary blocks keep close_block's
+   non-empty rule. */
+static void record_table_block(MdBuilder *b, size_t start, int table_index) {
+    if (b->failed) return;
+    if (!grow_blocks(b)) return;
+    MdBlock *block = &b->blocks[b->block_count++];
+    block->offset = start;
+    block->length = b->length - start;
+    block->kind = MD_BLOCK_TABLE;
+    block->quote_depth = 0;
+    block->list_depth = 0;
+    block->flags = 0;
+    block->first_indent = 0;
+    block->continuation_indent = 0;
+    block->table_index = table_index;
 }
 
 static bool is_space(wchar_t c) { return c == L' ' || c == L'\t'; }
@@ -573,6 +708,49 @@ static bool push_level(MdBlocks *blocks, const MdPrefix *p) {
     return true;
 }
 
+/* True when a line is entirely whitespace. */
+static bool line_is_blank(const wchar_t *line, size_t n) {
+    for (size_t i = 0; i < n; i++) if (!is_space(line[i])) return false;
+    return true;
+}
+
+/* A fence opener (up to three leading spaces). */
+static bool line_fence_open(const wchar_t *line, size_t n) {
+    MdFence marker;
+    return fence_marker(line, n, &marker);
+}
+
+/* A root-level ATX heading of level 1-3 with its required following space.
+   `from` receives the first content column. */
+static bool line_heading_root(const wchar_t *line, size_t n, int *level,
+    size_t *from) {
+    MdPrefix p;
+    scan_prefix(line, n, &p);
+    if (p.quote_depth || p.has_marker || p.rel > MD_ROOT_PREFIX_COLS)
+        return false;
+    size_t hashes = 0;
+    while (p.content + hashes < n && line[p.content + hashes] == L'#') ++hashes;
+    if (hashes < 1 || hashes > 3) return false;
+    size_t start = p.content + hashes;
+    if (start != n && !is_space(line[start])) return false;
+    while (start < n && is_space(line[start])) ++start;
+    if (level) *level = (int)hashes;
+    if (from) *from = start;
+    return true;
+}
+
+/* True when a line begins a block-level construct that ends an open table:
+   blank, a fence opener, a heading, or a quote/list prefix. Shared by
+   render_line's predicates and the table scanner so the two cannot drift. */
+static bool line_starts_block(const wchar_t *line, size_t n) {
+    if (line_is_blank(line, n)) return true;
+    if (line_fence_open(line, n)) return true;
+    if (line_heading_root(line, n, NULL, NULL)) return true;
+    MdPrefix p;
+    scan_prefix(line, n, &p);
+    return p.quote_depth != 0 || p.has_marker;
+}
+
 /* One source line; blocks are recognized line-by-line and fences hide their
    marker lines. Newlines are normalized to LF. */
 static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
@@ -599,8 +777,7 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
         *fence = marker;                    /* opening fence is hidden */
         return;
     }
-    bool blank = true;
-    for (size_t i = 0; i < n; i++) if (!is_space(line[i])) { blank = false; break; }
+    bool blank = line_is_blank(line, n);
     if (blank) {
         emit_break(b, 0);                   /* blank lines keep list state */
         return;
@@ -682,20 +859,9 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
     int heading_level = 0;
     size_t heading_from = 0;
     if (!literal && !p.has_marker && !continuation && !p.quote_depth &&
-        p.rel <= MD_ROOT_PREFIX_COLS) {
-        size_t hashes = 0;
-        while (p.content + hashes < n && line[p.content + hashes] == L'#')
-            ++hashes;
-        if (hashes >= 1 && hashes <= 3) {
-            size_t from = p.content + hashes;
-            if (from == n || is_space(line[from])) {
-                heading = true;
-                heading_level = (int)hashes;
-                heading_from = from;
-                while (heading_from < n && is_space(line[heading_from]))
-                    ++heading_from;
-            }
-        }
+        p.rel <= MD_ROOT_PREFIX_COLS &&
+        line_heading_root(line, n, &heading_level, &heading_from)) {
+        heading = true;
     }
 
     emit_break(b, 0);
@@ -744,6 +910,260 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
         flags, first, continuation_indent);
 }
 
+/* --- GFM tables ------------------------------------------------------------
+   Tables are recognized only at the root. A candidate header is confirmed by
+   the very next line, so a header that has not yet received its delimiter
+   keeps rendering as an ordinary paragraph (streaming-safe). Recognition
+   records metadata; the emitted text holds the cell contents and the display
+   layer keeps the whole message verbatim until table rendering is activated. */
+
+typedef struct { size_t begin, end; } MdCellRange;
+
+/* A `|` is a cell separator unless escaped: an odd run of backslashes right
+   before it makes it content. */
+static bool pipe_separator(const wchar_t *s, size_t index) {
+    size_t run = 0;
+    while (index > run && s[index - 1 - run] == L'\\') ++run;
+    return (run % 2) == 0;
+}
+
+static bool has_separator_pipe(const wchar_t *s, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (s[i] == L'|' && pipe_separator(s, i)) return true;
+    return false;
+}
+
+/* Splits one row into cells, stripping optional edge pipes (surrounding
+   whitespace included). At most `capacity` ranges are stored; `overflow` is
+   set when the row holds more cells than that. */
+static int split_row(const wchar_t *s, size_t n, MdCellRange *out, int capacity,
+    bool *overflow) {
+    if (overflow) *overflow = false;
+    size_t begin = 0, end = n;
+    size_t i = 0;
+    while (i < n && is_space(s[i])) ++i;
+    if (i < n && s[i] == L'|' && pipe_separator(s, i)) begin = i + 1;
+    size_t j = n;
+    while (j > begin && is_space(s[j - 1])) --j;
+    if (j > begin && s[j - 1] == L'|' && pipe_separator(s, j - 1)) end = j - 1;
+    int count = 0;
+    size_t seg = begin;
+    for (size_t k = begin; k < end; k++) {
+        if (s[k] != L'|' || !pipe_separator(s, k)) continue;
+        if (count < capacity) {
+            out[count].begin = seg;
+            out[count].end = k;
+            count++;
+        } else if (overflow) {
+            *overflow = true;
+        }
+        seg = k + 1;
+    }
+    if (count < capacity) {
+        out[count].begin = seg;
+        out[count].end = end;
+        count++;
+    } else if (overflow) {
+        *overflow = true;
+    }
+    return count;
+}
+
+/* One delimiter cell: `:?-+:?` with at least one dash, trimmed. Alignment
+   comes from the colons. */
+static bool delimiter_cell(const wchar_t *s, size_t n, unsigned char *align) {
+    size_t i = 0, j = n;
+    while (i < j && is_space(s[i])) ++i;
+    while (j > i && is_space(s[j - 1])) --j;
+    bool left = false, right = false;
+    if (i < j && s[i] == L':') { left = true; ++i; }
+    if (j > i && s[j - 1] == L':') { right = true; --j; }
+    if (i >= j) return false;
+    for (size_t k = i; k < j; k++) if (s[k] != L'-') return false;
+    *align = (unsigned char)(left && right ? MD_ALIGN_CENTER :
+        right ? MD_ALIGN_RIGHT : MD_ALIGN_LEFT);
+    return true;
+}
+
+/* Confirms a header/delimiter pair and returns its column count, or 0 when the
+   pair is not a table. Both lines must be root-level; at least one unescaped
+   pipe must appear in the pair, so "a" / "-" never becomes a one-column
+   table. */
+static int recognize_table(const wchar_t *header, size_t hn,
+    const wchar_t *delim, size_t dn, MdCellRange *cells,
+    unsigned char *align) {
+    MdPrefix hp, dp;
+    scan_prefix(header, hn, &hp);
+    scan_prefix(delim, dn, &dp);
+    if (hp.quote_depth || hp.has_marker || hp.rel > MD_ROOT_PREFIX_COLS)
+        return 0;
+    if (dp.quote_depth || dp.has_marker || dp.rel > MD_ROOT_PREFIX_COLS)
+        return 0;
+    if (line_is_blank(header, hn) || line_fence_open(header, hn) ||
+        line_heading_root(header, hn, NULL, NULL)) return 0;
+    if (!has_separator_pipe(header, hn) && !has_separator_pipe(delim, dn))
+        return 0;
+    bool h_overflow = false, d_overflow = false;
+    int hc = split_row(header, hn, cells, MD_MAX_TABLE_COLUMNS, &h_overflow);
+    MdCellRange dcells[MD_MAX_TABLE_COLUMNS];
+    int dc = split_row(delim, dn, dcells, MD_MAX_TABLE_COLUMNS, &d_overflow);
+    if (h_overflow || d_overflow || hc < 1 || hc != dc) return 0;
+    for (int i = 0; i < hc; i++) {
+        if (!delimiter_cell(delim + dcells[i].begin,
+            dcells[i].end - dcells[i].begin, &align[i])) return 0;
+    }
+    return hc;
+}
+
+/* Emits one cell's content. Escaped pipes are resolved (one backslash is
+   consumed) before the inline pass, so `\|` displays `|` even inside a code
+   span; other backslashes are left for parse_inline. Whitespace is trimmed and
+   the cell range is recorded even when empty. */
+static void emit_table_cell(MdBuilder *b, const wchar_t *line, size_t begin,
+    size_t end, unsigned style) {
+    if (b->failed) return;
+    size_t span = end > begin ? end - begin : 0;
+    if (!grow_scratch(b, span)) return;
+    wchar_t *buffer = b->scratch;
+    size_t out = 0;
+    for (size_t i = begin; i < end;) {
+        if (line[i] != L'\\') { buffer[out++] = line[i++]; continue; }
+        size_t j = i;
+        while (j < end && line[j] == L'\\') ++j;
+        size_t run = j - i;
+        if (j < end && line[j] == L'|' && (run % 2) == 1) {
+            for (size_t k = 1; k < run; k++) buffer[out++] = L'\\';
+            buffer[out++] = L'|';
+            i = j + 1;
+        } else {
+            for (size_t k = 0; k < run; k++) buffer[out++] = L'\\';
+            i = j;
+        }
+    }
+    size_t from = 0, to = out;
+    while (from < to && is_space(buffer[from])) ++from;
+    while (to > from && is_space(buffer[to - 1])) --to;
+    size_t offset = b->length;
+    if (to > from) {
+        MdStyle s = {0};
+        s.style = style;
+        parse_inline(b, buffer + from, to - from, s);
+    }
+    if (!grow_cells(b)) return;
+    b->cells[b->cell_count].offset = offset;
+    b->cells[b->cell_count].length = b->length - offset;
+    b->cell_count++;
+}
+
+/* Records one row and emits exactly `columns` cells, padding missing cells with
+   zero-length ranges and truncating extra ones. */
+static void emit_table_row(MdBuilder *b, const wchar_t *line,
+    const MdCellRange *cells, int cell_count, int columns, unsigned style) {
+    if (b->failed) return;
+    if (!grow_rows(b)) return;
+    int row = b->row_count++;
+    b->rows[row].first_cell = b->cell_count;
+    b->rows[row].cell_count = columns;
+    for (int col = 0; col < columns; col++) {
+        if (col < cell_count)
+            emit_table_cell(b, line, cells[col].begin, cells[col].end, style);
+        else
+            emit_table_cell(b, line, 0, 0, style);
+    }
+}
+
+static void append_literal(MdBuilder *b, const wchar_t *text, size_t length,
+    bool newline) {
+    if (b->failed) return;
+    if (!grow_literals(b, length + (newline ? 1u : 0u))) return;
+    if (newline) b->literals[b->literals_length++] = L'\n';
+    if (length) wmemcpy(b->literals + b->literals_length, text, length);
+    b->literals_length += length;
+}
+
+/* The first character of the next line, or NULL when `end` terminates the
+   source. An empty final line yields NULL as well: it can never be a valid
+   delimiter. */
+static const wchar_t *line_after(const wchar_t *end) {
+    if (!*end) return NULL;
+    const wchar_t *p = end + 1;
+    if (*end == L'\r' && *p == L'\n') ++p;
+    return *p ? p : NULL;
+}
+
+/* True when `p` continues the currently open list item: no marker, the same
+   quote depth (a quote boundary starts a fresh list), and indented past the
+   open level's own column. Mirrors render_line's continuation branch, so a
+   root-only table cannot hijack an indented list continuation. */
+static bool line_continues_list(const MdBlocks *blocks, const MdPrefix *p) {
+    if (blocks->depth <= 0) return false;
+    if (p->quote_depth != blocks->quote_depth) return false;
+    if (p->has_marker) return false;
+    return p->rel > blocks->level[blocks->depth - 1].column;
+}
+
+/* Recognizes one table beginning at `start`. Returns the number of source
+   wchars consumed (the table lines, terminators excluded), or 0 when `start`
+   does not open a table; the terminating line is left to render_line. A
+   recognized root table ends any open list, exactly as an ordinary root
+   paragraph would. */
+static size_t table_scan(MdBuilder *b, const wchar_t *start,
+    MdBlocks *blocks) {
+    const wchar_t *hend = start;
+    while (*hend && *hend != L'\n' && *hend != L'\r') ++hend;
+    MdPrefix hp;
+    scan_prefix(start, (size_t)(hend - start), &hp);
+    if (line_continues_list(blocks, &hp)) return 0;
+    const wchar_t *dline = line_after(hend);
+    if (!dline) return 0;
+    const wchar_t *dend = dline;
+    while (*dend && *dend != L'\n' && *dend != L'\r') ++dend;
+    MdCellRange hcells[MD_MAX_TABLE_COLUMNS];
+    unsigned char align[MD_MAX_TABLE_COLUMNS];
+    int columns = recognize_table(start, (size_t)(hend - start), dline,
+        (size_t)(dend - dline), hcells, align);
+    if (columns <= 0) return 0;
+
+    blocks->depth = 0;
+    blocks->quote_depth = 0;
+
+    int table_index = b->table_count;
+    if (!grow_tables(b)) return 0;
+    MdTable *table = &b->tables[b->table_count++];
+    table->first_row = b->row_count;
+    table->first_cell = b->cell_count;
+    table->columns = columns;
+    for (int i = 0; i < columns; i++) table->align[i] = align[i];
+    table->literal_offset = b->literals_length;
+    table->literal_length = 0;
+
+    emit_break(b, 0);
+    size_t block_start = b->length;
+    emit_table_row(b, start, hcells, columns, columns, MD_STYLE_BOLD);
+    append_literal(b, start, (size_t)(hend - start), false);
+    append_literal(b, dline, (size_t)(dend - dline), true);
+
+    const wchar_t *last_end = dend;
+    const wchar_t *row = line_after(dend);
+    while (row) {
+        size_t rn = 0;
+        while (row[rn] && row[rn] != L'\n' && row[rn] != L'\r') ++rn;
+        if (line_starts_block(row, rn)) break;
+        MdCellRange rcells[MD_MAX_TABLE_COLUMNS];
+        int rcount = split_row(row, rn, rcells, columns, NULL);
+        emit_table_row(b, row, rcells, rcount, columns, 0);
+        append_literal(b, row, rn, true);
+        last_end = row + rn;
+        row = line_after(row + rn);
+    }
+
+    record_table_block(b, block_start, table_index);
+    table->row_count = b->row_count - table->first_row;
+    table->cell_count = b->cell_count - table->first_cell;
+    table->literal_length = b->literals_length - table->literal_offset;
+    return (size_t)(last_end - start);
+}
+
 static void render_document(MdBuilder *b, const wchar_t *source) {
     const wchar_t *line = source ? source : L"";
     MdFence fence = {0};
@@ -751,6 +1171,16 @@ static void render_document(MdBuilder *b, const wchar_t *source) {
     for (;;) {
         const wchar_t *end = line;
         while (*end && *end != L'\n' && *end != L'\r') ++end;
+        if (!fence.delimiter) {
+            size_t consumed = table_scan(b, line, &blocks);
+            if (consumed) {
+                line += consumed;
+                if (!*line) break;
+                if (*line == L'\r' && line[1] == L'\n') line += 2;
+                else if (*line == L'\r' || *line == L'\n') line += 1;
+                continue;
+            }
+        }
         render_line(b, line, (size_t)(end - line), &fence, &blocks);
         if (!*end) break;
         line = end + 1;
@@ -772,8 +1202,14 @@ bool markdown_render(const wchar_t *source, MdDocument *doc) {
         free(b.blocks);
         free(b.links);
         free(b.targets);
+        free(b.cells);
+        free(b.rows);
+        free(b.tables);
+        free(b.literals);
+        free(b.scratch);
         return false;                       /* *doc stays zeroed */
     }
+    free(b.scratch);
     b.text[b.length] = L'\0';
     doc->text = b.text;
     doc->length = b.length;
@@ -789,5 +1225,17 @@ bool markdown_render(const wchar_t *source, MdDocument *doc) {
     doc->targets = b.targets;
     doc->targets_length = b.targets_length;
     doc->targets_capacity = b.targets_capacity;
+    doc->cells = b.cells;
+    doc->cell_count = b.cell_count;
+    doc->cell_capacity = b.cell_capacity;
+    doc->rows = b.rows;
+    doc->row_count = b.row_count;
+    doc->row_capacity = b.row_capacity;
+    doc->tables = b.tables;
+    doc->table_count = b.table_count;
+    doc->table_capacity = b.table_capacity;
+    doc->literals = b.literals;
+    doc->literals_length = b.literals_length;
+    doc->literals_capacity = b.literals_capacity;
     return true;
 }
