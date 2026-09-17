@@ -322,17 +322,41 @@ has only spaces or tabs after it; shorter, wrong-character and text-suffixed
 candidates remain raw code content, while longer closers are accepted. Fenced
 content is unparsed and removes at most the opener's leading spaces from each
 line; an unterminated fence keeps the remaining document as code. Fence lines and
-info strings are hidden, and code is monospace on the code tint. Flat lists use
-textual `• ` bullets, `☐ `/`☑ ` unordered task markers, and preserved ordered
-markers. `[label](http(s)://…)` links render as `label (url)` so the native URL
-detector opens them, and blockquotes are muted and bar-prefixed. Precedence is
+info strings are hidden, and code is monospace on the code tint.
+
+Lists use textual `• ` bullets, `☐ `/`☑ ` unordered task markers at any
+supported depth, and preserved ordered markers; blockquotes are muted and
+bar-prefixed with one `▌ ` per level. Nesting is conservative and bounded:
+a quote is `>` (each level with an optional single space, so `> > x` and `>> x`
+both nest) up to 8 levels; a nested list item must be indented to its parent's
+content column, so a shallower indent is a sibling item or a continuation, never
+a new level; the last quote marker needs a space or the end of line after it, so
+`> >x` is one quote containing `>x`. A continuation line — indented past an open
+item's marker — inherits that item's layout and pads the absent marker with
+spaces, which keeps the bars and the content aligned with the item it continues.
+Indentation past 32 columns clamps the layout and keeps the remaining source
+whitespace verbatim, tabs included, while a ninth quote or list level, a
+four-space indented root marker or any other unsupported prefix leaves the whole
+line literal; ordinary leading whitespace is preserved as text. Lazy
+continuation, indented code blocks, `+` bullets and fences inside quotes are not
+recognized. `[label](http(s)://…)` links render as `label (url)` so the native URL
+detector opens them. Precedence is
 fences → inline code → links → strikethrough → emphasis; escapes (`\*`) keep
 punctuation literal; malformed or unsupported
-syntax (tables, images, nested lists, deeper rules) is preserved verbatim. Every
+syntax (tables, images, deeper rules) is preserved verbatim.
+
+Each paragraph also records layout metadata — quote depth, list depth, item
+flags and the two indent columns — next to the styled runs. Rich Edit applies
+`dxStartIndent` and `dxOffset` from it (a positive `dxOffset` hangs wrapped
+lines inside the synthesized marker) and clears both across the whole document
+before every write, so a verbatim body, a literal fallback or a rebuilt document
+never inherits an indent; adjacent paragraphs sharing a layout are formatted
+with one selection. Every
 Rich Edit run sets bold, italic, strikethrough, face, size and background
 explicitly, so code tinting cannot bleed into following text, and identical
 adjacent runs coalesce. The parser is transactional and O(input)-memory: on
-allocation failure the body falls back to verbatim text. Rebuilds of completed
+allocation failure — including failure of the paragraph array alone — the body
+falls back to verbatim text. Rebuilds of completed
 turns may reparse the message; no render cache is kept.
 
 The key is read from `OPENROUTER_API_KEY` in the process environment, falling back

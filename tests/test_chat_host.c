@@ -812,6 +812,38 @@ static int default_suite(void) {
           SCF_SELECTION,(LPARAM)&f);
       CHECK(!(f.dwEffects&(CFE_BOLD|CFE_ITALIC|CFE_STRIKEOUT)) &&
           !wcscmp(f.szFaceName,L"Segoe UI")); }
+    /* ---- Nested Markdown streams the same way: an incomplete prefix stays
+       literal, the accumulated message is reparsed at the throttle interval,
+       and the terminal render carries the paragraph layout. ---- */
+    add_turn(chat,L"seed",L"seed answer",NULL,-1);
+    begin_regenerate(h);
+    int nested_turn=h->request_message;
+    h->transcript.body_render_tick=0;
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"> -"));
+    { wchar_t body[256]; body_text(h,nested_turn,body,256);
+      CHECK(!wcscmp(body,L"\u258C -")); }        /* marker without content */
+    h->transcript.body_render_tick=0;
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L" item"));
+    { wchar_t body[256]; body_text(h,nested_turn,body,256);
+      CHECK(!wcscmp(body,L"\u258C \u2022 item")); }
+    h->transcript.body_render_tick=0;
+    handle_event(h,fixture(h,OPENROUTER_DELTA,L"\n>   - nested"));
+    { wchar_t body[256]; body_text(h,nested_turn,body,256);
+      CHECK(!wcscmp(body,L"\u258C \u2022 item\r\n\u258C \u2022 nested")); }
+    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    { wchar_t body[256]; body_text(h,nested_turn,body,256);
+      CHECK(!wcscmp(body,L"\u258C \u2022 item\r\n\u258C \u2022 nested"));
+      HWND window=body_window(h,nested_turn);
+      size_t second=wcslen(L"\u258C \u2022 item\r\n");
+      PARAFORMAT2 pf;
+      memset(&pf,0,sizeof pf); pf.cbSize=sizeof pf;
+      SendMessageW(window,EM_SETSEL,(WPARAM)second,(LPARAM)(second+1));
+      SendMessageW(window,EM_GETPARAFORMAT,0,(LPARAM)&pf);
+      CHECK(pf.dxStartIndent>0);             /* the nested item is indented */
+      memset(&pf,0,sizeof pf); pf.cbSize=sizeof pf;
+      SendMessageW(window,EM_SETSEL,0,1);
+      SendMessageW(window,EM_GETPARAFORMAT,0,(LPARAM)&pf);
+      CHECK(pf.dxStartIndent==0 && pf.dxOffset>0); }   /* bars hang the text */
     command(h,CHAT_COMMAND_SELECT,cv);
     /* Compact metadata footer: deduplicated model, grouped tokens, no "stop",
        and unusual finish reasons surfaced. */
@@ -2523,6 +2555,20 @@ static int bounded_suite(void) {
         hm=transcript_measure_live(tr,meas,&qm);
         RichTextControl *body=transcript_surface(tr,eq,TRANSCRIPT_BODY);
         hl=transcript_measure_live(tr,body,&ql);
+        CHECK(qm==TRANSCRIPT_MEASURE_EXACT && ql==TRANSCRIPT_MEASURE_EXACT);
+        CHECK(hm==hl);
+        CHECK(tr->records[eq].body_h==hl);       /* cached == live */
+        /* nested markdown body: quoted lists and continuations indent their
+           paragraphs, so both surfaces must apply the same layout */
+        CHECK(chat_message_set_text(&chat->conversations[chat->active].messages[eq],
+            L"> - quoted item\n>   - nested item\n>     continuation of the "
+            L"nested item that is long enough to wrap at this width"));
+        refresh_turn(h,eq);
+        m=&chat->conversations[chat->active].messages[eq];
+        rich_text_set_markdown(meas,m->role,chat_message_text(m));
+        hm=transcript_measure_live(tr,meas,&qm);
+        hl=transcript_measure_live(tr,
+            transcript_surface(tr,eq,TRANSCRIPT_BODY),&ql);
         CHECK(qm==TRANSCRIPT_MEASURE_EXACT && ql==TRANSCRIPT_MEASURE_EXACT);
         CHECK(hm==hl);
         CHECK(tr->records[eq].body_h==hl);       /* cached == live */

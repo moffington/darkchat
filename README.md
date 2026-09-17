@@ -211,7 +211,9 @@ The automated suite does not require an API key or make live OpenRouter requests
 - No response branches or retained variants
 - Conversation search scans current in-memory messages on demand; there is no
   persisted or background index
-- Markdown tables, images, nested lists, and other unsupported syntax remain literal
+- Markdown tables, images, indented code blocks, and other unsupported syntax remain
+  literal; lists and blockquotes nest up to eight levels, with deeper or ambiguous
+  prefixes kept verbatim
 
 An allocation failure while receiving a response retains the partial response and
 marks it Interrupted. The 128 MB snapshot limit is a serialized-file limit, not

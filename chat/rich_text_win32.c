@@ -98,6 +98,55 @@ static void apply_format(RichTextControl *control, WPARAM scope, unsigned style,
     SendMessageW(control->window, EM_SETCHARFORMAT, scope, (LPARAM)&format);
 }
 
+/* Layout columns to twips. Twips are DIP * 15 (the unit yHeight already uses),
+   so the control converts them for the monitor DPI; one column is half an em,
+   roughly the advance of the synthesized marker glyphs. */
+static LONG indent_twips(const RichTextControl *control, int columns) {
+    return (LONG)(columns * control->theme.ui_size * 15.0f * 0.5f + 0.5f);
+}
+
+/* Paragraph format for the current selection. Every field is set on every
+   call, mirroring apply_format, so a paragraph never inherits a stale indent.
+   dxStartIndent moves the first line; a positive dxOffset moves the following
+   lines further in, which is the hanging indent a synthesized marker needs. */
+static void apply_paragraph(RichTextControl *control, int first, int hanging) {
+    PARAFORMAT2 format;
+    memset(&format, 0, sizeof format);
+    format.cbSize = sizeof format;
+    format.dwMask = PFM_STARTINDENT | PFM_OFFSET | PFM_RIGHTINDENT;
+    format.dxStartIndent = indent_twips(control, first);
+    format.dxOffset = indent_twips(control, hanging);
+    format.dxRightIndent = 0;
+    SendMessageW(control->window, EM_SETPARAFORMAT, 0, (LPARAM)&format);
+}
+
+/* Clears the paragraph format of the whole current selection: a verbatim body,
+   a literal fallback or a rebuilt document must never inherit an indent. */
+static void reset_paragraphs(RichTextControl *control) {
+    apply_paragraph(control, 0, 0);
+}
+
+/* Applies each paragraph's layout. Adjacent paragraphs sharing one layout are
+   formatted with a single selection, so a long fenced block costs one message. */
+static void apply_blocks(RichTextControl *control, const MdDocument *document) {
+    for (int i = 0; i < document->block_count;) {
+        const MdBlock *block = &document->blocks[i];
+        int j = i + 1;
+        while (j < document->block_count &&
+            document->blocks[j].first_indent == block->first_indent &&
+            document->blocks[j].continuation_indent ==
+                block->continuation_indent) ++j;
+        const MdBlock *last = &document->blocks[j - 1];
+        CHARRANGE range;
+        range.cpMin = (LONG)block->offset;
+        range.cpMax = (LONG)(last->offset + last->length);
+        SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&range);
+        apply_paragraph(control, block->first_indent,
+            block->continuation_indent - block->first_indent);
+        i = j;
+    }
+}
+
 static void caret_end(HWND window) {
     int length = GetWindowTextLengthW(window);
     SendMessageW(window, EM_SETSEL, (WPARAM)length, (LPARAM)length);
@@ -337,6 +386,9 @@ static void begin_write(RichTextControl *control) {
     SendMessageW(control->window, EM_SETREADONLY, FALSE, 0);
     SetWindowTextW(control->window, L"");
     caret_end(control->window);
+    /* Paragraph defaults are cleared only after the control is empty: the one
+       paragraph that remains is the one later text inherits from. */
+    reset_paragraphs(control);
 }
 
 static void end_write(RichTextControl *control) {
@@ -390,6 +442,15 @@ void rich_text_set_markdown(RichTextControl *control, ChatRole role,
     } else {
         SendMessageW(control->window, EM_REPLACESEL, FALSE,
             (LPARAM)document.text);
+        /* Defaults are re-asserted across the inserted document, since inserted
+           text inherits the format at the caret; nothing depends on the order
+           of the two writes above. */
+        CHARRANGE whole;
+        whole.cpMin = 0;
+        whole.cpMax = (LONG)document.length;
+        SendMessageW(control->window, EM_EXSETSEL, 0, (LPARAM)&whole);
+        reset_paragraphs(control);
+        apply_blocks(control, &document);
         for (int i = 0; i < document.run_count; i++) {
             const MdRun *r = &document.runs[i];
             if (!r->length) continue;

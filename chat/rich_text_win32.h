@@ -92,9 +92,11 @@ void rich_text_set_body(RichTextControl *control, ChatRole role,
 /* Live answer text appended verbatim; the completed body is re-rendered. */
 void rich_text_append_body(RichTextControl *control, const wchar_t *text);
 /* Body text only, rendered as Markdown: headings 1-3, bold, italic,
-   strikethrough, inline and fenced code, flat lists with unordered task
-   markers, HTTP(S) links and blockquotes. Falls back to verbatim text when
-   parsing or allocation fails. */
+   strikethrough, inline and fenced code, nested lists with unordered task
+   markers, nested blockquotes and HTTP(S) links. Paragraph indentation and
+   hanging indentation come from the parser's paragraph records and are cleared
+   before every write, so a verbatim or failed body never inherits an indent.
+   Falls back to verbatim text when parsing or allocation fails. */
 void rich_text_set_markdown(RichTextControl *control, ChatRole role,
     const wchar_t *text);
 /* Compact terminal-state metadata footer (status, timings, tokens, cost,

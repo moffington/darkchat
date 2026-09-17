@@ -18,6 +18,21 @@ static CHARFORMAT2W format_at(const RichTextControl *c, int cp) {
     return f;
 }
 
+/* Paragraph format at one character position. */
+static PARAFORMAT2 paragraph_at(const RichTextControl *c, int cp) {
+    PARAFORMAT2 f;
+    memset(&f, 0, sizeof f);
+    f.cbSize = sizeof f;
+    SendMessageW(c->window, EM_SETSEL, (WPARAM)cp, (LPARAM)(cp + 1));
+    SendMessageW(c->window, EM_GETPARAFORMAT, 0, (LPARAM)&f);
+    return f;
+}
+
+/* Layout columns in twips, the unit the renderer budgets them in. */
+static LONG columns_twips(const RichTextControl *c, int columns) {
+    return (LONG)(columns * c->theme.ui_size * 15.0f * 0.5f + 0.5f);
+}
+
 static void read_text(const RichTextControl *c, wchar_t *out, size_t cap) {
     out[0] = 0;
     if (c->window) rich_text_get_text(c, out, cap);
@@ -212,11 +227,87 @@ int main(void) {
     CHECK(SendMessageW(probe.window, WM_GETTEXTLENGTH, 0, 0) == (LRESULT)(n + 5));
     free(long_text);
 
+    /* Paragraph layout: plain text is flush, and every field is reset. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"plain `code` plain");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"plain code plain"));
+    PARAFORMAT2 pf = paragraph_at(&probe, 0);
+    CHECK(pf.dxStartIndent == 0 && pf.dxOffset == 0);
+    pf = paragraph_at(&probe, (int)wcslen(L"plain code "));
+    CHECK(pf.dxStartIndent == 0 && pf.dxOffset == 0);
+
+    /* A list item hangs its wrapped lines at the content column. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"- a\n  - b");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"\u2022 a\r\n\u2022 b"));
+    pf = paragraph_at(&probe, 0);
+    CHECK(pf.dxStartIndent == 0 && pf.dxOffset == columns_twips(&probe, 2));
+    pf = paragraph_at(&probe, 5);                   /* nested item */
+    CHECK(pf.dxStartIndent == columns_twips(&probe, 2) &&
+        pf.dxOffset == columns_twips(&probe, 2));
+
+    /* A quoted item indents by its bars and its bullet together. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"> - item");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"\u258C \u2022 item"));
+    pf = paragraph_at(&probe, 0);
+    CHECK(pf.dxStartIndent == 0 && pf.dxOffset == columns_twips(&probe, 4));
+
+    /* A nested quoted item keeps the four-character prefix as base indent. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"> - item\n>   - nested");
+    pf = paragraph_at(&probe, (int)wcslen(L"\u258C \u2022 item\r\n"));
+    CHECK(pf.dxStartIndent == columns_twips(&probe, 2) &&
+        pf.dxOffset == columns_twips(&probe, 4));
+
+    /* A quoted continuation aligns with the item it continues. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"> - item\n>   more");
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"\u258C \u2022 item\r\n\u258C   more"));
+    pf = paragraph_at(&probe, (int)wcslen(L"\u258C \u2022 item\r\n"));
+    CHECK(pf.dxStartIndent == 0 && pf.dxOffset == columns_twips(&probe, 4));
+
+    /* Nested rendering is stable across repeats and keeps its text. */
+    for (int i = 0; i < 3; i++) {
+        rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+            L"- one\n  - two\n    - three");
+        read_text(&probe, text, 512);
+        CHECK(!wcscmp(text, L"\u2022 one\r\n\u2022 two\r\n\u2022 three"));
+        pf = paragraph_at(&probe, (int)wcslen(L"\u2022 one\r\n\u2022 two\r\n"));
+        CHECK(pf.dxStartIndent == columns_twips(&probe, 4) &&
+            pf.dxOffset == columns_twips(&probe, 2));
+    }
+
+    /* Behavioral: a wrapped item line starts at the content column, not at the
+       margin where its bullet sits. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"- aaaaaaaa bbbbbbbb cccccccc dddddddd eeeeeeee ffffffff "
+        L"gggggggg hhhhhhhh iiiiiiii jjjjjjjj kkkkkkkk llllllll "
+        L"mmmmmmmm nnnnnnnn oooooooo pppppppp");
+    CHECK(SendMessageW(probe.window, EM_GETLINECOUNT, 0, 0) > 1);
+    int wrap_cp = -1;
+    for (int cp = 0; cp < 200 && wrap_cp < 0; cp++)
+        if ((int)SendMessageW(probe.window, EM_EXLINEFROMCHAR, 0,
+            (LPARAM)cp) > 0) wrap_cp = cp;
+    CHECK(wrap_cp > 0);
+    POINTL first, wrapped, content;
+    memset(&first, 0, sizeof first);
+    memset(&wrapped, 0, sizeof wrapped);
+    memset(&content, 0, sizeof content);
+    SendMessageW(probe.window, EM_POSFROMCHAR, (WPARAM)&first, (LPARAM)0);
+    SendMessageW(probe.window, EM_POSFROMCHAR, (WPARAM)&wrapped,
+        (LPARAM)wrap_cp);
+    SendMessageW(probe.window, EM_POSFROMCHAR, (WPARAM)&content, (LPARAM)2);
+    CHECK(wrapped.x > first.x);
+    CHECK(abs(wrapped.x - content.x) <= 6);
+
     /* Allocation failure falls back to verbatim text, then recovers. */
     markdown_test_fail_allocations(true);
-    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"**x** tail");
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"- **x** tail");
     read_text(&probe, text, 512);
-    CHECK(!wcscmp(text, L"**x** tail"));
+    CHECK(!wcscmp(text, L"- **x** tail"));
+    pf = paragraph_at(&probe, 0);
+    CHECK(pf.dxStartIndent == 0 && pf.dxOffset == 0);  /* fallback is flush */
     markdown_test_fail_allocations(false);
     rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"**x** tail");
     read_text(&probe, text, 512);

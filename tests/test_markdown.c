@@ -35,6 +35,46 @@ static bool style_is(const MdRun *run, unsigned style) {
     return run && run->style == style;
 }
 
+/* Finds the block covering the first occurrence of needle in the document. */
+static const MdBlock *block_over(const MdDocument *d, const wchar_t *needle) {
+    const wchar_t *at = d->text ? wcsstr(d->text, needle) : NULL;
+    if (!at) return NULL;
+    size_t offset = (size_t)(at - d->text);
+    size_t end = offset + wcslen(needle);
+    for (int i = 0; i < d->block_count; i++) {
+        const MdBlock *k = &d->blocks[i];
+        if (k->offset <= offset && end <= k->offset + k->length) return k;
+    }
+    return NULL;
+}
+
+static void block_is(const MdBlock *k, int kind, unsigned char quote,
+    unsigned char list, unsigned char flags, unsigned char first,
+    unsigned char continuation, const char *what) {
+    check(k != NULL, what);
+    if (!k) return;
+    check(k->kind == (unsigned char)kind && k->quote_depth == quote &&
+        k->list_depth == list && k->flags == flags &&
+        k->first_indent == first && k->continuation_indent == continuation,
+        what);
+}
+
+/* Blocks are ordered, disjoint, non-empty, hold no paragraph separator and
+    never indent content before the line's first column. */
+static void blocks_sane(const MdDocument *d, const char *what) {
+    size_t reached = 0;
+    for (int i = 0; i < d->block_count; i++) {
+        const MdBlock *k = &d->blocks[i];
+        check(k->offset >= reached, what);
+        check(k->length > 0, what);
+        check(k->continuation_indent >= k->first_indent, what);
+        for (size_t j = k->offset; j < k->offset + k->length; j++)
+            if (d->text[j] == L'\n') { check(false, what); return; }
+        reached = k->offset + k->length;
+    }
+    check(reached <= d->length, what);
+}
+
 int main(void) {
     check((MD_STYLE_MONO & MD_STYLE_CODE) == 0,
         "mono and code flags do not overlap");
@@ -262,7 +302,7 @@ int main(void) {
         MdDocument d;
         render_ok(L"  ````\n  zero\n    two\n\t tab\n   ````\n  plain\n    deep",
             &d, "fence indentation renders");
-        text_is(&d, L"zero\n  two\n\t tab\nplain\n deep",
+        text_is(&d, L"zero\n  two\n\t tab\n  plain\n    deep",
             "fence indentation is distinct from ordinary lines");
         check(style_is(run_over(&d, L"  two"), MD_STYLE_MONO | MD_STYLE_CODE),
             "remaining fenced indentation is code");
@@ -272,7 +312,7 @@ int main(void) {
     { /* Four leading spaces never open a fence; CRLF fences normalize normally. */
         MdDocument d;
         render_ok(L"    ```\nplain", &d, "four-space fence marker renders");
-        text_is(&d, L" ```\nplain", "four-space marker stays ordinary text");
+        text_is(&d, L"    ```\nplain", "four-space marker stays ordinary text");
         check(d.run_count == 1 && d.runs[0].style == 0,
             "four-space marker has no code style");
         markdown_dispose(&d);
@@ -383,6 +423,248 @@ int main(void) {
         const MdRun *l = run_over(&d, L"l (https://x.io/a)");
         check(style_is(l, MD_STYLE_BOLD), "link inside bold");
         markdown_dispose(&d); }
+    { /* Flat paragraphs describe their own layout; nesting arrives later. */
+        MdDocument d;
+        render_ok(L"- a\n* [x] t\n1. one\n10. ten\n> quote\ntext", &d,
+            "flat blocks render");
+        text_is(&d, L"\u2022 a\n\u2611 t\n1. one\n10. ten\n"
+            L"\u258C quote\ntext", "flat block text unchanged");
+        blocks_sane(&d, "flat blocks are sane");
+        check(d.block_count == 6, "one block per non-empty paragraph");
+        block_is(&d.blocks[0], MD_BLOCK_ITEM, 0, 1, 0, 0, 2, "bullet block");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 0, 1,
+            MD_FLAG_TASK | MD_FLAG_CHECKED, 0, 2, "checked task block");
+        block_is(&d.blocks[2], MD_BLOCK_ITEM, 0, 1, MD_FLAG_ORDERED, 0, 3,
+            "ordered block keeps its marker width");
+        block_is(&d.blocks[3], MD_BLOCK_ITEM, 0, 1, MD_FLAG_ORDERED, 0, 4,
+            "two-digit ordered block");
+        block_is(&d.blocks[4], MD_BLOCK_QUOTE, 1, 0, 0, 0,
+            MD_QUOTE_GLYPH_COLS, "quote block");
+        block_is(&d.blocks[5], MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0,
+            "plain block");
+        block_is(block_over(&d, L"quote"), MD_BLOCK_QUOTE, 1, 0, 0, 0,
+            MD_QUOTE_GLYPH_COLS, "quote block found by text");
+        markdown_dispose(&d); }
+    { /* Headings, blank lines and fences record only their own paragraphs. */
+        MdDocument d;
+        render_ok(L"# H\n\nbefore\n```\nx\ny\n```\nafter", &d,
+            "mixed blocks render");
+        blocks_sane(&d, "mixed blocks are sane");
+        check(d.block_count == 5, "a blank line records no block");
+        block_is(&d.blocks[0], MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0,
+            "heading block");
+        block_is(&d.blocks[1], MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0,
+            "prose block");
+        block_is(&d.blocks[2], MD_BLOCK_CODE, 0, 0, 0, 0, 0, "first code line");
+        block_is(&d.blocks[3], MD_BLOCK_CODE, 0, 0, 0, 0, 0,
+            "second code line");
+        block_is(&d.blocks[4], MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0,
+            "trailing block");
+        markdown_dispose(&d); }
+    { /* Runs and blocks are independent layers: one code run, two code blocks. */
+        MdDocument d; render_ok(L"```\nx\ny\n```", &d, "fence layers render");
+        text_is(&d, L"x\ny", "fenced content unchanged");
+        check(d.run_count == 1, "fenced lines coalesce into one run");
+        check(d.block_count == 2, "one code block per fenced line");
+        blocks_sane(&d, "fence blocks are sane");
+        markdown_dispose(&d); }
+    { /* Nested unordered lists: depth, indentation and wrapped-line column. */
+        MdDocument d; render_ok(L"- a\n  - b\n    - c", &d, "nesting renders");
+        text_is(&d, L"\u2022 a\n\u2022 b\n\u2022 c", "bullets synthesized");
+        blocks_sane(&d, "nested blocks are sane");
+        block_is(&d.blocks[0], MD_BLOCK_ITEM, 0, 1, 0, 0, 2, "depth 1 item");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 0, 2, 0, 2, 4, "depth 2 item");
+        block_is(&d.blocks[2], MD_BLOCK_ITEM, 0, 3, 0, 4, 6, "depth 3 item");
+        markdown_dispose(&d); }
+    { /* A child needs the parent's content column; one stray space does not
+         open a level, it continues the item. */
+        MdDocument d; render_ok(L"- a\n - b", &d, "stray space renders");
+        text_is(&d, L"\u2022 a\n\u2022 b", "one space is a sibling item");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 0, 1, 0, 1, 3,
+            "sibling stays at depth 1");
+        markdown_dispose(&d);
+        render_ok(L"- a\n  - b", &d, "child indent renders");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 0, 2, 0, 2, 4,
+            "child at the content column");
+        markdown_dispose(&d); }
+    { /* Mixed nesting keeps each level's own marker and geometry. */
+        MdDocument d; render_ok(L"1. a\n   - b\n1) c", &d, "mixed renders");
+        text_is(&d, L"1. a\n\u2022 b\n1) c", "mixed markers kept");
+        blocks_sane(&d, "mixed blocks are sane");
+        block_is(&d.blocks[0], MD_BLOCK_ITEM, 0, 1, MD_FLAG_ORDERED, 0, 3,
+            "ordered parent");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 0, 2, 0, 3, 5,
+            "bullet child of an ordered item");
+        block_is(&d.blocks[2], MD_BLOCK_ITEM, 0, 1, MD_FLAG_ORDERED, 0, 3,
+            "popping back to depth 1");
+        markdown_dispose(&d); }
+    { /* Continuation lines inherit the item's layout; a flush line does not. */
+        MdDocument d; render_ok(L"- a\n b", &d, "continuation renders");
+        text_is(&d, L"\u2022 a\n  b", "continuation pads the absent marker");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 0, 1, MD_FLAG_CONTINUATION, 0, 2,
+            "continuation inherits the item layout");
+        markdown_dispose(&d);
+        render_ok(L"- a\nb", &d, "flush line renders");
+        block_is(&d.blocks[1], MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0,
+            "a flush line is an ordinary paragraph");
+        markdown_dispose(&d); }
+    { /* Quote prefixes: source width and rendered bars are counted separately,
+         and only the last marker may end without a space. */
+        MdDocument d; render_ok(L"> x\n> > x\n>> x", &d, "quote depths render");
+        text_is(&d, L"\u258C x\n\u258C \u258C x\n\u258C \u258C x",
+            "one bar per level, compact and spaced alike");
+        block_is(&d.blocks[0], MD_BLOCK_QUOTE, 1, 0, 0, 0, 2, "depth 1 quote");
+        block_is(&d.blocks[1], MD_BLOCK_QUOTE, 2, 0, 0, 0, 4, "depth 2 quote");
+        block_is(&d.blocks[2], MD_BLOCK_QUOTE, 2, 0, 0, 0, 4,
+            "compact depth 2 quote");
+        markdown_dispose(&d);
+        render_ok(L"> >x\n>>x\n>x", &d, "unterminated quotes render");
+        text_is(&d, L"\u258C >x\n\u258C >x\n>x",
+            "a marker without its space stays literal content");
+        block_is(&d.blocks[0], MD_BLOCK_QUOTE, 1, 0, 0, 0, 2,
+            "unterminated quote is depth 1");
+        block_is(&d.blocks[2], MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0,
+            "bare marker is not a quote");
+        markdown_dispose(&d); }
+    { /* The legacy root tolerance still finds a quote after three spaces;
+         indentation inside a quote is structural. */
+        MdDocument d; render_ok(L"> quote\n   > quote\n    > x\n>   x", &d,
+            "quote indentation renders");
+        text_is(&d, L"\u258C quote\n\u258C quote\n    > x\n\u258C x",
+            "recognized quotes render, unsupported ones stay literal");
+        block_is(&d.blocks[0], MD_BLOCK_QUOTE, 1, 0, 0, 0, 2, "plain quote");
+        block_is(&d.blocks[1], MD_BLOCK_QUOTE, 1, 0, 0, 0, 2,
+            "three leading spaces still open a quote");
+        block_is(&d.blocks[2], MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0,
+            "four leading spaces leave the line literal");
+        block_is(&d.blocks[3], MD_BLOCK_QUOTE, 1, 0, 0, 2, 4,
+            "indentation inside a quote is base indentation");
+        markdown_dispose(&d); }
+    { /* Quoted lists: bars at the left, content aligned with the item text. */
+        MdDocument d; render_ok(L"> - item\n>   more", &d,
+            "quoted continuation renders");
+        text_is(&d, L"\u258C \u2022 item\n\u258C   more",
+            "bars, bullet and padded continuation");
+        blocks_sane(&d, "quoted list blocks are sane");
+        block_is(&d.blocks[0], MD_BLOCK_ITEM, 1, 1, 0, 0, 4, "quoted item");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 1, 1, MD_FLAG_CONTINUATION, 0, 4,
+            "quoted continuation keeps bars and content aligned");
+        markdown_dispose(&d);
+        render_ok(L"> - item\n>   - nested\n>     deeper", &d,
+            "nested quoted list renders");
+        text_is(&d, L"\u258C \u2022 item\n\u258C \u2022 nested\n"
+            L"\u258C   deeper", "nested continuation aligns with its item");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 1, 2, 0, 2, 6,
+            "nested quoted item keeps its four-character prefix");
+        block_is(&d.blocks[2], MD_BLOCK_ITEM, 1, 2, MD_FLAG_CONTINUATION, 2, 6,
+            "a deeper continuation follows the nested item");
+        markdown_dispose(&d); }
+    { /* A quote boundary starts a fresh list. */
+        MdDocument d; render_ok(L"- a\n> - b\n  - c", &d,
+            "quote boundary renders");
+        text_is(&d, L"\u2022 a\n\u258C \u2022 b\n\u2022 c",
+            "quoted item renders as a quoted item");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 1, 1, 0, 0, 4,
+            "quoted item is depth 1 in its own quote, not depth 2");
+        block_is(&d.blocks[2], MD_BLOCK_ITEM, 0, 1, 0, 2, 4,
+            "the quote ended the unquoted list, which restarts at depth 1");
+        markdown_dispose(&d); }
+    { /* Task markers work at any supported depth. */
+        MdDocument d; render_ok(L"> - [x] deep\n>   - [ ] deeper", &d,
+            "nested tasks render");
+        text_is(&d, L"\u258C \u2611 deep\n\u258C \u2610 deeper",
+            "task markers replace the bullet at depth");
+        block_is(&d.blocks[0], MD_BLOCK_ITEM, 1, 1,
+            MD_FLAG_TASK | MD_FLAG_CHECKED, 0, 4, "checked nested task");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 1, 2, MD_FLAG_TASK, 2, 6,
+            "unchecked deeper task");
+        markdown_dispose(&d); }
+    { /* Nesting past the supported depth stays literal and ends the list. */
+        MdDocument d;
+        render_ok(L"- a\n  - b\n    - c\n      - d\n        - e\n"
+            L"          - f\n            - g\n              - h\n"
+            L"                - i\n  - j", &d, "deep nesting renders");
+        blocks_sane(&d, "deep blocks are sane");
+        block_is(&d.blocks[7], MD_BLOCK_ITEM, 0, 8, 0, 14, 16,
+            "depth 8 is the last supported level");
+        block_is(&d.blocks[8], MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0,
+            "deeper line stays literal");
+        block_is(&d.blocks[9], MD_BLOCK_ITEM, 0, 1, 0, 2, 4,
+            "the literal line cleared the list stack");
+        markdown_dispose(&d);
+        render_ok(L"> > > > > > > > > x", &d, "deep quote renders");
+        check(d.block_count == 1 && d.blocks[0].kind == MD_BLOCK_PARAGRAPH &&
+            d.blocks[0].first_indent == 0,
+            "quote depth past the limit stays literal");
+        markdown_dispose(&d); }
+    { /* Indentation past the layout cap is kept verbatim, tabs included. */
+        MdDocument d;
+        render_ok(L"- a\n                                        - b", &d,
+            "capped indentation renders");
+        text_is(&d, L"\u2022 a\n\u2022         b",
+            "excess columns stay in the text");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 0, 2, 0, MD_MAX_INDENT,
+            MD_MAX_INDENT + 2, "layout clamped, text retained");
+        markdown_dispose(&d);
+        render_ok(L"- a\n                                        \tb", &d,
+            "capped tab renders");
+        text_is(&d, L"\u2022 a\n          \tb", "retained tab is not spaces");
+        markdown_dispose(&d); }
+    { /* Ordinary leading whitespace is preserved as text, not as layout. */
+        MdDocument d; render_ok(L"  plain\n    deep", &d, "indent renders");
+        text_is(&d, L"  plain\n    deep", "ordinary whitespace preserved");
+        block_is(&d.blocks[0], MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0,
+            "leading whitespace is not layout");
+        markdown_dispose(&d);
+        render_ok(L"    - a", &d, "root cap renders");
+        text_is(&d, L"    - a", "four-space marker stays literal");
+        block_is(&d.blocks[0], MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0,
+            "root cap line is a plain paragraph");
+        markdown_dispose(&d); }
+    { /* Every character of a quote prefix counts toward the source column, so
+         a tab after the markers lands on the right tab stop. */
+        MdDocument d; render_ok(L"> \tx", &d, "quoted tab renders");
+        text_is(&d, L"\u258C x", "quoted tab content unchanged");
+        block_is(&d.blocks[0], MD_BLOCK_QUOTE, 1, 0, 0, 2, 4,
+            "tab stops count the consumed markers");
+        markdown_dispose(&d); }
+    { /* A shifted sibling re-anchors its level, so the next line is classified
+         against the sibling's column rather than the original marker's. */
+        MdDocument d; render_ok(L"- a\n - b\n  - c", &d,
+            "shifted sibling renders");
+        text_is(&d, L"\u2022 a\n\u2022 b\n\u2022 c", "all three are items");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 0, 1, 0, 1, 3,
+            "sibling anchors the level at its own column");
+        block_is(&d.blocks[2], MD_BLOCK_ITEM, 0, 1, 0, 2, 4,
+            "one more column is still a sibling of the shifted level");
+        markdown_dispose(&d); }
+    { /* A recognized marker keeps its source indentation, even at the root. */
+        MdDocument d; render_ok(L"   - a\n- b", &d, "root indent renders");
+        text_is(&d, L"\u2022 a\n\u2022 b", "bullets synthesized");
+        block_is(&d.blocks[0], MD_BLOCK_ITEM, 0, 1, 0, 3, 5,
+            "three-space root item keeps three columns");
+        block_is(&d.blocks[1], MD_BLOCK_ITEM, 0, 1, 0, 0, 2,
+            "flush root item stays flush");
+        markdown_dispose(&d); }
+    { /* Hundreds of quote markers cannot wrap the depth count into a valid
+         quote: the line stays literal. */
+        wchar_t deep[320];
+        for (int i = 0; i < 256 + MD_MAX_DEPTH; i++) deep[i] = L'>';
+        wcscpy(deep + 256 + MD_MAX_DEPTH, L" x");
+        MdDocument d; render_ok(deep, &d, "overflowing quote renders");
+        check(d.block_count == 1 && d.blocks[0].kind == MD_BLOCK_PARAGRAPH &&
+            d.blocks[0].quote_depth == 0,
+            "an unbounded marker run never becomes a shallow quote");
+        markdown_dispose(&d); }
+    { /* Fences keep precedence and shield nested syntax. */
+        MdDocument d; render_ok(L"~~~\n- [x] raw\n> - quoted\n~~~", &d,
+            "shielded nesting renders");
+        text_is(&d, L"- [x] raw\n> - quoted", "fenced nesting stays raw");
+        check(d.run_count == 1, "shielded lines are one code run");
+        check(d.block_count == 2, "one code block per fenced line");
+        block_is(&d.blocks[0], MD_BLOCK_CODE, 0, 0, 0, 0, 0,
+            "fenced line is code");
+        markdown_dispose(&d); }
     { /* Long input completes with linear work. */
         size_t n = 100000;
         wchar_t *src = (wchar_t *)malloc((n + 8) * sizeof(wchar_t));
@@ -402,11 +684,28 @@ int main(void) {
         MdDocument d;
         markdown_test_fail_allocations(true);
         check(!markdown_render(L"**x**", &d), "failure reported");
-        check(d.text == NULL && d.runs == NULL && d.run_count == 0 &&
-            d.length == 0, "failed document zeroed");
+        check(d.text == NULL && d.runs == NULL && d.blocks == NULL &&
+            d.run_count == 0 && d.block_count == 0 && d.length == 0,
+            "failed document zeroed");
         markdown_test_fail_allocations(false);
         render_ok(L"**x**", &d, "render works again after failure");
         text_is(&d, L"x", "post-failure render correct");
+        markdown_dispose(&d); }
+    { /* Block growth alone is transactional: an empty document needs no block
+         array, while any recorded paragraph discards the whole document. */
+        MdDocument d;
+        markdown_test_fail_blocks(true);
+        render_ok(L"", &d, "empty document allocates no blocks");
+        check(d.block_count == 0, "empty document has no blocks");
+        markdown_dispose(&d);
+        check(!markdown_render(L"- a\n> b", &d), "block failure reported");
+        check(d.text == NULL && d.runs == NULL && d.blocks == NULL &&
+            d.run_count == 0 && d.block_count == 0 && d.length == 0,
+            "block failure document zeroed");
+        markdown_test_fail_blocks(false);
+        render_ok(L"- a\n> b", &d, "render works after block failure");
+        check(d.block_count == 2, "post-failure blocks recorded");
+        blocks_sane(&d, "post-failure blocks are sane");
         markdown_dispose(&d); }
     markdown_dispose(NULL);
     if (failures) { printf("%d markdown test(s) failed\n", failures); return 1; }

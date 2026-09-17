@@ -11,15 +11,21 @@
 #define MD_NPOS ((size_t)-1)
 
 static bool test_fail_allocations;
+static bool test_fail_blocks;
 
 void markdown_test_fail_allocations(bool enable) {
     test_fail_allocations = enable;
+}
+
+void markdown_test_fail_blocks(bool enable) {
+    test_fail_blocks = enable;
 }
 
 void markdown_dispose(MdDocument *doc) {
     if (!doc) return;
     free(doc->text);
     free(doc->runs);
+    free(doc->blocks);
     memset(doc, 0, sizeof *doc);
 }
 
@@ -33,6 +39,8 @@ typedef struct {
     size_t length, capacity;
     MdRun *runs;
     int run_count, run_capacity;
+    MdBlock *blocks;
+    int block_count, block_capacity;
     bool failed;
 } MdBuilder;
 
@@ -58,6 +66,18 @@ static bool grow_runs(MdBuilder *b) {
     if (!grown) { b->failed = true; return false; }
     b->runs = grown;
     b->run_capacity = capacity;
+    return true;
+}
+
+static bool grow_blocks(MdBuilder *b) {
+    if (b->failed) return false;
+    if (test_fail_allocations || test_fail_blocks) { b->failed = true; return false; }
+    if (b->block_count < b->block_capacity) return true;
+    int capacity = b->block_capacity ? b->block_capacity * 2 : 32;
+    MdBlock *grown = (MdBlock *)realloc(b->blocks, (size_t)capacity * sizeof *grown);
+    if (!grown) { b->failed = true; return false; }
+    b->blocks = grown;
+    b->block_capacity = capacity;
     return true;
 }
 
@@ -93,6 +113,25 @@ static void emit_break(MdBuilder *b, unsigned style) {
     MdStyle s = {0};
     s.style = style;
     emit(b, L"\n", 1, s);
+}
+
+/* Records the paragraph written since `start`. Empty paragraphs (blank lines,
+    hidden fence markers) are not recorded: they hold no character and need no
+    layout. */
+static void close_block(MdBuilder *b, size_t start, int kind, unsigned char quote,
+    unsigned char list, unsigned char flags, unsigned char first,
+    unsigned char continuation) {
+    if (b->failed || b->length == start) return;
+    if (!grow_blocks(b)) return;
+    MdBlock *block = &b->blocks[b->block_count++];
+    block->offset = start;
+    block->length = b->length - start;
+    block->kind = (unsigned char)kind;
+    block->quote_depth = quote;
+    block->list_depth = list;
+    block->flags = flags;
+    block->first_indent = first;
+    block->continuation_indent = continuation;
 }
 
 static bool is_space(wchar_t c) { return c == L' ' || c == L'\t'; }
@@ -341,14 +380,145 @@ static bool fence_closes(const wchar_t *line, size_t n, const MdFence *fence) {
     return true;
 }
 
+/* One active list level: its marker column and glyph width in quote-relative
+   columns, plus the layout pair its content was written with, so a following
+   continuation can inherit both. */
+typedef struct {
+    unsigned char column, glyph, first, continuation;
+} MdLevel;
+
+typedef struct {
+    unsigned char quote_depth;
+    MdLevel level[MD_MAX_DEPTH];
+    int depth;
+} MdBlocks;
+
+/* A parsed block prefix. Nothing is emitted while it is filled in, so a line
+   that is rejected (too deep, unsupported indentation) stays entirely
+   literal. `quote_depth` saturates one past MD_MAX_DEPTH: the source may hold
+   any number of markers, and a deeper line than the cap renders literally. */
+typedef struct {
+    size_t rel;                 /* indentation columns after the prefix */
+    size_t base_column;         /* column `rel` is measured from */
+    size_t ws_begin, ws_end;    /* the whitespace run that produced rel */
+    size_t content;             /* index where content starts */
+    size_t marker;              /* index of the list marker, when present */
+    unsigned char quote_depth, digits, glyph;
+    bool has_marker, ordered, task, checked;
+} MdPrefix;
+
+static size_t column_step(size_t column, wchar_t c) {
+    return c == L'\t' ? (column / 4 + 1) * 4 : column + 1;
+}
+
+static unsigned char clamp_columns(size_t columns) {
+    return columns > 255u ? (unsigned char)255 : (unsigned char)columns;
+}
+
+/* Scans a line's block prefix. Up to three root spaces may precede a quote
+   marker (the legacy tolerance); indentation is then measured against the real
+   source cursor after the quote prefix, so ">> x" and "> > x" both start
+   their content at relative column 0 even though their source widths differ,
+   while the rendered bars are counted separately from the source. */
+static void scan_prefix(const wchar_t *line, size_t n, MdPrefix *p) {
+    memset(p, 0, sizeof *p);
+    size_t skip = 0;
+    while (skip < n && skip < MD_ROOT_PREFIX_COLS && line[skip] == L' ') ++skip;
+    size_t i = skip, column = skip;
+    size_t depth = 0;
+    for (;;) {
+        if (i >= n || line[i] != L'>') break;
+        size_t after = i + 1;                   /* past the marker */
+        bool spaced = after < n && is_space(line[after]);
+        size_t end = spaced ? after + 1 : after;/* past the optional space */
+        bool interior = end < n && line[end] == L'>';
+        /* The last marker needs a space or the end of the line after it. */
+        if (!interior && !spaced && end != n) break;
+        /* Every consumed character counts: a tab after the markers lands on
+           the tab stop of the real source column. */
+        column = column_step(column, L'>');
+        if (spaced) column = column_step(column, line[after]);
+        i = end;
+        ++depth;
+        if (!interior) break;
+    }
+    p->quote_depth = depth > MD_MAX_DEPTH ? (unsigned char)(MD_MAX_DEPTH + 1)
+        : (unsigned char)depth;
+    if (depth) {
+        p->base_column = column;
+        p->ws_begin = i;
+    } else {
+        /* Unquoted indentation is measured from the line start, so the whole
+           leading run belongs to the indentation the layout may have to cut. */
+        p->base_column = 0;
+        p->ws_begin = 0;
+        i = 0;
+        column = 0;
+    }
+    while (i < n && is_space(line[i])) { column = column_step(column, line[i]); ++i; }
+    p->ws_end = i;
+    p->rel = column - p->base_column;
+    p->content = i;
+    if (i < n && (line[i] == L'-' || line[i] == L'*') && i + 1 < n &&
+        is_space(line[i + 1])) {
+        size_t from = i + 1;
+        while (from < n && is_space(line[from])) ++from;
+        bool checked = false;
+        if (task_marker(line + from, n - from, &checked)) {
+            p->task = true;
+            p->checked = checked;
+            from += 3;
+            while (from < n && is_space(line[from])) ++from;
+        }
+        p->has_marker = true;
+        p->glyph = 2;
+        p->marker = i;
+        p->content = from;
+    } else {
+        size_t digits = 0;
+        while (i + digits < n && digits < 9 && line[i + digits] >= L'0' &&
+            line[i + digits] <= L'9') ++digits;
+        if (digits >= 1 && i + digits < n &&
+            (line[i + digits] == L'.' || line[i + digits] == L')') &&
+            i + digits + 1 < n && is_space(line[i + digits + 1])) {
+            size_t from = i + digits + 1;
+            while (from < n && is_space(line[from])) ++from;
+            p->has_marker = true;
+            p->ordered = true;
+            p->digits = (unsigned char)digits;
+            p->glyph = (unsigned char)(digits + 2);
+            p->marker = i;
+            p->content = from;
+        }
+    }
+}
+
+/* Index in [begin, end) where the column budget runs out. The remaining source
+   whitespace is kept verbatim, so a tab is never rewritten as spaces. */
+static size_t indent_cut(const wchar_t *line, size_t begin, size_t end,
+    size_t from_column, size_t budget) {
+    size_t column = from_column;
+    for (size_t i = begin; i < end; i++) {
+        column = column_step(column, line[i]);
+        if (column - from_column > budget) return i;
+    }
+    return end;
+}
+
+static bool push_level(MdBlocks *blocks, const MdPrefix *p) {
+    if (blocks->depth >= MD_MAX_DEPTH) return false;
+    MdLevel *level = &blocks->level[blocks->depth++];
+    level->column = clamp_columns(p->rel);
+    level->glyph = p->glyph;
+    level->first = 0;
+    level->continuation = 0;
+    return true;
+}
+
 /* One source line; blocks are recognized line-by-line and fences hide their
    marker lines. Newlines are normalized to LF. */
 static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
-    MdFence *fence) {
-    size_t indent = 0;
-    while (indent < n && indent < 3 && line[indent] == L' ') ++indent;
-    const wchar_t *c = line + indent;
-    size_t m = n - indent;
+    MdFence *fence, MdBlocks *blocks) {
     MdStyle plain = {0};
     if (fence->delimiter) {
         if (fence_closes(line, n, fence)) {
@@ -360,7 +530,9 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
             while (from < n && from < fence->indent && line[from] == L' ')
                 ++from;
             emit_break(b, code.style);
+            size_t start = b->length;
             emit(b, line + from, n - from, code);
+            close_block(b, start, MD_BLOCK_CODE, 0, 0, 0, 0, 0);
         }
         return;
     }
@@ -370,74 +542,158 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
         return;
     }
     bool blank = true;
-    for (size_t i = 0; i < m; i++) if (!is_space(c[i])) { blank = false; break; }
+    for (size_t i = 0; i < n; i++) if (!is_space(line[i])) { blank = false; break; }
     if (blank) {
-        emit_break(b, 0);
+        emit_break(b, 0);                   /* blank lines keep list state */
         return;
     }
-    if (c[0] == L'#') {
-        int level = 0;
-        while (level < (int)m && c[level] == L'#') ++level;
-        if (level >= 1 && level <= 3 &&
-            ((size_t)level == m || is_space(c[level]))) {
-            size_t from = (size_t)level;
-            while (from < m && is_space(c[from])) ++from;
-            emit_break(b, 0);
-            MdStyle heading = {0};
-            heading.style = MD_STYLE_BOLD;
-            heading.heading = level;
-            parse_inline(b, c + from, m - from, heading);
-            return;
-        }
-    } else if (c[0] == L'>' && (m == 1 || is_space(c[1]))) {
-        size_t from = m == 1 ? m : 1;
-        while (from < m && is_space(c[from])) ++from;
-        emit_break(b, 0);
-        emit(b, L"\u258C ", 2, plain);      /* quote bar, muted content */
-        MdStyle quoted = plain;
-        quoted.style |= MD_STYLE_MUTED;
-        parse_inline(b, c + from, m - from, quoted);
-        return;
-    } else if ((c[0] == L'-' || c[0] == L'*') && m >= 2 && is_space(c[1])) {
-        size_t from = 1;
-        while (from < m && is_space(c[from])) ++from;
-        emit_break(b, 0);
-        bool checked;
-        if (task_marker(c + from, m - from, &checked)) {
-            from += 3;
-            while (from < m && is_space(c[from])) ++from;
-            emit(b, checked ? L"\u2611 " : L"\u2610 ", 2, plain);
+    MdPrefix p;
+    scan_prefix(line, n, &p);
+    /* A quote boundary starts a fresh list: "- a" followed by "> - b" must
+       not make the quoted item a second level of the unquoted list. */
+    if (p.quote_depth != blocks->quote_depth) blocks->depth = 0;
+    blocks->quote_depth = p.quote_depth;
+
+    bool nested = blocks->depth > 0;
+    bool literal = p.quote_depth > MD_MAX_DEPTH;
+    bool continuation = false;
+    if (!literal && p.has_marker) {
+        if (!nested && p.quote_depth == 0 && p.rel > MD_ROOT_PREFIX_COLS) {
+            literal = true;                 /* four-space indented marker */
         } else {
-            emit(b, L"\u2022 ", 2, plain);  /* textual bullet, no indent state */
+            while (blocks->depth > 0 &&
+                p.rel < blocks->level[blocks->depth - 1].column)
+                --blocks->depth;
+            if (blocks->depth == 0) {
+                if (!push_level(blocks, &p)) literal = true;
+            } else if (p.rel < blocks->level[blocks->depth - 1].column +
+                blocks->level[blocks->depth - 1].glyph) {
+                /* Within the parent's marker tolerance: a sibling item, whose
+                   own column anchors the level from here on. */
+                blocks->level[blocks->depth - 1].column = clamp_columns(p.rel);
+                blocks->level[blocks->depth - 1].glyph = p.glyph;
+            } else if (!push_level(blocks, &p)) {
+                literal = true;
+            }
         }
-        parse_inline(b, c + from, m - from, plain);
-        return;
-    } else {
-        size_t digits = 0;
-        while (digits < m && digits < 9 && c[digits] >= L'0' &&
-            c[digits] <= L'9') ++digits;
-        if (digits >= 1 && digits < m &&
-            (c[digits] == L'.' || c[digits] == L')') &&
-            digits + 1 < m && is_space(c[digits + 1])) {
-            size_t from = digits + 1;
-            while (from < m && is_space(c[from])) ++from;
-            emit_break(b, 0);
-            emit(b, c, digits + 2, plain);  /* ordered marker kept verbatim */
-            parse_inline(b, c + from, m - from, plain);
-            return;
+    } else if (!literal && blocks->depth > 0 &&
+        p.rel > blocks->level[blocks->depth - 1].column) {
+        continuation = true;                /* indented under an open item */
+    }
+
+    unsigned char first = 0, continuation_indent = 0, flags = 0;
+    int kind = MD_BLOCK_PARAGRAPH;
+    size_t retain_from = p.ws_end, retain_to = p.ws_end;
+    if (!literal) {
+        /* Only an unindented ordinary paragraph loses its leading columns (the
+           legacy root tolerance); a recognized marker, a live list or a quote
+           makes the source indentation structural. */
+        size_t base = (p.quote_depth || nested || p.has_marker) ? p.rel : 0;
+        if (base > MD_MAX_INDENT) {
+            retain_from = indent_cut(line, p.ws_begin, p.ws_end, p.base_column,
+                MD_MAX_INDENT);
+            retain_to = p.ws_end;
+            base = MD_MAX_INDENT;
+        }
+        first = clamp_columns(base);
+        if (p.has_marker) {
+            kind = MD_BLOCK_ITEM;
+            flags = p.ordered ? (unsigned char)MD_FLAG_ORDERED : (unsigned char)0;
+            if (p.task)
+                flags |= (unsigned char)(MD_FLAG_TASK |
+                    (p.checked ? MD_FLAG_CHECKED : 0));
+            continuation_indent = (unsigned char)(first +
+                p.quote_depth * MD_QUOTE_GLYPH_COLS + p.glyph);
+            MdLevel *level = &blocks->level[blocks->depth - 1];
+            level->first = first;
+            level->continuation = continuation_indent;
+        } else if (continuation) {
+            kind = MD_BLOCK_ITEM;
+            flags = MD_FLAG_CONTINUATION;
+            const MdLevel *level = &blocks->level[blocks->depth - 1];
+            first = level->first;           /* bars and content stay aligned */
+            continuation_indent = level->continuation;
+        } else if (p.quote_depth) {
+            kind = MD_BLOCK_QUOTE;
+            continuation_indent = (unsigned char)(first +
+                p.quote_depth * MD_QUOTE_GLYPH_COLS);
         }
     }
+
+    bool heading = false;
+    int heading_level = 0;
+    size_t heading_from = 0;
+    if (!literal && !p.has_marker && !continuation && !p.quote_depth &&
+        p.rel <= MD_ROOT_PREFIX_COLS) {
+        size_t hashes = 0;
+        while (p.content + hashes < n && line[p.content + hashes] == L'#')
+            ++hashes;
+        if (hashes >= 1 && hashes <= 3) {
+            size_t from = p.content + hashes;
+            if (from == n || is_space(line[from])) {
+                heading = true;
+                heading_level = (int)hashes;
+                heading_from = from;
+                while (heading_from < n && is_space(line[heading_from]))
+                    ++heading_from;
+            }
+        }
+    }
+
     emit_break(b, 0);
-    parse_inline(b, c, m, plain);
+    size_t start = b->length;
+    if (literal || (!p.has_marker && !continuation && !p.quote_depth &&
+        !heading)) {
+        /* Plain, or unsupported: the whole line stays verbatim, whitespace
+           included, and any open list ends here. */
+        parse_inline(b, line, n, plain);
+        close_block(b, start, MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0);
+        blocks->depth = 0;
+        return;
+    }
+    if (heading) {
+        MdStyle style = {0};
+        style.style = MD_STYLE_BOLD;
+        style.heading = heading_level;
+        parse_inline(b, line + heading_from, n - heading_from, style);
+        close_block(b, start, MD_BLOCK_PARAGRAPH, 0, 0, 0, 0, 0);
+        blocks->depth = 0;
+        return;
+    }
+    /* Recorded before an ordinary paragraph closes the list it interrupts. */
+    unsigned char list_depth = (unsigned char)blocks->depth;
+    if (!p.has_marker) blocks->depth = 0;   /* a quoted paragraph ends a list */
+    MdStyle style = plain;
+    if (p.quote_depth) style.style |= MD_STYLE_MUTED;
+    for (unsigned q = 0; q < p.quote_depth; q++)
+        emit(b, L"\u258C ", 2, plain);      /* one bar per quote level */
+    if (p.has_marker) {
+        if (p.task) emit(b, p.checked ? L"\u2611 " : L"\u2610 ", 2, plain);
+        else if (p.ordered) emit(b, line + p.marker, p.digits + 2, plain);
+        else emit(b, L"\u2022 ", 2, plain);
+    } else if (continuation) {
+        /* Spaces stand in for the parent's marker so both the bars and the
+           content line up with the item they continue. */
+        size_t pad = (size_t)continuation_indent - first -
+            (size_t)p.quote_depth * MD_QUOTE_GLYPH_COLS;
+        for (size_t k = 0; k < pad; k++) emit(b, L" ", 1, plain);
+    }
+    if (retain_to > retain_from)
+        emit(b, line + retain_from, retain_to - retain_from, plain);
+    parse_inline(b, line + p.content, n - p.content, style);
+    close_block(b, start, kind, p.quote_depth,
+        p.has_marker || continuation ? list_depth : 0,
+        flags, first, continuation_indent);
 }
 
 static void render_document(MdBuilder *b, const wchar_t *source) {
     const wchar_t *line = source ? source : L"";
     MdFence fence = {0};
+    MdBlocks blocks = {0};
     for (;;) {
         const wchar_t *end = line;
         while (*end && *end != L'\n' && *end != L'\r') ++end;
-        render_line(b, line, (size_t)(end - line), &fence);
+        render_line(b, line, (size_t)(end - line), &fence, &blocks);
         if (!*end) break;
         line = end + 1;
         if (*end == L'\r' && *line == L'\n') ++line;
@@ -455,6 +711,7 @@ bool markdown_render(const wchar_t *source, MdDocument *doc) {
     if (b.failed) {
         free(b.text);
         free(b.runs);
+        free(b.blocks);
         return false;                       /* *doc stays zeroed */
     }
     b.text[b.length] = L'\0';
@@ -463,5 +720,8 @@ bool markdown_render(const wchar_t *source, MdDocument *doc) {
     doc->runs = b.runs;
     doc->run_count = b.run_count;
     doc->run_capacity = b.run_capacity;
+    doc->blocks = b.blocks;
+    doc->block_count = b.block_count;
+    doc->block_capacity = b.block_capacity;
     return true;
 }
