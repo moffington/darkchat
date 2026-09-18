@@ -330,6 +330,10 @@ typedef struct {
     RichTextTheme theme;
     uint32_t theme_epoch;               /* part of the measurement stamp */
     int view_scroll, view_content, view_page, view_width, view_margin, view_gap;
+    /* Left edge of the centered readable content column inside the container
+       (0 when the window is no wider than the column). Only placement uses
+       it; measurement and geometry stay in view_width units. */
+    int view_x;
     int view_reason_gap, view_meta_gap, view_reason_inset;
     RichTextControl *measuring;         /* control awaiting EN_REQUESTRESIZE */
     int measured;

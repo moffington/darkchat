@@ -1230,8 +1230,20 @@ static void place_turn_control(Transcript *t, RichTextControl *control,
         ShowWindow(control->window, SW_HIDE);
         return;
     }
-    SetWindowPos(control->window, NULL, t->view_margin + inset, top,
-        t->view_width - 2 * inset, height,
+    int x = t->view_x + inset;
+    int width = t->view_width - 2 * inset;
+    /* Identical geometry is a no-op. Streaming repositions every control on
+       each rebuild; skipping the unchanged ones removes window churn (and
+       with it the cursor re-evaluation a resize under the pointer causes). */
+    RECT current;
+    POINT origin = { 0, 0 };
+    ClientToScreen(t->view, &origin);
+    if ((GetWindowLongPtrW(control->window, GWL_STYLE) & WS_VISIBLE) != 0 &&
+        GetWindowRect(control->window, &current) &&
+        current.left == origin.x + x && current.top == origin.y + top &&
+        current.right == origin.x + x + width &&
+        current.bottom == origin.y + top + height) return;
+    SetWindowPos(control->window, NULL, x, top, width, height,
         SWP_NOZORDER | SWP_NOACTIVATE);
     ShowWindow(control->window, SW_SHOWNOACTIVATE);
 }
@@ -2497,14 +2509,21 @@ void transcript_render(Transcript *t, const TranscriptFeed *feed) {
     const Chat *chat = feed->chat;
     RECT client;
     GetClientRect(t->view, &client);
-    t->view_margin = px(t, 12);
-    t->view_gap = px(t, 10);
+    t->view_margin = px(t, 16);
+    t->view_gap = px(t, 18);
     t->view_reason_gap = px(t, 8);
     t->view_meta_gap = px(t, 8);
     t->view_reason_inset = px(t, 10);
-    t->view_width = client.right - 2 * t->view_margin;
+    /* The readable column is centered in the container and never exceeds
+       CHAT_CONTENT_WIDTH_DIPS, so long prose keeps a comfortable measure and
+       wide windows do not stretch lines edge to edge. */
+    int usable = client.right - 2 * t->view_margin;
+    int column = px(t, CHAT_CONTENT_WIDTH_DIPS);
+    t->view_width = usable > column ? column : usable;
     int minimum = px(t, 40);
     if (t->view_width < minimum) t->view_width = minimum;
+    t->view_x = (client.right - t->view_width) / 2;
+    if (t->view_x < 0) t->view_x = 0;
     const ChatConversation *c = chat_active(chat);
     int count = c ? (int)c->message_count : 0;
     if (count < 0) count = 0;

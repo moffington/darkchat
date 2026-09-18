@@ -2755,7 +2755,10 @@ static int bounded_suite(void) {
        transcript, so the storm is simulated by resizing the view itself. */
     SetWindowPos(h->view,NULL,0,0,700,430,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
     CHECK(visible_realized(h));                  /* I-GAP holds each step */
-    SetWindowPos(h->view,NULL,0,0,860,510,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
+    /* Both storm widths stay below the readable-column cap, so each step
+       genuinely re-wraps: a width at or above the cap would leave the
+       content measure unchanged by design. */
+    SetWindowPos(h->view,NULL,0,0,640,510,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOMOVE);
     CHECK(visible_realized(h));
     bool stale_offscreen=false;
     for (int i=0;i<h->transcript.record_count;i++) {

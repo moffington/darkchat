@@ -70,7 +70,9 @@ void rich_text_theme(RichTextTheme *theme, const UiTheme *ui) {
     theme->text = color_of(ui->colors[UI_TEXT]);
     theme->muted = color_of(ui->colors[UI_MUTED]);
     theme->header_user = color_of(ui->colors[UI_ACCENT]);
-    theme->header_assistant = color_of(ui->colors[UI_BRIGHT]);
+    /* The assistant label is deliberately quiet: the answer carries the
+       hierarchy, the role name only anchors it. */
+    theme->header_assistant = color_of(ui->colors[UI_MUTED]);
     theme->header_system = color_of(ui->colors[UI_MUTED]);
     theme->error = RGB(224, 108, 117);
     theme->code_background = color_of(ui->colors[UI_TRACK]);
@@ -267,6 +269,17 @@ static LRESULT CALLBACK rich_proc(HWND window, UINT message, WPARAM w,
         return CallWindowProcW(control->previous, window, message, w, l);
     }
     if (message == WM_GETDLGCODE) return DLGC_WANTALLKEYS | DLGC_WANTCHARS;
+    /* A read-only transcript surface always presents the text-selection
+       cursor. Streaming rebuilds make the control transiently writable
+       (EM_SETREADONLY) and a child resize under the pointer delivers
+       WM_SETCURSOR inside that window; the cursor must never depend on
+       transient write state, so it is installed here and the message is
+       consumed. Editable controls (composer, fields) keep native behavior. */
+    if (message == WM_SETCURSOR && control->readonly &&
+        LOWORD(l) == HTCLIENT) {
+        SetCursor(LoadCursorW(NULL, MAKEINTRESOURCEW(32513)));
+        return TRUE;
+    }
     /* Read-only transcript blocks never consume the wheel: the transcript
        container decides whether to scroll a reasoning viewport or itself, so
        the target no longer depends on which control holds focus. */
