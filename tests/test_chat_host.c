@@ -1888,7 +1888,6 @@ static int default_suite(void) {
         float pitch = ui->theme.control_height +
             ui_node(ui, h->chat_ui.list)->style.gap;
         float row_bottom = probe_index * pitch + ui->theme.control_height;
-        int offset_before = h->chat_ui.window_offset;
         float scroll = ui_scroll_offset(ui, h->chat_ui.list);
         CHECK(probe_index * pitch >= scroll &&
             row_bottom > scroll + viewport);   /* partly visible only */
@@ -1897,16 +1896,29 @@ static int default_suite(void) {
             chat->conversations[probe_index].id);
         flush(h);
         pump_messages(30);
-        CHECK(fabsf(ui_scroll_offset(ui, h->chat_ui.list) -
-            (row_bottom - viewport)) < .05f);
-        CHECK(h->chat_ui.window_offset == offset_before);
+        float revealed = ui_scroll_offset(ui, h->chat_ui.list);
+        CHECK(fabsf(revealed - (row_bottom - viewport)) < .05f);
+        /* Bottom-aligned: the probe row is now fully visible. The reveal may
+           move the window by a whole row, which is exactly the state the
+           second remap of the flush must fold into the accumulated report. */
+        CHECK(revealed <= probe_index * pitch + .05f &&
+            row_bottom <= revealed + viewport + .05f);
         bool merged = false;
         for (int i = 0; i < h->remap.name_changed_count; i++)
             if (h->remap.name_changed[i].id == probe_row &&
                 !wcscmp(h->remap.name_changed[i].old_title, probe_old))
                 merged = true;
         CHECK(merged);
-        CHECK(!wcscmp(ui_node(ui, probe_row)->text, L"Merge probe"));
+        /* Identity-based binding: whichever pool row now carries the probe
+           conversation shows the renamed title. */
+        bool shows_name = false;
+        for (int j = 0; j < h->chat_ui.pool_count; j++)
+            if ((uint64_t)ui_node(ui, h->chat_ui.rows[j])->tag ==
+                    chat->conversations[probe_index].id &&
+                !wcscmp(ui_node(ui, h->chat_ui.rows[j])->text,
+                    L"Merge probe"))
+                shows_name = true;
+        CHECK(shows_name);
     }
     /* Search navigation within the already-active conversation must also
        reveal the sidebar row. */
@@ -1937,6 +1949,25 @@ static int default_suite(void) {
         command(h, CHAT_COMMAND_SELECT, 0);
         pump_messages(30);
         rich_text_set_text(&h->composer, L"Unsent draft");
+    }
+    /* The native Tab cycle excludes a collapsed sidebar's hidden search edit,
+       and a search command reveals the sidebar (restoring the persisted
+       preference) before the edit is placed and focused. */
+    {
+        if (h->chat_ui.sidebar_open) {
+            CHECK(chat_ui_toggle_sidebar(&h->chat_ui));
+            flush(h);
+        }
+        CHECK(!h->chat_ui.sidebar_open && chat->sidebar_collapsed == 1);
+        HWND order[3];
+        int count = native_focus_order(h, order, 3);
+        CHECK(count == 2 && order[0] == h->field.window &&
+            order[1] == h->composer.window);
+        action(h, ACTION_SEARCH);
+        pump_messages(10);
+        CHECK(h->chat_ui.sidebar_open && chat->sidebar_collapsed == 0);
+        count = native_focus_order(h, order, 3);
+        CHECK(count == 3 && order[1] == h->search.window);
     }
     /* F1: retain-all never enters bounded realization or creates its measurer. */
     CHECK(!h->transcript.bounded && !h->transcript.measurer_valid);

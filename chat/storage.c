@@ -155,6 +155,11 @@ static bool encode(const Chat *chat, JsonBuf *b) {
     NUM(b, chat, window_height);
     NUM(b, chat, maximized);
     NUM(b, chat, sidebar_width);
+    /* Additive sidebar preference, emitted only when collapsed so an
+       expanded snapshot keeps the older byte shape and an older build
+       ignores the field (a missing value means expanded). */
+    if (chat->sidebar_collapsed)
+        number(b, "sidebar_collapsed", 1);
     STR(b, chat, model);
     STR(b, chat, system_prompt);
     /* Optional provider-routing settings, appended last and emitted only when
@@ -282,6 +287,13 @@ static bool decode(char *data, Chat *chat) {
     READ_INT(chat, window_height, 480, 10000);
     READ_INT(chat, maximized, 0, 1);
     READ_INT(chat, sidebar_width, 160, 360);
+    /* Additive sidebar preference: absent in older snapshots and defaulted
+       to expanded. A present but malformed value is corruption. */
+    {
+        int collapsed;
+        if (!optional_int(line,"sidebar_collapsed",0,1,0,&collapsed)) goto bad;
+        chat->sidebar_collapsed=collapsed;
+    }
     READ_STR(chat, model);
     READ_STR(chat, system_prompt);
     /* Optional provider-routing settings: absent in older snapshots and

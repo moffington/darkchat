@@ -78,6 +78,7 @@ static bool same_chat(const Chat *a, const Chat *b) {
         a->window_width != b->window_width ||
         a->window_height != b->window_height ||
         a->maximized != b->maximized || a->sidebar_width != b->sidebar_width ||
+        a->sidebar_collapsed != b->sidebar_collapsed ||
         wcscmp(a->model, b->model) ||
         a->backend != b->backend ||
         wcscmp(a->ollama_model, b->ollama_model) ||
@@ -329,6 +330,7 @@ int main(void) {
     wcscpy(chat->system_prompt,L"Be concise.\nUnicode \x03bb");
     wcscpy(chat->conversations[0].draft,L"Unsent draft");
     chat->sidebar_width=280;
+    chat->sidebar_collapsed=1;
     int n=chat_begin_response(chat,CHAT_SEND,L"First question"); CHECK(n==1);
     ChatMessage *m=&chat->conversations[0].messages[n];
     wcscpy(m->text,L"Partial \xd83d\xde80\n```c\nint x;\n```");
@@ -343,6 +345,7 @@ int main(void) {
     CHECK(!wcscmp(loaded->conversations[0].messages[1].text,m->text));
     CHECK(!wcscmp(loaded->system_prompt,chat->system_prompt));
     CHECK(loaded->sidebar_width==280 && loaded->model_history_count==1);
+    CHECK(loaded->sidebar_collapsed==1);
     CHECK(!wcscmp(loaded->conversations[0].draft,L"Unsent draft"));
     /* A message line without the optional reasoning fields (an older version 1
        snapshot) loads with empty reasoning and unavailable duration. */
@@ -476,6 +479,39 @@ int main(void) {
         for (size_t i=0;i<sizeof malformed/sizeof malformed[0];i++) {
             CHECK(load_backend_case(malformed[i],dest)==-1);
             CHECK(load_backend_case(NULL,dest)==1);   /* store stays loadable */
+        }
+        chat_dispose(dest); free(dest);
+    }
+    /* The sidebar collapse preference is additive at format 3: emitted only
+       when collapsed, absent means expanded, and a present malformed value
+       rejects the snapshot. */
+    {
+        char *collapsed=NULL; size_t collapsed_size=0;
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&collapsed,&collapsed_size));
+        CHECK(strstr(collapsed,"\"sidebar_collapsed\":1")!=NULL);
+        free(collapsed);
+        chat->sidebar_collapsed=0;
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&collapsed,&collapsed_size));
+        CHECK(strstr(collapsed,"\"sidebar_collapsed\"")==NULL);
+        free(collapsed);
+        CHECK(storage_load(&store,loaded)==1);
+        CHECK(loaded->sidebar_collapsed==0);
+        /* The reordered settings line: an absent field defaults to expanded. */
+        Chat *dest=calloc(1,sizeof *dest); CHECK(dest);
+        CHECK(load_backend_case("\"sidebar_collapsed\":1",dest)==1);
+        CHECK(dest->sidebar_collapsed==1);
+        CHECK(load_backend_case(NULL,dest)==1);
+        CHECK(dest->sidebar_collapsed==0);
+        static const char *const malformed[]={
+            "\"sidebar_collapsed\":2","\"sidebar_collapsed\":-1",
+            "\"sidebar_collapsed\":0.5","\"sidebar_collapsed\":true",
+            "\"sidebar_collapsed\":\"1\"","\"sidebar_collapsed\":null"
+        };
+        for (size_t i=0;i<sizeof malformed/sizeof malformed[0];i++) {
+            CHECK(load_backend_case(malformed[i],dest)==-1);
+            CHECK(load_backend_case(NULL,dest)==1);
         }
         chat_dispose(dest); free(dest);
     }

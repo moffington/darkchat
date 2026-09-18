@@ -35,6 +35,10 @@
 #define CHAT_MODEL_TEXT 96
 #define CHAT_STATUS_TEXT 160
 #define CHAT_MODEL_HISTORY 16
+/* Shared composition metric: the centered transcript and composer columns
+   never exceed this width in DIPs. Kept here so the DarkUI chrome and the
+   native transcript container agree on the readable measure. */
+#define CHAT_CONTENT_WIDTH_DIPS 780.0f
 
 /* The active provider. OpenRouter is the historical default and keeps the
    zero value, so an existing snapshot that has no backend field and a zeroed
@@ -203,6 +207,11 @@ typedef struct {
     ChatBackend model_history_backend[CHAT_MODEL_HISTORY];
     int model_history_count;
     int window_x, window_y, window_width, window_height, maximized, sidebar_width;
+    /* Explicit user preference for the collapsible conversation sidebar:
+       0 = expanded (the historical default and the meaning of an absent
+       snapshot field), 1 = collapsed. The temporary narrow-width drawer is
+       session state and is never persisted. Additive at snapshot format 3. */
+    int sidebar_collapsed;
 } Chat;
 
 int64_t chat_now(void);

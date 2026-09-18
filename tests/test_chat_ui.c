@@ -75,14 +75,15 @@ int main(void) {
     ui->event_user = chat_ui;
     check(chat_ui_resize(chat_ui, 1100, 720), "first resize lays out");
     UiNode *model = ui_node(ui, chat_ui->model);
-    check(model && model->rect.w >= 279 && model->rect.h >= 29,
+    check(model && model->rect.w >= 200 && model->rect.h >= 29,
         "model editor placeholder remains visible");
     UiNode *search = ui_node(ui, chat_ui->search);
     check(search && search->rect.w > 100 && search->rect.h >= 29,
         "conversation search placeholder remains visible");
 
     float pitch = pitch_of(chat_ui);
-    check(fabsf(pitch - 36.0f) < .01f, "row pitch is control height plus gap");
+    check(fabsf(pitch - (ui->theme.control_height + 2.0f)) < .01f,
+        "row pitch is control height plus gap");
     float gap = ui_node(ui, chat_ui->list)->style.gap;
     UiId list = chat_ui->list;
 
@@ -387,7 +388,7 @@ int main(void) {
     check(chat_ui_resize(chat_ui, 1100, 720),
         "a pending relayout runs on the next resize call");
     check(chat_ui_resize(chat_ui, 720, 480), "a changed size lays out");
-    check(model && model->rect.w >= 279 && model->rect.h >= 29,
+    check(model && model->rect.w >= 200 && model->rect.h >= 29,
         "model editor remains visible at the minimum window size");
     check(search && search->rect.w > 100 && search->rect.h >= 29,
         "conversation search remains visible at the minimum window size");
@@ -424,15 +425,156 @@ int main(void) {
         "search result status updates without rebuilding the UI");
     chat_ui_set_generation(chat_ui, true, false);
     UiNode *send = ui_node(ui, chat_ui->send);
-    check(send && wcscmp(send->text, L"Stop") == 0 && !send->disabled,
-        "generation exposes an enabled Stop button");
+    check(send && send->icon == UI_ICON_STOP && !send->disabled,
+        "generation exposes an enabled Stop control");
+    check(!wcscmp(ui_accessible_name(ui, chat_ui->send), L"Stop generation"),
+        "the Stop control carries its accessible name");
     chat_ui_set_generation(chat_ui, true, true);
     check(send && send->disabled, "stopping disables repeated cancellation");
+    check(!wcscmp(ui_accessible_name(ui, chat_ui->send),
+        L"Stopping generation"),
+        "the stopping state announces itself");
     chat_ui_set_generation(chat_ui, false, false);
-    check(send && wcscmp(send->text, L"Send") == 0 && !send->disabled,
+    check(send && send->icon == UI_ICON_SEND && !send->disabled,
         "completed generation restores Send");
+    check(!wcscmp(ui_accessible_name(ui, chat_ui->send), L"Send message"),
+        "the restored Send control carries its accessible name");
     check(ui_node(ui, chat_ui->transcript) != NULL,
         "transcript placeholder remains for the per-turn container");
+
+    /* ---- Redesigned composition: header, sidebar, composer ---- */
+    check(chat_ui_resize(chat_ui, 1100, 720),
+        "the composition checks lay out at the desktop size");
+    UiNode *header = ui_node(ui, chat_ui->header);
+    UiNode *hamburger = ui_node(ui, chat_ui->hamburger);
+    UiNode *overflow = ui_node(ui, chat_ui->overflow);
+    UiNode *heading = ui_node(ui, chat_ui->heading);
+    UiNode *sidebar = ui_node(ui, chat_ui->sidebar);
+    UiNode *main = ui_node(ui, chat_ui->main);
+    UiNode *card = ui_node(ui, chat_ui->composer_card);
+    UiNode *composer = ui_node(ui, chat_ui->composer);
+    UiNode *status = ui_node(ui, chat_ui->status);
+    check(header && hamburger && overflow && heading && sidebar && main &&
+        card && composer && status, "the redesigned nodes all exist");
+    check(hamburger->rect.x >= header->rect.x &&
+        hamburger->rect.x + hamburger->rect.w <= heading->rect.x &&
+        model->rect.x >= heading->rect.x + heading->rect.w &&
+        overflow->rect.x >= model->rect.x + model->rect.w &&
+        overflow->rect.x + overflow->rect.w <= header->rect.x + header->rect.w,
+        "header controls never overlap at 1100 DIP");
+    check(main->rect.x >= sidebar->rect.x + sidebar->rect.w &&
+        card->rect.x >= main->rect.x &&
+        card->rect.x + card->rect.w <= main->rect.x + main->rect.w &&
+        send->rect.x >= card->rect.x &&
+        send->rect.x + send->rect.w <= card->rect.x + card->rect.w &&
+        card->rect.y + card->rect.h <= main->rect.y + main->rect.h &&
+        status->rect.y >= card->rect.y + card->rect.h &&
+        status->rect.y + status->rect.h <=
+            main->rect.y + main->rect.h,
+        "the transcript and composer stay inside the main column");
+
+    check(!sidebar->hidden &&
+        fabsf(sidebar->rect.w - (float)chat->sidebar_width) < .01f,
+        "the wide sidebar is expanded at the persisted width");
+    check(!wcscmp(ui_accessible_name(ui, chat_ui->hamburger),
+        L"Hide conversation sidebar"),
+        "the hamburger announces the expanded state");
+
+    /* Wide toggle: flips and persists the explicit preference, removes the
+       panel from layout, and hands the reclaimed width to the main column. */
+    check(chat_ui_toggle_sidebar(chat_ui), "the wide toggle persists a change");
+    check(chat->sidebar_collapsed == 1, "the collapsed preference persists");
+    check(sidebar->hidden, "the collapsed sidebar leaves the layout");
+    ui_layout(ui, 1100, 720);
+    check(main->rect.x == sidebar->rect.x &&
+        main->rect.w == 1100 - sidebar->rect.x,
+        "the conversation surface reclaims the collapsed width");
+    check(!wcscmp(ui_accessible_name(ui, chat_ui->hamburger),
+        L"Show conversation sidebar"),
+        "the hamburger announces the collapsed state");
+    check(chat_ui_toggle_sidebar(chat_ui) && !sidebar->hidden &&
+        chat->sidebar_collapsed == 0,
+        "expanding again restores and persists the preference");
+    ui_layout(ui, 1100, 720);
+
+    /* Reveal: a search-style command restores a collapsed wide sidebar and
+       persists the expanded preference. */
+    check(chat_ui_toggle_sidebar(chat_ui) && chat->sidebar_collapsed == 1 &&
+        sidebar->hidden, "the sidebar collapses again");
+    check(chat_ui_reveal_sidebar(chat_ui) && !sidebar->hidden &&
+        chat->sidebar_collapsed == 0,
+        "revealing a collapsed sidebar restores the preference");
+    check(!chat_ui_reveal_sidebar(chat_ui),
+        "revealing an already visible sidebar is a no-op");
+    ui_layout(ui, 1100, 720);
+
+    /* Narrow widths: the sidebar auto-collapses to a temporary drawer that
+       still participates in layout, opens on demand, and never persists. */
+    check(chat_ui_resize(chat_ui, 760, 650), "the narrow layout applies");
+    check(chat_ui->narrow && sidebar->hidden,
+        "the narrow layout starts with the drawer closed");
+    check(!chat_ui_narrow_drawer_open(chat_ui),
+        "no temporary drawer is open by default");
+    check(!chat_ui_toggle_sidebar(chat_ui),
+        "the narrow toggle is session state, not a preference");
+    check(chat_ui_narrow_drawer_open(chat_ui) && !sidebar->hidden,
+        "the hamburger opens the in-flow drawer");
+    ui_layout(ui, 760, 650);
+    check(main->rect.x >= sidebar->rect.x + sidebar->rect.w &&
+        main->rect.w > 400,
+        "the open drawer reflows the conversation surface beside it");
+    check(hamburger->rect.x + hamburger->rect.w <= heading->rect.x &&
+        model->rect.x >= heading->rect.x + heading->rect.w &&
+        overflow->rect.x + overflow->rect.w <=
+            header->rect.x + header->rect.w,
+        "header controls never overlap at 760 DIP");
+    chat_ui_close_drawer(chat_ui);
+    check(sidebar->hidden && !chat_ui_narrow_drawer_open(chat_ui),
+        "Escape-equivalent close removes the temporary drawer");
+    check(chat->sidebar_collapsed == 0,
+        "closing the drawer leaves the explicit preference untouched");
+    /* Reveal: a command that targets the list or search opens the narrow
+       drawer without touching the explicit preference. */
+    check(!chat_ui_reveal_sidebar(chat_ui) &&
+        chat_ui_narrow_drawer_open(chat_ui) && !sidebar->hidden &&
+        chat->sidebar_collapsed == 0,
+        "revealing opens the narrow drawer without persisting");
+    check(!chat_ui_reveal_sidebar(chat_ui),
+        "revealing an already visible drawer is a no-op");
+    chat_ui_close_drawer(chat_ui);
+    check(chat_ui_resize(chat_ui, 1100, 720), "the wide layout returns");
+    check(!chat_ui->narrow && !sidebar->hidden,
+        "the explicit preference reapplies at wide widths");
+    ui_layout(ui, 1100, 720);
+
+    /* Focus rings and accessible names on the retained placeholders. */
+    check(!card->selected, "the composer card starts unfocused");
+    chat_ui_set_focus_ring(chat_ui, chat_ui->composer_card, true);
+    check(card->selected, "composer focus marks the card");
+    chat_ui_set_focus_ring(chat_ui, chat_ui->composer_card, false);
+    check(!card->selected, "composer blur clears the card");
+    check(wcsstr(ui_accessible_name(ui, chat_ui->model), L"Model:") != NULL,
+        "the model chip exposes its accessible name");
+    check(!wcscmp(ui_accessible_name(ui, chat_ui->overflow), L"More actions"),
+        "the overflow control exposes its accessible name");
+    check(!wcscmp(ui_accessible_name(ui, chat_ui->search),
+        L"Search conversations"),
+        "the search field exposes its accessible name");
+
+    /* Empty state: visible only while the active conversation has no
+       messages. */
+    UiNode *empty = ui_node(ui, chat_ui->empty);
+    UiNode *empty_title = ui_node(ui, chat_ui->empty_title);
+    check(empty && empty->hidden,
+        "a conversation with messages hides the empty state");
+    check(empty_title && empty_title->style.text_centered,
+        "the empty-state hero text is centered");
+    chat_clear(chat);
+    chat_ui_sync(chat_ui);
+    check(empty && !empty->hidden,
+        "an empty conversation reveals the empty state");
+    check(!sidebar->hidden, "clearing messages does not disturb the sidebar");
+
     free(chat_ui); chat_dispose(chat); free(chat); free(ui);
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("\nall chat UI checks passed\n");

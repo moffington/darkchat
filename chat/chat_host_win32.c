@@ -26,6 +26,11 @@
    paint-retry timers use ids 2 and 1. */
 #define CHAT_TIMER_BODY_FLUSH 3
 #define CHAT_SEARCH_QUERY_TEXT 256
+/* Posted (never sent) so the overflow popup opens after the button-up input
+   cycle completes and mouse capture is released; opening it synchronously
+   inside the click handler lets the popup's own input loop see the held
+   capture and dismiss it immediately. */
+#define CHAT_WM_ACTIONS_MENU (WM_APP + 0x52)
 
 typedef struct {
     ChatHostConfig config;
@@ -112,6 +117,8 @@ static bool turn_row_click(void *user, RichTextControl *control, int line,
 static bool search_submit(void *user);
 static bool search_refresh(ChatHost *host, bool reverse);
 static bool search_step(ChatHost *host, bool reverse);
+static void place_container(ChatHost *host);
+static void open_actions_menu(ChatHost *host);
 
 static int px(ChatHost *host, float dips) {
     return (int)lroundf(dips * host->dpi / 96.0f);
@@ -139,6 +146,16 @@ static TranscriptFeed transcript_feed(ChatHost *host) {
 static void render_transcript(ChatHost *host) {
     TranscriptFeed feed = transcript_feed(host);
     transcript_render(&host->transcript, &feed);
+}
+
+/* Reconciles the native transcript container's visibility with the active
+   conversation before a transition render (new/select/clear), so a
+   conversation that is empty shows the retained hero instead and one that
+   just gained its first turn is measured in a shown, correctly sized
+   container. Ordinary renders and direct container resizes do not call
+   this: the container tracks the placeholder on the next layout. */
+static void sync_transcript_container(ChatHost *host) {
+    place_container(host);
 }
 static void refresh_turn(ChatHost *host, int index) {
     TranscriptFeed feed = transcript_feed(host);
@@ -653,78 +670,109 @@ static void end_reasoning(ChatHost *host) {
     host->reasoning_streaming = false;
 }
 
+/* Places a native child exactly over an arranged placeholder rectangle and
+   keeps visibility in step. Identical geometry and visibility are a no-op,
+   so the placement pass can run on every flush without touching child
+   windows (and without provoking relayout churn). */
+/* Whether the last placement left the child shown. The WS_VISIBLE style is
+   authoritative even when the top-level window is not shown (the hidden test
+   harness), unlike IsWindowVisible, which folds in ancestor visibility. */
+static bool child_shown(HWND child) {
+    return child && (GetWindowLongPtrW(child, GWL_STYLE) & WS_VISIBLE) != 0;
+}
+
+static void place_native(ChatHost *host, HWND child, UiRect area, bool show) {
+    if (!child) return;
+    if (!show || area.w <= 2 || area.h <= 2) {
+        if (child_shown(child)) ShowWindow(child, SW_HIDE);
+        return;
+    }
+    int x = px(host, area.x), y = px(host, area.y);
+    int w = px(host, area.x + area.w) - x;
+    int h = px(host, area.y + area.h) - y;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    RECT current;
+    POINT origin = { 0, 0 };
+    ClientToScreen(host->window, &origin);
+    if (child_shown(child) &&
+        GetWindowRect(child, &current) &&
+        current.left == origin.x + x && current.top == origin.y + y &&
+        current.right == origin.x + x + w &&
+        current.bottom == origin.y + y + h) return;
+    SetWindowPos(child, NULL, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    ShowWindow(child, SW_SHOWNOACTIVATE);
+}
+
 static void place(ChatHost *host, RichTextControl *control, UiId id,
     float inset) {
     UiNode *item = ui_node(host->config.ui, id);
     if (!item || !control->window) return;
-    if (!ui_visible(host->config.ui, id)) {
-        ShowWindow(control->window, SW_HIDE);
-        return;
-    }
     UiRect area = ui_intersect(item->rect, item->clip);
     area.x += inset;
     area.y += inset;
     area.w -= 2 * inset;
     area.h -= 2 * inset;
-    if (area.w <= 2 || area.h <= 2) { ShowWindow(control->window, SW_HIDE); return; }
-    int x = px(host, area.x), y = px(host, area.y);
-    SetWindowPos(control->window, NULL, x, y, px(host, area.x + area.w) - x,
-        px(host, area.y + area.h) - y, SWP_NOZORDER | SWP_NOACTIVATE);
-    ShowWindow(control->window, SW_SHOWNOACTIVATE);
+    place_native(host, control->window, area,
+        ui_visible(host->config.ui, id));
 }
 
-/* A single-line field is vertically centered inside its placeholder. */
-static void place_field(ChatHost *host, RichTextControl *control, UiId id) {
+/* A single-line field is vertically centered inside its placeholder. The
+   horizontal inset leaves room for a retained glyph drawn inside the
+   placeholder (the search field's magnifier). */
+static void place_field_inset(ChatHost *host, RichTextControl *control, UiId id,
+    float left_inset) {
     UiNode *item = ui_node(host->config.ui, id);
     if (!item || !control->window) return;
     UiRect area = ui_intersect(item->rect, item->clip);
-    area.x += 1;
-    area.w -= 2;
+    area.x += left_inset;
+    area.w -= left_inset + 1;
+    area.y += 1;
+    area.h -= 2;
     float line = host->rich_theme.ui_size * 1.8f;
     float top = area.y + (area.h - line) / 2;
     if (top < area.y) top = area.y;
     float height = line < area.h ? line : area.h;
-    if (area.w <= 2 || height <= 2) { ShowWindow(control->window, SW_HIDE); return; }
-    int x = px(host, area.x), y = px(host, top);
-    SetWindowPos(control->window, NULL, x, y, px(host, area.x + area.w) - x,
-        px(host, top + height) - y, SWP_NOZORDER | SWP_NOACTIVATE);
-    ShowWindow(control->window, SW_SHOWNOACTIVATE);
+    place_native(host, control->window,
+        (UiRect){area.x, top, area.w, height},
+        ui_visible(host->config.ui, id));
 }
 
-/* Sizes the transcript container over its placeholder, inside the drawn border. */
+/* Sizes the transcript container over its placeholder, inside the drawn
+   border. An empty conversation has nothing to realize, so the container is
+   hidden and the retained empty-state hero shows through instead. */
 static void place_container(ChatHost *host) {
     UiNode *item = ui_node(host->config.ui, host->chat_ui.transcript);
     if (!item || !host->view) return;
-    if (!ui_visible(host->config.ui, host->chat_ui.transcript)) {
-        ShowWindow(host->view, SW_HIDE);
-        return;
-    }
+    const ChatConversation *active = chat_active(host->config.chat);
+    bool empty = !active || active->message_count == 0;
     UiRect area = ui_intersect(item->rect, item->clip);
     area.x += 1;
     area.y += 1;
     area.w -= 2;
     area.h -= 2;
-    if (area.w <= 2 || area.h <= 2) { ShowWindow(host->view, SW_HIDE); return; }
-    int x = px(host, area.x), y = px(host, area.y);
-    SetWindowPos(host->view, NULL, x, y, px(host, area.x + area.w) - x,
-        px(host, area.y + area.h) - y, SWP_NOZORDER | SWP_NOACTIVATE);
-    ShowWindow(host->view, SW_SHOWNOACTIVATE);
+    place_native(host, host->view, area,
+        ui_visible(host->config.ui, host->chat_ui.transcript) && !empty);
 }
 
 static void layout(ChatHost *host) {
     if (host->minimized) return;
     RECT client;
     GetClientRect(host->window, &client);
-    /* chat_ui_resize lays out only when the client size changed or a relayout
-       is owed; when it early-outs the native overlay rectangles cannot have
-       moved either, so repositioning them is skipped as well. */
-    if (!chat_ui_resize(&host->chat_ui, dip(host, client.right),
-            dip(host, client.bottom)))
-        return;
+    /* chat_ui_resize lays out only when the client size changed, the
+       responsive sidebar state flipped, or a relayout is owed. */
+    bool laid_out = chat_ui_resize(&host->chat_ui, dip(host, client.right),
+        dip(host, client.bottom));
+    /* The transcript container's desired visibility also depends on the
+       active conversation being empty, which changes without a layout, so it
+       is reconciled on every pass (a no-op when nothing moved). The other
+       native overlays can only move when the layout ran. */
     place_container(host);
+    if (!laid_out) return;
     place(host, &host->composer, host->chat_ui.composer, 1.0f);
-    place_field(host, &host->field, host->chat_ui.model);
-    place_field(host, &host->search, host->chat_ui.search);
+    place_field_inset(host, &host->field, host->chat_ui.model, 1.0f);
+    place_field_inset(host, &host->search, host->chat_ui.search,
+        CHAT_UI_SEARCH_ICON_INSET);
 }
 
 /* Translates the sidebar remap change report into UIA notifications. Row
@@ -798,17 +846,72 @@ static void sync_model(ChatHost *host) {
 static void field_blur(void *user) { sync_model((ChatHost *)user); }
 
 
-static void focus_surface(ChatHost *host, bool reverse) {
-    /* Native fields are the explicit Tab stops; Tab from a transcript turn
-       returns to the model field. */
-    HWND order[3] = { host->field.window, host->search.window,
+/* A native child that can receive focus: shown by the last placement (the
+   WS_VISIBLE style, which is meaningful even when the top-level is not
+   shown, as in the hidden test harness) and not disabled. */
+static bool native_child_usable(HWND window) {
+    return window &&
+        (GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE) != 0 &&
+        IsWindowEnabled(window);
+}
+
+/* The native Tab stops in visual order. A hidden or disabled field is not a
+   candidate: the collapsed sidebar hides the search edit and generation
+   disables the model edit, so including them would strand focus on a window
+   that cannot take it. */
+static int native_focus_order(ChatHost *host, HWND *order, int capacity) {
+    HWND candidates[3] = { host->field.window, host->search.window,
         host->composer.window };
+    int count = 0;
+    for (int i = 0; i < 3 && count < capacity; i++)
+        if (native_child_usable(candidates[i])) order[count++] = candidates[i];
+    return count;
+}
+
+/* Moves focus into the retained DarkUI tree at its first (forward) or last
+   (reverse) focusable control, so Tab continues there instead of wrapping
+   inside the native fields. */
+static void focus_retained_edge(ChatHost *host, bool reverse) {
+    if (!ui_focus_edge(host->config.ui, reverse)) return;
+    SetFocus(host->window);
+    flush(host);
+}
+
+/* Moves focus to the first (forward) or last (reverse) usable native field. */
+static void focus_native_edge(ChatHost *host, bool reverse) {
+    HWND order[3];
+    int count = native_focus_order(host, order, 3);
+    if (!count) return;
+    SetFocus(order[reverse ? count - 1 : 0]);
+}
+
+/* Tab traversal that spans the native fields and the retained controls: the
+   two form one cycle (model -> search -> composer -> hamburger -> ... ->
+   send -> model) rather than two disconnected rings. */
+static void focus_surface(ChatHost *host, bool reverse) {
+    HWND order[3];
+    int count = native_focus_order(host, order, 3);
     HWND focus = GetFocus();
     int current = -1;
-    for (int i = 0; i < 3; i++) if (order[i] == focus) current = i;
-    int next = current < 0 ? (reverse ? 2 : 0) :
-        (current + (reverse ? -1 : 1) + 3) % 3;
+    for (int i = 0; i < count; i++) if (order[i] == focus) current = i;
+    if (current < 0) { focus_native_edge(host, reverse); return; }
+    int next = current + (reverse ? -1 : 1);
+    if (next < 0 || next >= count) {
+        focus_retained_edge(host, reverse);
+        return;
+    }
     SetFocus(order[next]);
+}
+
+/* After the sidebar changes, a focused native window that is now hidden
+   (the search edit when the sidebar collapses) must hand focus back to the
+   composer, exactly like a transcript surface that is about to be hidden. */
+static void ensure_native_focus(ChatHost *host) {
+    HWND focus = GetFocus();
+    if (focus && (focus == host->field.window || focus == host->search.window ||
+        focus == host->composer.window) && !native_child_usable(focus) &&
+        native_child_usable(host->composer.window))
+        SetFocus(host->composer.window);
 }
 static void capture_settings(ChatHost *host) {
     Chat *chat=host->config.chat;
@@ -937,6 +1040,7 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
             set_status(host,status);
         } else set_status(host,L"Generating...");
     }
+    sync_transcript_container(host);
     render_transcript(host); chat_ui_sync(&host->chat_ui); flush(host);
 }
 
@@ -1102,6 +1206,23 @@ static void handle_event(ChatHost *host, CompletionEvent *event) {
 static void command(void *user, ChatCommand code, int index) {
     ChatHost *host = (ChatHost *)user;
     Chat *chat = host->config.chat;
+    if (code == CHAT_COMMAND_TOGGLE_SIDEBAR) {
+        /* The wide-width preference is persisted; the narrow-width drawer is
+           session state, so only a preference flip marks the store dirty. */
+        if (chat_ui_toggle_sidebar(&host->chat_ui)) {
+            mark_dirty(host);
+            save(host);
+        }
+        flush(host);
+        /* Collapsing can hide the focused search edit; never strand focus. */
+        ensure_native_focus(host);
+        return;
+    }
+    if (code == CHAT_COMMAND_OVERFLOW) {
+        PostMessageW(host->window, CHAT_WM_ACTIONS_MENU, 0, 0);
+        return;
+    }
+    if (code == CHAT_COMMAND_MODEL_PICKER) { open_model_picker(host); return; }
     if (code != CHAT_COMMAND_SEND) {
         capture_settings(host);
         host->editing=false;
@@ -1112,6 +1233,7 @@ static void command(void *user, ChatCommand code, int index) {
         if (chat_new_conversation(chat) >= 0) {
             cancel_body_flush(host);
             transcript_invalidate(&host->transcript);
+            sync_transcript_container(host);
             render_transcript(host);
             rich_text_set_text(&host->composer, L"");
             chat_ui_sync(&host->chat_ui);
@@ -1123,6 +1245,7 @@ static void command(void *user, ChatCommand code, int index) {
         if (chat_select_conversation(chat, index)) {
             cancel_body_flush(host);
             transcript_invalidate(&host->transcript);
+            sync_transcript_container(host);
             render_transcript(host);
             rich_text_set_text(&host->composer,chat->conversations[chat->active].draft);
             chat_ui_sync(&host->chat_ui);
@@ -1245,10 +1368,36 @@ static bool search_submit(void *user) {
     return search_refresh((ChatHost *)user, false);
 }
 
+/* Anchors the complete retained command menu under the overflow button. The
+   default presentation has no menu bar, but every Conversation, Response and
+   Settings command stays reachable here (and through its keyboard shortcut).
+   TrackPopupMenu's WM_INITMENUPOPUP runs the live routing/backend sync. */
+static void open_actions_menu(ChatHost *host) {
+    UiRect r = chat_ui_rect(&host->chat_ui, host->chat_ui.overflow);
+    /* The arranged rectangle is in 96-DPI DIPs; ClientToScreen expects
+       physical pixels, so both coordinates scale before the conversion. */
+    POINT point = { px(host, r.x + r.w), px(host, r.y + r.h + 4) };
+    ClientToScreen(host->window, &point);
+    HMENU menu = chat_actions_menu(host->config.chat);
+    if (!menu) return;
+    SetForegroundWindow(host->window);
+    int command_id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTALIGN |
+        TPM_TOPALIGN, point.x, point.y, 0, host->window, NULL);
+    DestroyMenu(menu);
+    if (command_id) action(host, command_id);
+    /* MSDN: a queued null message lets the menu dismiss cleanly. */
+    PostMessageW(host->window, WM_NULL, 0, 0);
+}
+
 static void action(ChatHost *host, int code) {
     Chat *chat=host->config.chat;
     ChatConversation *c=&chat->conversations[chat->active];
     if (code==ACTION_SEARCH) {
+        /* The search field lives in the sidebar: reveal it (opening the
+           narrow-width drawer, or restoring the wide-width preference)
+           before placing and focusing the hidden native edit. */
+        if (chat_ui_reveal_sidebar(&host->chat_ui)) { mark_dirty(host); save(host); }
+        flush(host);
         SetFocus(host->search.window);
         SendMessageW(host->search.window,EM_SETSEL,0,-1);
         return;
@@ -1305,6 +1454,7 @@ static void action(ChatHost *host, int code) {
         else if (code==ACTION_DELETE_ALL) chat_delete_all(chat);
         else chat_clear(chat);
         transcript_invalidate(&host->transcript);
+        sync_transcript_container(host);
         host->editing=false; rich_text_set_text(&host->composer,chat->conversations[chat->active].draft); render_transcript(host);
         /* The active conversation may have shifted above or below the
            sidebar window after deletion. */
@@ -1387,6 +1537,17 @@ static bool surface_key(void *user, WPARAM key, bool shift, bool control,
         return true;
     }
     if (control && key == VK_SPACE && down) { action(host,ACTION_MODELS); return true; }
+    /* Ctrl+B toggles the sidebar; F10 / the context-menu key open the
+       retained command menu, the replacement route to every command that the
+       removed menu bar used to carry. */
+    if (control && (key == L'B' || key == L'b') && down) {
+        command(host, CHAT_COMMAND_TOGGLE_SIDEBAR, -1);
+        return true;
+    }
+    if ((key == VK_F10 || key == VK_APPS) && down) {
+        command(host, CHAT_COMMAND_OVERFLOW, -1);
+        return true;
+    }
     if (key == VK_TAB && down) { focus_surface(host, shift); return true; }
     return false;
 }
@@ -1512,6 +1673,17 @@ static LRESULT CALLBACK view_proc(HWND window, UINT message, WPARAM w,
     }
     if (!host) return DefWindowProcW(window, message, w, l);
     switch (message) {
+    case WM_SETCURSOR:
+        /* The whole transcript is a text-selection surface. Without this,
+           the pointer over a gap or margin is an arrow while a turn control
+           is an I-beam, and a streaming turn resizing under the pointer
+           flips between them as its edges move. One stable cursor for the
+           container and its read-only surfaces removes the flicker. */
+        if (LOWORD(l) == HTCLIENT) {
+            SetCursor(LoadCursorW(NULL, MAKEINTRESOURCEW(32513)));
+            return TRUE;
+        }
+        break;
     case WM_ERASEBKGND: {
         RECT bounds;
         GetClientRect(window, &bounds);
@@ -1726,7 +1898,8 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             ui_set_accessible_name(u, u->root, host->config.title);
         host->accessibility = ui_accessibility_create(window, u);
         if (!host->accessibility) return -1;
-        SetMenu(window,chat_actions_menu(host->config.chat));
+        /* No menu bar: the header's overflow button (and the retained
+           keyboard shortcuts) carries every command. */
         SetTimer(window,2,1000,NULL);
         rich_text_set_text(&host->composer,host->config.chat->conversations[host->config.chat->active].draft);
         render_transcript(host);
@@ -1772,6 +1945,24 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
 
     case WM_COMMAND:
         if (!l) { action(host,LOWORD(w)); return 0; }
+        /* Rich Edit focus notifications from the native fields (no event
+           mask is required). They drive the retained focus ring on the
+           matching placeholder surface. */
+        if (HIWORD(w) == EN_SETFOCUS || HIWORD(w) == EN_KILLFOCUS) {
+            bool focused = HIWORD(w) == EN_SETFOCUS;
+            HWND source = (HWND)l;
+            if (source == host->composer.window)
+                chat_ui_set_focus_ring(&host->chat_ui,
+                    host->chat_ui.composer_card, focused);
+            else if (source == host->field.window)
+                chat_ui_set_focus_ring(&host->chat_ui, host->chat_ui.model,
+                    focused);
+            else if (source == host->search.window)
+                chat_ui_set_focus_ring(&host->chat_ui, host->chat_ui.search,
+                    focused);
+            flush(host);
+            return 0;
+        }
         break;
 
     case WM_TIMER:
@@ -1874,7 +2065,8 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         UINT dpi = host->dpi > 0 ? (UINT)host->dpi : GetDpiForSystem();
         RECT r = { 0, 0, MulDiv(host->config.min_width, (int)dpi, 96),
             MulDiv(host->config.min_height, (int)dpi, 96) };
-        AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, TRUE, 0, dpi);
+        /* There is no menu bar (commands live on the overflow button). */
+        AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
         info->ptMinTrackSize.x = r.right - r.left;
         info->ptMinTrackSize.y = r.bottom - r.top;
         return 0;
@@ -1919,9 +2111,34 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
     case WM_KEYUP: {
         bool down = message == WM_KEYDOWN;
         bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        /* Escape dismisses the narrow-width temporary drawer before any
+           other Escape handling; the explicit wide-width preference is not
+           affected. */
+        if (down && w == VK_ESCAPE &&
+            chat_ui_narrow_drawer_open(&host->chat_ui)) {
+            chat_ui_close_drawer(&host->chat_ui);
+            flush(host);
+            return 0;
+        }
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         if (down && ((control && (w == L'F' || w == L'f')) || w == VK_F3)) {
-            surface_key(host, w, (GetKeyState(VK_SHIFT) & 0x8000) != 0,
-                control, true);
+            surface_key(host, w, shift, control, true);
+            return 0;
+        }
+        /* Keyboard routes for the retained chrome: Ctrl+B toggles the
+           sidebar, F10 / the context-menu key open the command menu, and Tab
+           hands off to the native fields when retained focus reaches an
+           edge, so the two focus systems form one cycle. */
+        if (down && control && (w == L'B' || w == L'b')) {
+            command(host, CHAT_COMMAND_TOGGLE_SIDEBAR, -1);
+            return 0;
+        }
+        if (down && (w == VK_F10 || w == VK_APPS)) {
+            command(host, CHAT_COMMAND_OVERFLOW, -1);
+            return 0;
+        }
+        if (down && w == VK_TAB && ui_focus_boundary(u, shift)) {
+            focus_native_edge(host, shift);
             return 0;
         }
         UiKey key;
@@ -1946,6 +2163,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         return 0;
     case CHAT_WM_CATALOG_EVENT:
         catalog_event(host, (ModelCatalogEvent *)l);
+        return 0;
+    case CHAT_WM_ACTIONS_MENU:
+        open_actions_menu(host);
         return 0;
     case CHAT_WM_SAVER_RESULT:
         /* wParam carries the result bit and this job's attempt id; lParam

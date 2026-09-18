@@ -115,7 +115,10 @@ void chat_actions_sync_routing(HMENU menu, const Chat *chat) {
         EnableMenuItem(menu, id, enable);
 }
 HMENU chat_actions_menu(const Chat *chat) {
-    HMENU bar=CreateMenu(), conversation=CreatePopupMenu(), response=CreatePopupMenu(), settings=CreatePopupMenu();
+    /* A popup root, not a menu bar: the only consumer tracks it directly
+       with TrackPopupMenu, which does not render a CreateMenu() bar (it
+       displays as an empty box). The three groups stay submenus. */
+    HMENU bar=CreatePopupMenu(), conversation=CreatePopupMenu(), response=CreatePopupMenu(), settings=CreatePopupMenu();
     HMENU routing=CreatePopupMenu(), backend=CreatePopupMenu();
     AppendMenuW(conversation,MF_STRING,ACTION_NEW,L"&New conversation");
     AppendMenuW(conversation,MF_STRING,ACTION_RENAME,L"&Rename...");
