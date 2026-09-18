@@ -3752,6 +3752,33 @@ static int backend_suite(void) {
         DestroyMenu(menu);
     }
 
+    /* chat_actions_sync is the single enabled-state authority. Routing sync
+       runs first purely for check/radio marks; the availability pass must
+       still win, including during an OpenRouter generation. */
+    {
+        HMENU menu=CreatePopupMenu();
+        AppendMenuW(menu,MF_STRING,ACTION_BACKEND_OPENROUTER,L"OpenRouter");
+        AppendMenuW(menu,MF_STRING,ACTION_ROUTING_ZDR,L"zdr");
+        ChatActionContext context;
+        chat->backend=CHAT_BACKEND_OPENROUTER;
+        chat_action_context_init(&context,chat);
+        chat_actions_sync(menu,&context);
+        CHECK((GetMenuState(menu,ACTION_ROUTING_ZDR,MF_BYCOMMAND)&MF_GRAYED)==0);
+        context.generating=true;
+        chat_actions_sync(menu,&context);
+        CHECK((GetMenuState(menu,ACTION_ROUTING_ZDR,MF_BYCOMMAND)&MF_GRAYED)!=0);
+        CHECK((GetMenuState(menu,ACTION_BACKEND_OPENROUTER,MF_BYCOMMAND)&MF_GRAYED)!=0);
+        chat->backend=CHAT_BACKEND_OLLAMA;
+        chat_action_context_init(&context,chat);
+        chat_actions_sync(menu,&context);
+        CHECK((GetMenuState(menu,ACTION_ROUTING_ZDR,MF_BYCOMMAND)&MF_GRAYED)!=0);
+        context.generating=true;
+        chat_actions_sync(menu,&context);
+        CHECK((GetMenuState(menu,ACTION_ROUTING_ZDR,MF_BYCOMMAND)&MF_GRAYED)!=0);
+        chat->backend=CHAT_BACKEND_OPENROUTER;
+        DestroyMenu(menu);
+    }
+
     /* Switching to Ollama with no remembered model opens the picker and does
        not commit the switch; accepting commits and stores the selection. */
     select_backend(h,CHAT_BACKEND_OPENROUTER);

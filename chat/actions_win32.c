@@ -1,6 +1,8 @@
 #include "actions_win32.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 typedef struct { HWND edit; wchar_t *text; size_t capacity; bool done, accepted, multiline; } EditDialog;
 static LRESULT CALLBACK edit_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
@@ -114,45 +116,59 @@ void chat_actions_sync_routing(HMENU menu, const Chat *chat) {
     for (UINT id = ACTION_ROUTING_SORT_DEFAULT; id <= ACTION_ROUTING_ZDR; id++)
         EnableMenuItem(menu, id, enable);
 }
+void chat_actions_sync(HMENU menu, const ChatActionContext *context) {
+    if (!menu || !context) return;
+    /* Routing/backend sync owns check and radio marks, but not the enabled
+       decision: it runs first so availability, applied last, is authoritative.
+       Otherwise an OpenRouter generation would re-enable routing items. */
+    chat_actions_sync_routing(menu, context->chat);
+    size_t count;
+    const ChatActionInfo *table = chat_action_table(&count);
+    for (size_t i = 0; i < count; i++) {
+        UINT enable = chat_action_available(table[i].id, context)
+            ? MF_ENABLED : MF_GRAYED;
+        EnableMenuItem(menu, (UINT)table[i].id, MF_BYCOMMAND | enable);
+    }
+}
+static void append_action(HMENU menu, int id) {
+    const ChatActionInfo *info = chat_action_info(id);
+    if (!info) return;
+    if (info->flags & CHAT_ACTION_FLAG_SEPARATOR_BEFORE)
+        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    wchar_t text[CHAT_ACTION_LABEL_TEXT];
+    if (info->shortcut && info->shortcut[0])
+        swprintf(text, CHAT_ACTION_LABEL_TEXT, L"%ls (%ls)",
+            info->menu_label, info->shortcut);
+    else
+        swprintf(text, CHAT_ACTION_LABEL_TEXT, L"%ls", info->menu_label);
+    text[CHAT_ACTION_LABEL_TEXT - 1] = 0;
+    AppendMenuW(menu, MF_STRING, (UINT_PTR)id, text);
+}
 HMENU chat_actions_menu(const Chat *chat) {
     /* A popup root, not a menu bar: the only consumer tracks it directly
        with TrackPopupMenu, which does not render a CreateMenu() bar (it
-       displays as an empty box). The three groups stay submenus. */
-    HMENU bar=CreatePopupMenu(), conversation=CreatePopupMenu(), response=CreatePopupMenu(), settings=CreatePopupMenu();
-    HMENU routing=CreatePopupMenu(), backend=CreatePopupMenu();
-    AppendMenuW(conversation,MF_STRING,ACTION_NEW,L"&New conversation");
-    AppendMenuW(conversation,MF_STRING,ACTION_RENAME,L"&Rename...");
-    AppendMenuW(conversation,MF_STRING,ACTION_DELETE,L"&Delete...");
-    AppendMenuW(conversation,MF_STRING,ACTION_DELETE_ALL,L"Delete &all...");
-    AppendMenuW(conversation,MF_STRING,ACTION_CLEAR,L"&Clear messages...");
-    AppendMenuW(conversation,MF_SEPARATOR,0,NULL);
-    AppendMenuW(conversation,MF_STRING,ACTION_SEARCH,L"&Search conversations (Ctrl+F)");
-    AppendMenuW(response,MF_STRING,ACTION_RETRY,L"&Retry unsuccessful response");
-    AppendMenuW(response,MF_STRING,ACTION_REGENERATE,L"Re&generate last response");
-    AppendMenuW(response,MF_STRING,ACTION_EDIT,L"&Edit latest user message...");
-    AppendMenuW(response,MF_STRING,ACTION_CANCEL_EDIT,L"Cancel edit mode");
-    AppendMenuW(response,MF_SEPARATOR,0,NULL);
-    AppendMenuW(response,MF_STRING,ACTION_COPY,L"&Copy response");
-    AppendMenuW(response,MF_STRING,ACTION_SELECTION,L"Copy transcript &selection");
-    AppendMenuW(settings,MF_STRING,ACTION_SYSTEM,L"&System prompt...");
-    AppendMenuW(settings,MF_STRING,ACTION_SIDEBAR,L"Sidebar &width...");
-    AppendMenuW(settings,MF_STRING,ACTION_MODELS,L"&Choose model... (Ctrl+Space)");
-    AppendMenuW(backend,MF_STRING,ACTION_BACKEND_OPENROUTER,L"&OpenRouter");
-    AppendMenuW(backend,MF_STRING,ACTION_BACKEND_OLLAMA,L"&Ollama (local)");
-    chat_actions_sync_routing(backend,chat);
-    AppendMenuW(settings,MF_POPUP,(UINT_PTR)backend,L"&Backend");
-    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_SORT_DEFAULT,L"Sort: &Default (balanced)");
-    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_SORT_PRICE,L"Sort: Prefer lowest &price");
-    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_SORT_THROUGHPUT,L"Sort: Prefer highest t&hroughput");
-    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_SORT_LATENCY,L"Sort: Prefer lowest &latency");
-    AppendMenuW(routing,MF_SEPARATOR,0,NULL);
-    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_ALLOW_FALLBACKS,L"Allow fallback &providers");
-    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_DATA_COLLECTION,L"Allow providers that may store &data");
-    AppendMenuW(routing,MF_STRING,ACTION_ROUTING_ZDR,L"Require &zero data retention");
-    chat_actions_sync_routing(routing,chat);
-    AppendMenuW(settings,MF_POPUP,(UINT_PTR)routing,L"Provider &routing");
-    AppendMenuW(bar,MF_POPUP,(UINT_PTR)conversation,L"&Conversation");
-    AppendMenuW(bar,MF_POPUP,(UINT_PTR)response,L"&Response");
-    AppendMenuW(bar,MF_POPUP,(UINT_PTR)settings,L"&Settings");
+       displays as an empty box). Items, their order and their separators come
+       from the registry; only the submenu hierarchy is structural. */
+    HMENU group[CHAT_ACTION_GROUP_COUNT];
+    for (int g = 0; g < CHAT_ACTION_GROUP_COUNT; g++)
+        group[g] = CreatePopupMenu();
+    size_t count;
+    const ChatActionInfo *table = chat_action_table(&count);
+    for (size_t i = 0; i < count; i++)
+        if ((unsigned)table[i].group < (unsigned)CHAT_ACTION_GROUP_COUNT)
+            append_action(group[table[i].group], table[i].id);
+    chat_actions_sync_routing(group[CHAT_ACTION_GROUP_BACKEND], chat);
+    chat_actions_sync_routing(group[CHAT_ACTION_GROUP_ROUTING], chat);
+    AppendMenuW(group[CHAT_ACTION_GROUP_SETTINGS], MF_POPUP,
+        (UINT_PTR)group[CHAT_ACTION_GROUP_BACKEND], L"&Backend");
+    AppendMenuW(group[CHAT_ACTION_GROUP_SETTINGS], MF_POPUP,
+        (UINT_PTR)group[CHAT_ACTION_GROUP_ROUTING], L"Provider &routing");
+    HMENU bar = CreatePopupMenu();
+    AppendMenuW(bar, MF_POPUP,
+        (UINT_PTR)group[CHAT_ACTION_GROUP_CONVERSATION], L"&Conversation");
+    AppendMenuW(bar, MF_POPUP,
+        (UINT_PTR)group[CHAT_ACTION_GROUP_RESPONSE], L"&Response");
+    AppendMenuW(bar, MF_POPUP,
+        (UINT_PTR)group[CHAT_ACTION_GROUP_SETTINGS], L"&Settings");
     return bar;
 }

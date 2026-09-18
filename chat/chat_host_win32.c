@@ -1368,10 +1368,24 @@ static bool search_submit(void *user) {
     return search_refresh((ChatHost *)user, false);
 }
 
+/* True when any realized transcript surface currently holds a selection. */
+static RichTextControl *transcript_selected_surface(ChatHost *host) {
+    const TranscriptSurface surfaces[3]={TRANSCRIPT_HEAD,TRANSCRIPT_BODY,
+        TRANSCRIPT_REASON};
+    for (int i=0;i<host->transcript.record_count;i++)
+        for (int k=0;k<3;k++) {
+            RichTextControl *control=transcript_surface(&host->transcript,
+                i,surfaces[k]);
+            if (control && rich_text_has_selection(control)) return control;
+        }
+    return NULL;
+}
+
 /* Anchors the complete retained command menu under the overflow button. The
    default presentation has no menu bar, but every Conversation, Response and
    Settings command stays reachable here (and through its keyboard shortcut).
-   TrackPopupMenu's WM_INITMENUPOPUP runs the live routing/backend sync. */
+   TrackPopupMenu's WM_INITMENUPOPUP runs the live availability and
+   routing/backend sync. */
 static void open_actions_menu(ChatHost *host) {
     UiRect r = chat_ui_rect(&host->chat_ui, host->chat_ui.overflow);
     /* The arranged rectangle is in 96-DPI DIPs; ClientToScreen expects
@@ -1412,19 +1426,10 @@ static void action(ChatHost *host, int code) {
     }
     if (code==ACTION_SELECTION) {
         /* Copy whichever turn viewport/block currently holds a selection. */
-        const TranscriptSurface surfaces[3]={TRANSCRIPT_HEAD,TRANSCRIPT_BODY,
-            TRANSCRIPT_REASON};
-        for (int i=0;i<host->transcript.record_count;i++) {
-            for (int k=0;k<3;k++) {
-                RichTextControl *control=transcript_surface(&host->transcript,
-                    i,surfaces[k]);
-                if (!control) continue;
-                if (rich_text_has_selection(control)) {
-                    SendMessageW(control->window,WM_COPY,0,0);
-                    set_status(host,L"Transcript selection copied");
-                    return;
-                }
-            }
+        RichTextControl *control=transcript_selected_surface(host);
+        if (control) {
+            SendMessageW(control->window,WM_COPY,0,0);
+            set_status(host,L"Transcript selection copied");
         }
         return;
     }
@@ -1936,13 +1941,19 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         EndPaint(window, &paint);
         return 0;
     }
-    case WM_INITMENUPOPUP:
-        /* Re-derive the routing check/radio marks from live state each time a
-           popup opens, so the menu can never disagree with what a request
-           would send. A no-op for popups without those items. */
-        chat_actions_sync_routing((HMENU)w,host->config.chat);
+    case WM_INITMENUPOPUP: {
+        /* Re-derive enabled state and the routing check/radio marks from live
+           state each time a popup opens, so the menu can never disagree with
+           what the host would actually do. A no-op for absent items. */
+        ChatActionContext context;
+        chat_action_context_init(&context,host->config.chat);
+        context.generating = host->generating;
+        context.editing = host->editing;
+        context.has_transcript_selection =
+            transcript_selected_surface(host) != NULL;
+        chat_actions_sync((HMENU)w,&context);
         break;
-
+    }
     case WM_COMMAND:
         if (!l) { action(host,LOWORD(w)); return 0; }
         /* Rich Edit focus notifications from the native fields (no event
