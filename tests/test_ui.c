@@ -123,6 +123,94 @@ static void scrolling_test(void) {
     for (UiId c=NODE(inner).first;c;c=NODE(c).next) ui_set_hidden(&u,c,c!=last);
     ui_layout(&u,300,200); NEAR(NODE(inner).scroll,0); NEAR(ui_scroll_thumb(&u,inner).h,0);
 }
+static void roving_focus_test(void) {
+    UiId root=init(UI_COLUMN);
+    UiId scroll=ui_add(&u,root,UI_SCROLL,L"");
+    NODE(scroll).style.height=ui_fixed(90); NODE(scroll).style.gap=0;
+    UiId a=ui_add(&u,scroll,UI_BUTTON,L"A");
+    UiId b=ui_add(&u,scroll,UI_BUTTON,L"B");
+    UiId disabled=ui_add(&u,scroll,UI_BUTTON,L"Disabled");
+    UiId hidden=ui_add(&u,scroll,UI_BUTTON,L"Hidden");
+    UiId c=ui_add(&u,scroll,UI_BUTTON,L"C");
+    UiId filler=ui_add(&u,scroll,UI_COLUMN,L"");
+    NODE(filler).style.height=ui_fixed(400);
+    ui_set_disabled(&u,disabled,true);
+    ui_set_hidden(&u,hidden,true);
+    ui_layout(&u,200,90);
+    /* Arrow roving moves between the scroll's button-like items and skips
+       disabled and hidden ones. */
+    ui_focus(&u,a,true);
+    ui_key(&u,UI_KEY_DOWN,true,false,false); CHECK(u.focus==b);
+    ui_key(&u,UI_KEY_DOWN,true,false,false); CHECK(u.focus==c);
+    ui_key(&u,UI_KEY_DOWN,true,false,false); CHECK(u.focus==c);
+    ui_key(&u,UI_KEY_UP,true,false,false); CHECK(u.focus==b);
+    ui_key(&u,UI_KEY_HOME,true,false,false); CHECK(u.focus==a);
+    ui_key(&u,UI_KEY_END,true,false,false); CHECK(u.focus==c);
+    CHECK(NODE(scroll).scroll>0);   /* reveal followed the rove */
+    /* The direct API clamps at the container edges. */
+    ui_focus(&u,a,true);
+    CHECK(!ui_focus_move(&u,-1) && u.focus==a);
+    CHECK(ui_focus_move(&u,1) && u.focus==b);
+    ui_focus(&u,c,true);
+    CHECK(!ui_focus_move(&u,1) && u.focus==c);
+    /* PageUp/PageDown still scroll while an item holds focus. */
+    ui_focus(&u,a,true);
+    ui_key(&u,UI_KEY_PAGE_DOWN,true,false,false);
+    CHECK(NODE(scroll).scroll>0);
+    /* Container focus keeps the original arrow and Home/End scroll semantics. */
+    ui_focus(&u,scroll,true);
+    ui_key(&u,UI_KEY_END,true,false,false); NEAR(NODE(scroll).scroll,ui_scroll_max(&u,scroll));
+    float bottom=NODE(scroll).scroll;
+    ui_key(&u,UI_KEY_UP,true,false,false); CHECK(NODE(scroll).scroll<bottom);
+    ui_key(&u,UI_KEY_DOWN,true,false,false); NEAR(NODE(scroll).scroll,bottom);
+    ui_key(&u,UI_KEY_HOME,true,false,false); NEAR(NODE(scroll).scroll,0);
+    /* Movement never crosses into a sibling container. */
+    UiId other=ui_add(&u,root,UI_SCROLL,L"");
+    NODE(other).style.height=ui_fixed(90); NODE(other).style.gap=0;
+    (void)ui_add(&u,other,UI_BUTTON,L"Z");
+    ui_layout(&u,200,200);
+    ui_focus(&u,c,true);
+    ui_key(&u,UI_KEY_DOWN,true,false,false); CHECK(u.focus==c);
+    CHECK(!ui_focus_move(&u,1));
+    /* Only button-like items inside a scroll rove; others refuse safely. */
+    ui_focus(&u,scroll,true);
+    CHECK(!ui_focus_move(&u,1));
+    UiId plain=ui_add(&u,root,UI_BUTTON,L"Plain");
+    ui_layout(&u,200,200);
+    ui_focus(&u,plain,true);
+    ui_key(&u,UI_KEY_DOWN,true,false,false); CHECK(u.focus==plain);
+    CHECK(!ui_focus_move(&u,1));
+}
+static void nested_roving_focus_test(void) {
+    UiId root=init(UI_COLUMN);
+    UiId outer=ui_add(&u,root,UI_SCROLL,L"");
+    NODE(outer).style.height=ui_fixed(120); NODE(outer).style.gap=0;
+    UiId a=ui_add(&u,outer,UI_BUTTON,L"A");
+    UiId inner=ui_add(&u,outer,UI_SCROLL,L"");
+    NODE(inner).style.height=ui_fixed(60); NODE(inner).style.gap=0;
+    UiId b=ui_add(&u,inner,UI_BUTTON,L"B");
+    UiId inner_filler=ui_add(&u,inner,UI_COLUMN,L"");
+    NODE(inner_filler).style.height=ui_fixed(200);
+    UiId c=ui_add(&u,outer,UI_BUTTON,L"C");
+    UiId outer_filler=ui_add(&u,outer,UI_COLUMN,L"");
+    NODE(outer_filler).style.height=ui_fixed(400);
+    ui_layout(&u,200,120);
+    /* A descendant scroll is a traversal boundary: the outer group skips the
+       inner item entirely, so A reaches C and never B. */
+    ui_focus(&u,a,true);
+    ui_key(&u,UI_KEY_DOWN,true,false,false); CHECK(u.focus==c);
+    ui_key(&u,UI_KEY_UP,true,false,false); CHECK(u.focus==a);
+    ui_key(&u,UI_KEY_END,true,false,false); CHECK(u.focus==c);
+    ui_key(&u,UI_KEY_HOME,true,false,false); CHECK(u.focus==a);
+    /* An inner item roves only within its own scroll. */
+    ui_focus(&u,b,true);
+    CHECK(!ui_focus_move(&u,-1) && !ui_focus_move(&u,1) && u.focus==b);
+    ui_key(&u,UI_KEY_DOWN,true,false,false); CHECK(u.focus==b);
+    ui_key(&u,UI_KEY_UP,true,false,false); CHECK(u.focus==b);
+    /* Home/End from an inner item never target outer items. */
+    ui_key(&u,UI_KEY_HOME,true,false,false); CHECK(u.focus==b);
+    ui_key(&u,UI_KEY_END,true,false,false); CHECK(u.focus==b);
+}
 static void scroll_api_test(void) {
     UiId root=init(UI_SCROLL); NODE(root).style.gap=0;
     UiId a=ui_add(&u,root,UI_BUTTON,L"A"), b=ui_add(&u,root,UI_BUTTON,L"B");
@@ -303,7 +391,7 @@ static void showcase_test(void) {
     CHECK(visible==1 && !NODE(s.catalog_rows[4]).hidden);
 }
 int main(void) {
-    layout_test(); input_test(); focus_bridge_test(); scrolling_test(); scroll_api_test(); slider_test(); text_and_capacity_test(); lifetime_test(); accessibility_metadata_test(); icon_test(); showcase_test();
+    layout_test(); input_test(); focus_bridge_test(); scrolling_test(); roving_focus_test(); nested_roving_focus_test(); scroll_api_test(); slider_test(); text_and_capacity_test(); lifetime_test(); accessibility_metadata_test(); icon_test(); showcase_test();
     printf("PASS: %u assertions (layout, input, nested scroll, focus reveal, values, lifetime, capacity, icons, showcase breakpoints)\n",assertions);
     return 0;
 }

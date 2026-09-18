@@ -162,6 +162,14 @@ bool ui_focus_edge(Ui *ui, bool reverse);
    A host that mixes retained controls with native child windows uses this to
    hand focus across the boundary instead of wrapping inside the tree. */
 bool ui_focus_boundary(const Ui *ui, bool reverse);
+/* Moves keyboard focus by `delta` items among the enabled, visible button-like
+   items (button, icon button, checkbox, switch) of the focused node's nearest
+   UI_SCROLL ancestor, in tree order. `delta` is clamped to the container's
+   first/last item, so movement never wraps into a sibling container, and
+   sliders, textboxes and scroll containers keep their own arrow semantics.
+   Returns true only when focus changed. Focus is applied with keyboard state,
+   so reveal runs and keyboard focus is recorded. */
+bool ui_focus_move(Ui *ui, int delta);
 void ui_set_active(Ui *ui, bool active);
 UiRect ui_scroll_thumb(const Ui *ui, UiId id);
 float ui_scroll_max(const Ui *ui, UiId id);

@@ -18,6 +18,12 @@ static bool focusable(UiKind k) {
     return k == UI_BUTTON || k == UI_ICON_BUTTON || k == UI_CHECKBOX ||
            k == UI_SWITCH || k == UI_SLIDER || k == UI_TEXTBOX || k == UI_SCROLL;
 }
+/* Button-like focusables that rove with the arrow keys. Sliders and textboxes
+   keep their own arrow semantics and scroll containers keep scrolling. */
+static bool item_focusable(UiKind k) {
+    return k == UI_BUTTON || k == UI_ICON_BUTTON || k == UI_CHECKBOX ||
+           k == UI_SWITCH;
+}
 bool ui_visible(const Ui *u, UiId id) {
     if (!valid(u, id)) return false;
     for (; id; id = const_node(u,id)->parent) if (const_node(u,id)->hidden) return false;
@@ -425,6 +431,48 @@ static void focus_next(Ui *u, bool reverse) {
     }
     ui_focus(u,UI_NONE,true);
 }
+static UiId nearest_scroll(const Ui *u, UiId id) {
+    for (UiId p=const_node(u,id)->parent;p;p=const_node(u,p)->parent)
+        if (const_node(u,p)->kind==UI_SCROLL) return p;
+    return UI_NONE;
+}
+static void item_order(const Ui *u, UiId root, UiId id, UiId *order, int *count) {
+    if (!ui_enabled(u,id)) return;
+    if (id != root && const_node(u,id)->kind==UI_SCROLL) return;
+    if (item_focusable(const_node(u,id)->kind)) order[(*count)++]=id;
+    for (UiId c=const_node(u,id)->first;c;c=const_node(u,c)->next)
+        item_order(u,root,c,order,count);
+}
+bool ui_focus_move(Ui *u, int delta) {
+    if (!u || !delta) return false;
+    UiId id=u->focus;
+    if (!id || !valid(u,id) || !item_focusable(const_node(u,id)->kind)) return false;
+    UiId scroll=nearest_scroll(u,id);
+    if (!scroll) return false;
+    UiId order[UI_CAPACITY]; int count=0, current=-1;
+    item_order(u,scroll,scroll,order,&count);
+    for (int i=0;i<count;i++) if (order[i]==id) current=i;
+    if (current<0 || !count) return false;
+    int next=current+delta;
+    if (next<0) next=0;
+    if (next>=count) next=count-1;
+    if (next==current) return false;
+    ui_focus(u,order[next],true);
+    return true;
+}
+static bool focus_item_edge(Ui *u, bool last) {
+    UiId id=u->focus;
+    if (!id || !valid(u,id) || !item_focusable(const_node(u,id)->kind)) return false;
+    UiId scroll=nearest_scroll(u,id);
+    if (!scroll) return false;
+    UiId order[UI_CAPACITY]; int count=0;
+    item_order(u,scroll,scroll,order,&count);
+    if (!count) return false;
+    UiId target=order[last?count-1:0];
+    if (target==id) return false;
+    ui_focus(u,target,true);
+    return true;
+}
 bool ui_focus_edge(Ui *u, bool reverse) {
     UiId order[UI_CAPACITY]; int count=0;
     if (u->root) focus_order(u,u->root,order,&count);
@@ -463,19 +511,26 @@ void ui_key(Ui *u, UiKey key, bool down, bool shift, bool repeat) {
         if (key==UI_KEY_PAGE_DOWN) value(u,id,n->value-.1f);
         if (key==UI_KEY_HOME) value(u,id,0);
         if (key==UI_KEY_END) value(u,id,1);
-    } else if (n->kind!=UI_TEXTBOX) {
-        UiId p=id;
-        while (p && node(u,p)->kind!=UI_SCROLL) p=node(u,p)->parent;
-        if (p) {
-            UiNode *s=node(u,p); float next=s->scroll;
-            if (key==UI_KEY_UP) next-=u->theme.control_height;
-            if (key==UI_KEY_DOWN) next+=u->theme.control_height;
-            if (key==UI_KEY_PAGE_UP) next-=s->viewport.h*.9f;
-            if (key==UI_KEY_PAGE_DOWN) next+=s->viewport.h*.9f;
-            if (key==UI_KEY_HOME) next=0;
-            if (key==UI_KEY_END) next=ui_scroll_max(u,p);
-            s->scroll=clamp(next,0,ui_scroll_max(u,p));
-            ui_invalidate(u,true);
-        }
+        return;
+    }
+    if (n->kind==UI_TEXTBOX) return;
+    if (item_focusable(n->kind)) {
+        if (key==UI_KEY_UP) { ui_focus_move(u,-1); return; }
+        if (key==UI_KEY_DOWN) { ui_focus_move(u,1); return; }
+        if (key==UI_KEY_HOME) { focus_item_edge(u,false); return; }
+        if (key==UI_KEY_END) { focus_item_edge(u,true); return; }
+    }
+    UiId p=id;
+    while (p && node(u,p)->kind!=UI_SCROLL) p=node(u,p)->parent;
+    if (p) {
+        UiNode *s=node(u,p); float next=s->scroll;
+        if (key==UI_KEY_UP) next-=u->theme.control_height;
+        if (key==UI_KEY_DOWN) next+=u->theme.control_height;
+        if (key==UI_KEY_PAGE_UP) next-=s->viewport.h*.9f;
+        if (key==UI_KEY_PAGE_DOWN) next+=s->viewport.h*.9f;
+        if (key==UI_KEY_HOME) next=0;
+        if (key==UI_KEY_END) next=ui_scroll_max(u,p);
+        s->scroll=clamp(next,0,ui_scroll_max(u,p));
+        ui_invalidate(u,true);
     }
 }
