@@ -1,14 +1,15 @@
 # DarkChat
 
-DarkChat is a native OpenRouter chat client for Windows, written in C17 with Win32, Direct2D, DirectWrite, Rich Edit, and WinHTTP.
+DarkChat is a native OpenRouter and Ollama chat client for Windows, written in C17 with Win32, Direct2D, DirectWrite, Rich Edit, and WinHTTP.
 
-It provides streaming responses, per-turn reasoning views, progressive Markdown rendering, a searchable OpenRouter model catalog, provider-routing controls, durable local conversation history, and the basic lifecycle tools expected from a usable desktop chat client—without Electron, a browser runtime, or third-party libraries.
+It provides streaming responses, per-turn reasoning views, progressive Markdown rendering, a searchable per-backend model catalog, OpenRouter provider-routing controls, durable local conversation history, and the basic lifecycle tools expected from a usable desktop chat client—without Electron, a browser runtime, or third-party libraries.
 
 > **Status:** DarkChat is functional and under active development. It is currently a focused personal desktop client rather than a finished general-purpose release.
 
 ## Current capabilities
 
-- Stream responses from any OpenRouter model identifier over SSE.
+- Stream responses from any OpenRouter model identifier over SSE, or from a local [Ollama](https://ollama.com) server through its OpenAI-compatible API.
+- Switch backends under Settings > Backend. Each backend remembers its own last-used model, and choosing Ollama with no remembered local model opens the Ollama picker first.
 - Display reasoning separately for each assistant turn.
   - Reasoning is collapsed by default.
   - Live reasoning can be opened, scrolled, collapsed, and reopened without losing its place.
@@ -26,15 +27,15 @@ It provides streaming responses, per-turn reasoning views, progressive Markdown 
 - Retry unsuccessful responses, regenerate the latest response, or edit and resend the latest user message.
 - Stop an active request while retaining its partial response.
 - Copy responses, transcript selections, and composer text.
-- Configure the model, global system prompt, sidebar width, and OpenRouter provider routing.
-- Browse and search OpenRouter's model catalog with `Ctrl+Space`; offline or without a key it falls back to the current model and the 16 most recently used identifiers.
-- Apply global provider routing to future requests: sort by price, throughput, or latency; allow or disable fallback providers; allow or deny providers that may store data; and require Zero Data Retention. Every control defaults to OpenRouter's own default.
+- Configure the backend, the model, the global system prompt, sidebar width, and OpenRouter provider routing.
+- Browse and search the active backend's model catalog with `Ctrl+Space`; offline or without a key it falls back to the current model and that backend's 16 most recently used identifiers (history is tagged per backend, so the two pickers stay isolated).
+- Apply global provider routing to future OpenRouter requests: sort by price, throughput, or latency; allow or disable fallback providers; allow or deny providers that may store data; and require Zero Data Retention. Every control defaults to OpenRouter's own default and is disabled while Ollama is active.
 - Show completion metadata including:
   - Time to first token
   - Total latency
   - Input and output tokens
-  - OpenRouter-reported cost
-  - Requested and actual model
+  - OpenRouter-reported cost (local Ollama turns show `local` instead)
+  - Backend, requested and actual model
   - Unusual finish reasons
 - Recover interrupted generations and valid backup snapshots after a crash or torn write.
 
@@ -80,11 +81,26 @@ The key is never written to conversation state or included in persisted history,
 
 Enter any valid OpenRouter model identifier in the model field, or press `Ctrl+Space` to search OpenRouter's model catalog. The catalog is fetched on demand with the same key, cached in memory for one hour, and never persisted; offline or without a key, the picker falls back to the current model and recent history. Provider routing is configured under Settings > Provider routing.
 
+## Ollama setup
+
+Ollama is first-class through its **OpenAI-compatible** API, not its native `/api/chat`:
+
+```text
+http://localhost:11434/v1/chat/completions
+http://localhost:11434/v1/models
+```
+
+Start the server (for example `ollama serve`), then choose Settings > Backend > Ollama. No API key, `Authorization` header, HTTP-Referer, X-Title, TLS, or OpenRouter provider object is used; DarkChat opens a direct, no-proxy WinHTTP session for localhost. A missing `OPENROUTER_API_KEY` never blocks Ollama.
+
+The first time you switch to Ollama with no remembered local model, the Ollama picker opens and the switch commits only after you select a model. Ollama generation metadata shows `Ollama · model`, uses streamed usage via `stream_options.include_usage`, and reports its cost as `local`. If the server is not running, the failure reads `Ollama is not reachable at localhost:11434.`
+
+The Ollama endpoint is fixed at `localhost:11434`; there is no configurable endpoint.
+
 ## Everyday controls
 
 - `Enter` sends a message.
 - `Shift+Enter` inserts a newline.
-- `Ctrl+Space` opens the searchable model picker (current model, recent models, then the OpenRouter catalog). Type to filter by id or name, use Up/Down, then Enter or double-click to select; Escape cancels.
+- `Ctrl+Space` opens the searchable model picker for the active backend (current model, recent models, then the backend's catalog). Type to filter by id or name, use Up/Down, then Enter or double-click to select; Escape cancels.
 - `Ctrl+F` focuses conversation search. Enter refreshes the search and jumps to
   its first result; `F3` / `Shift+F3` move through message and reasoning hits.
 - The Send button becomes Stop during generation.
@@ -103,7 +119,7 @@ DarkChat stores its state at:
 %LOCALAPPDATA%\DarkChat\state.jsonl
 ```
 
-The snapshot contains conversations, messages, drafts, model history, generation metadata, settings (including provider routing), and window geometry. It does not contain the OpenRouter API key.
+The snapshot contains conversations, messages, drafts, model history, generation metadata (including the originating backend), settings (the active backend, one last-used model per backend, and provider routing), and window geometry. It does not contain the OpenRouter API key.
 
 Persistence uses a checksummed UTF-8 JSONL format with:
 
@@ -116,7 +132,9 @@ Persistence uses a checksummed UTF-8 JSONL format with:
 
 Current writes use format 3. DarkChat loads formats 1 through 3 and rewrites
 older valid snapshots as format 3 on the next save; an unsupported newer format
-fails closed without overwriting it from a backup.
+fails closed without overwriting it from a backup. The active backend, the
+per-backend models, and each generation's backend are additive optional fields
+at format 3: an older snapshot decodes as OpenRouter with no Ollama model.
 
 State is autosaved roughly once per second while dirty and immediately after important lifecycle actions such as sending, stopping, completing, deleting, or closing.
 
@@ -133,8 +151,8 @@ DarkChat now represents most of the active development in this repository.
 | Application UI | `chat/chat_ui.*`, `chat/actions_win32.*` | Sidebar, composer, menus, settings, commands, and visible application state |
 | Transcript | `chat/transcript_win32.*`, `chat/rich_text_win32.*` | Bounded, recycled native Rich Edit slots; scrolling, selection preservation, reasoning viewports, incremental updates |
 | Markdown | `chat/markdown.*` | Transactional, platform-independent Markdown subset parser |
-| OpenRouter | `chat/openrouter_winhttp.*`, `chat/sse.*`, `chat/json.*` | Request encoding, WinHTTP streaming, SSE framing, response decoding |
-| Model catalog | `chat/model_catalog.*`, `chat/model_catalog_winhttp.*`, `chat/model_picker_win32.*` | Transient OpenRouter model-catalog fetch, parse/merge/filter, and the searchable picker |
+| Completion | `chat/completion_request.*`, `chat/completion_winhttp.*`, `chat/sse.*`, `chat/json.*` | Backend-aware request encoding, endpoint descriptors, WinHTTP streaming, SSE framing, response decoding for OpenRouter and Ollama |
+| Model catalog | `chat/model_catalog.*`, `chat/model_catalog_winhttp.*`, `chat/model_picker_win32.*` | Transient per-backend model-catalog fetch, parse/merge/filter, and the searchable picker |
 | Provider routing | `chat/provider_routing.*` | OpenRouter `provider` object construction, sharing exact bytes with the request-context budget |
 | Storage | `chat/storage.*` | Checksummed JSONL snapshots, atomic replacement, backup and recovery |
 | DarkUI foundation | `ui/*`, `platform/*` | Retained controls, theme, painting, layout, Direct2D/DirectWrite rendering, and accessibility infrastructure |
@@ -170,9 +188,12 @@ Coverage includes:
 - Retry, regenerate, edit-and-resend, cancellation, and crash recovery
 - Dynamic message allocation and injected allocation failures
 - Unicode, JSON, SSE, and split-boundary parsing
-- OpenRouter request and response fixtures
-- OpenRouter model-catalog parsing, picker merge/filter, and offline or keyless fallback
+- OpenRouter and Ollama request and response fixtures, including byte-for-byte
+  OpenRouter bodies, Ollama request bytes with no credentials or provider
+  routing, and context/body size equality for both backends
+- Model-catalog parsing and picker merge/filter per backend, and offline or keyless OpenRouter fallback
 - Provider-routing serialization, request-context budget accounting, persistence round-trips, and the settings-to-request seam
+- Backend and per-backend model persistence, old-snapshot OpenRouter defaults, and routing-menu state under Ollama
 - Reasoning ownership and live reasoning viewports
 - Progressive Markdown rendering
 - Selection-preserving transcript updates
@@ -195,7 +216,17 @@ $env:OPENROUTER_API_KEY = [Environment]::GetEnvironmentVariable(
 Remove-Item Env:OPENROUTER_API_KEY
 ```
 
-The automated suite does not require an API key or make live OpenRouter requests.
+A live local Ollama request is also available when a server is running and a
+model is named; it is never required for the normal suite:
+
+```powershell
+$env:DARKCHAT_OLLAMA_MODEL = "llama3.2"
+.\build\test_openrouter.exe --live
+Remove-Item Env:DARKCHAT_OLLAMA_MODEL
+```
+
+The automated suite does not require an API key or a local Ollama server, and
+does not make live network requests.
 
 ## Current limits
 
@@ -207,7 +238,8 @@ The automated suite does not require an API key or make live OpenRouter requests
   they have no fixed per-message length cap
 - 128 MB maximum persisted snapshot
 - 16 recently used model identifiers (the offline picker fallback)
-- Provider routing exposes sorting, fallback, data-collection, and ZDR controls only; per-provider `only`/`ignore`/`order` selection is not exposed
+- Provider routing exposes sorting, fallback, data-collection, and ZDR controls only; per-provider `only`/`ignore`/`order` selection is not exposed, and the controls apply to OpenRouter only
+- Ollama is reached at the fixed OpenAI-compatible endpoint `localhost:11434/v1`; the endpoint is not configurable
 - No response branches or retained variants
 - Conversation search scans current in-memory messages on demand; there is no
   persisted or background index

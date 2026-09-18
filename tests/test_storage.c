@@ -46,7 +46,7 @@ static void seam_reset(void) {
 
 /* Compares two generations by every field the format persists. */
 static bool same_generation(const ChatGeneration *a, const ChatGeneration *b) {
-    return a->state == b->state &&
+    return a->state == b->state && a->backend == b->backend &&
         a->started_at == b->started_at && a->finished_at == b->finished_at &&
         a->first_token_at == b->first_token_at &&
         a->ttft_ms == b->ttft_ms && a->latency_ms == b->latency_ms &&
@@ -79,13 +79,17 @@ static bool same_chat(const Chat *a, const Chat *b) {
         a->window_height != b->window_height ||
         a->maximized != b->maximized || a->sidebar_width != b->sidebar_width ||
         wcscmp(a->model, b->model) ||
+        a->backend != b->backend ||
+        wcscmp(a->ollama_model, b->ollama_model) ||
         wcscmp(a->system_prompt, b->system_prompt) ||
         a->provider_routing.sort != b->provider_routing.sort ||
         a->provider_routing.disallow_fallbacks != b->provider_routing.disallow_fallbacks ||
         a->provider_routing.data_collection != b->provider_routing.data_collection ||
         a->provider_routing.zdr != b->provider_routing.zdr) return false;
     for (int i = 0; i < a->model_history_count; i++)
-        if (wcscmp(a->model_history[i], b->model_history[i])) return false;
+        if (wcscmp(a->model_history[i], b->model_history[i]) ||
+            a->model_history_backend[i] != b->model_history_backend[i])
+            return false;
     for (int i = 0; i < a->conversation_count; i++) {
         const ChatConversation *ca = &a->conversations[i];
         const ChatConversation *cb = &b->conversations[i];
@@ -198,6 +202,34 @@ static int load_routing_case(const char *provider_fields, Chat *dest) {
         "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
         "\"system_prompt\":\"\"%s%s}", provider_fields[0] ? "," : "",
         provider_fields);
+    snprintf(conversation, sizeof conversation,
+        "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
+        "\"modified_at\":1000,\"renamed\":0,\"message_count\":0,"
+        "\"title\":\"c\",\"draft\":\"\"}");
+    const char *lines[2] = { settings, conversation };
+    int result = write_snapshot(store.path, lines, 2) ?
+        storage_load(&store, dest) : -2;
+    storage_close(&store);
+    remove_store(&store, dir);
+    return result;
+}
+/* Builds a one-conversation, no-message snapshot whose settings line carries
+    `backend_fields` verbatim (empty or NULL for an absent-field snapshot),
+    loads it and removes the store. */
+static int load_backend_case(const char *backend_fields, Chat *dest) {
+    wchar_t dir[256];
+    swprintf(dir, 256, L"build\\storage-backend-%lu", GetCurrentProcessId());
+    ChatStorage store;
+    if (!storage_open(&store, dir)) return -2;
+    if (!backend_fields) backend_fields = "";
+    char settings[512], conversation[256];
+    snprintf(settings, sizeof settings,
+        "{\"type\":\"settings\",\"version\":1,\"next_id\":1,\"active\":0,"
+        "\"conversation_count\":1,\"model_history_count\":0,\"window_x\":0,"
+        "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+        "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+        "\"system_prompt\":\"\"%s%s}", backend_fields[0] ? "," : "",
+        backend_fields);
     snprintf(conversation, sizeof conversation,
         "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
         "\"modified_at\":1000,\"renamed\":0,\"message_count\":0,"
@@ -400,6 +432,78 @@ int main(void) {
         }
         chat_dispose(dest); free(dest);
     }
+    /* The active backend and the per-backend models are additive at the same
+       format version: an OpenRouter-only snapshot carries neither field, an
+       Ollama selection round-trips, and a malformed backend rejects. */
+    {
+        char *absent=NULL; size_t absent_size=0;
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&absent,&absent_size));
+        CHECK(strstr(absent,"\"backend\"")==NULL);
+        CHECK(strstr(absent,"\"ollama_model\"")==NULL);
+        free(absent);
+    }
+    chat->backend=CHAT_BACKEND_OLLAMA;
+    wcscpy(chat->ollama_model,L"llama3.2:latest");
+    m->generation.backend=CHAT_BACKEND_OLLAMA;
+    CHECK(storage_save(&store,chat));
+    CHECK(storage_load(&store,loaded)==1);
+    CHECK(loaded->backend==CHAT_BACKEND_OLLAMA);
+    CHECK(!wcscmp(loaded->ollama_model,L"llama3.2:latest"));
+    CHECK(loaded->conversations[0].messages[1].generation.backend==CHAT_BACKEND_OLLAMA);
+    {
+        char *selected=NULL; size_t selected_size=0;
+        CHECK(read_file_bytes(store.path,&selected,&selected_size));
+        CHECK(strstr(selected,"\"backend\":1")!=NULL);
+        CHECK(strstr(selected,"\"ollama_model\":\"llama3.2:latest\"")!=NULL);
+        free(selected);
+    }
+    /* Old-snapshot defaults and present-but-malformed rejection. */
+    {
+        Chat *dest=calloc(1,sizeof *dest); CHECK(dest);
+        CHECK(load_backend_case("\"backend\":1,\"ollama_model\":\"local/m\"",dest)==1);
+        CHECK(dest->backend==CHAT_BACKEND_OLLAMA &&
+            !wcscmp(dest->ollama_model,L"local/m"));
+        CHECK(load_backend_case(NULL,dest)==1);
+        CHECK(dest->backend==CHAT_BACKEND_OPENROUTER && !dest->ollama_model[0]);
+        static const char *const malformed[]={
+            "\"backend\":2","\"backend\":-1","\"backend\":1.5",
+            "\"backend\":\"ollama\"",
+            "\"ollama_model\":42",                 /* present, wrong JSON type */
+            "\"backend\":1",                       /* Ollama with no local model */
+            "\"backend\":1,\"ollama_model\":\"\""   /* Ollama with an empty local model */
+        };
+        for (size_t i=0;i<sizeof malformed/sizeof malformed[0];i++) {
+            CHECK(load_backend_case(malformed[i],dest)==-1);
+            CHECK(load_backend_case(NULL,dest)==1);   /* store stays loadable */
+        }
+        chat_dispose(dest); free(dest);
+    }
+    /* Backend-tagged history round-trips: one backend's recent models never
+       migrate to another backend's tag on load. */
+    wcsncpy(chat->model_history[0],L"openrouter/history",CHAT_MODEL_TEXT-1);
+    chat->model_history_backend[0]=CHAT_BACKEND_OPENROUTER;
+    wcsncpy(chat->model_history[1],L"local/history",CHAT_MODEL_TEXT-1);
+    chat->model_history_backend[1]=CHAT_BACKEND_OLLAMA;
+    chat->model_history_count=2;
+    CHECK(storage_save(&store,chat));
+    CHECK(storage_load(&store,loaded)==1);
+    CHECK(loaded->model_history_count==2);
+    CHECK(!wcscmp(loaded->model_history[0],L"openrouter/history") &&
+        loaded->model_history_backend[0]==CHAT_BACKEND_OPENROUTER);
+    CHECK(!wcscmp(loaded->model_history[1],L"local/history") &&
+        loaded->model_history_backend[1]==CHAT_BACKEND_OLLAMA);
+    {
+        char *tags=NULL; size_t tags_size=0;
+        CHECK(read_file_bytes(store.path,&tags,&tags_size));
+        CHECK(strstr(tags,"\"model\":\"local/history\",\"backend\":1")!=NULL);
+        CHECK(strstr(tags,"\"model\":\"openrouter/history\",\"backend\"")==NULL);
+        free(tags);
+    }
+    chat->model_history_count=0;
+    chat->backend=CHAT_BACKEND_OPENROUTER;
+    chat->ollama_model[0]=0;
+    m->generation.backend=CHAT_BACKEND_OPENROUTER;
     wchar_t *large_reasoning=(wchar_t *)malloc(70001*sizeof(wchar_t));
     CHECK(large_reasoning);
     for (int i=0;i<70000;i++) large_reasoning[i]=L'r';

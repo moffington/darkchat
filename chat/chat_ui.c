@@ -194,7 +194,7 @@ bool chat_ui_init(ChatUi *chat_ui, Ui *ui, Chat *chat) {
     fill_width(chat_ui, chat_ui->bottom_spacer);
     height(chat_ui, chat_ui->bottom_spacer, 0);
     ui_set_hidden(ui, chat_ui->bottom_spacer, true);
-    label(chat_ui, sidebar, L"Replies need OPENROUTER_API_KEY", UI_SMALL,
+    label(chat_ui, sidebar, L"OpenRouter needs OPENROUTER_API_KEY", UI_SMALL,
         UI_FAINT);
 
     UiId main = add(chat_ui, body, UI_COLUMN, L"");

@@ -4,34 +4,41 @@
 #include <process.h>
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
-/* Client seam: chat.bat test links this suite with -Wl,--wrap=openrouter_request,
-   so every request the host starts passes through __wrap_openrouter_request.
+/* Client seam: chat.bat test links this suite with -Wl,--wrap=completion_request,
+   so every request the host starts passes through __wrap_completion_request.
    That shows exactly which context (if any) would reach the network client
    without touching the network: the wrapper records the messages the host was
    about to send, and can fake a started generation so a real successful send
    with omitted history is driven end to end. */
-static int openrouter_request_calls;
-static int openrouter_request_last_count;
-static ChatRole openrouter_request_last_roles[CHAT_CONTEXT_MAX_ENTRIES];
-static const wchar_t *openrouter_request_last_texts[CHAT_CONTEXT_MAX_ENTRIES];
-static int openrouter_request_fake_generation;   /* 0: delegate to the real client */
-static ChatProviderRouting openrouter_request_last_routing;
-int __real_openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
-    const wchar_t *model, const OpenRouterMessage *messages, int count,
+static int completion_request_calls;
+static int completion_request_last_count;
+static ChatRole completion_request_last_roles[CHAT_CONTEXT_MAX_ENTRIES];
+static const wchar_t *completion_request_last_texts[CHAT_CONTEXT_MAX_ENTRIES];
+static int completion_request_fake_generation;   /* 0: delegate to the real client */
+static ChatProviderRouting completion_request_last_routing;
+static ChatBackend completion_request_last_backend;
+static bool completion_request_last_had_routing;
+int __real_completion_request(CompletionClient *client, ChatBackend backend,
+    const char *api_key_utf8, const wchar_t *model,
+    const CompletionMessage *messages, int count,
     const ChatProviderRouting *routing);
-int __wrap_openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
-    const wchar_t *model, const OpenRouterMessage *messages, int count,
+int __wrap_completion_request(CompletionClient *client, ChatBackend backend,
+    const char *api_key_utf8, const wchar_t *model,
+    const CompletionMessage *messages, int count,
     const ChatProviderRouting *routing) {
-    ++openrouter_request_calls;
-    openrouter_request_last_count=count;
+    ++completion_request_calls;
+    completion_request_last_count=count;
+    completion_request_last_backend=backend;
     for (int i=0;i<count && i<CHAT_CONTEXT_MAX_ENTRIES;i++) {
-        openrouter_request_last_roles[i]=messages[i].role;
-        openrouter_request_last_texts[i]=messages[i].text;
+        completion_request_last_roles[i]=messages[i].role;
+        completion_request_last_texts[i]=messages[i].text;
     }
-    if (routing) openrouter_request_last_routing=*routing;
-    else chat_provider_routing_init(&openrouter_request_last_routing);
-    if (openrouter_request_fake_generation) return openrouter_request_fake_generation;
-    return __real_openrouter_request(client,api_key_utf8,model,messages,count,routing);
+    completion_request_last_had_routing=routing!=NULL;
+    if (routing) completion_request_last_routing=*routing;
+    else chat_provider_routing_init(&completion_request_last_routing);
+    if (completion_request_fake_generation) return completion_request_fake_generation;
+    return __real_completion_request(client,backend,api_key_utf8,model,messages,
+        count,routing);
 }
 /* Catalog seams (linked with -Wl,--wrap=model_catalog_request and
    -Wl,--wrap=model_picker_pump): the fetch is counted but never starts a
@@ -45,17 +52,24 @@ static unsigned __stdcall catalog_fake_worker(void *parameter) {
     (void)parameter;
     return 0;
 }
-int __real_model_catalog_request(ModelCatalogClient *client, const char *api_key_utf8);
-int __wrap_model_catalog_request(ModelCatalogClient *client, const char *api_key_utf8) {
-    if (!api_key_utf8 || !api_key_utf8[0]) return 0;
+int __real_model_catalog_request(ModelCatalogClient *client, ChatBackend backend,
+    const char *api_key_utf8);
+int __wrap_model_catalog_request(ModelCatalogClient *client, ChatBackend backend,
+    const char *api_key_utf8) {
+    if (backend == CHAT_BACKEND_OPENROUTER &&
+        (!api_key_utf8 || !api_key_utf8[0])) return 0;
     ++catalog_request_calls;
+    int generation=++catalog_request_generation;
     if (catalog_request_lost_worker) {
         uintptr_t thread=_beginthreadex(NULL,0,catalog_fake_worker,NULL,0,NULL);
         if (!thread) return 0;
         WaitForSingleObject((HANDLE)thread,INFINITE);
         client->thread=(HANDLE)thread;
     }
-    return ++catalog_request_generation;
+    /* Mirror the real request's generation bookkeeping so a completion can
+       join the (possibly parked) worker. */
+    client->generation=generation;
+    return generation;
 }
 /* Focused allocation-failure seams for the picker's transactional refresh;
    disarmed (-1) they forward to the CRT. */
@@ -119,8 +133,8 @@ static void arm_save_pause(void) {
     ResetEvent(save_resume_event);
     pause_next_save=1;
 }
-static OpenRouterEvent *fixture(ChatHost *h,OpenRouterEventType type,const wchar_t *text) {
-    OpenRouterEvent *e=calloc(1,sizeof *e);
+static CompletionEvent *fixture(ChatHost *h,CompletionEventType type,const wchar_t *text) {
+    CompletionEvent *e=calloc(1,sizeof *e);
     e->generation=h->request_generation; e->type=type;
     e->metadata=pending(h)->generation;
     if (text) { size_t size=(wcslen(text)+1)*sizeof(wchar_t); e->text=malloc(size); memcpy(e->text,text,size); }
@@ -140,6 +154,13 @@ static void begin_mode(ChatHost *h,ChatSendMode mode) {
 }
 static void begin_fixture(ChatHost *h) { begin_mode(h,CHAT_RETRY); }
 static void begin_regenerate(ChatHost *h) { begin_mode(h,CHAT_REGENERATE); }
+/* A parked worker lets the catalog hand-off test model a fetch that is still
+   in flight without driving the real transport. */
+static HANDLE parked_release;
+static unsigned __stdcall parked_worker(void *parameter) {
+    WaitForSingleObject((HANDLE)parameter, INFINITE);
+    return 0;
+}
 /* Reads a turn's rendered controls back to prove per-turn ownership. */
 static void head_text(ChatHost *h,int i,wchar_t *out,size_t cap) {
     out[0]=0;
@@ -327,7 +348,7 @@ static int default_suite(void) {
     CHECK(!h->generating);
     /* The seam is live: the missing-key send above did reach the client (which
        refused it), so "the client was never called" below means something. */
-    CHECK(openrouter_request_calls==1);
+    CHECK(completion_request_calls==1);
     /* An oversized indispensable context must fail explicitly instead of being
        truncated: here the system prompt and the message each fit the budget
        alone, but not together. The pending turn stays retryable, neither the
@@ -336,7 +357,7 @@ static int default_suite(void) {
     {
         wchar_t *wide=(wchar_t *)malloc(16384*sizeof *wide);
         CHECK(wide);
-        int calls=openrouter_request_calls;
+        int calls=completion_request_calls;
         for (int i=0;i<16383;i++) wide[i]=0x2014;   /* three encoded bytes each */
         wide[16383]=0;
         wcscpy(chat->system_prompt,wide);
@@ -346,7 +367,7 @@ static int default_suite(void) {
         CHECK(c->message_count==4);
         CHECK(c->messages[3].generation.state==CHAT_GENERATION_FAILED);
         CHECK(!h->generating && h->request_generation==0 && h->context_dropped==0);
-        CHECK(openrouter_request_calls==calls);           /* nothing was sent */
+        CHECK(completion_request_calls==calls);           /* nothing was sent */
         CHECK(wcsstr(c->messages[3].generation.error,L"too large together")!=NULL);
         CHECK(wcsstr(c->messages[3].generation.error,L"65536")!=NULL);
         CHECK(wcslen(chat_message_text(&c->messages[2]))==16383);  /* never truncated */
@@ -362,7 +383,7 @@ static int default_suite(void) {
         CHECK(c->messages[3].generation.state==CHAT_GENERATION_FAILED);
         CHECK(wcsstr(c->messages[3].generation.error,L"too large together")!=NULL);
         CHECK(!h->generating && h->request_generation==0);
-        CHECK(openrouter_request_calls==calls);
+        CHECK(completion_request_calls==calls);
         /* Restore the state the following checks expect. */
         for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
         c->message_count=2;
@@ -390,27 +411,27 @@ static int default_suite(void) {
         chat_append(chat,CHAT_ROLE_USER,L"middle question");               /* 4 kept */
         int middle=chat_append(chat,CHAT_ROLE_ASSISTANT,L"middle answer"); /* 5 kept */
         c->messages[middle].generation.state=CHAT_GENERATION_COMPLETE;
-        int calls=openrouter_request_calls;
+        int calls=completion_request_calls;
         rich_text_set_text(&h->composer,L"final question");
-        openrouter_request_fake_generation=4242;
+        completion_request_fake_generation=4242;
         perform_send(h);
-        openrouter_request_fake_generation=0;
-        CHECK(openrouter_request_calls==calls+1);          /* exactly one send */
+        completion_request_fake_generation=0;
+        CHECK(completion_request_calls==calls+1);          /* exactly one send */
         CHECK(h->generating && h->request_generation==4242);
         /* What the client was handed: the system prompt, the newest eligible
            history that fits, and the trigger -- never the dropped text. */
-        CHECK(openrouter_request_last_count==4);
-        CHECK(openrouter_request_last_roles[0]==CHAT_ROLE_SYSTEM &&
-              !wcscmp(openrouter_request_last_texts[0],L"Be brief."));
-        CHECK(openrouter_request_last_roles[1]==CHAT_ROLE_USER &&
-              !wcscmp(openrouter_request_last_texts[1],L"middle question"));
-        CHECK(openrouter_request_last_roles[2]==CHAT_ROLE_ASSISTANT &&
-              !wcscmp(openrouter_request_last_texts[2],L"middle answer"));
-        CHECK(openrouter_request_last_roles[3]==CHAT_ROLE_USER &&
-              !wcscmp(openrouter_request_last_texts[3],L"final question"));
+        CHECK(completion_request_last_count==4);
+        CHECK(completion_request_last_roles[0]==CHAT_ROLE_SYSTEM &&
+              !wcscmp(completion_request_last_texts[0],L"Be brief."));
+        CHECK(completion_request_last_roles[1]==CHAT_ROLE_USER &&
+              !wcscmp(completion_request_last_texts[1],L"middle question"));
+        CHECK(completion_request_last_roles[2]==CHAT_ROLE_ASSISTANT &&
+              !wcscmp(completion_request_last_texts[2],L"middle answer"));
+        CHECK(completion_request_last_roles[3]==CHAT_ROLE_USER &&
+              !wcscmp(completion_request_last_texts[3],L"final question"));
         int sent_huge=0;
-        for (int i=0;i<openrouter_request_last_count;i++)
-            if (openrouter_request_last_texts[i]==chat_message_text(&c->messages[old]))
+        for (int i=0;i<completion_request_last_count;i++)
+            if (completion_request_last_texts[i]==chat_message_text(&c->messages[old]))
                 sent_huge=1;
         CHECK(!sent_huge);                                 /* the huge message stayed home */
         CHECK(h->context_dropped==3);                      /* "Question", "old question", huge */
@@ -420,8 +441,8 @@ static int default_suite(void) {
         CHECK(wcsstr(chat->status,L"elapsed")!=NULL &&
               wcsstr(chat->status,L"3 older messages omitted")!=NULL);
         /* Finish the faked request through the real event path. */
-        handle_event(h,fixture(h,OPENROUTER_DELTA,L"streamed answer"));
-        handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+        handle_event(h,fixture(h,COMPLETION_DELTA,L"streamed answer"));
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
         c=&chat->conversations[0];
         CHECK(!h->generating && !h->context_dropped);
         CHECK(c->message_count==8 && c->messages[6].role==CHAT_ROLE_USER);
@@ -439,7 +460,7 @@ static int default_suite(void) {
     }
     /* ---- Provider routing: menu action -> persisted setting -> request ---- */
     {
-        int calls=openrouter_request_calls;
+        int calls=completion_request_calls;
         action(h,ACTION_ROUTING_SORT_LATENCY);
         action(h,ACTION_ROUTING_ALLOW_FALLBACKS);   /* toggles fallbacks off */
         action(h,ACTION_ROUTING_DATA_COLLECTION);   /* toggles data collection to deny */
@@ -450,16 +471,16 @@ static int default_suite(void) {
         CHECK(chat->provider_routing.zdr);
         /* The next request carries exactly this routing, captured at the seam. */
         rich_text_set_text(&h->composer,L"routed question");
-        openrouter_request_fake_generation=7373;
+        completion_request_fake_generation=7373;
         perform_send(h);
-        openrouter_request_fake_generation=0;
-        CHECK(openrouter_request_calls==calls+1);
+        completion_request_fake_generation=0;
+        CHECK(completion_request_calls==calls+1);
         CHECK(h->generating && h->request_generation==7373);
-        CHECK(openrouter_request_last_routing.sort==CHAT_PROVIDER_SORT_LATENCY &&
-            openrouter_request_last_routing.disallow_fallbacks &&
-            openrouter_request_last_routing.data_collection==CHAT_DATA_COLLECTION_DENY &&
-            openrouter_request_last_routing.zdr);
-        handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+        CHECK(completion_request_last_routing.sort==CHAT_PROVIDER_SORT_LATENCY &&
+            completion_request_last_routing.disallow_fallbacks &&
+            completion_request_last_routing.data_collection==CHAT_DATA_COLLECTION_DENY &&
+            completion_request_last_routing.zdr);
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
         /* Restore OpenRouter defaults so the rest of the suite is unaffected. */
         action(h,ACTION_ROUTING_SORT_DEFAULT);
         action(h,ACTION_ROUTING_ALLOW_FALLBACKS);
@@ -480,28 +501,28 @@ static int default_suite(void) {
         render_transcript(h);
     }
     begin_fixture(h); CHECK(h->request_message==1);
-    OpenRouterEvent *e=fixture(h,OPENROUTER_DELTA,L"Partial answer");
+    CompletionEvent *e=fixture(h,COMPLETION_DELTA,L"Partial answer");
     e->metadata.ttft_ms=12; e->metadata.first_token_at=chat_now();
     handle_event(h,e); CHECK(!wcscmp(pending(h)->text,L"Partial answer"));
     mark_dirty(h); CHECK(save_sync(h));   /* durable before the stale event lands */
-    e=fixture(h,OPENROUTER_DELTA,L"STALE"); --e->generation; handle_event(h,e);
+    e=fixture(h,COMPLETION_DELTA,L"STALE"); --e->generation; handle_event(h,e);
     CHECK(!wcscmp(pending(h)->text,L"Partial answer"));
     command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
     CHECK(chat->active==1 && chat->conversations[1].message_count==0);
-    handle_event(h,fixture(h,OPENROUTER_ERROR,L"Provider failed"));
+    handle_event(h,fixture(h,COMPLETION_ERROR,L"Provider failed"));
     CHECK(chat->conversations[0].messages[1].generation.state==CHAT_GENERATION_FAILED);
     CHECK(!wcscmp(chat->conversations[0].messages[1].text,L"Partial answer"));
     CHECK(chat->conversations[1].message_count==0);
     command(h,CHAT_COMMAND_SELECT,0);
     begin_fixture(h);
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"New response"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"New response"));
     h->stopping=true; h->accepting=false; h->stop_state=CHAT_GENERATION_CANCELLED;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"late chunk"));
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"late chunk"));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_CANCELLED);
     CHECK(!wcscmp(pending(h)->text,L"New response"));
     CHECK(chat->conversations[0].message_count==2);
-    begin_fixture(h); handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    begin_fixture(h); handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED); /* empty completion */
     /* ---- Per-turn reasoning ownership ---- */
     command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
@@ -547,11 +568,11 @@ static int default_suite(void) {
     click_row(h,second);
     CHECK(h->transcript.records[second].reason_live &&
         chat->conversations[cv].messages[second].reasoning_open);
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L"stream rea"));
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L"soning"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L"stream rea"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L"soning"));
     reasoning_text(h,second,text,128);
     CHECK(!wcscmp(text,L"stream reasoning"));
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"Streamed answer"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"Streamed answer"));
     CHECK(h->transcript.records[second].reason_live &&
         chat->conversations[cv].messages[second].reasoning_open);
     CHECK(pending(h)->generation.reasoning_ms>=0);
@@ -560,7 +581,7 @@ static int default_suite(void) {
     { wchar_t body[256]; body_text(h,second,body,256);
       CHECK(!wcscmp(body,L"Streamed answer")); }
     CHECK(!h->transcript.records[second].meta_live);
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
     CHECK(h->transcript.records[second].meta_live);
     { wchar_t meta[256]; meta_text(h,second,meta,256);
@@ -577,9 +598,9 @@ static int default_suite(void) {
        begins rather than left empty. */
     begin_regenerate(h);
     CHECK(row_present(h,second));
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"Only answer"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"Only answer"));
     CHECK(!row_present(h,second));
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
     /* Retry/regenerate replaces the turn and cannot leak reasoning or its
        expansion state. */
@@ -592,15 +613,15 @@ static int default_suite(void) {
     CHECK(chat->conversations[cv].messages[second].reasoning[0]==0);
     CHECK(!chat->conversations[cv].messages[second].reasoning_open);
     CHECK(!h->transcript.records[second].reason_live);
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED);
     /* Cancellation/error keeps that turn coherent: reasoning retained, row and
        expansion intact. */
     begin_regenerate(h);
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L"kept"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L"kept"));
     click_row(h,second);
     CHECK(h->transcript.records[second].reason_live);
-    handle_event(h,fixture(h,OPENROUTER_ERROR,L"boom"));
+    handle_event(h,fixture(h,COMPLETION_ERROR,L"boom"));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED);
     CHECK(!wcscmp(chat->conversations[cv].messages[second].reasoning,L"kept"));
     CHECK(row_present(h,second) &&
@@ -625,11 +646,11 @@ static int default_suite(void) {
     CHECK(long_text);
     for (int i=0;i<40000;i++) long_text[i]=L'z';
     long_text[40000]=0;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,long_text));
+    handle_event(h,fixture(h,COMPLETION_DELTA,long_text));
     free(long_text);
     CHECK(h->accepting && pending(h)->generation.state==CHAT_GENERATION_RUNNING);
     CHECK(wcslen(chat_message_text(pending(h)))==40000);
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
     /* Native composer text uses CRLF. The transcript must treat that pair as
        one break instead of rendering CR and LF as separate paragraphs. */
@@ -647,12 +668,12 @@ static int default_suite(void) {
     CHECK(long_reasoning);
     for (int i=0;i<70000;i++) long_reasoning[i]=L'r';
     long_reasoning[70000]=0;
-    handle_event(h,fixture(h,OPENROUTER_REASONING,long_reasoning));
+    handle_event(h,fixture(h,COMPLETION_REASONING,long_reasoning));
     free(long_reasoning);
     CHECK(h->accepting &&
         wcslen(chat_message_reasoning(pending(h)))==70000);
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"Answer after long reasoning"));
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"Answer after long reasoning"));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
     /* Composer text comes back as CRLF; rendering must not count CR and LF as
        separate paragraph breaks. */
@@ -666,15 +687,15 @@ static int default_suite(void) {
        layouts, follows only at the bottom, and never scrolls inside a body. */
     begin_regenerate(h);
     click_row(h,second);
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L"Working through it"));
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"Answer"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L"Working through it"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"Answer"));
     { TranscriptRecord *turn=&h->transcript.records[second];
       int head_height=turn->head_h;
       int reason_y=turn->reason_y;
       position_turns(h,true);
       for (int i=0;i<80;i++) {
           int height=turn->body_h, scroll=h->transcript.view_scroll;
-          handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nAnother line of the streamed answer."));
+          handle_event(h,fixture(h,COMPLETION_DELTA,L"\nAnother line of the streamed answer."));
           CHECK(turn->head_h==head_height && turn->reason_y==reason_y);
           CHECK(turn->body_h>=height && turn->body_h-height<px(h,40));
           CHECK(h->transcript.view_scroll>=scroll && transcript_pinned(&h->transcript));
@@ -687,17 +708,17 @@ static int default_suite(void) {
          step and the transcript still follows at the bottom. */
       int before_flush=turn->body_h;
       h->transcript.body_render_tick=0;
-      handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nFlushed rebuild."));
+      handle_event(h,fixture(h,COMPLETION_DELTA,L"\nFlushed rebuild."));
       CHECK(turn->body_h>before_flush && transcript_pinned(&h->transcript));
        transcript_note_user_scroll(&h->transcript,px(h,30)); position_turns(h,false);
        CHECK(!transcript_pinned(&h->transcript));
       int scroll=h->transcript.view_scroll;
       for (int i=0;i<8;i++) {
-          handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nMore text while reading above."));
+          handle_event(h,fixture(h,COMPLETION_DELTA,L"\nMore text while reading above."));
           CHECK(h->transcript.view_scroll==scroll);
       }
     }
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     /* A viewport the reader scrolled up is not force-followed on append. */
     { RichTextControl probe;
       CHECK(rich_text_create_viewport(&probe,window,900,&h->rich_theme,96));
@@ -732,19 +753,19 @@ static int default_suite(void) {
     add_turn(chat,L"seed",L"seed answer",NULL,-1);
     begin_regenerate(h);
     int stream_turn=h->request_message;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"# Tit"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"# Tit"));
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
       CHECK(!wcscmp(body,L"Tit")); }
     h->transcript.body_render_tick=GetTickCount64();
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"le **bo"));
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"ld** an"));
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"d `co"));
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"de` an"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"le **bo"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"ld** an"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"d `co"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"de` an"));
     CHECK(GetTickCount64()-h->transcript.body_render_tick<CHAT_BODY_RENDER_MS);
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
       CHECK(!wcscmp(body,L"Tit")); }
     Sleep(CHAT_BODY_RENDER_MS+20);
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"d\nnext **ope"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"d\nnext **ope"));
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
       CHECK(!wcscmp(body,L"Title bold and code and\r\nnext **ope"));
       CHARFORMAT2W f;
@@ -768,13 +789,13 @@ static int default_suite(void) {
         L"# Title **bold** and `code` and\nnext **ope"));
     SendMessageW(body_window(h,stream_turn),EM_SETSEL,(WPARAM)-1,(LPARAM)-1);
     h->transcript.body_render_tick=0;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"n** ~~old and ``variable"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"n** ~~old and ``variable"));
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
       CHECK(!wcscmp(body,L"Title bold and code and\r\nnext open ~~old and ``variable")); }
     CHECK(!wcscmp(pending(h)->text,
         L"# Title **bold** and `code` and\nnext **open** ~~old and ``variable"));
     h->transcript.body_render_tick=0;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,
+    handle_event(h,fixture(h,COMPLETION_DELTA,
         L"``~~\n~~~~\n~~fenced~~\n- [x] task\n~~~"));
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
       CHECK(!wcscmp(body,L"Title bold and code and\r\nnext open old and variable\r\n~~fenced~~\r\n- [x] task\r\n~~~"));
@@ -790,8 +811,8 @@ static int default_suite(void) {
     CHECK(!wcscmp(pending(h)->text,
         L"# Title **bold** and `code` and\nnext **open** ~~old and ``variable``~~\n~~~~\n~~fenced~~\n- [x] task\n~~~"));
     SendMessageW(body_window(h,stream_turn),EM_SETSEL,(WPARAM)-1,(LPARAM)-1);
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"\n~~~~\nafter"));
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"\n~~~~\nafter"));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
       CHECK(!wcscmp(body,L"Title bold and code and\r\nnext open old and variable\r\n~~fenced~~\r\n- [x] task\r\n~~~\r\nafter"));
@@ -819,18 +840,18 @@ static int default_suite(void) {
     begin_regenerate(h);
     int nested_turn=h->request_message;
     h->transcript.body_render_tick=0;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"> -"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"> -"));
     { wchar_t body[256]; body_text(h,nested_turn,body,256);
       CHECK(!wcscmp(body,L"\u258C -")); }        /* marker without content */
     h->transcript.body_render_tick=0;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L" item"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L" item"));
     { wchar_t body[256]; body_text(h,nested_turn,body,256);
       CHECK(!wcscmp(body,L"\u258C \u2022 item")); }
     h->transcript.body_render_tick=0;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"\n>   - nested"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"\n>   - nested"));
     { wchar_t body[256]; body_text(h,nested_turn,body,256);
       CHECK(!wcscmp(body,L"\u258C \u2022 item\r\n\u258C \u2022 nested")); }
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     { wchar_t body[256]; body_text(h,nested_turn,body,256);
       CHECK(!wcscmp(body,L"\u258C \u2022 item\r\n\u258C \u2022 nested"));
       HWND window=body_window(h,nested_turn);
@@ -850,12 +871,12 @@ static int default_suite(void) {
     add_turn(chat,L"seed",L"seed answer",NULL,-1);
     begin_regenerate(h);
     int link_turn=h->request_message;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"[site](https://exa"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"[site](https://exa"));
     { wchar_t body[128]; body_text(h,link_turn,body,128);
       CHECK(!wcscmp(body,L"[site](https://exa")); }  /* incomplete: literal */
     h->transcript.body_render_tick=0;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"mple.com) tail"));
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"mple.com) tail"));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     { wchar_t body[128]; body_text(h,link_turn,body,128);
       CHECK(!wcscmp(body,L"site tail")); }
     { RichTextControl *body=transcript_surface(&h->transcript,link_turn,
@@ -873,18 +894,18 @@ static int default_suite(void) {
     begin_regenerate(h);
     int table_stream_turn=h->request_message;
     h->transcript.body_render_tick=0;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"| a | b |\n"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"| a | b |\n"));
     { wchar_t body[256]; body_text(h,table_stream_turn,body,256);
       CHECK(wcsstr(body,L"| a | b |")!=NULL); }   /* header alone: literal */
     h->transcript.body_render_tick=0;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"| --- | --- |\n"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"| --- | --- |\n"));
     { wchar_t body[256]; body_text(h,table_stream_turn,body,256);
       CHECK(wcsstr(body,L"|")==NULL && wcsstr(body,L"\t")!=NULL); }
     h->transcript.body_render_tick=0;
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"| c | d |"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"| c | d |"));
     { wchar_t body[256]; body_text(h,table_stream_turn,body,256);
       CHECK(!wcscmp(body,L"a\tb\r\nc\td")); }
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
     { wchar_t body[256]; body_text(h,table_stream_turn,body,256);
       CHECK(!wcscmp(body,L"a\tb\r\nc\td"));
@@ -945,7 +966,7 @@ static int default_suite(void) {
       SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
       CHECK(sel.cpMin==2 && sel.cpMax==6);
       begin_regenerate(h);
-      handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+      handle_event(h,fixture(h,COMPLETION_DONE,NULL));
       CHECK(!h->generating);
       SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
       CHECK(sel.cpMin==2 && sel.cpMax==6);
@@ -985,20 +1006,20 @@ static int default_suite(void) {
       CHECK(!turn->body_pending && !turn->head_pending);
       wchar_t kept[128]; body_text(h,first,kept,128);
       CHECK(wcsstr(kept,L"First answer")!=NULL);
-      handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+      handle_event(h,fixture(h,COMPLETION_DONE,NULL));
       SendMessageW(body,EM_SETSEL,0,0); }
     /* Streaming: a selection inside the live answer defers the throttled
        Markdown rebuild; clearing the selection applies the deferred render and
        relayouts from the affected turn, so geometry, the scrollbar range and
        bottom-following stay correct even with no further stream event. */
     begin_regenerate(h);
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"**raw *stream"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"**raw *stream"));
     { HWND body=body_window(h,second);
       TranscriptRecord *turn=&h->transcript.records[second];
       CHECK(body);
       SendMessageW(body,EM_SETSEL,3,7);
       h->transcript.body_render_tick=0;   /* force the throttled rebuild */
-      handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nmore"));
+      handle_event(h,fixture(h,COMPLETION_DELTA,L"\nmore"));
       CHARRANGE sel; memset(&sel,0,sizeof sel);
       SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
       CHECK(sel.cpMin==3 && sel.cpMax==7);   /* selection survived the flush */
@@ -1019,19 +1040,19 @@ static int default_suite(void) {
       CHECK(transcript_pinned(&h->transcript));
       body_text(h,second,shown,256);
       CHECK(wcsstr(shown,L"more")!=NULL); }
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     /* The same deferral persists through generation completion: the terminal
        Markdown render waits for the selection, and clearing afterwards still
        relayouts so the following metadata footer and scrollbar follow. */
     begin_regenerate(h);
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"**raw *stream"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"**raw *stream"));
     { HWND body=body_window(h,second);
       TranscriptRecord *turn=&h->transcript.records[second];
       CHECK(body);
       SendMessageW(body,EM_SETSEL,3,7);
       h->transcript.body_render_tick=0;
-      handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nmore"));
-      handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+      handle_event(h,fixture(h,COMPLETION_DELTA,L"\nmore"));
+      handle_event(h,fixture(h,COMPLETION_DONE,NULL));
       CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
       CHECK(h->transcript.records[second].meta_live);
       wchar_t shown[256]; body_text(h,second,shown,256);
@@ -1051,27 +1072,27 @@ static int default_suite(void) {
     begin_regenerate(h);
     click_row(h,second);
     CHECK(h->transcript.records[second].reason_live);
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L"alpha beta"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L"alpha beta"));
     { HWND vp=transcript_surface(&h->transcript,second,TRANSCRIPT_REASON)->window;
       CHECK(vp);
       SendMessageW(vp,EM_SETSEL,2,5);
-      handle_event(h,fixture(h,OPENROUTER_REASONING,L" gamma"));
+      handle_event(h,fixture(h,COMPLETION_REASONING,L" gamma"));
       CHARRANGE sel; memset(&sel,0,sizeof sel);
       SendMessageW(vp,EM_EXGETSEL,0,(LPARAM)&sel);
       CHECK(sel.cpMin==2 && sel.cpMax==5);
       wchar_t shown[128]; reasoning_text(h,second,shown,128);
       CHECK(!wcscmp(shown,L"alpha beta gamma")); }
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     /* ---- Scheduled streaming flush ---- */
     /* A burst inside the throttle window marks the body dirty and arms a
        one-shot flush; with no further delta, the accumulated text still
        reaches the body once the timer fires. */
     begin_regenerate(h);
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"first token"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"first token"));
     { wchar_t body[256]; body_text(h,second,body,256);
       CHECK(!wcscmp(body,L"first token")); }
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L" second"));
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L" part"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L" second"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L" part"));
     CHECK(h->body_flush_pending);
     { wchar_t body[256]; body_text(h,second,body,256);
       CHECK(wcsstr(body,L"second")==NULL); }        /* not rebuilt yet */
@@ -1080,13 +1101,13 @@ static int default_suite(void) {
     { wchar_t body[256]; body_text(h,second,body,256);
       CHECK(!wcscmp(body,L"first token second part")); }
     CHECK(transcript_pinned(&h->transcript));
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     /* Scheduling cannot strand dirty text: when no flush can be armed
        (SetTimer failure) the body renders at once and the pending flag clears
        so later deltas can arm again. */
     begin_regenerate(h);
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"first token"));
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L" second"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"first token"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L" second"));
     CHECK(h->body_flush_pending);
     { wchar_t body[256]; body_text(h,second,body,256);
       CHECK(wcsstr(body,L"second")==NULL); }
@@ -1096,17 +1117,17 @@ static int default_suite(void) {
     CHECK(!h->body_flush_pending);
     { wchar_t body[256]; body_text(h,second,body,256);
       CHECK(wcsstr(body,L"second")!=NULL); }      /* rendered immediately */
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     /* A scheduled flush must not destroy a selection in the live body: the
        rebuild is deferred, then applied and relaid out when the range clears. */
     begin_regenerate(h);
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"streamed so far"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"streamed so far"));
     { HWND body=body_window(h,second);
       TranscriptRecord *turn=&h->transcript.records[second];
       CHECK(body);
       SendMessageW(body,EM_SETSEL,3,7);
       int body_before=turn->body_h;
-      handle_event(h,fixture(h,OPENROUTER_DELTA,L"\nplus more"));
+      handle_event(h,fixture(h,COMPLETION_DELTA,L"\nplus more"));
       CHECK(h->body_flush_pending);
       pump_messages(500);                    /* let the scheduled flush fire */
       CHECK(!h->body_flush_pending);
@@ -1132,24 +1153,24 @@ static int default_suite(void) {
          text now in the control. */
       CHECK(turn->body_revision==
           chat->conversations[cv].messages[second].body_revision); }
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     /* A scheduled flush writes the body outside prepare_turn(), so the
        recorded revision must advance with it. Completion then refreshes only
        the footer, leaving a selection in the live body untouched. */
     begin_regenerate(h);
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"first token"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"first token"));
     { TranscriptRecord *turn=&h->transcript.records[second];
       ChatMessage *m=&chat->conversations[cv].messages[second];
       HWND body=body_window(h,second); CHECK(body);
       CHECK(turn->body_revision==m->body_revision);
-      handle_event(h,fixture(h,OPENROUTER_DELTA,L" second"));
-      handle_event(h,fixture(h,OPENROUTER_DELTA,L" part"));
+      handle_event(h,fixture(h,COMPLETION_DELTA,L" second"));
+      handle_event(h,fixture(h,COMPLETION_DELTA,L" part"));
       CHECK(h->body_flush_pending);
       CHECK(pump_until_body(h,second,L"first token second part",1000));
       CHECK(!h->body_flush_pending);
       CHECK(turn->body_revision==m->body_revision);
       SendMessageW(body,EM_SETSEL,1,4);
-      handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+      handle_event(h,fixture(h,COMPLETION_DONE,NULL));
       CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
       CHECK(!turn->body_pending);                  /* footer only */
       CHARRANGE sel; memset(&sel,0,sizeof sel);
@@ -1162,23 +1183,23 @@ static int default_suite(void) {
     begin_regenerate(h);
     click_row(h,second);
     CHECK(h->transcript.records[second].reason_live);
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L"first"));
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L" second"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L"first"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L" second"));
     { wchar_t shown[128]; reasoning_text(h,second,shown,128);
       CHECK(!wcscmp(shown,L"first second")); }
     click_row(h,second);                     /* collapse mid-stream */
     CHECK(!h->transcript.records[second].reason_live);
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L" hidden"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L" hidden"));
     click_row(h,second);                     /* reopen */
     CHECK(h->transcript.records[second].reason_live);
     { wchar_t shown[128]; reasoning_text(h,second,shown,128);
       CHECK(!wcscmp(shown,L"first second hidden")); }
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L" live"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L" live"));
     { wchar_t shown[128]; reasoning_text(h,second,shown,128);
       CHECK(!wcscmp(shown,L"first second hidden live")); }
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"answer after reasoning"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"answer after reasoning"));
     CHECK(h->transcript.records[second].reason_live);  /* answer start keeps it */
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     /* ---- Long transcript: bounded renders and reader state ---- */
     /* A maximum-length transcript must not realize additional controls when it
        is rendered again or when one turn streams, and streaming that turn must
@@ -1210,9 +1231,9 @@ static int default_suite(void) {
     begin_regenerate(h);
     int long_turn=h->request_message;
     CHECK(child_controls(h->view,false)==realized);  /* streaming adds none */
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"long"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"long"));
     for (int i=0;i<40;i++)
-        handle_event(h,fixture(h,OPENROUTER_DELTA,L" burst line"));
+        handle_event(h,fixture(h,COMPLETION_DELTA,L" burst line"));
     CHECK(h->body_flush_pending);
     CHECK(h->transcript.view_content>h->transcript.view_page);
      transcript_note_user_scroll(&h->transcript,0);
@@ -1225,9 +1246,9 @@ static int default_suite(void) {
     CHECK(!h->body_flush_pending);
     CHECK(h->transcript.view_scroll==scroll);        /* flush did not follow */
     CHECK(child_controls(h->view,false)==realized);
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L" tail"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L" tail"));
     CHECK(h->transcript.view_scroll==scroll);
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
     CHECK(h->transcript.view_scroll==scroll);        /* completion did not follow */
     /* The historical turn was neither rewritten nor deselected by the stream,
@@ -1596,23 +1617,23 @@ static int default_suite(void) {
     begin_regenerate(h);
     click_row(h,1);
     CHECK(h->transcript.records[1].reason_live);
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L"A live"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L"A live"));
     command(h,CHAT_COMMAND_SELECT,conv_b);
     CHECK(chat->active==conv_b);
     { wchar_t shown[128]; reasoning_text(h,1,shown,128);
       CHECK(!wcscmp(shown,L"B reasoning")); }
     /* A keeps streaming while hidden; the reply stays with its origin. */
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L" more"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L" more"));
     CHECK(!wcscmp(chat_message_reasoning(
         &chat->conversations[conv_a].messages[1]),L"A live more"));
     command(h,CHAT_COMMAND_SELECT,conv_a);
     CHECK(h->generating && h->request_conversation==conv_a);
     { wchar_t shown[128]; reasoning_text(h,1,shown,128);
       CHECK(!wcscmp(shown,L"A live more")); }
-    handle_event(h,fixture(h,OPENROUTER_REASONING,L" end"));
+    handle_event(h,fixture(h,COMPLETION_REASONING,L" end"));
     { wchar_t shown[128]; reasoning_text(h,1,shown,128);
       CHECK(!wcscmp(shown,L"A live more end")); }
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     /* A selection must never carry across conversations: switching while text
        is selected forces immediate replacement with the other conversation's
        own content. */
@@ -1740,10 +1761,10 @@ static int default_suite(void) {
         block=CreateFileW(h->storage.temporary,GENERIC_WRITE,0,NULL,
             OPEN_ALWAYS,0,NULL);
         CHECK(block!=INVALID_HANDLE_VALUE);
-        int calls=openrouter_request_calls;
+        int calls=completion_request_calls;
         rich_text_set_text(&h->composer,L"gate question");
         perform_send(h);
-        CHECK(openrouter_request_calls==calls);          /* request not sent */
+        CHECK(completion_request_calls==calls);          /* request not sent */
         CHECK(!h->generating);
         { ChatConversation *c=&chat->conversations[chat->active];
           CHECK(c->message_count>=2);
@@ -1920,7 +1941,7 @@ static int default_suite(void) {
     /* F1: retain-all never enters bounded realization or creates its measurer. */
     CHECK(!h->transcript.bounded && !h->transcript.measurer_valid);
     CHECK(h->transcript.render_epoch==0 && h->transcript.stat.fallback_rounds==0);
-    begin_fixture(h); handle_event(h,fixture(h,OPENROUTER_DELTA,L"Closing partial"));
+    begin_fixture(h); handle_event(h,fixture(h,COMPLETION_DELTA,L"Closing partial"));
     SendMessageW(window,WM_CLOSE,0,0);
     CHECK(!IsWindow(window) && !h->generating);
     Chat *loaded=calloc(1,sizeof *loaded); CHECK(loaded);
@@ -2039,6 +2060,12 @@ static const char *catalog_five_json =
     "{\"id\":\"meta-llama/llama-3\",\"name\":\"Llama 3\"},"
     "{\"id\":\"google/gemini-2\",\"name\":\"Gemini 2\"},"
     "{\"id\":\"mistral/mistral-large\",\"name\":\"Mistral Large\"}]}";
+/* Ollama's OpenAI-compatible /v1/models shape: an object list whose data
+   entries carry an id and no display name. */
+static const char *catalog_ollama_json =
+    "{\"object\":\"list\",\"data\":["
+    "{\"id\":\"llama3.2:latest\",\"object\":\"model\",\"owned_by\":\"library\"},"
+    "{\"id\":\"qwen2.5:7b\",\"object\":\"model\",\"owned_by\":\"library\"}]}";
 
 static int catalog_suite(void) {
     CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
@@ -2085,7 +2112,7 @@ static int catalog_suite(void) {
 
     /* Success replaces catalog state and clears loading. */
     catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_first_json,NULL));
-    CHECK(!h->catalog_loading && h->catalog_loaded && h->catalog.count==3);
+    CHECK(!h->catalog_loading && h->catalog_loaded[CHAT_BACKEND_OPENROUTER] && h->catalog[CHAT_BACKEND_OPENROUTER].count==3);
     CHECK(h->catalog_generation==0);
 
     /* A live picker gets the merged list; a refresh while open preserves the
@@ -2152,18 +2179,18 @@ static int catalog_suite(void) {
 
     /* A stale generation is ignored and cannot replace the catalog. */
     {
-        size_t before=h->catalog.count;
+        size_t before=h->catalog[CHAT_BACKEND_OPENROUTER].count;
         ModelCatalogEvent *stale=catalog_fixture(h,MODEL_CATALOG_OK,
             catalog_second_json,NULL);
         stale->generation=h->catalog_generation+77;
         catalog_event(h,stale);
-        CHECK(h->catalog.count==before);
+        CHECK(h->catalog[CHAT_BACKEND_OPENROUTER].count==before);
     }
 
     /* Without a catalog, a failed refresh keeps the history fallback, and a
        later open retries the fetch. */
-    chat_model_catalog_dispose(&h->catalog);
-    h->catalog_loaded=false; h->catalog_failed=false;
+    chat_model_catalog_dispose(&h->catalog[CHAT_BACKEND_OPENROUTER]);
+    h->catalog_loaded[CHAT_BACKEND_OPENROUTER]=false; h->catalog_failed[CHAT_BACKEND_OPENROUTER]=false;
     h->catalog_loading=false; h->catalog_generation=0;
     wcscpy(chat->model_history[0],L"history/model"); chat->model_history_count=1;
     CHECK(apply_model(h,L"typed/model"));
@@ -2171,7 +2198,7 @@ static int catalog_suite(void) {
     begin_model_picker(h);
     CHECK(catalog_request_calls==1 && h->open_picker);
     catalog_event(h,catalog_fixture(h,MODEL_CATALOG_NETWORK_ERROR,NULL,L"offline"));
-    CHECK(h->catalog_failed && !h->catalog_loading && h->catalog.count==0);
+    CHECK(h->catalog_failed[CHAT_BACKEND_OPENROUTER] && !h->catalog_loading && h->catalog[CHAT_BACKEND_OPENROUTER].count==0);
     CHECK(h->open_picker && model_picker_match_count(h->open_picker)>=2);
     CHECK(!wcscmp(model_picker_match_id(h->open_picker,0),L"typed/model"));
     model_picker_cancel(h->open_picker);
@@ -2186,8 +2213,8 @@ static int catalog_suite(void) {
        posted) must be reaped so the next open starts a fresh request, without
        any manual model_catalog_complete. The wrapper leaves an already-finished
        thread handle, exactly as that worker does. */
-    chat_model_catalog_dispose(&h->catalog);
-    h->catalog_loaded=false; h->catalog_failed=false;
+    chat_model_catalog_dispose(&h->catalog[CHAT_BACKEND_OPENROUTER]);
+    h->catalog_loaded[CHAT_BACKEND_OPENROUTER]=false; h->catalog_failed[CHAT_BACKEND_OPENROUTER]=false;
     h->catalog_loading=false; h->catalog_generation=0;
     catalog_request_lost_worker=true;
     catalog_request_calls=0;
@@ -2220,7 +2247,7 @@ static int catalog_suite(void) {
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
     ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
     transcript_dispose(&h->transcript); rich_text_library_close();
-    chat_model_catalog_dispose(&h->catalog); chat_model_catalog_dispose(&h->picker_source);
+    chat_model_catalog_dispose(&h->catalog[CHAT_BACKEND_OPENROUTER]); chat_model_catalog_dispose(&h->picker_source);
     chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
     return 0;
 }
@@ -2425,8 +2452,8 @@ static int bounded_suite(void) {
       block_fail_id=100+h->transcript.records[r4].slot*4+(int)TRANSCRIPT_BODY;
       DestroyWindow(body->window);
       CHECK(!body->window);   /* WM_NCDESTROY cleared the destroyed handle */ }
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L"first"));
-    handle_event(h,fixture(h,OPENROUTER_DELTA,L" second"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"first"));
+    handle_event(h,fixture(h,COMPLETION_DELTA,L" second"));
     CHECK(h->body_flush_pending);                /* armed by the missing body */
     CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_BODY)==NULL);
     CHECK(h->transcript.records[r4].blocked_resource);
@@ -2454,7 +2481,7 @@ static int bounded_suite(void) {
     block_fail_id=0;
     render_transcript(h);
     CHECK(transcript_surface(&h->transcript,r4,TRANSCRIPT_HEAD)!=NULL);
-    handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
     /* Metadata footer fails independently; body untouched. */
     { RichTextControl *meta=transcript_surface(&h->transcript,r4,TRANSCRIPT_META);
@@ -2764,11 +2791,11 @@ static int bounded_suite(void) {
         begin_regenerate(h);
         int stream_turn=h->request_message;
         CHECK(stream_turn>21);
-        handle_event(h,fixture(h,OPENROUTER_DELTA,L"streamed"));
+        handle_event(h,fixture(h,COMPLETION_DELTA,L"streamed"));
         for (int i=0;i<8;i++)
-            handle_event(h,fixture(h,OPENROUTER_DELTA,L" tail line"));
+            handle_event(h,fixture(h,COMPLETION_DELTA,L" tail line"));
         CHECK(!transcript_following(&h->transcript) && ANCHOR_HELD(h));
-        handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
         CHECK(!transcript_following(&h->transcript) && ANCHOR_HELD(h));
         /* Reasoning toggle on the anchor turn itself: the viewport inserts
             above the anchored body and the restore tracks the body down, so
@@ -2821,10 +2848,10 @@ static int bounded_suite(void) {
         transcript_position(&h->transcript,feed_arg(h),false);
         CHECK(transcript_following(&h->transcript));
         begin_regenerate(h);
-        handle_event(h,fixture(h,OPENROUTER_DELTA,L"resume"));
+        handle_event(h,fixture(h,COMPLETION_DELTA,L"resume"));
         CHECK(transcript_following(&h->transcript) &&
             transcript_pinned(&h->transcript));
-        handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
         CHECK(transcript_following(&h->transcript));
         /* Boundary: a position inside the top margin (above the first
             turn) is not the top anchor -- it is named with a negative
@@ -2964,7 +2991,7 @@ static int bounded_suite(void) {
             (the documented retry behavior), but the SWITCH back after
             leaving must not bless the dead position. */
         begin_regenerate(h);
-        handle_event(h,fixture(h,OPENROUTER_DONE,NULL));
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
         CHECK(chat->conversations[stale_conv].messages[stale_turn].id!=
             stale_id);
         command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);   /* saves dead anchor */
@@ -3586,6 +3613,274 @@ static int bounded_suite(void) {
     return 0;
 }
 
+/* ---- Backend selection / Ollama suite ------------------------------------ */
+
+static int backend_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Backend host",1100,720,720,480,"test-key",false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-backend-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Backend integration",WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+    catalog_request_calls=0; catalog_request_generation=0; picker_pump_calls=0;
+
+    /* Defaults: OpenRouter with the historical model as the active model. */
+    CHECK(chat->backend==CHAT_BACKEND_OPENROUTER);
+    CHECK(!wcscmp(chat_active_model(chat),chat->model));
+    CHECK(!wcscmp(chat_backend_name(CHAT_BACKEND_OPENROUTER),L"OpenRouter") &&
+        !wcscmp(chat_backend_name(CHAT_BACKEND_OLLAMA),L"Ollama"));
+
+    /* apply_model targets the active backend's remembered slot. During a
+       pending switch it writes the target slot without touching the active
+       one, and leaves the field alone until the switch commits. */
+    h->backend_target=CHAT_BACKEND_OPENROUTER;
+    CHECK(apply_model(h,L"openrouter/model"));
+    CHECK(!wcscmp(chat->model,L"openrouter/model") && !chat->ollama_model[0]);
+    h->backend_target=CHAT_BACKEND_OLLAMA; h->backend_switch_pending=true;
+    CHECK(apply_model(h,L"local/model:latest"));
+    CHECK(!wcscmp(chat->ollama_model,L"local/model:latest") &&
+        !wcscmp(chat->model,L"openrouter/model"));
+    h->backend_switch_pending=false; h->backend_target=chat->backend;
+
+    /* Generation metadata records the backend and the active model. */
+    add_turn(chat,L"hello",L"answer",NULL,-1);
+    render_transcript(h);
+    begin_regenerate(h);
+    CHECK(pending(h)->generation.backend==CHAT_BACKEND_OPENROUTER);
+    CHECK(!wcscmp(pending(h)->generation.requested_model,L"openrouter/model"));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+
+    /* A remembered Ollama model switches directly, and the next request is
+       dispatched to Ollama with no provider-routing object. */
+    select_backend(h,CHAT_BACKEND_OLLAMA);
+    CHECK(chat->backend==CHAT_BACKEND_OLLAMA);
+    CHECK(!wcscmp(chat_active_model(chat),L"local/model:latest"));
+    completion_request_fake_generation=5151; completion_request_calls=0;
+    start_response(h,CHAT_REGENERATE,NULL);
+    completion_request_fake_generation=0;
+    CHECK(completion_request_calls==1);
+    CHECK(completion_request_last_backend==CHAT_BACKEND_OLLAMA);
+    CHECK(!completion_request_last_had_routing);
+    CHECK(h->generating && h->request_generation==5151);
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+    CHECK(pending(h)->generation.backend==CHAT_BACKEND_OLLAMA);
+
+    /* Missing OPENROUTER_API_KEY never blocks Ollama, but still blocks
+       OpenRouter before any client call. */
+    h->config.api_key_utf8=NULL;
+    completion_request_fake_generation=6161; completion_request_calls=0;
+    start_response(h,CHAT_REGENERATE,NULL);
+    completion_request_fake_generation=0;
+    CHECK(completion_request_calls==1);
+    CHECK(completion_request_last_backend==CHAT_BACKEND_OLLAMA);
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+    select_backend(h,CHAT_BACKEND_OPENROUTER);
+    completion_request_calls=0;
+    start_response(h,CHAT_REGENERATE,NULL);
+    /* The client is consulted but refuses to start without a key. */
+    CHECK(completion_request_calls==1);
+    CHECK(!h->generating);
+    CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED);
+    CHECK(wcsstr(pending(h)->generation.error,L"OPENROUTER_API_KEY")!=NULL);
+    h->config.api_key_utf8="test-key";
+
+    /* Provider routing is clearly ignored while Ollama is active, and the
+       routing menu items are grayed. */
+    chat->backend=CHAT_BACKEND_OLLAMA;
+    chat->provider_routing.zdr=false;
+    action(h,ACTION_ROUTING_ZDR);
+    CHECK(!chat->provider_routing.zdr);
+    CHECK(wcsstr(chat->status,L"OpenRouter only")!=NULL);
+    {
+        HMENU menu=CreatePopupMenu();
+        AppendMenuW(menu,MF_STRING,ACTION_BACKEND_OPENROUTER,L"OpenRouter");
+        AppendMenuW(menu,MF_STRING,ACTION_BACKEND_OLLAMA,L"Ollama");
+        AppendMenuW(menu,MF_STRING,ACTION_ROUTING_ZDR,L"zdr");
+        chat_actions_sync_routing(menu,chat);
+        CHECK((GetMenuState(menu,ACTION_BACKEND_OLLAMA,MF_BYCOMMAND)&MF_CHECKED)!=0);
+        CHECK((GetMenuState(menu,ACTION_BACKEND_OPENROUTER,MF_BYCOMMAND)&MF_CHECKED)==0);
+        CHECK((GetMenuState(menu,ACTION_ROUTING_ZDR,MF_BYCOMMAND)&MF_GRAYED)!=0);
+        chat->backend=CHAT_BACKEND_OPENROUTER;
+        chat_actions_sync_routing(menu,chat);
+        CHECK((GetMenuState(menu,ACTION_BACKEND_OPENROUTER,MF_BYCOMMAND)&MF_CHECKED)!=0);
+        CHECK((GetMenuState(menu,ACTION_ROUTING_ZDR,MF_BYCOMMAND)&MF_GRAYED)==0);
+        DestroyMenu(menu);
+    }
+
+    /* Switching to Ollama with no remembered model opens the picker and does
+       not commit the switch; accepting commits and stores the selection. */
+    select_backend(h,CHAT_BACKEND_OPENROUTER);
+    chat->ollama_model[0]=0;
+    h->backend_target=chat->backend;
+    select_backend(h,CHAT_BACKEND_OLLAMA);
+    CHECK(chat->backend==CHAT_BACKEND_OPENROUTER);   /* pump did not accept */
+    CHECK(!h->backend_switch_pending);
+    /* Complete the catalogue fetch the cancelled switch started. */
+    catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_ollama_json,NULL));
+    h->backend_target=CHAT_BACKEND_OLLAMA; h->backend_switch_pending=true;
+    begin_model_picker(h);
+    CHECK(h->open_picker);
+    CHECK(!wcscmp(current_model(chat,CHAT_BACKEND_OLLAMA),L""));
+    model_picker_set_selected(h->open_picker,L"llama3.2:latest");
+    model_picker_accept(h->open_picker);
+    end_model_picker(h);
+    CHECK(chat->backend==CHAT_BACKEND_OLLAMA);
+    CHECK(!wcscmp(chat->ollama_model,L"llama3.2:latest"));
+    { wchar_t shown[CHAT_MODEL_TEXT]; rich_text_get_text(&h->field,shown,CHAT_MODEL_TEXT);
+      CHECK(!wcscmp(shown,L"llama3.2:latest")); }
+    /* Complete the accept's fetch so the client is not left busy. */
+    catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_ollama_json,NULL));
+
+    /* Separate last-good catalogs and status per backend. */
+    chat->backend=CHAT_BACKEND_OPENROUTER; h->backend_target=CHAT_BACKEND_OPENROUTER;
+    catalog_request_calls=0;
+    begin_model_picker(h);
+    CHECK(catalog_request_calls==1);
+    catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_first_json,NULL));
+    CHECK(h->catalog[CHAT_BACKEND_OPENROUTER].count==3 &&
+        h->catalog_loaded[CHAT_BACKEND_OPENROUTER]);
+    CHECK(h->open_picker &&
+        !wcscmp(model_picker_match_id(h->open_picker,0),L"openrouter/model"));
+    model_picker_cancel(h->open_picker);
+    end_model_picker(h);
+    /* A fresh Ollama open fetches Ollama's own catalogue and leaves the
+       OpenRouter one untouched. */
+    chat_model_catalog_dispose(&h->catalog[CHAT_BACKEND_OLLAMA]);
+    h->catalog_loaded[CHAT_BACKEND_OLLAMA]=false;
+    h->catalog_failed[CHAT_BACKEND_OLLAMA]=false;
+    chat->backend=CHAT_BACKEND_OLLAMA; h->backend_target=CHAT_BACKEND_OLLAMA;
+    catalog_request_calls=0;
+    begin_model_picker(h);
+    CHECK(catalog_request_calls==1);
+    catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_ollama_json,NULL));
+    CHECK(h->catalog[CHAT_BACKEND_OLLAMA].count==2 &&
+        h->catalog[CHAT_BACKEND_OPENROUTER].count==3);
+    CHECK(!wcscmp(h->catalog[CHAT_BACKEND_OLLAMA].items[0].id,L"llama3.2:latest"));
+    CHECK(!wcscmp(h->catalog[CHAT_BACKEND_OPENROUTER].items[0].id,L"openai/gpt-4"));
+    CHECK(h->open_picker &&
+        !wcscmp(model_picker_match_id(h->open_picker,0),L"llama3.2:latest"));
+    model_picker_cancel(h->open_picker);
+    end_model_picker(h);
+
+    /* Cross-backend history isolation: a backend's picker never shows the
+       other backend's recent models, and chat_remember_model tags the active
+       backend while preserving each backend's MRU subsequence. */
+    {
+        wcsncpy(chat->model_history[0],L"openrouter/only",CHAT_MODEL_TEXT-1);
+        chat->model_history_backend[0]=CHAT_BACKEND_OPENROUTER;
+        wcsncpy(chat->model_history[1],L"local/only",CHAT_MODEL_TEXT-1);
+        chat->model_history_backend[1]=CHAT_BACKEND_OLLAMA;
+        chat->model_history_count=2;
+        build_picker_source(h,CHAT_BACKEND_OPENROUTER);
+        CHECK(chat_model_catalog_contains(&h->picker_source,L"openrouter/only"));
+        CHECK(!chat_model_catalog_contains(&h->picker_source,L"local/only"));
+        build_picker_source(h,CHAT_BACKEND_OLLAMA);
+        CHECK(chat_model_catalog_contains(&h->picker_source,L"local/only"));
+        CHECK(!chat_model_catalog_contains(&h->picker_source,L"openrouter/only"));
+        chat->model_history_count=0;
+        chat->backend=CHAT_BACKEND_OPENROUTER;
+        wcscpy(chat->model,L"or/one"); chat_remember_model(chat);
+        wcscpy(chat->model,L"or/two"); chat_remember_model(chat);
+        chat->backend=CHAT_BACKEND_OLLAMA;
+        wcscpy(chat->ollama_model,L"local/one"); chat_remember_model(chat);
+        CHECK(chat->model_history_count==3);
+        CHECK(chat->model_history_backend[0]==CHAT_BACKEND_OLLAMA &&
+            !wcscmp(chat->model_history[0],L"local/one"));
+        CHECK(chat->model_history_backend[1]==CHAT_BACKEND_OPENROUTER &&
+            !wcscmp(chat->model_history[1],L"or/two"));
+        CHECK(chat->model_history_backend[2]==CHAT_BACKEND_OPENROUTER &&
+            !wcscmp(chat->model_history[2],L"or/one"));
+        chat->model_history_count=0;
+        chat->backend=CHAT_BACKEND_OPENROUTER;
+    }
+
+    /* Catalog hand-off: an OpenRouter fetch that settles while the Ollama
+       picker is open queues Ollama's own fetch without a reopen. */
+    {
+        chat_model_catalog_dispose(&h->catalog[CHAT_BACKEND_OPENROUTER]);
+        h->catalog_loaded[CHAT_BACKEND_OPENROUTER]=false;
+        h->catalog_failed[CHAT_BACKEND_OPENROUTER]=false;
+        chat_model_catalog_dispose(&h->catalog[CHAT_BACKEND_OLLAMA]);
+        h->catalog_loaded[CHAT_BACKEND_OLLAMA]=false;
+        h->catalog_failed[CHAT_BACKEND_OLLAMA]=false;
+        chat->backend=CHAT_BACKEND_OPENROUTER; h->backend_target=CHAT_BACKEND_OPENROUTER;
+        catalog_request_calls=0;
+        begin_model_picker(h);
+        CHECK(catalog_request_calls==1 &&
+            h->catalog_loading && h->catalog_backend==CHAT_BACKEND_OPENROUTER);
+        /* The OR worker is still running while the user opens Ollama. */
+        parked_release=CreateEventW(NULL,TRUE,FALSE,NULL);
+        CHECK(parked_release);
+        { uintptr_t thread=_beginthreadex(NULL,0,parked_worker,parked_release,0,NULL);
+          CHECK(thread);
+          h->catalog_client.thread=(HANDLE)thread; }
+        model_picker_cancel(h->open_picker);
+        end_model_picker(h);
+        h->backend_target=CHAT_BACKEND_OLLAMA;
+        begin_model_picker(h);
+        CHECK(h->open_picker && catalog_request_calls==1);
+        /* The OpenRouter completion settles; Ollama's fetch is now queued. */
+        SetEvent(parked_release); CloseHandle(parked_release); parked_release=NULL;
+        catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_first_json,NULL));
+        CHECK(h->catalog[CHAT_BACKEND_OPENROUTER].count==3);
+        CHECK(catalog_request_calls==2 &&
+            h->catalog_loading && h->catalog_backend==CHAT_BACKEND_OLLAMA);
+        catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_ollama_json,NULL));
+        CHECK(h->catalog[CHAT_BACKEND_OLLAMA].count==2);
+        CHECK(h->open_picker &&
+            chat_model_catalog_contains(&h->picker_source,L"llama3.2:latest") &&
+            chat_model_catalog_contains(&h->picker_source,L"qwen2.5:7b"));
+        model_picker_cancel(h->open_picker);
+        end_model_picker(h);
+    }
+
+    /* Metadata names the backend and marks local generations. */
+    {
+        int index=add_turn(chat,L"meta q",L"meta answer",NULL,-1);
+        ChatMessage *m=&chat->conversations[chat->active].messages[index];
+        wchar_t meta[512];
+        m->generation.backend=CHAT_BACKEND_OLLAMA;
+        m->generation.cost=0.0;
+        wcscpy(m->generation.requested_model,L"local/model");
+        wcscpy(m->generation.actual_model,L"local/model");
+        chat_message_touch(m);
+        render_transcript(h);
+        meta_text(h,index,meta,512);
+        CHECK(wcsstr(meta,L"Ollama \u00b7 local/model")!=NULL);
+        CHECK(wcsstr(meta,L"local")!=NULL);
+        CHECK(wcsstr(meta,L"$0.00000")==NULL);
+        m->generation.backend=CHAT_BACKEND_OPENROUTER;
+        chat_message_touch(m);
+        render_transcript(h);
+        meta_text(h,index,meta,512);
+        CHECK(wcsstr(meta,L"OpenRouter \u00b7 local/model")!=NULL);
+        CHECK(wcsstr(meta,L"$0.00000")!=NULL);
+    }
+
+    saver_shutdown(&h->saver);
+    model_catalog_shutdown(&h->catalog_client);
+    storage_close(&h->storage);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
+    transcript_dispose(&h->transcript); rich_text_library_close();
+    for (int i=0;i<CHAT_BACKEND_COUNT;i++) chat_model_catalog_dispose(&h->catalog[i]);
+    chat_model_catalog_dispose(&h->picker_source);
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
 int main(void) {
     int failed=default_suite();
     if (failed) return failed;
@@ -3595,6 +3890,8 @@ int main(void) {
     if (failed) return failed;
     failed=catalog_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded + catalog fixtures) passed");
+    failed=backend_suite();
+    if (failed) return failed;
+    puts("Hidden host (default + bounded + catalog + backend fixtures) passed");
     return failed;
 }

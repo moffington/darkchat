@@ -17,7 +17,9 @@ typedef struct {
     int width, height;             /* initial client size in DIPs */
     int min_width, min_height;     /* minimum client size in DIPs */
     /* UTF-8 OPENROUTER_API_KEY borrowed from the caller's storage; the host
-       neither copies it into persistent state nor logs it. May be empty. */
+       neither copies it into persistent state nor logs it. May be empty, and
+       is required only while OpenRouter is the active backend: Ollama needs
+       no key. */
     const char *api_key_utf8;
     /* Transcript realization mode, fixed at init: false keeps the retain-all
        pool (every record binds one slot for the process lifetime); true

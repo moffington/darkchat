@@ -560,8 +560,10 @@ static void stats_append(wchar_t *out, size_t cap, const wchar_t *part) {
 }
 
 /* Compact two-line footer: "Complete · TTFT 18.0s · 19.4s · 44 in / 1,365 out
-   · $0.00165" followed by the model, deduplicated when requested == actual.
-   Normal "stop" is omitted; unusual finish reasons are surfaced. */
+   · $0.00165" followed by "OpenRouter · model" (or "Ollama · model"), with the
+   backend named on the model line. A local Ollama turn shows "local" where a
+   remote cost would appear. Normal "stop" is omitted; unusual finish reasons
+   are surfaced. */
 static void format_stats(const ChatGeneration *g, wchar_t *info, size_t cap) {
     info[0] = 0;
     wchar_t piece[192];
@@ -582,7 +584,10 @@ static void format_stats(const ChatGeneration *g, wchar_t *info, size_t cap) {
         swprintf(piece, 192, L"%ls in / %ls out", in, out);
         stats_append(info, cap, piece);
     }
-    if (g->cost >= 0) {
+    if (g->backend == CHAT_BACKEND_OLLAMA) {
+        /* Local generation has no billed cost; never imply one. */
+        stats_append(info, cap, L"local");
+    } else if (g->cost >= 0) {
         swprintf(piece, 192, L"$%.5f", g->cost);
         stats_append(info, cap, piece);
     }
@@ -592,17 +597,23 @@ static void format_stats(const ChatGeneration *g, wchar_t *info, size_t cap) {
     }
     const wchar_t *requested = g->requested_model[0] ? g->requested_model : NULL;
     const wchar_t *actual = g->actual_model[0] ? g->actual_model : NULL;
-    wchar_t model[224];
-    model[0] = 0;
+    wchar_t base[224];
+    base[0] = 0;
     if (requested && actual) {
-        if (!wcscmp(requested, actual)) wcsncpy(model, actual, 223);
-        else swprintf(model, 224, L"%ls \u2192 %ls", requested, actual);
+        if (!wcscmp(requested, actual)) wcsncpy(base, actual, 223);
+        else swprintf(base, 224, L"%ls \u2192 %ls", requested, actual);
     } else if (actual) {
-        wcsncpy(model, actual, 223);
+        wcsncpy(base, actual, 223);
     } else if (requested) {
-        wcsncpy(model, requested, 223);
+        wcsncpy(base, requested, 223);
     }
-    model[223] = 0;
+    base[223] = 0;
+    wchar_t model[256];
+    model[0] = 0;
+    if (base[0])
+        swprintf(model, 256, L"%ls \u00b7 %ls", chat_backend_name(g->backend),
+            base);
+    model[255] = 0;
     if (model[0]) {
         size_t used = wcslen(info);
         if (used + 2 < cap) {

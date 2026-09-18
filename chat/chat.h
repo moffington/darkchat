@@ -36,6 +36,17 @@
 #define CHAT_STATUS_TEXT 160
 #define CHAT_MODEL_HISTORY 16
 
+/* The active provider. OpenRouter is the historical default and keeps the
+   zero value, so an existing snapshot that has no backend field and a zeroed
+   or freshly initialized Chat both mean OpenRouter. Ollama is first-class:
+   its OpenAI-compatible endpoints are used, never the native /api/chat. */
+typedef enum {
+    CHAT_BACKEND_OPENROUTER = 0,
+    CHAT_BACKEND_OLLAMA = 1
+} ChatBackend;
+
+#define CHAT_BACKEND_COUNT 2
+
 typedef enum {
     CHAT_GENERATION_NONE, CHAT_GENERATION_RUNNING, CHAT_GENERATION_COMPLETE,
     CHAT_GENERATION_CANCELLED, CHAT_GENERATION_INTERRUPTED, CHAT_GENERATION_FAILED
@@ -43,6 +54,9 @@ typedef enum {
 
 typedef struct {
     ChatGenerationState state;
+    /* Which backend produced this turn. Persisted with the message; an older
+       snapshot without the field decodes as OpenRouter. */
+    ChatBackend backend;
     wchar_t requested_model[CHAT_MODEL_TEXT], actual_model[CHAT_MODEL_TEXT];
     wchar_t finish_reason[64], error[512];
     int64_t started_at, finished_at, first_token_at;
@@ -170,18 +184,33 @@ typedef struct {
     ChatConversation conversations[CHAT_MAX_CONVERSATIONS];
     int conversation_count;
     int active;
+    /* Active provider and one remembered last-used model per backend. `model`
+       is OpenRouter's slot; `ollama_model` is Ollama's. chat_active_model()
+       resolves the slot the active backend sends. An older snapshot without
+       the backend field decodes as OpenRouter and keeps its `model`. */
+    ChatBackend backend;
     wchar_t model[CHAT_MODEL_TEXT];
+    wchar_t ollama_model[CHAT_MODEL_TEXT];
     wchar_t status[CHAT_STATUS_TEXT];
     unsigned replies;
     uint64_t next_id;
     wchar_t system_prompt[CHAT_COMPOSER_TEXT];
     ChatProviderRouting provider_routing;
     wchar_t model_history[CHAT_MODEL_HISTORY][CHAT_MODEL_TEXT];
+    /* Backend tag for each history entry, parallel to model_history, so one
+       backend's recent models never appear in another backend's picker. An
+       older snapshot without the tag decodes every entry as OpenRouter. */
+    ChatBackend model_history_backend[CHAT_MODEL_HISTORY];
     int model_history_count;
     int window_x, window_y, window_width, window_height, maximized, sidebar_width;
 } Chat;
 
 int64_t chat_now(void);
+/* Display name for a backend: L"OpenRouter" or L"Ollama". */
+const wchar_t *chat_backend_name(ChatBackend backend);
+/* The remembered last-used model of the active backend. Borrowed, never NULL
+   (an unset Ollama slot is the empty string). */
+const wchar_t *chat_active_model(const Chat *chat);
 /* Deep, transactional copy for asynchronous persistence: the result is fully
    owned by the caller, shares no allocation with `chat`, and is safe to hand
    to a background writer while the UI thread keeps mutating the original.

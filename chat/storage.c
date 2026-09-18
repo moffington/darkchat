@@ -42,6 +42,32 @@ static bool get_string(const char *s, const char *name, wchar_t *out, size_t cap
     free(wide); free(text);
     return ok;
 }
+/* Additive optional string field. Absence leaves `out` at its default; a
+   present value that is not a decodable string (wrong type, object, array,
+   bool, null) or exceeds capacity rejects the snapshot. Presence is decided
+   by the exact-key field classifier, so a numeric or boolean value is
+   corruption rather than a silent default. */
+static bool optional_string(const char *s, const char *name, wchar_t *out,
+    size_t cap) {
+    JsonFieldKind kind;
+    double value;
+    if (!json_query_field(s, name, &kind, &value)) return false;
+    if (kind == JSON_FIELD_ABSENT) return true;
+    char *text = malloc(strlen(s) + 1);
+    if (!text) return false;
+    bool ok = json_query_string(s, name, text, strlen(s) + 1);
+    if (ok) {
+        wchar_t *wide = json_utf8_to_utf16(text, strlen(text));
+        if (!wide) ok = false;
+        else {
+            if (wcslen(wide) >= cap) ok = false;
+            else wcscpy(out, wide);
+            free(wide);
+        }
+    }
+    free(text);
+    return ok;
+}
 static bool get_message_string(const char *s, const char *name,
     ChatMessage *message, bool reasoning, bool required) {
     size_t size=strlen(s)+1;
@@ -143,9 +169,23 @@ static bool encode(const Chat *chat, JsonBuf *b) {
         number(b, "provider_data_collection", (double)chat->provider_routing.data_collection);
     if (chat->provider_routing.zdr)
         number(b, "provider_zdr", 1);
+    /* Additive backend settings at the same format version: emitted only when
+       non-default so an OpenRouter-only snapshot keeps the older byte shape
+       and an older build ignores the fields. A missing backend decodes as
+       OpenRouter; a missing Ollama model leaves that slot empty. */
+    if (chat->backend != CHAT_BACKEND_OPENROUTER)
+        number(b, "backend", (double)chat->backend);
+    if (chat->ollama_model[0])
+        string(b, "ollama_model", chat->ollama_model);
     raw(b, "}\n");
     for (int i = 0; i < chat->model_history_count; i++) {
-        raw(b, "{\"type\":\"model\""); string(b, "model", chat->model_history[i]); raw(b, "}\n");
+        raw(b, "{\"type\":\"model\"");
+        string(b, "model", chat->model_history[i]);
+        /* Additive per-entry backend tag, emitted only for a non-OpenRouter
+           entry so an OpenRouter-only snapshot keeps the older byte shape. */
+        if (chat->model_history_backend[i] != CHAT_BACKEND_OPENROUTER)
+            number(b, "backend", (double)chat->model_history_backend[i]);
+        raw(b, "}\n");
     }
     for (int i = 0; i < chat->conversation_count; i++) {
         const ChatConversation *c = &chat->conversations[i];
@@ -189,6 +229,11 @@ static bool encode(const Chat *chat, JsonBuf *b) {
             if (chat_message_reasoning(m)[0])
                 string(b, "reasoning", chat_message_reasoning(m));
             if (g->reasoning_ms >= 0) number(b, "reasoning_ms", g->reasoning_ms);
+            /* Additive, emitted only for a non-OpenRouter generation; an older
+               build ignores it and a snapshot without it decodes as
+               OpenRouter. */
+            if (g->backend != CHAT_BACKEND_OPENROUTER)
+                number(b, "backend", (double)g->backend);
             raw(b, "}\n");
         }
     }
@@ -260,10 +305,27 @@ static bool decode(char *data, Chat *chat) {
         : CHAT_DATA_COLLECTION_ALLOW;
     if (!optional_int(line,"provider_zdr",0,1,0,&routing_value)) goto bad;
     chat->provider_routing.zdr=routing_value!=0;
+    /* Additive backend settings: absent in older snapshots and defaulted here
+       to OpenRouter with no remembered Ollama model. A field that is present
+       but malformed rejects the snapshot. */
+    int backend_value;
+    if (!optional_int(line,"backend",0,CHAT_BACKEND_OLLAMA,
+            CHAT_BACKEND_OPENROUTER,&backend_value)) goto bad;
+    chat->backend=(ChatBackend)backend_value;
+    if (!optional_string(line,"ollama_model",chat->ollama_model,CHAT_MODEL_TEXT))
+        goto bad;
+    /* An Ollama-active snapshot must remember the local model it will send:
+       an empty slot would make the next request unusable and is corruption. */
+    if (chat->backend == CHAT_BACKEND_OLLAMA && !chat->ollama_model[0])
+        goto bad;
     if (chat->active >= chat->conversation_count || !chat->model[0]) goto bad;
     for (int i=0; i<chat->model_history_count; i++) {
         line=next_line(&cursor);
         if (!type_is(line,"model") || !get_string(line,"model",chat->model_history[i],CHAT_MODEL_TEXT)) goto bad;
+        int history_backend;
+        if (!optional_int(line,"backend",0,CHAT_BACKEND_OLLAMA,
+                CHAT_BACKEND_OPENROUTER,&history_backend)) goto bad;
+        chat->model_history_backend[i]=(ChatBackend)history_backend;
     }
     for (int i=0; i<chat->conversation_count; i++) {
         ChatConversation *c=&chat->conversations[i];
@@ -338,6 +400,14 @@ static bool decode(char *data, Chat *chat) {
             g->reasoning_ms=-1;
             if (json_query_number(line,"reasoning_ms",&v) && v>=-1)
                 g->reasoning_ms=v;
+            /* Additive per-generation backend: absent in older snapshots and
+               defaulted to OpenRouter. */
+            {
+                int message_backend;
+                if (!optional_int(line,"backend",0,CHAT_BACKEND_OLLAMA,
+                        CHAT_BACKEND_OPENROUTER,&message_backend)) goto bad;
+                g->backend=(ChatBackend)message_backend;
+            }
             if (g->state == CHAT_GENERATION_RUNNING) {
                 g->state = CHAT_GENERATION_INTERRUPTED;
                 /* End time is unknown after a crash; do not invent latency. */

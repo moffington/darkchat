@@ -5,10 +5,12 @@
 
 static const wchar_t *const welcome =
     L"Welcome to DarkChat.\n\n"
-    L"Type a message below and press Enter; the whole conversation goes to "
-    L"the model selected in the toolbar over the OpenRouter chat-completions "
-    L"endpoint. Set OPENROUTER_API_KEY in the environment before launching; "
-    L"without it DarkChat explains what is missing instead of answering.";
+    L"Type a message below and press Enter; the conversation goes to the model "
+    L"selected in the toolbar, sent to OpenRouter over HTTPS or to a local "
+    L"Ollama server over its OpenAI-compatible endpoint. Settings > Backend "
+    L"chooses which. OpenRouter needs OPENROUTER_API_KEY in the environment; "
+    L"Ollama needs only a running local server. DarkChat explains what is "
+    L"missing instead of answering.";
 
 static const wchar_t *message_value(const wchar_t *inline_text,
     const wchar_t *overflow) {
@@ -465,14 +467,30 @@ const wchar_t *chat_generation_name(ChatGenerationState state) {
     return state >= 0 && state <= CHAT_GENERATION_FAILED ? names[state] : L"Unknown";
 }
 
+const wchar_t *chat_backend_name(ChatBackend backend) {
+    return backend == CHAT_BACKEND_OLLAMA ? L"Ollama" : L"OpenRouter";
+}
+
+const wchar_t *chat_active_model(const Chat *chat) {
+    if (!chat) return L"";
+    return chat->backend == CHAT_BACKEND_OLLAMA ? chat->ollama_model : chat->model;
+}
+
 void chat_remember_model(Chat *chat) {
+    const wchar_t *model = chat_active_model(chat);
+    ChatBackend backend = chat->backend;
     int found = chat->model_history_count;
     for (int i = 0; i < chat->model_history_count; i++)
-        if (!wcscmp(chat->model_history[i], chat->model)) { found = i; break; }
+        if (chat->model_history_backend[i] == backend &&
+            !wcscmp(chat->model_history[i], model)) { found = i; break; }
     if (found == CHAT_MODEL_HISTORY) --found;
-    for (int i = found; i > 0; --i)
+    for (int i = found; i > 0; --i) {
         wcscpy(chat->model_history[i], chat->model_history[i - 1]);
-    wcscpy(chat->model_history[0], chat->model);
+        chat->model_history_backend[i] = chat->model_history_backend[i - 1];
+    }
+    wcsncpy(chat->model_history[0], model, CHAT_MODEL_TEXT - 1);
+    chat->model_history[0][CHAT_MODEL_TEXT - 1] = 0;
+    chat->model_history_backend[0] = backend;
     if (chat->model_history_count < CHAT_MODEL_HISTORY && found == chat->model_history_count)
         ++chat->model_history_count;
 }
@@ -598,8 +616,10 @@ int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt) {
     if (index<0) return -1;
     ChatGeneration *g = &c->messages[index].generation;
     g->state = CHAT_GENERATION_RUNNING;
+    g->backend = chat->backend;
     g->started_at = chat_now();
-    wcscpy(g->requested_model, chat->model);
+    wcsncpy(g->requested_model, chat_active_model(chat), CHAT_MODEL_TEXT - 1);
+    g->requested_model[CHAT_MODEL_TEXT - 1] = 0;
     chat_remember_model(chat);
     return index;
 }

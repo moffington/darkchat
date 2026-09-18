@@ -5,9 +5,27 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MODEL_CATALOG_HOST L"openrouter.ai"
-#define MODEL_CATALOG_PATH L"/api/v1/models"
-#define MODEL_CATALOG_USER_AGENT L"DarkChat/0.4"
+/* Hard-coded catalog endpoint descriptors, exactly like the completion
+   client's: OpenRouter over TLS with credentials, Ollama direct over
+   localhost with none. */
+typedef struct {
+    const wchar_t *host;
+    INTERNET_PORT port;
+    const wchar_t *path;
+    const wchar_t *user_agent;
+    DWORD access_type;
+    DWORD request_flags;
+    bool authorize;
+} CatalogEndpoint;
+
+static const CatalogEndpoint CATALOG_ENDPOINTS[CHAT_BACKEND_COUNT] = {
+    { L"openrouter.ai", INTERNET_DEFAULT_HTTPS_PORT, L"/api/v1/models",
+      L"DarkChat/0.4", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+      WINHTTP_FLAG_SECURE, true },
+    { L"localhost", 11434, L"/v1/models", L"DarkChat/0.4",
+      WINHTTP_ACCESS_TYPE_NO_PROXY, 0, false },
+};
+
 #define MODEL_CATALOG_MAX_RESPONSE (16u * 1024u * 1024u)
 
 typedef struct {
@@ -15,7 +33,8 @@ typedef struct {
     HWND notify;
     UINT message;
     ModelCatalogClient *client;
-    wchar_t *headers;   /* owned; contains the bearer key */
+    ChatBackend backend;
+    wchar_t *headers;   /* owned; contains the bearer key for OpenRouter */
 } ModelCatalogWork;
 
 /* Cancellation view handed to the transport so a seam can abandon an in-flight
@@ -25,7 +44,8 @@ typedef struct {
     int generation;
 } ModelCatalogCancel;
 
-typedef bool (*ModelCatalogTransport)(const wchar_t *headers,
+typedef bool (*ModelCatalogTransport)(ChatBackend backend,
+    const CatalogEndpoint *endpoint, const wchar_t *headers,
     const ModelCatalogCancel *cancel, char **body, size_t *length,
     DWORD *status, wchar_t **error);
 
@@ -43,7 +63,8 @@ static bool cancelled(const ModelCatalogCancel *cancel) {
         == cancel->generation;
 }
 
-static bool winhttp_transport(const wchar_t *headers,
+static bool winhttp_transport(ChatBackend backend,
+    const CatalogEndpoint *endpoint, const wchar_t *headers,
     const ModelCatalogCancel *cancel, char **body, size_t *length,
     DWORD *status, wchar_t **error);
 
@@ -77,7 +98,12 @@ bool model_catalog_busy(ModelCatalogClient *client) {
     return client->thread != NULL;
 }
 
-static wchar_t *build_headers(const char *api_key_utf8) {
+/* Builds the request headers for `backend`. OpenRouter authenticates and
+   carries its attribution headers; Ollama sends no credentials at all. */
+static wchar_t *build_catalog_headers(ChatBackend backend,
+    const char *api_key_utf8) {
+    if (!CATALOG_ENDPOINTS[backend].authorize)
+        return copy_wide(L"Accept: application/json\r\n");
     size_t length = strlen(api_key_utf8);
     wchar_t *key = (wchar_t *)malloc((length + 1) * sizeof *key);
     if (!key) return NULL;
@@ -111,22 +137,27 @@ static bool reserve(char **data, size_t *capacity, size_t needed) {
     return true;
 }
 
-static bool winhttp_transport(const wchar_t *headers,
+static bool winhttp_transport(ChatBackend backend,
+    const CatalogEndpoint *endpoint, const wchar_t *headers,
     const ModelCatalogCancel *cancel, char **body, size_t *length,
     DWORD *status, wchar_t **error) {
     *body = NULL; *length = 0; *status = 0; *error = NULL;
     HINTERNET session = NULL, connect = NULL, request = NULL;
     bool ok = false;
-    session = WinHttpOpen(MODEL_CATALOG_USER_AGENT,
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
+    session = WinHttpOpen(endpoint->user_agent, endpoint->access_type,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) { *error = copy_wide(L"Could not open a network session."); goto done; }
     WinHttpSetTimeouts(session, 10000, 10000, 10000, 15000);
-    connect = WinHttpConnect(session, MODEL_CATALOG_HOST,
-        INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!connect) { *error = copy_wide(L"Could not connect to OpenRouter."); goto done; }
-    request = WinHttpOpenRequest(connect, L"GET", MODEL_CATALOG_PATH, NULL,
-        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    connect = WinHttpConnect(session, endpoint->host, endpoint->port, 0);
+    if (!connect) {
+        *error = copy_wide(backend == CHAT_BACKEND_OLLAMA ?
+            L"Ollama is not reachable at localhost:11434." :
+            L"Could not connect to OpenRouter.");
+        goto done;
+    }
+    request = WinHttpOpenRequest(connect, L"GET", endpoint->path, NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        endpoint->request_flags);
     if (!request) { *error = copy_wide(L"Could not create the catalog request."); goto done; }
     if (!WinHttpSendRequest(request, headers, (DWORD)-1, WINHTTP_NO_REQUEST_DATA,
         0, 0, 0)) {
@@ -135,7 +166,9 @@ static bool winhttp_transport(const wchar_t *headers,
     }
     if (cancelled(cancel)) goto done;
     if (!WinHttpReceiveResponse(request, NULL)) {
-        *error = copy_wide(L"No response from OpenRouter for the catalog.");
+        *error = copy_wide(backend == CHAT_BACKEND_OLLAMA ?
+            L"Ollama is not reachable at localhost:11434." :
+            L"No response from OpenRouter for the catalog.");
         goto done;
     }
     DWORD code = 0, size = sizeof code;
@@ -226,21 +259,22 @@ static unsigned __stdcall worker(void *parameter) {
     ModelCatalogWork *work = (ModelCatalogWork *)parameter;
     ModelCatalogCancel cancel = { &work->client->cancelled_generation,
         work->generation };
+    const CatalogEndpoint *endpoint = &CATALOG_ENDPOINTS[work->backend];
     char *body = NULL, *json = NULL;
     size_t length = 0;
     DWORD status = 0;
     wchar_t *error = NULL, *final_error = NULL;
     ModelCatalogResult result = MODEL_CATALOG_NETWORK_ERROR;
-    bool ok = model_catalog_transport(work->headers, &cancel, &body, &length,
-        &status, &error);
+    bool ok = model_catalog_transport(work->backend, endpoint, work->headers,
+        &cancel, &body, &length, &status, &error);
     if (!ok) {
         if (cancelled(&cancel)) { free(error); free(body); free_work(work); return 0; }
         final_error = error ? error : copy_wide(L"Model catalog request failed.");
         error = NULL;
     } else if (status != 200) {
         wchar_t composed[128];
-        swprintf(composed, 128, L"OpenRouter returned HTTP %lu for the catalog.",
-            (unsigned long)status);
+        swprintf(composed, 128, L"%ls returned HTTP %lu for the catalog.",
+            chat_backend_name(work->backend), (unsigned long)status);
         final_error = copy_wide(composed);
         result = MODEL_CATALOG_HTTP_ERROR;
         free(body);
@@ -258,9 +292,13 @@ static unsigned __stdcall worker(void *parameter) {
     return 0;
 }
 
-int model_catalog_request(ModelCatalogClient *client, const char *api_key_utf8) {
-    if (!client || !client->notify) return 0;
-    if (!api_key_utf8 || !api_key_utf8[0]) return 0;
+int model_catalog_request(ModelCatalogClient *client, ChatBackend backend,
+    const char *api_key_utf8) {
+    if (!client || !client->notify || backend < 0 || backend >= CHAT_BACKEND_COUNT)
+        return 0;
+    /* Only OpenRouter needs a key; Ollama must work without OPENROUTER_API_KEY. */
+    if (backend == CHAT_BACKEND_OPENROUTER &&
+        (!api_key_utf8 || !api_key_utf8[0])) return 0;
     reap_finished(client);
     if (client->thread) return 0;
     int generation = (int)InterlockedIncrement((LONG *)&client->generation);
@@ -271,7 +309,8 @@ int model_catalog_request(ModelCatalogClient *client, const char *api_key_utf8) 
     work->notify = client->notify;
     work->message = client->message;
     work->client = client;
-    work->headers = build_headers(api_key_utf8);
+    work->backend = backend;
+    work->headers = build_catalog_headers(backend, api_key_utf8);
     if (work->headers) {
         uintptr_t thread = _beginthreadex(NULL, 0, worker, work, 0, NULL);
         if (thread) {

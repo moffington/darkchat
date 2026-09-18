@@ -91,6 +91,11 @@ static int routing_sort_action(ChatProviderSort sort) {
 void chat_actions_sync_routing(HMENU menu, const Chat *chat) {
     if (!menu || !chat) return;
     const ChatProviderRouting *routing = &chat->provider_routing;
+    /* Backend radios: a no-op for menus that do not carry them. */
+    CheckMenuRadioItem(menu, ACTION_BACKEND_OPENROUTER, ACTION_BACKEND_OLLAMA,
+        chat->backend == CHAT_BACKEND_OLLAMA ? ACTION_BACKEND_OLLAMA
+                                             : ACTION_BACKEND_OPENROUTER,
+        MF_BYCOMMAND);
     CheckMenuRadioItem(menu, ACTION_ROUTING_SORT_DEFAULT,
         ACTION_ROUTING_SORT_LATENCY, routing_sort_action(routing->sort),
         MF_BYCOMMAND);
@@ -101,10 +106,17 @@ void chat_actions_sync_routing(HMENU menu, const Chat *chat) {
             ? MF_UNCHECKED : MF_CHECKED));
     CheckMenuItem(menu, ACTION_ROUTING_ZDR,
         MF_BYCOMMAND | (routing->zdr ? MF_CHECKED : MF_UNCHECKED));
+    /* Provider routing is OpenRouter-only: gray the whole group while a local
+       Ollama backend is active so the controls cannot imply an effect. The
+       host also ignores a stale activation with an explicit status. */
+    UINT enable = MF_BYCOMMAND |
+        (chat->backend == CHAT_BACKEND_OLLAMA ? MF_GRAYED : MF_ENABLED);
+    for (UINT id = ACTION_ROUTING_SORT_DEFAULT; id <= ACTION_ROUTING_ZDR; id++)
+        EnableMenuItem(menu, id, enable);
 }
 HMENU chat_actions_menu(const Chat *chat) {
     HMENU bar=CreateMenu(), conversation=CreatePopupMenu(), response=CreatePopupMenu(), settings=CreatePopupMenu();
-    HMENU routing=CreatePopupMenu();
+    HMENU routing=CreatePopupMenu(), backend=CreatePopupMenu();
     AppendMenuW(conversation,MF_STRING,ACTION_NEW,L"&New conversation");
     AppendMenuW(conversation,MF_STRING,ACTION_RENAME,L"&Rename...");
     AppendMenuW(conversation,MF_STRING,ACTION_DELETE,L"&Delete...");
@@ -122,6 +134,10 @@ HMENU chat_actions_menu(const Chat *chat) {
     AppendMenuW(settings,MF_STRING,ACTION_SYSTEM,L"&System prompt...");
     AppendMenuW(settings,MF_STRING,ACTION_SIDEBAR,L"Sidebar &width...");
     AppendMenuW(settings,MF_STRING,ACTION_MODELS,L"&Choose model... (Ctrl+Space)");
+    AppendMenuW(backend,MF_STRING,ACTION_BACKEND_OPENROUTER,L"&OpenRouter");
+    AppendMenuW(backend,MF_STRING,ACTION_BACKEND_OLLAMA,L"&Ollama (local)");
+    chat_actions_sync_routing(backend,chat);
+    AppendMenuW(settings,MF_POPUP,(UINT_PTR)backend,L"&Backend");
     AppendMenuW(routing,MF_STRING,ACTION_ROUTING_SORT_DEFAULT,L"Sort: &Default (balanced)");
     AppendMenuW(routing,MF_STRING,ACTION_ROUTING_SORT_PRICE,L"Sort: Prefer lowest &price");
     AppendMenuW(routing,MF_STRING,ACTION_ROUTING_SORT_THROUGHPUT,L"Sort: Prefer highest t&hroughput");

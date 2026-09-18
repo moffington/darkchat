@@ -1,6 +1,5 @@
-#include "openrouter_winhttp.h"
-#include "json.h"
-#include "provider_routing.h"
+#include "completion_winhttp.h"
+#include "completion_request.h"
 #include "sse.h"
 #include <winhttp.h>
 #include <process.h>
@@ -8,16 +7,36 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define OPENROUTER_HOST L"openrouter.ai"
-#define OPENROUTER_PATH L"/api/v1/chat/completions"
-#define OPENROUTER_USER_AGENT L"DarkChat/0.3"
-#define OPENROUTER_MAX_RESPONSE (16u * 1024u * 1024u)
+/* Hard-coded endpoint descriptors. The OpenAI-compatible request shape is
+   identical for both; only the network specifics and headers differ, and only
+   OpenRouter authenticates or carries a provider object. A small, fixed table
+   (never caller-configurable) is the whole selection mechanism. */
+typedef struct {
+    const wchar_t *host;
+    INTERNET_PORT port;
+    const wchar_t *path;
+    const wchar_t *user_agent;
+    DWORD access_type;   /* WINHTTP_ACCESS_TYPE_* */
+    DWORD request_flags; /* WINHTTP_FLAG_SECURE for https, 0 for local http */
+    bool authorize;      /* whether the API key and OpenRouter headers are sent */
+} CompletionEndpoint;
+
+static const CompletionEndpoint ENDPOINTS[CHAT_BACKEND_COUNT] = {
+    { L"openrouter.ai", INTERNET_DEFAULT_HTTPS_PORT,
+      L"/api/v1/chat/completions", L"DarkChat/0.3",
+      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE, true },
+    { L"localhost", 11434, L"/v1/chat/completions", L"DarkChat/0.4",
+      WINHTTP_ACCESS_TYPE_NO_PROXY, 0, false },
+};
+
+#define COMPLETION_MAX_RESPONSE (16u * 1024u * 1024u)
 
 typedef struct {
     int generation;
     HWND notify;
     UINT message;
-    OpenRouterClient *client;
+    CompletionClient *client;
+    ChatBackend backend;
     char *api_key;
     wchar_t *model;
     ChatRole *roles;
@@ -26,7 +45,7 @@ typedef struct {
     ChatProviderRouting routing;
     ChatGeneration metadata;
     ULONGLONG started_tick;
-} OpenRouterWork;
+} CompletionWork;
 
 typedef struct { char *data; size_t length, capacity; } Response;
 typedef struct {
@@ -36,7 +55,7 @@ typedef struct {
     DWORD bytes;
 } AsyncState;
 typedef struct {
-    OpenRouterWork *work;
+    CompletionWork *work;
     bool done, failed;
     wchar_t *error;
 } Stream;
@@ -50,31 +69,31 @@ static wchar_t *copy_wide(const wchar_t *text) {
     return copy;
 }
 
-void openrouter_init(OpenRouterClient *client, HWND notify, UINT message) {
+void completion_init(CompletionClient *client, HWND notify, UINT message) {
     if (!client) return;
     memset(client, 0, sizeof *client);
     client->notify = notify;
     client->message = message;
 }
 
-void openrouter_event_free(OpenRouterEvent *event) {
+void completion_event_free(CompletionEvent *event) {
     if (!event) return;
     free(event->text);
     free(event);
 }
 
-static bool cancelled(const OpenRouterWork *work) {
+static bool cancelled(const CompletionWork *work) {
     return InterlockedCompareExchange(&work->client->cancelled_generation,
         0, 0) == work->generation;
 }
 
-static bool post_event(OpenRouterWork *work, OpenRouterEventType type,
+static bool post_event(CompletionWork *work, CompletionEventType type,
     wchar_t *owned_text) {
-    if (type == OPENROUTER_DELTA && cancelled(work)) {
+    if (type == COMPLETION_DELTA && cancelled(work)) {
         free(owned_text);
         return false;
     }
-    OpenRouterEvent *event = (OpenRouterEvent *)calloc(1, sizeof *event);
+    CompletionEvent *event = (CompletionEvent *)calloc(1, sizeof *event);
     if (!event) { free(owned_text); return false; }
     event->generation = work->generation;
     event->type = type;
@@ -82,46 +101,41 @@ static bool post_event(OpenRouterWork *work, OpenRouterEventType type,
     event->metadata = work->metadata;
     if (!PostMessageW(work->notify, work->message, (WPARAM)work->generation,
         (LPARAM)event)) {
-        openrouter_event_free(event);
+        completion_event_free(event);
         return false;
     }
     return true;
 }
 
-static const char *role_name(ChatRole role) {
-    switch (role) {
-    case CHAT_ROLE_ASSISTANT: return "assistant";
-    case CHAT_ROLE_SYSTEM: return "system";
-    default: return "user";
+/* Real encoder: adapts the work arrays into the shared borrowed view. Kept as
+   a thin adapter so the exact bytes live in one place. */
+static bool build_request(const CompletionWork *work, JsonBuf *body) {
+    /* Initialize before any fallible step so a caller can always free it. */
+    json_buf_init(body, 0);
+    ChatRequestMessage *messages = NULL;
+    if (work->count > 0) {
+        messages = (ChatRequestMessage *)malloc(
+            (size_t)work->count * sizeof *messages);
+        if (!messages) return false;
     }
-}
-
-static bool build_request(const OpenRouterWork *work, JsonBuf *body) {
-    json_buf_init(body, 8192);
-    if (!json_buf_append_raw(body, "{\"model\":", 9) ||
-        !json_buf_append_json_string(body, work->model) ||
-        !json_buf_append_raw(body, ",\"messages\":[", 13)) return false;
-    bool first = true;
     for (int i = 0; i < work->count; i++) {
-        if (work->roles[i] == CHAT_ROLE_ERROR) continue;
-        if (!first && !json_buf_append_raw(body, ",", 1)) return false;
-        first = false;
-        const char *role = role_name(work->roles[i]);
-        if (!json_buf_append_raw(body, "{\"role\":\"", 9) ||
-            !json_buf_append_raw(body, role, strlen(role)) ||
-            !json_buf_append_raw(body, "\",\"content\":", 12) ||
-            !json_buf_append_json_string(body, work->texts[i]) ||
-            !json_buf_append_raw(body, "}", 1)) return false;
+        messages[i].role = work->roles[i];
+        messages[i].text = work->texts[i];
     }
-    if (!json_buf_append_raw(body,
-        "],\"stream\":true,\"reasoning\":{\"enabled\":true}", 44)) return false;
-    /* OpenRouter provider defaults are preserved: nothing is sent unless a
-       routing control differs from the default. */
-    if (!chat_provider_append(body, &work->routing)) return false;
-    return json_buf_append_raw(body, "}", 1);
+    bool ok = chat_completion_request_build(body, work->backend, work->model,
+        messages, work->count, &work->routing);
+    free(messages);
+    return ok;
 }
 
-static wchar_t *build_headers(const char *api_key) {
+static wchar_t *build_headers(const CompletionWork *work) {
+    if (!ENDPOINTS[work->backend].authorize) {
+        static const wchar_t *const plain =
+            L"Content-Type: application/json\r\n"
+            L"Accept: text/event-stream\r\n";
+        return copy_wide(plain);
+    }
+    const char *api_key = work->api_key;
     size_t length = strlen(api_key);
     wchar_t *key = (wchar_t *)malloc((length + 1) * sizeof *key);
     if (!key) return NULL;
@@ -172,7 +186,7 @@ static void CALLBACK winhttp_callback(HINTERNET handle, DWORD_PTR context,
     SetEvent(state->event);
 }
 
-static bool wait_status(OpenRouterWork *work, AsyncState *state,
+static bool wait_status(CompletionWork *work, AsyncState *state,
     DWORD expected) {
     for (;;) {
         DWORD waited = WaitForSingleObject(state->event, 100);
@@ -215,7 +229,8 @@ static void close_request(HINTERNET request, AsyncState *state,
     }
 }
 
-static wchar_t *http_error(DWORD status, const char *body) {
+static wchar_t *http_error(ChatBackend backend, DWORD status, const char *body) {
+    const wchar_t *name = chat_backend_name(backend);
     wchar_t *detail = NULL;
     if (body) {
         size_t size = strlen(body) + 1;
@@ -226,12 +241,12 @@ static wchar_t *http_error(DWORD status, const char *body) {
     }
     wchar_t composed[512];
     if (detail) {
-        _snwprintf(composed, 512, L"OpenRouter returned HTTP %lu: %ls",
-            (unsigned long)status, detail);
+        _snwprintf(composed, 512, L"%ls returned HTTP %lu: %ls",
+            name, (unsigned long)status, detail);
         free(detail);
     } else {
-        _snwprintf(composed, 512, L"OpenRouter returned HTTP %lu.",
-            (unsigned long)status);
+        _snwprintf(composed, 512, L"%ls returned HTTP %lu.",
+            name, (unsigned long)status);
     }
     composed[511] = 0;
     return copy_wide(composed);
@@ -295,7 +310,7 @@ static bool stream_event(void *user, const char *data, size_t length) {
         if (has_fragment) {
             has_reasoning = true;
             wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
-            if (!wide || !post_event(stream->work, OPENROUTER_REASONING, wide)) {
+            if (!wide || !post_event(stream->work, COMPLETION_REASONING, wide)) {
                 if (!cancelled(stream->work))
                     stream->error = copy_wide(
                         L"Could not deliver streamed reasoning.");
@@ -303,7 +318,8 @@ static bool stream_event(void *user, const char *data, size_t length) {
             }
         }
     }
-    /* Plain fields are compatibility fallbacks used by some providers. */
+    /* Plain fields are compatibility fallbacks used by some providers,
+       including Ollama's OpenAI-compatible reasoning output. */
     bool has_plain_reasoning = false;
     if (!has_reasoning && !stream->failed)
         has_plain_reasoning = json_query_string(json,
@@ -315,7 +331,7 @@ static bool stream_event(void *user, const char *data, size_t length) {
             decoded[0];
     if (has_plain_reasoning && !stream->failed) {
         wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
-        if (!wide || !post_event(stream->work, OPENROUTER_REASONING, wide)) {
+        if (!wide || !post_event(stream->work, COMPLETION_REASONING, wide)) {
             if (!cancelled(stream->work))
                 stream->error = copy_wide(L"Could not deliver streamed reasoning.");
             stream->failed = true;
@@ -329,7 +345,7 @@ static bool stream_event(void *user, const char *data, size_t length) {
             g->ttft_ms = (double)(GetTickCount64() - stream->work->started_tick);
         }
         wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
-        if (!wide || !post_event(stream->work, OPENROUTER_DELTA, wide)) {
+        if (!wide || !post_event(stream->work, COMPLETION_DELTA, wide)) {
             if (!cancelled(stream->work))
                 stream->error = copy_wide(L"Could not deliver streamed text.");
             stream->failed = true;
@@ -343,7 +359,8 @@ static bool stream_event(void *user, const char *data, size_t length) {
     return !stream->failed;
 }
 
-static RequestOutcome perform(OpenRouterWork *work, wchar_t **error) {
+static RequestOutcome perform(CompletionWork *work, wchar_t **error) {
+    const CompletionEndpoint *endpoint = &ENDPOINTS[work->backend];
     JsonBuf body;
     wchar_t *headers = NULL;
     HINTERNET session = NULL, connect = NULL, request = NULL;
@@ -367,12 +384,12 @@ static RequestOutcome perform(OpenRouterWork *work, wchar_t **error) {
         CloseHandle(async.event);
         return outcome;
     }
-    headers = build_headers(work->api_key);
+    headers = build_headers(work);
     if (!headers) {
         *error = copy_wide(L"DarkChat could not build request headers.");
         goto cleanup;
     }
-    session = WinHttpOpen(OPENROUTER_USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    session = WinHttpOpen(endpoint->user_agent, endpoint->access_type,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
     if (!session) { winhttp_error = GetLastError(); goto network_error; }
     if (WinHttpSetStatusCallback(session, winhttp_callback,
@@ -384,11 +401,11 @@ static RequestOutcome perform(OpenRouterWork *work, wchar_t **error) {
         WINHTTP_CALLBACK_FLAG_HANDLES, 0) == WINHTTP_INVALID_STATUS_CALLBACK) {
         winhttp_error = GetLastError(); goto network_error;
     }
-    connect = WinHttpConnect(session, OPENROUTER_HOST,
-        INTERNET_DEFAULT_HTTPS_PORT, 0);
+    connect = WinHttpConnect(session, endpoint->host, endpoint->port, 0);
     if (!connect) { winhttp_error = GetLastError(); goto network_error; }
-    request = WinHttpOpenRequest(connect, L"POST", OPENROUTER_PATH, NULL,
-        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    request = WinHttpOpenRequest(connect, L"POST", endpoint->path, NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        endpoint->request_flags);
     if (!request) { winhttp_error = GetLastError(); goto network_error; }
     DWORD_PTR context = (DWORD_PTR)&async;
     if (!WinHttpSetOption(request, WINHTTP_OPTION_CONTEXT_VALUE, &context,
@@ -424,12 +441,14 @@ static RequestOutcome perform(OpenRouterWork *work, wchar_t **error) {
         }
         DWORD available = async.bytes;
         if (!available) break;
-        if (response.length + available > OPENROUTER_MAX_RESPONSE) {
-            *error = copy_wide(L"The OpenRouter response exceeded the 16 MB limit.");
+        if (response.length + available > COMPLETION_MAX_RESPONSE) {
+            *error = copy_wide(work->backend == CHAT_BACKEND_OLLAMA ?
+                L"The Ollama response exceeded the 16 MB limit." :
+                L"The OpenRouter response exceeded the 16 MB limit.");
             goto cleanup;
         }
         if (!response_reserve(&response, available)) {
-            *error = copy_wide(L"Out of memory reading the OpenRouter response.");
+            *error = copy_wide(L"Out of memory reading the response.");
             goto cleanup;
         }
         begin_async(&async);
@@ -454,7 +473,8 @@ static RequestOutcome perform(OpenRouterWork *work, wchar_t **error) {
         response.data[response.length] = 0;
     }
     if (status != 200 && status != 201) {
-        *error = http_error(status, response.data ? response.data : "");
+        *error = http_error(work->backend, status,
+            response.data ? response.data : "");
         goto cleanup;
     }
     if (!sse_finish(&parser, stream_event, &stream) || stream.failed) {
@@ -466,7 +486,9 @@ static RequestOutcome perform(OpenRouterWork *work, wchar_t **error) {
     }
     if (!stream.done) {
         outcome = REQUEST_INTERRUPTED;
-        *error = copy_wide(L"The stream ended before OpenRouter sent [DONE].");
+        *error = copy_wide(work->backend == CHAT_BACKEND_OLLAMA ?
+            L"The stream ended before Ollama sent [DONE]." :
+            L"The stream ended before OpenRouter sent [DONE].");
         goto cleanup;
     }
     outcome = REQUEST_DONE;
@@ -479,8 +501,11 @@ network_error:
     if (work->metadata.first_token_at) outcome = REQUEST_INTERRUPTED;
     {
         wchar_t text[160];
-        swprintf(text, 160, L"Network request failed (WinHTTP error %lu).",
-            (unsigned long)winhttp_error);
+        if (work->backend == CHAT_BACKEND_OLLAMA)
+            swprintf(text, 160, L"Ollama is not reachable at localhost:11434.");
+        else
+            swprintf(text, 160, L"Network request failed (WinHTTP error %lu).",
+                (unsigned long)winhttp_error);
         *error = copy_wide(text);
     }
     goto cleanup;
@@ -502,7 +527,7 @@ cleanup:
     return outcome;
 }
 
-static void free_work(OpenRouterWork *work) {
+static void free_work(CompletionWork *work) {
     if (!work) return;
     if (work->api_key) {
         SecureZeroMemory(work->api_key, strlen(work->api_key));
@@ -514,12 +539,12 @@ static void free_work(OpenRouterWork *work) {
 }
 
 static unsigned __stdcall worker(void *parameter) {
-    OpenRouterWork *work = (OpenRouterWork *)parameter;
+    CompletionWork *work = (CompletionWork *)parameter;
     wchar_t *error = NULL;
     RequestOutcome outcome = perform(work, &error);
-    OpenRouterEventType type = outcome == REQUEST_DONE ? OPENROUTER_DONE :
-        outcome == REQUEST_CANCELLED ? OPENROUTER_CANCELLED :
-        outcome == REQUEST_INTERRUPTED ? OPENROUTER_INTERRUPTED : OPENROUTER_ERROR;
+    CompletionEventType type = outcome == REQUEST_DONE ? COMPLETION_DONE :
+        outcome == REQUEST_CANCELLED ? COMPLETION_CANCELLED :
+        outcome == REQUEST_INTERRUPTED ? COMPLETION_INTERRUPTED : COMPLETION_ERROR;
     work->metadata.finished_at = chat_now();
     work->metadata.latency_ms = (double)(GetTickCount64() - work->started_tick);
     post_event(work, type, error);
@@ -527,17 +552,22 @@ static unsigned __stdcall worker(void *parameter) {
     return 0;
 }
 
-int openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
-    const wchar_t *model, const OpenRouterMessage *messages, int count,
+int completion_request(CompletionClient *client, ChatBackend backend,
+    const char *api_key_utf8, const wchar_t *model,
+    const CompletionMessage *messages, int count,
     const ChatProviderRouting *routing) {
-    if (!client || !client->notify || !api_key_utf8 || !api_key_utf8[0] ||
-        !model || !model[0] || count < 0 || (count > 0 && !messages) ||
-        client->thread) return 0;
+    if (!client || !client->notify || backend < 0 ||
+        backend >= CHAT_BACKEND_COUNT || !model || !model[0] || count < 0 ||
+        (count > 0 && !messages) || client->thread) return 0;
+    /* Only OpenRouter needs a key; Ollama must work without OPENROUTER_API_KEY. */
+    if (backend == CHAT_BACKEND_OPENROUTER &&
+        (!api_key_utf8 || !api_key_utf8[0])) return 0;
     LONG generation = InterlockedIncrement(&client->generation);
     InterlockedExchange(&client->cancelled_generation, 0);
-    OpenRouterWork *work = (OpenRouterWork *)calloc(1, sizeof *work);
+    CompletionWork *work = (CompletionWork *)calloc(1, sizeof *work);
     if (!work) return 0;
     chat_generation_init(&work->metadata);
+    work->metadata.backend = backend;
     work->metadata.started_at = chat_now();
     work->started_tick = GetTickCount64();
     wcsncpy(work->metadata.requested_model, model, CHAT_MODEL_TEXT - 1);
@@ -545,18 +575,23 @@ int openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
     work->notify = client->notify;
     work->message = client->message;
     work->client = client;
+    work->backend = backend;
     work->count = count;
     /* The work item is calloc-zeroed, so a NULL routing keeps OpenRouter's
        defaults; otherwise the caller's routing is copied for this request. */
     if (routing) work->routing = *routing;
-    size_t key_length = strlen(api_key_utf8);
-    work->api_key = (char *)calloc(key_length + 1, 1);
+    bool ok = true;
+    if (api_key_utf8 && api_key_utf8[0]) {
+        size_t key_length = strlen(api_key_utf8);
+        work->api_key = (char *)calloc(key_length + 1, 1);
+        if (work->api_key) memcpy(work->api_key, api_key_utf8, key_length + 1);
+        else ok = false;
+    }
     work->model = copy_wide(model);
     work->roles = (ChatRole *)malloc((count ? count : 1) * sizeof *work->roles);
     work->texts = (wchar_t **)calloc(count ? count : 1, sizeof *work->texts);
-    bool ok = work->api_key && work->model && work->roles && work->texts;
+    ok = ok && work->model && work->roles && work->texts;
     if (ok) {
-        memcpy(work->api_key, api_key_utf8, key_length + 1);
         for (int i = 0; i < count && ok; i++) {
             work->roles[i] = messages[i].role;
             work->texts[i] = copy_wide(messages[i].text);
@@ -574,23 +609,23 @@ int openrouter_request(OpenRouterClient *client, const char *api_key_utf8,
     return 0;
 }
 
-bool openrouter_cancel(OpenRouterClient *client, int generation) {
+bool completion_cancel(CompletionClient *client, int generation) {
     if (!client || !client->thread || generation != client->generation) return false;
     InterlockedExchange(&client->cancelled_generation, generation);
     return true;
 }
 
-void openrouter_complete(OpenRouterClient *client, int generation) {
+void completion_complete(CompletionClient *client, int generation) {
     if (!client || !client->thread || generation != client->generation) return;
     WaitForSingleObject(client->thread, INFINITE);
     CloseHandle(client->thread);
     client->thread = NULL;
 }
 
-void openrouter_shutdown(OpenRouterClient *client) {
+void completion_shutdown(CompletionClient *client) {
     if (!client || !client->thread) return;
     int generation = (int)client->generation;
-    openrouter_cancel(client, generation);
+    completion_cancel(client, generation);
     WaitForSingleObject(client->thread, INFINITE);
     CloseHandle(client->thread);
     client->thread = NULL;

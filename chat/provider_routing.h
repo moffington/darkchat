@@ -1,11 +1,12 @@
 #ifndef DARKCHAT_PROVIDER_ROUTING_H
 #define DARKCHAT_PROVIDER_ROUTING_H
 
-/* Pure OpenRouter provider-routing serialization. Both the request encoder
-   (chat/openrouter_winhttp.c) and the request-context budget
+/* Pure OpenRouter provider-routing serialization. Both the request builder
+   (chat/completion_request.c) and the request-context budget
    (chat/context.c) derive the exact `provider` object bytes here, so the body
    the budget measures is structurally the body the encoder writes and the two
-   cannot drift. No allocation, no Win32. */
+   cannot drift. The object is OpenRouter-only: the Ollama envelope never
+   carries it. No allocation, no Win32. */
 #include <stdbool.h>
 #include <stddef.h>
 #include "chat.h"

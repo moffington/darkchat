@@ -24,10 +24,11 @@ static const char *transport_payload =
     "{\"data\":[{\"id\":\"openai/gpt-4\",\"name\":\"GPT-4\","
     "\"context_length\":8192}]}";
 
-static bool fake_transport(const wchar_t *headers,
+static bool fake_transport(ChatBackend backend,
+    const CatalogEndpoint *endpoint, const wchar_t *headers,
     const ModelCatalogCancel *cancel, char **body, size_t *length,
     DWORD *status, wchar_t **error) {
-    (void)headers; (void)error;
+    (void)backend; (void)endpoint; (void)headers; (void)error;
     *body = NULL; *length = 0; *status = 0;
     if (transport_mode == MODE_BLOCK)
         WaitForSingleObject(transport_release, INFINITE);
@@ -101,14 +102,24 @@ int main(void) {
     model_catalog_client_init(&client, window, CHAT_WM_CATALOG_EVENT);
     int generation;
 
-    /* Missing key: no worker is started. */
-    CHECK(model_catalog_request(&client, NULL) == 0);
-    CHECK(model_catalog_request(&client, "") == 0);
+    /* Missing key: no OpenRouter worker is started. Ollama needs no key. */
+    CHECK(model_catalog_request(&client, CHAT_BACKEND_OPENROUTER, NULL) == 0);
+    CHECK(model_catalog_request(&client, CHAT_BACKEND_OPENROUTER, "") == 0);
     CHECK(!model_catalog_busy(&client));
+    transport_mode = MODE_OK;
+    generation = model_catalog_request(&client, CHAT_BACKEND_OLLAMA, NULL);
+    CHECK(generation > 0 && model_catalog_busy(&client));
+    CHECK(await_event(5000));
+    CHECK(received->result == MODEL_CATALOG_OK && received->json);
+    free_received();
+    model_catalog_complete(&client, generation);
+    CHECK(!model_catalog_busy(&client));
+    /* An out-of-range backend is rejected. */
+    CHECK(model_catalog_request(&client, (ChatBackend)7, "key") == 0);
 
     /* Successful fetch. */
     transport_mode = MODE_OK;
-    generation = model_catalog_request(&client, "key");
+    generation = model_catalog_request(&client, CHAT_BACKEND_OPENROUTER, "key");
     CHECK(generation > 0 && model_catalog_busy(&client));
     CHECK(await_event(5000));
     CHECK(received->result == MODEL_CATALOG_OK && received->json);
@@ -126,7 +137,7 @@ int main(void) {
 
     /* Non-2xx is rejected before parsing. */
     transport_mode = MODE_HTTP_ERROR;
-    generation = model_catalog_request(&client, "key");
+    generation = model_catalog_request(&client, CHAT_BACKEND_OPENROUTER, "key");
     CHECK(generation > 0 && await_event(5000));
     CHECK(received->result == MODEL_CATALOG_HTTP_ERROR && !received->json &&
         received->error);
@@ -135,7 +146,7 @@ int main(void) {
 
     /* Oversized body is refused. */
     transport_mode = MODE_TOO_LARGE;
-    generation = model_catalog_request(&client, "key");
+    generation = model_catalog_request(&client, CHAT_BACKEND_OPENROUTER, "key");
     CHECK(generation > 0 && await_event(5000));
     CHECK(received->result == MODEL_CATALOG_TOO_LARGE && !received->json);
     free_received();
@@ -144,9 +155,9 @@ int main(void) {
     /* A second fetch is refused while one is in flight. */
     transport_mode = MODE_BLOCK;
     ResetEvent(transport_release);
-    generation = model_catalog_request(&client, "key");
+    generation = model_catalog_request(&client, CHAT_BACKEND_OPENROUTER, "key");
     CHECK(generation > 0);
-    CHECK(model_catalog_request(&client, "key") == 0);
+    CHECK(model_catalog_request(&client, CHAT_BACKEND_OPENROUTER, "key") == 0);
     SetEvent(transport_release);
     CHECK(await_event(5000));
     free_received();
@@ -154,14 +165,14 @@ int main(void) {
 
     /* Allocation failure while building headers refuses to start. */
     alloc_fail_countdown = 0;
-    CHECK(model_catalog_request(&client, "key") == 0);
+    CHECK(model_catalog_request(&client, CHAT_BACKEND_OPENROUTER, "key") == 0);
     alloc_fail_countdown = -1;
 
     /* A failed completion post must not wedge the client: the worker exits and
        can be reaped. */
     transport_mode = MODE_OK;
     client.notify = (HWND)1;
-    generation = model_catalog_request(&client, "key");
+    generation = model_catalog_request(&client, CHAT_BACKEND_OPENROUTER, "key");
     CHECK(generation > 0);
     model_catalog_complete(&client, generation);
     CHECK(!model_catalog_busy(&client));
@@ -170,7 +181,7 @@ int main(void) {
     /* Shutdown cancels and joins an in-flight fetch. */
     transport_mode = MODE_CANCEL;
     received = NULL;
-    generation = model_catalog_request(&client, "key");
+    generation = model_catalog_request(&client, CHAT_BACKEND_OPENROUTER, "key");
     CHECK(generation > 0);
     Sleep(50);
     model_catalog_shutdown(&client);

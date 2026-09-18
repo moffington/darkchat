@@ -34,10 +34,22 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   Sending replaces that user message and its response. Cancel edit or switching
   conversations abandons the edit and restores the ordinary saved draft. Editing
   text is not autosaved until sent; ordinary per-conversation drafts are autosaved.
-- Settings menu edits the global system prompt and sidebar width (160–360 DIPs).
-  The system prompt is prepended to future requests; changing it does not rewrite
-  old messages. The model field still accepts any OpenRouter identifier typed
-  directly.
+- Settings menu edits the global system prompt, the sidebar width (160–360 DIPs),
+  and the active backend. The system prompt is prepended to future requests;
+  changing it does not rewrite old messages. The model field accepts any
+  identifier typed directly, interpreted by the active backend.
+- Settings > Backend selects OpenRouter or Ollama (radio). OpenRouter is the
+  default and the historical behavior. Ollama is first-class through its
+  **OpenAI-compatible** endpoints (`http://localhost:11434/v1/chat/completions`
+  and `/v1/models`), never its native `/api/chat`; the endpoint is fixed and not
+  configurable. Each backend remembers its own last-used model. Switching to
+  Ollama with a remembered local model applies it immediately and sends future
+  requests to Ollama; switching with no remembered model opens the Ollama picker
+  and commits the switch only after a model is selected (cancelling leaves the
+  active backend unchanged). A missing `OPENROUTER_API_KEY` never blocks Ollama,
+  and no API key, `Authorization` header, HTTP-Referer, X-Title, TLS or provider
+  object is ever sent to the local server. If the server is not running the
+  failure reads `Ollama is not reachable at localhost:11434.`
 - Settings > Provider routing applies global OpenRouter provider routing to
   future requests: sorting (Default — balanced, or price/throughput/latency),
   fallback providers on/off, whether providers that may store data are allowed,
@@ -48,20 +60,31 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   account, it just adds nothing. A change applies to the next request and never
   rewrites history. A routing restriction (no fallbacks, data-collection deny,
   or ZDR) can make a request fail when no eligible provider exists; the failure
-  surfaces through the ordinary Failed/Retry path.
-- Ctrl+Space opens the model picker (Settings > Choose model...). It opens
-  immediately with the current model and the recent-model history, then fills in
-  from OpenRouter's catalog when the fetch completes, refreshing in place
-  without losing the filter text or the selected id. The filter matches
-  case-insensitively against a model's id and display name; Up/Down move, Enter
-  or a double-click selects, Escape cancels. The merged list is the current
-  model (when set), then history in most-recent order, then the catalog in API
-  order, deduplicated by id; ids longer than the model field are skipped and
-  counted. The picker never blocks startup: it fetches on first open, caches in
-  memory for one hour, retries on a later open after a failure, and falls back
-  to the current model and history when offline or when OPENROUTER_API_KEY is
-  unset. Only a confirmed selection replaces the model; a model joins history
-  only when a request is sent, and the catalog is never persisted.
+  surfaces through the ordinary Failed/Retry path. Provider routing is
+  OpenRouter-only: while Ollama is active the controls are grayed and an
+  activation is ignored with an explicit status.
+- Ctrl+Space opens the model picker (Settings > Choose model...) for the active
+  backend. It opens immediately with the backend's current model and that
+  backend's recent-model history, then fills in from that backend's catalog when
+  the fetch completes, refreshing in place without losing the filter text or the
+  selected
+  id. The filter matches case-insensitively against a model's id and display
+  name; Up/Down move, Enter or a double-click selects, Escape cancels. The
+  merged list is the current model (when set), then history in most-recent
+  order, then the catalog in API order, deduplicated by id; ids longer than the
+  model field are skipped and counted. History entries are tagged with the
+  backend that produced them, so an OpenRouter model never appears in the Ollama
+  picker or vice versa. The picker never blocks startup: it
+  fetches on first open, caches in memory for one hour, retries on a later open
+  after a failure, and falls back to the current model and history when offline
+  or when OpenRouter's key is unset. Each backend keeps its own last-good
+  transient catalog and status; Ollama's keyless catalog parses the same
+  `data[].id` shape. Only one fetch runs at a time, and if the other backend's
+  fetch is in flight when the picker opens, that backend's fetch is queued as
+  soon as the in-flight one settles, so the picker fills in without a reopen.
+  Only a confirmed selection replaces the active backend's
+  model; a model joins history only when a request is sent, and the catalog is
+  never persisted.
 - Ctrl+F focuses the sidebar search field. Enter performs a fresh on-demand
   search over every live message body and reasoning field; F3 and Shift+F3 move
   between retained results. Matching is locale-independent ordinal Unicode
@@ -71,11 +94,12 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   opens that turn's reasoning viewport before the transcript minimally reveals
   it. Search queries, snippets, and results are transient and are never saved.
 - Each completed response displays a compact metadata footer: completion state,
-  TTFT and latency in seconds, grouped input/output token counts, USD cost and
-  the model (shown once when requested and actual match, otherwise
-  requested → actual). Normal `stop` is omitted and only unusual finish reasons
-  are surfaced. The status line shows the active request's model, state and
-  elapsed time.
+  TTFT and latency in seconds, grouped input/output token counts, USD cost (or
+  `local` for an Ollama turn, which is never billed) and the model line, which
+  names the backend (`OpenRouter · model` / `Ollama · model`) and shows the
+  model once when requested and actual match, otherwise requested → actual.
+  Normal `stop` is omitted and only unusual finish reasons are surfaced. The
+  status line shows the active request's model, state and elapsed time.
 - Reasoning-capable models stream reasoning separately from the answer. Every
   assistant turn owns its own reasoning row: a subtle **Thinking… ⌄** row appears
   while a request waits or reasons, and reads **⌄ Thought for X.Xs** once it
@@ -297,9 +321,12 @@ reconciliation for a live surface.
 
 Metadata is a terminal-state footer only: a compact muted line
 (`Complete · TTFT 18.0s · 19.4s · 44 in / 1,365 out · $0.00165`) with the model
-on its own line, shown once when the requested and actual models match and as
-`requested → actual` when they differ. Normal `stop` is omitted; unusual finish
-reasons are surfaced. A running turn never mixes stats into the streaming answer.
+on its own line, prefixed by the backend (`OpenRouter · model` / `Ollama ·
+model`), shown once when the requested and actual models match and as
+`requested → actual` when they differ. An Ollama turn shows `local` where the
+USD cost would appear; a local request is never billed. Normal `stop` is
+omitted; unusual finish reasons are surfaced. A running turn never mixes stats
+into the streaming answer.
 
 ### Markdown rendering
 
@@ -387,9 +414,10 @@ turns may reparse the message; no render cache is kept.
 The key is read from `OPENROUTER_API_KEY` in the process environment, falling back
 to the Windows User environment registry value (so an existing desktop session
 can pick up a newly configured key). Key buffers are cleared before release.
-The same key authenticates the model-catalog fetch (`GET /api/v1/models`); its
-owned header buffer is cleared before release too.
-The key is never part of conversation state or persistence.
+The same key authenticates the OpenRouter model-catalog fetch
+(`GET /api/v1/models`); its owned header buffer is cleared before release too.
+The key is never part of conversation state or persistence, and it is required
+only for OpenRouter: Ollama sends no credentials of any kind.
 
 ## Lifecycle and history contract
 
@@ -463,7 +491,7 @@ never sent as conversation text.
 
 ### Request context budget
 
-Persisted history and the payload sent to OpenRouter are separate things. A
+Persisted history and the payload sent to a provider are separate things. A
 request carries a **bounded projection** of the conversation (`chat/context.c`, a
 pure, allocation-free module): the system prompt when set, the triggering user
 message, and the newest eligible history messages that fit
@@ -487,10 +515,15 @@ into the transcript or the payload.
 - The budget counts the **encoded request body in bytes**, measured with the
   encoder's own escape rules (`json_encoded_string_size`, shared with
   `json_buf_append_json_string`), so the size the drop decision is made on is the
-  size actually sent; a test proves equality against the real request encoder.
-  When provider routing is configured the body also carries the optional
-  `provider` object, whose exact bytes are added to the measured envelope by the
-  same pure builder the encoder uses, so the measured size stays exact.
+  size actually sent; a test proves equality against the real request encoder
+  for both backends. The framing itself comes from the same pure backend-aware
+  builder the transport encodes with (`chat/completion_request.c`), so the
+  measured envelope and per-message bytes cannot drift from the body. For
+  OpenRouter the body may also carry the optional `provider` object, whose exact
+  bytes are added to the measured envelope by the same pure builder the encoder
+  uses; the Ollama envelope instead carries
+  `stream_options.include_usage` and never a `provider` object or reasoning
+  control.
 - If the indispensable messages cannot fit, the request is not sent at all: the
   pending turn is marked Failed with the cause (system prompt, this message, or
   the two together) and the complete body size they would have needed
@@ -507,19 +540,33 @@ into the transcript or the payload.
 `%LOCALAPPDATA%\DarkChat\state.jsonl` is a UTF-8, version-3 JSONL snapshot:
 
 1. A settings record with `type: "settings"`, `version: 3`, selected conversation
-   index, next ID counter, record counts, model/system prompt, geometry, and the
+   index, next ID counter, record counts, model/system prompt, geometry, the
    optional provider-routing fields (`provider_sort`, `provider_no_fallbacks`,
-   `provider_data_collection`, `provider_zdr`).
-2. Zero or more `type: "model"` history records.
+   `provider_data_collection`, `provider_zdr`), and the optional backend fields
+   (`backend`, `ollama_model`).
+2. Zero or more `type: "model"` history records, each carrying its backend tag
+   (`"backend"`) when it is not OpenRouter; an untagged record loads as
+   OpenRouter. The tags keep each backend's picker history isolated, and an
+   Ollama-active snapshot whose `ollama_model` is missing or empty is rejected
+   as corruption.
 3. For each conversation, a `type: "conversation"` record followed by its declared
-   number of `type: "message"` records, each carrying its stable `"id"`.
+   number of `type: "message"` records, each carrying its stable `"id"` and,
+   when it is not OpenRouter, the generation's `"backend"`.
 4. A `type: "commit"` record containing the 32-bit FNV-1a checksum of every byte
    before that record (including LF separators).
 
 The record layout is identical in formats 1–3. Format 2 raised the conversation
 limit from 16 to 128, and format 3 raised the per-conversation message limit
-from 64 to 512. Provider-routing settings are additive optional fields appended
-last, emitted only when non-default and defaulted when absent; like the optional
+from 64 to 512. The active backend, the per-backend models, each generation's
+backend, and each history entry's backend are additive optional fields emitted
+only when non-default
+(`backend` only when Ollama, `ollama_model` only when non-empty) and defaulted
+when absent — to OpenRouter with no remembered Ollama model, and with every
+history entry tagged OpenRouter. A present field of the wrong JSON type is
+corruption, and an Ollama-active snapshot with an empty `ollama_model` is
+rejected. Provider-routing
+settings are additive optional fields appended last, emitted only when
+non-default and defaulted when absent; like the optional
 reasoning fields they do not change the format version, so the emitted version
 stays 3 and older snapshots load with OpenRouter's routing defaults. This build
 decodes all three versions, so an old snapshot
@@ -543,12 +590,15 @@ and modified timestamps and generation started/first-token/finished
 timestamps are Unix milliseconds (currently second-resolution wall clock).
 TTFT and latency use monotonic millisecond timing. A zero generation timestamp
 means unknown; numeric metadata uses -1 for unavailable. Cost is supplied by
-OpenRouter, never estimated locally. A crash-recovered response has no invented
-finish timestamp or latency. Window size/sidebar width use DIPs; position uses
-Windows workspace coordinates, with off-monitor fallback on restore. Any
+OpenRouter, never estimated locally; an Ollama turn has no cost and is shown as
+`local`. A crash-recovered response has no invented finish timestamp or latency.
+Window size/sidebar width use DIPs; position uses Windows workspace coordinates,
+with off-monitor fallback on restore. Any
 reasoning a provider supplied is persisted per message alongside its answer,
 with its duration; the optional fields are appended last so a version 1 snapshot
-without reasoning still loads.
+without reasoning still loads. Each generation also records the backend that
+produced it, so a transcript's metadata footer remains correct after later
+backend switches.
 
 Writes serialize explicit fields, flush `state.tmp.jsonl`, then atomically replace
 `state.jsonl` on the same volume using `MoveFileExW` with write-through. Before
@@ -643,7 +693,8 @@ storage or a cross-machine synchronization format.
 - `test_transcript_policy` and `test_transcript_slots`: visibility/protection,
   shape-aware slot and forced-victim policy, raise-only capacity formula and
   limits, plus the one-allocation slot arena lifecycle.
-- `test_chat_host` (`default_suite`, `seam_toggle_suite`, `bounded_suite`):
+- `test_chat_host` (`default_suite`, `seam_toggle_suite`, `bounded_suite`,
+  `catalog_suite`, `backend_suite`):
   real hidden-HWND integration for recycling, foreign-content prevention,
   exact/estimated measurement and retries, resize/DPI settling, streaming and
   deferred writes, BOTTOM/FREE anchoring, search reveal, focus transfer, table
@@ -695,8 +746,9 @@ The complete coverage includes:
   diagnostics, invalid arguments (each rejecting call zeroes its output), a
   read-only proof over overflow storage, a budget sweep asserting the suffix,
   monotonicity and size invariants, and equality between the measured size and
-  the real encoded request body. A hidden-HWND suite links the real host with a
-  wrapped `openrouter_request` seam: it proves an oversized send fails
+  the real encoded request body for both backends. A hidden-HWND suite links the
+  real host with a wrapped `completion_request` seam: it proves an oversized send
+  fails
   explicitly, keeps its user message whole, retries through the real send path
   with the same failure, and never invokes the client, then drives a real
   successful send with omitted history and checks exactly which messages the
@@ -740,7 +792,29 @@ The complete coverage includes:
 - Real request encoder/SSE callback fixtures for model, usage, cost, TTFT,
   finish reason and provider errors after partial content, now also the enabled
   reasoning request parameter and reasoning_details/text-summary/plain fallback
-  parsing that never fabricates reasoning.
+  parsing that never fabricates reasoning — exercised for both backends. The
+  OpenRouter body is pinned byte-for-byte and still carries its credentials,
+  attribution headers, reasoning control and optional provider object; the
+  Ollama body requests `stream_options.include_usage`, never carries a reason or
+  provider control, and its headers contain no `Authorization`, `X-Title`,
+  `HTTP-Referer` or bearer token even when a key is set. Ollama content,
+  reasoning (`reasoning`/`reasoning_content`), usage, `[DONE]`, malformed-stream
+  and cancelled paths reuse the same parser and event lifecycle.
+- Backend identity and selection: the active backend and per-backend last-used
+  models round-trip through storage at unchanged format 3 and an old snapshot
+  decodes as OpenRouter with no Ollama model; a malformed backend field rejects,
+  and an Ollama-active snapshot whose `ollama_model` is absent, empty, or the
+  wrong JSON type rejects. The hidden host drives the Settings > Backend actions,
+  proves the active model
+  and request backend switch together, that an Ollama request starts without
+  `OPENROUTER_API_KEY` while an OpenRouter request still refuses, that switching
+  to Ollama with no remembered model opens the picker and commits only on a
+  selection, that each backend keeps its own last-good catalog, that a backend's
+  picker history never contains the other backend's models (and remembers by
+  backend tag), that an in-flight fetch for the other backend queues the open
+  picker's own fetch as soon as it settles, and that provider
+  routing is ignored (with an explicit status) and grayed while Ollama is active.
+  The metadata footer names the backend and shows `local` for local turns.
 - Provider routing: an all-default routing sends no `provider` object at all;
   each control serializes to its exact request JSON shape and only non-default
   keys are emitted in a fixed order; the request-context budget charges exactly
@@ -755,12 +829,14 @@ The complete coverage includes:
   length cancellation, malformed roots, an ordinal case-insensitive id/name
   substring filter, the current/history/catalog merge order, and transactional
   allocation failures; and the one-shot worker through an injected transport
-  for success, non-2xx, oversized bodies, missing key, allocation failure,
+  for success, non-2xx, oversized bodies, a missing OpenRouter key, an
+  Ollama request that needs no key, allocation failure,
   duplicate-start rejection, failed completion post and cancel-and-join
   shutdown. The hidden host exercises the picker seam for exactly one fetch on
   first open, success refresh, filter/selection preservation across an open
   refresh, accept/cancel, stale-generation rejection, keyed-offline history
-  fallback with retry, and a close deferred until the modal loop unwinds.
+  fallback with retry, backend-specific fetch routing and last-good catalogs for
+  OpenRouter and Ollama, and a close deferred until the modal loop unwinds.
 - Per-turn reasoning ownership (hidden HWND host): two assistant turns keep
   independent rows and viewports; expanding one does not affect another;
   collapsed by default while streaming; explicit expansion streams live; a
@@ -769,8 +845,10 @@ The complete coverage includes:
   was supplied; conversation switching and reload restore each message's
   reasoning; retry/regenerate cannot leak reasoning or expansion; cancellation
   and error paths stay coherent.
-- Compact metadata footer: grouped token counts, a deduplicated model line
-  (shown once when requested and actual match, else requested → actual), normal
+- Compact metadata footer: grouped token counts, a model line naming the backend
+  (`OpenRouter · ...` / `Ollama · ...`) and deduplicated
+  (shown once when requested and actual match, else requested → actual), `local`
+  where a local turn has no cost, normal
   `stop` omitted and unusual finish reasons surfaced. A running turn's answer
   never contains stats, and no footer exists until the turn is terminal.
 - Storage round-trips reasoning and its duration and still loads a version 1
@@ -871,12 +949,22 @@ $env:OPENROUTER_API_KEY = [Environment]::GetEnvironmentVariable('OPENROUTER_API_
 Remove-Item Env:OPENROUTER_API_KEY
 ```
 
+A local Ollama stream can be checked the same way; it is optional and never
+required by the suite:
+
+```powershell
+$env:DARKCHAT_OLLAMA_MODEL = "llama3.2"
+.\build\test_openrouter.exe --live
+Remove-Item Env:DARKCHAT_OLLAMA_MODEL
+```
+
 Reproducible result: `chat.bat test` exits zero, running the chat suite above and
 the DarkUI toolkit suite. The per-turn inline reasoning architecture (its own row
 and viewport per assistant turn, live streaming, follow/pin behavior, no-reasoning
 removal, and version 1 persistence compatibility) and the compact metadata footer
-are covered by focused hidden-HWND tests. Live OpenRouter behavior is not asserted
-by any repo command; it is the manual, key-gated check shown above. Tests use
+are covered by focused hidden-HWND tests. Live OpenRouter and Ollama behavior is
+not asserted by any repo command; it is the manual, key- or model-gated check
+shown above. Tests use
 isolated directories under `build`, not the user's conversation store. Search
 matching, snippets, invalidation, stable-ID resolution and hidden-host jumps are
 also covered.
@@ -905,7 +993,10 @@ one unpaginated request, held in memory only and never persisted, so an offline
 restart falls back to history until a later fetch succeeds. Provider routing
 exposes sorting, fallback, data-collection and ZDR controls only; per-provider
 `only`/`ignore`/`order` selection, quantization, and price/performance
-thresholds are not exposed. Response variants remain outside this pass.
+thresholds are not exposed, and the controls apply to OpenRouter only. Ollama is
+reached at the fixed OpenAI-compatible endpoint `localhost:11434/v1`; the
+endpoint is not configurable, and a local turn carries no billed cost. Response
+variants remain outside this pass.
 Interactive clipboard/IME behavior, modal-dialog appearance and physical
 multi-monitor DPI transitions still need a manual desktop check; hidden-HWND
 tests do not substitute for that visual review.

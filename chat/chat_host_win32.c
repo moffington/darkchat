@@ -2,7 +2,8 @@
 #include "chat_ui.h"
 #include "rich_text_win32.h"
 #include "transcript_win32.h"
-#include "openrouter_winhttp.h"
+#include "completion_winhttp.h"
+#include "completion_request.h"
 #include "context.h"
 #include "search.h"
 #include "storage.h"
@@ -41,7 +42,7 @@ typedef struct {
     bool tracking, minimized;
     unsigned retries;
     UiId accessibility_focus;
-    OpenRouterClient client;
+    CompletionClient client;
     int request_generation, request_conversation, request_message;
     /* Request-scoped: how many older messages the live request omitted to fit
        the context budget. Shown by the one-second generating status sweep. */
@@ -69,16 +70,23 @@ typedef struct {
     /* Latest sidebar remap change report, translated into UIA notifications
        by the host (chat_ui.c itself knows nothing about accessibility). */
     ChatUiRemapReport remap;
-    /* Transient model catalog: the last-good parsed list, a merged view built
-       for the picker, and the one-shot fetch worker. Never persisted. When no
-       catalog is available the picker falls back to the model history. */
-    ChatModelCatalog catalog, picker_source;
-    ChatModelParseStats catalog_stats;
+    /* Transient model catalogs: the last-good parsed list and status per
+       backend, a merged view built for the picker, and the one-shot fetch
+       worker. Never persisted. When no catalog is available the picker falls
+       back to the model history. `backend_target` is the backend the picker is
+       choosing for; it equals the active backend except while an Ollama switch
+       waits for a model selection. */
+    ChatModelCatalog catalog[CHAT_BACKEND_COUNT], picker_source;
+    ChatModelParseStats catalog_stats[CHAT_BACKEND_COUNT];
     ModelCatalogClient catalog_client;
     int catalog_generation;
-    ULONGLONG catalog_success_tick;
-    bool catalog_loaded, catalog_loading, catalog_failed;
-    wchar_t catalog_error[CHAT_STATUS_TEXT];
+    ChatBackend catalog_backend;
+    ULONGLONG catalog_success_tick[CHAT_BACKEND_COUNT];
+    bool catalog_loaded[CHAT_BACKEND_COUNT], catalog_loading;
+    bool catalog_failed[CHAT_BACKEND_COUNT];
+    wchar_t catalog_error[CHAT_BACKEND_COUNT][CHAT_STATUS_TEXT];
+    ChatBackend backend_target;
+    bool backend_switch_pending;
     ModelPicker *open_picker;
     bool picker_pumping;
     bool close_pending, model_applied;
@@ -323,67 +331,95 @@ static void mark_dirty(ChatHost *host) {
 
 /* ---- Model catalog and picker ----------------------------------------- */
 
-/* Writes the selected id into Chat and the visible field atomically. Rejects
-   empty and over-capacity ids. The model is added to history only when a
-   request actually begins (chat_begin_response), never here, and manual entry
-   through the field remains a fully supported secondary path. */
+/* The remembered model slot of one backend. OpenRouter keeps the historical
+   `model`; Ollama has its own additive slot. */
+static wchar_t *model_slot(Chat *chat, ChatBackend backend) {
+    return backend == CHAT_BACKEND_OLLAMA ? chat->ollama_model : chat->model;
+}
+static const wchar_t *current_model(const Chat *chat, ChatBackend backend) {
+    return backend == CHAT_BACKEND_OLLAMA ? chat->ollama_model : chat->model;
+}
+
+/* Writes the selected id into the target backend's slot and the visible field
+   atomically. Rejects empty and over-capacity ids. The model is added to
+   history only when a request actually begins (chat_begin_response), never
+   here, and manual entry through the field remains a fully supported
+   secondary path. During a pending backend switch the field is not updated
+   until the switch commits. */
 static bool apply_model(ChatHost *host, const wchar_t *id) {
     if (!id || !id[0] || wcslen(id) >= CHAT_MODEL_TEXT) return false;
     Chat *chat = host->config.chat;
-    bool changed = wcscmp(chat->model, id) != 0;
+    wchar_t *slot = model_slot(chat, host->backend_target);
+    bool changed = wcscmp(slot, id) != 0;
     if (changed) {
-        wcsncpy(chat->model, id, CHAT_MODEL_TEXT - 1);
-        chat->model[CHAT_MODEL_TEXT - 1] = 0;
+        wcsncpy(slot, id, CHAT_MODEL_TEXT - 1);
+        slot[CHAT_MODEL_TEXT - 1] = 0;
         mark_dirty(host);
     }
-    /* The visible field always mirrors the stored model, changed or not. */
-    rich_text_set_text(&host->field, chat->model);
+    /* The visible field always mirrors the active backend, changed or not. */
+    if (!host->backend_switch_pending)
+        rich_text_set_text(&host->field, chat_active_model(chat));
     return changed;
 }
 
-/* Concise, nonfatal status for the picker's status line. */
-static void picker_status(ChatHost *host, wchar_t *out, size_t capacity) {
+/* Concise, nonfatal status for the picker's status line, for one backend. */
+static void picker_status(ChatHost *host, ChatBackend backend, wchar_t *out,
+    size_t capacity) {
     if (!out || !capacity) return;
     out[0] = 0;
-    if (host->catalog_failed && host->catalog.count)
+    const ChatModelCatalog *catalog = &host->catalog[(int)backend];
+    const ChatModelParseStats *stats = &host->catalog_stats[(int)backend];
+    if (host->catalog_failed[backend] && catalog->count)
         wcsncpy(out, L"Refresh failed; showing cached catalog.", capacity - 1);
-    else if (host->catalog_failed) {
-        if (host->catalog_error[0])
+    else if (host->catalog_failed[backend]) {
+        if (host->catalog_error[backend][0])
             _snwprintf(out, capacity,
                 L"Catalog unavailable: %ls. Showing recent models.",
-                host->catalog_error);
+                host->catalog_error[backend]);
         else
             wcsncpy(out, L"Catalog unavailable; showing recent models.",
                 capacity - 1);
-    } else if (host->catalog_loading && !host->catalog.count)
-        wcsncpy(out, L"Loading OpenRouter models\u2026", capacity - 1);
-    else if (host->catalog_stats.too_long)
+    } else if (host->catalog_loading && host->catalog_backend == backend &&
+        !catalog->count)
+        _snwprintf(out, capacity, L"Loading %ls models\u2026",
+            chat_backend_name(backend));
+    else if (stats->too_long)
         _snwprintf(out, capacity, L"%lu models hidden (id too long).",
-            (unsigned long)host->catalog_stats.too_long);
-    else if (host->catalog_stats.truncated)
+            (unsigned long)stats->too_long);
+    else if (stats->truncated)
         _snwprintf(out, capacity, L"%lu models omitted (catalog limit).",
-            (unsigned long)host->catalog_stats.truncated);
-    else if (host->catalog_loaded)
+            (unsigned long)stats->truncated);
+    else if (host->catalog_loaded[backend])
         _snwprintf(out, capacity, L"%lu models",
-            (unsigned long)host->catalog.count);
+            (unsigned long)catalog->count);
     out[capacity - 1] = 0;
 }
 
-static bool should_fetch_catalog(ChatHost *host) {
-    if (!host->config.api_key_utf8 || !host->config.api_key_utf8[0])
+/* OpenRouter needs a key to fetch; Ollama never does. */
+static bool should_fetch_catalog(ChatHost *host, ChatBackend backend) {
+    if (backend == CHAT_BACKEND_OPENROUTER &&
+        (!host->config.api_key_utf8 || !host->config.api_key_utf8[0]))
         return false;
-    if (host->catalog.count == 0 || host->catalog_failed) return true;
-    return GetTickCount64() - host->catalog_success_tick >= 3600000ULL;
+    const ChatModelCatalog *catalog = &host->catalog[(int)backend];
+    if (catalog->count == 0 || host->catalog_failed[backend]) return true;
+    return GetTickCount64() - host->catalog_success_tick[(int)backend] >= 3600000ULL;
 }
 
-/* Rebuilds the merged picker list (current, history, catalog) into its own
-   storage; the previous view is kept if the rebuild cannot allocate. */
-static void build_picker_source(ChatHost *host) {
+/* Rebuilds the merged picker list (current, history, catalog) for `backend`
+   into its own storage; the previous view is kept if the rebuild cannot
+   allocate. History is tagged by backend and filtered here, so an OpenRouter
+   model never appears in the Ollama picker or vice versa. */
+static void build_picker_source(ChatHost *host, ChatBackend backend) {
     Chat *chat = host->config.chat;
+    wchar_t history[CHAT_MODEL_HISTORY][CHAT_MODEL_TEXT];
+    int history_count = 0;
+    for (int i = 0; i < chat->model_history_count; i++)
+        if (chat->model_history_backend[i] == backend)
+            wcscpy(history[history_count++], chat->model_history[i]);
     ChatModelCatalog merged;
     chat_model_catalog_init(&merged);
-    if (chat_model_catalog_merged(&host->catalog, chat->model,
-            chat->model_history, chat->model_history_count, &merged)) {
+    if (chat_model_catalog_merged(&host->catalog[(int)backend],
+            current_model(chat, backend), history, history_count, &merged)) {
         chat_model_catalog_dispose(&host->picker_source);
         host->picker_source = merged;
     } else {
@@ -400,64 +436,99 @@ static bool catalog_event_pending(const ChatHost *host) {
         CHAT_WM_CATALOG_EVENT, PM_NOREMOVE) != FALSE;
 }
 
-/* Opens the picker: builds the merged view, starts at most one fetch, and
-   creates the popup. The caller drives the pump. */
+/* Starts a fetch for `backend` now; the caller guarantees the client is idle. */
+static void request_catalog(ChatHost *host, ChatBackend backend) {
+    int generation = model_catalog_request(&host->catalog_client, backend,
+        host->config.api_key_utf8);
+    if (generation) {
+        host->catalog_generation = generation;
+        host->catalog_backend = backend;
+        host->catalog_loading = true;
+        host->catalog_failed[backend] = false;
+    } else {
+        host->catalog_failed[backend] = true;
+        wcsncpy(host->catalog_error[backend],
+            L"Could not start the catalog request.", CHAT_STATUS_TEXT - 1);
+        host->catalog_error[backend][CHAT_STATUS_TEXT - 1] = 0;
+    }
+}
+
+/* Reaps a worker that finished without posting its completion (a failed post),
+   treating it as a retryable failure for the backend that owned it, so a
+   loading flag no event will clear can never block a later fetch. */
+static void recover_lost_catalog(ChatHost *host) {
+    if (!host->catalog_loading || catalog_event_pending(host) ||
+        model_catalog_busy(&host->catalog_client)) return;
+    ChatBackend lost = host->catalog_backend;
+    host->catalog_loading = false;
+    host->catalog_failed[lost] = true;
+    wcsncpy(host->catalog_error[lost],
+        L"The model catalog request did not complete.", CHAT_STATUS_TEXT - 1);
+    host->catalog_error[lost][CHAT_STATUS_TEXT - 1] = 0;
+}
+
+/* Starts the target backend's fetch when one is wanted and none is in flight.
+   Called after any completion settles, which closes the switch gap: an
+   OpenRouter result that lands while the Ollama picker is open queues Ollama's
+   own fetch instead of leaving the picker stale until it is reopened. */
+static void maybe_start_catalog_fetch(ChatHost *host, ChatBackend backend) {
+    if (host->catalog_loading || model_catalog_busy(&host->catalog_client))
+        return;
+    if (!should_fetch_catalog(host, backend)) return;
+    request_catalog(host, backend);
+}
+
+/* Opens the picker for the backend `backend_target`: builds the merged view,
+   starts at most one fetch, and creates the popup. The caller drives the
+   pump. */
 static void begin_model_picker(ChatHost *host) {
     if (host->open_picker) return;
-    if (!host->config.api_key_utf8 || !host->config.api_key_utf8[0]) {
-        host->catalog_failed = true;
-        wcsncpy(host->catalog_error,
+    Chat *chat = host->config.chat;
+    ChatBackend backend = host->backend_target;
+    bool has_key = host->config.api_key_utf8 && host->config.api_key_utf8[0];
+    if (backend == CHAT_BACKEND_OPENROUTER && !has_key) {
+        host->catalog_failed[backend] = true;
+        wcsncpy(host->catalog_error[backend],
             L"Set OPENROUTER_API_KEY to load the model catalog.",
             CHAT_STATUS_TEXT - 1);
-        host->catalog_error[CHAT_STATUS_TEXT - 1] = 0;
+        host->catalog_error[backend][CHAT_STATUS_TEXT - 1] = 0;
     } else {
-        if (host->catalog_loading && !catalog_event_pending(host) &&
-            !model_catalog_busy(&host->catalog_client)) {
-            /* The worker finished without its completion being handled (a
-               failed post). Treat it as a retryable failure. */
-            host->catalog_loading = false;
-            host->catalog_failed = true;
-            wcsncpy(host->catalog_error,
-                L"The model catalog request did not complete.",
-                CHAT_STATUS_TEXT - 1);
-            host->catalog_error[CHAT_STATUS_TEXT - 1] = 0;
-        }
-        if (should_fetch_catalog(host) && !host->catalog_loading &&
-            !model_catalog_busy(&host->catalog_client)) {
-            int generation = model_catalog_request(&host->catalog_client,
-                host->config.api_key_utf8);
-            if (generation) {
-                host->catalog_generation = generation;
-                host->catalog_loading = true;
-                host->catalog_failed = false;
-            } else {
-                host->catalog_failed = true;
-                wcsncpy(host->catalog_error,
-                    L"Could not start the catalog request.",
-                    CHAT_STATUS_TEXT - 1);
-                host->catalog_error[CHAT_STATUS_TEXT - 1] = 0;
-            }
-        }
+        recover_lost_catalog(host);
+        maybe_start_catalog_fetch(host, backend);
     }
-    build_picker_source(host);
+    build_picker_source(host, backend);
     wchar_t status[CHAT_STATUS_TEXT];
-    picker_status(host, status, CHAT_STATUS_TEXT);
+    picker_status(host, backend, status, CHAT_STATUS_TEXT);
     host->open_picker = model_picker_create(host->window, &host->picker_source,
-        status, host->config.chat->model);
+        status, current_model(chat, backend));
     if (!host->open_picker) set_status(host, L"Could not open the model picker.");
 }
 
 /* Applies the picker's result, destroys it, and reposts a close that arrived
-   while the modal loop was live. */
+   while the modal loop was live. A confirmed selection for a pending backend
+   switch commits the switch only now. */
 static void end_model_picker(ChatHost *host) {
     ModelPicker *picker = host->open_picker;
     if (!picker) return;
+    Chat *chat = host->config.chat;
     bool accepted = model_picker_accepted(picker);
     wchar_t id[CHAT_MODEL_TEXT];
     wcscpy(id, accepted ? model_picker_selected_id(picker) : L"");
     model_picker_destroy(picker);
     host->open_picker = NULL;
-    bool changed = accepted && apply_model(host, id);
+    bool changed = false;
+    if (accepted) {
+        changed = apply_model(host, id);
+        if (host->backend_switch_pending) {
+            chat->backend = host->backend_target;
+            rich_text_set_text(&host->field, chat_active_model(chat));
+            changed = true;
+        }
+    }
+    /* Cancelling a pending switch leaves no pending state behind; the picker
+       never leaves the target pointing at an uncommitted backend. */
+    host->backend_switch_pending = false;
+    host->backend_target = chat->backend;
     host->model_applied = changed;
     if (changed) {
         save(host);
@@ -471,6 +542,8 @@ static void end_model_picker(ChatHost *host) {
 }
 
 static void open_model_picker(ChatHost *host) {
+    if (!host->backend_switch_pending)
+        host->backend_target = host->config.chat->backend;
     begin_model_picker(host);
     if (host->open_picker) {
         host->picker_pumping = true;
@@ -480,47 +553,91 @@ static void open_model_picker(ChatHost *host) {
     end_model_picker(host);
 }
 
+/* Switches the active backend. Switching to Ollama when no local model has
+   been remembered opens the Ollama picker instead and commits the switch only
+   after a model is selected (or does nothing when the picker is cancelled). */
+static void select_backend(ChatHost *host, ChatBackend backend) {
+    Chat *chat = host->config.chat;
+    if (chat->backend == backend && !host->backend_switch_pending) {
+        set_status(host, backend == CHAT_BACKEND_OLLAMA ?
+            L"Ollama is already the active backend." :
+            L"OpenRouter is already the active backend.");
+        return;
+    }
+    if (backend == CHAT_BACKEND_OLLAMA && !chat->ollama_model[0]) {
+        host->backend_target = CHAT_BACKEND_OLLAMA;
+        host->backend_switch_pending = true;
+        begin_model_picker(host);
+        if (host->open_picker) {
+            host->picker_pumping = true;
+            model_picker_pump(host->open_picker);
+            host->picker_pumping = false;
+        }
+        end_model_picker(host);
+        if (chat->backend == CHAT_BACKEND_OLLAMA)
+            set_status(host, L"Switched to Ollama.");
+        return;
+    }
+    chat->backend = backend;
+    host->backend_target = backend;
+    mark_dirty(host);
+    rich_text_set_text(&host->field, chat_active_model(chat));
+    save(host);
+    chat_ui_sync(&host->chat_ui);
+    set_status(host, backend == CHAT_BACKEND_OLLAMA ?
+        L"Switched to Ollama." : L"Switched to OpenRouter.");
+}
+
 /* Interprets one fetch completion. Stale generations are freed and dropped;
-   success replaces the catalog, failure keeps the last good one and records a
-   nonfatal reason. An open picker is refreshed in place with its filter and
-   selection preserved. */
+   success replaces that backend's catalog, failure keeps its last good one and
+   records a nonfatal reason. An open picker is refreshed in place with its
+   filter and selection preserved. */
 static void catalog_event(ChatHost *host, ModelCatalogEvent *event) {
     if (!event) return;
     if (event->generation != host->catalog_generation) {
         model_catalog_event_free(event);
         return;
     }
+    ChatBackend backend = host->catalog_backend;
+    ChatModelCatalog *catalog = &host->catalog[(int)backend];
     host->catalog_loading = false;
     if (event->result == MODEL_CATALOG_OK && event->json) {
         ChatModelParseStats stats;
-        if (chat_model_catalog_parse(&host->catalog, event->json, &stats)) {
-            host->catalog_stats = stats;
-            host->catalog_loaded = true;
-            host->catalog_failed = false;
-            host->catalog_error[0] = 0;
-            host->catalog_success_tick = GetTickCount64();
+        if (chat_model_catalog_parse(catalog, event->json, &stats)) {
+            host->catalog_stats[backend] = stats;
+            host->catalog_loaded[backend] = true;
+            host->catalog_failed[backend] = false;
+            host->catalog_error[backend][0] = 0;
+            host->catalog_success_tick[backend] = GetTickCount64();
         } else {
-            host->catalog_failed = true;
-            wcsncpy(host->catalog_error,
+            host->catalog_failed[backend] = true;
+            wcsncpy(host->catalog_error[backend],
                 L"The catalog response could not be parsed.",
                 CHAT_STATUS_TEXT - 1);
-            host->catalog_error[CHAT_STATUS_TEXT - 1] = 0;
+            host->catalog_error[backend][CHAT_STATUS_TEXT - 1] = 0;
         }
     } else {
-        host->catalog_failed = true;
-        wcsncpy(host->catalog_error,
+        host->catalog_failed[backend] = true;
+        wcsncpy(host->catalog_error[backend],
             event->error ? event->error : L"Model catalog request failed.",
             CHAT_STATUS_TEXT - 1);
-        host->catalog_error[CHAT_STATUS_TEXT - 1] = 0;
+        host->catalog_error[backend][CHAT_STATUS_TEXT - 1] = 0;
     }
     int generation = event->generation;
     model_catalog_event_free(event);
     model_catalog_complete(&host->catalog_client, generation);
     host->catalog_generation = 0;
     if (host->open_picker) {
-        build_picker_source(host);
+        ChatBackend target = host->backend_target;
+        /* Only a completion for the other backend leaves the open picker
+           without its own fetch; queue that fetch so a switch completes in
+           place. A fetch for the target itself is never auto-retried here, so
+           a failure cannot spin. */
+        if (target != backend)
+            maybe_start_catalog_fetch(host, target);
+        build_picker_source(host, target);
         wchar_t status[CHAT_STATUS_TEXT];
-        picker_status(host, status, CHAT_STATUS_TEXT);
+        picker_status(host, target, status, CHAT_STATUS_TEXT);
         model_picker_source_updated(host->open_picker, &host->picker_source,
             status);
     }
@@ -658,6 +775,7 @@ static void flush(ChatHost *host) {
 }
 
 static void sync_model(ChatHost *host) {
+    Chat *chat = host->config.chat;
     wchar_t buffer[CHAT_MODEL_TEXT];
     rich_text_get_text(&host->field, buffer, CHAT_MODEL_TEXT);
     wchar_t *model = buffer;
@@ -666,12 +784,14 @@ static void sync_model(ChatHost *host) {
     while (length && (model[length - 1] == L' ' || model[length - 1] == L'\t'))
         model[--length] = 0;
     if (length) {
-        wcsncpy(host->config.chat->model, model, CHAT_MODEL_TEXT - 1);
-        host->config.chat->model[CHAT_MODEL_TEXT - 1] = 0;
+        wchar_t *slot = model_slot(chat, chat->backend);
+        wcsncpy(slot, model, CHAT_MODEL_TEXT - 1);
+        slot[CHAT_MODEL_TEXT - 1] = 0;
     }
     /* Never let the visible field and the stored model disagree: an empty field
-       falls back to the last valid model, which is written back into the field. */
-    rich_text_set_text(&host->field, host->config.chat->model);
+       falls back to the active backend's last valid model, which is written
+       back into the field. */
+    rich_text_set_text(&host->field, chat_active_model(chat));
     mark_dirty(host);
 }
 
@@ -700,7 +820,8 @@ static void capture_settings(ChatHost *host) {
     }
     wchar_t model[CHAT_MODEL_TEXT];
     rich_text_get_text(&host->field,model,CHAT_MODEL_TEXT);
-    if (model[0] && wcscmp(model,chat->model)) { wcscpy(chat->model,model); mark_dirty(host); }
+    wchar_t *slot=model_slot(chat,chat->backend);
+    if (model[0] && wcscmp(model,slot)) { wcscpy(slot,model); mark_dirty(host); }
     WINDOWPLACEMENT placement={0}; placement.length=sizeof placement;
     if (GetWindowPlacement(host->window,&placement)) {
         RECT r=placement.rcNormalPosition;
@@ -761,9 +882,14 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     ChatContextResult built=chat_context_build(chat,c,index-1,
         CHAT_CONTEXT_BUDGET_BYTES,&context);
     host->context_dropped=built==CHAT_CONTEXT_OK ? context.dropped_messages : 0;
-    host->request_generation=saved && built==CHAT_CONTEXT_OK ? openrouter_request(&host->client,
-        host->config.api_key_utf8,chat->model,context.messages,context.count,
-        &chat->provider_routing) : 0;
+    /* OpenRouter keeps its credentials and provider routing; Ollama needs
+       neither, so a missing OPENROUTER_API_KEY never blocks it. */
+    host->request_generation=saved && built==CHAT_CONTEXT_OK ?
+        completion_request(&host->client,chat->backend,
+            host->config.api_key_utf8,chat_active_model(chat),
+            context.messages,context.count,
+            chat->backend==CHAT_BACKEND_OPENROUTER ?
+                &chat->provider_routing : NULL) : 0;
     if (!host->request_generation) {
         m->generation.state=CHAT_GENERATION_FAILED;
         m->generation.finished_at=chat_now();
@@ -790,10 +916,13 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
                swprintf: terminate explicitly so every reader is safe. */
             m->generation.error[bound-1]=0;
         }
-        else wcscpy(m->generation.error,
-            !host->config.api_key_utf8 || !host->config.api_key_utf8[0] ?
-            L"OPENROUTER_API_KEY is unavailable. Set the Windows User environment variable and restart." :
-            L"Could not start OpenRouter request.");
+        else if (chat->backend==CHAT_BACKEND_OPENROUTER &&
+            (!host->config.api_key_utf8 || !host->config.api_key_utf8[0]))
+            wcscpy(m->generation.error,
+            L"OPENROUTER_API_KEY is unavailable. Set the Windows User environment variable and restart.");
+        else if (chat->backend==CHAT_BACKEND_OLLAMA)
+            wcscpy(m->generation.error,L"Could not start Ollama request.");
+        else wcscpy(m->generation.error,L"Could not start OpenRouter request.");
         chat_message_touch(m);
         mark_dirty(host); save(host); set_status(host,L"Request failed; use Response > Retry.");
     } else {
@@ -813,7 +942,7 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
 
 static void perform_send(ChatHost *host) {
     if (host->generating) {
-        if (!host->stopping && openrouter_cancel(&host->client,host->request_generation)) {
+        if (!host->stopping && completion_cancel(&host->client,host->request_generation)) {
             host->stopping=true; host->accepting=false;
             pending(host)->generation.state=CHAT_GENERATION_CANCELLED;
             pending(host)->generation.finished_at=chat_now();
@@ -830,7 +959,7 @@ static void perform_send(ChatHost *host) {
     start_response(host,host->editing ? CHAT_EDIT_RESEND : CHAT_SEND,prompt);
 }
 
-static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
+static void append_stream_delta(ChatHost *host, CompletionEvent *event) {
     if (!event->text || !event->text[0] || !host->accepting) return;
     ChatMessage *m=pending(host);
     double keep_reasoning_ms=m->generation.reasoning_ms;
@@ -847,7 +976,7 @@ static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
     if (!chat_message_append_text(m,event->text)) {
         host->stop_state=CHAT_GENERATION_INTERRUPTED;
         host->accepting=false; host->stopping=true;
-        openrouter_cancel(&host->client,host->request_generation);
+        completion_cancel(&host->client,host->request_generation);
         chat_ui_set_generation(&host->chat_ui,true,true);
         set_status(host,L"Not enough memory to continue the response.");
         return;
@@ -892,7 +1021,7 @@ static void append_stream_delta(ChatHost *host, OpenRouterEvent *event) {
     }
 }
 
-static void append_reasoning_delta(ChatHost *host, OpenRouterEvent *event) {
+static void append_reasoning_delta(ChatHost *host, CompletionEvent *event) {
     if (!event->text || !event->text[0] || !host->accepting) return;
     ChatMessage *m=pending(host);
     m->generation=event->metadata; m->generation.state=CHAT_GENERATION_RUNNING;
@@ -901,7 +1030,7 @@ static void append_reasoning_delta(ChatHost *host, OpenRouterEvent *event) {
         if (!chat_message_append_reasoning(m,event->text)) {
             host->stop_state=CHAT_GENERATION_INTERRUPTED;
             host->accepting=false; host->stopping=true;
-            openrouter_cancel(&host->client,host->request_generation);
+            completion_cancel(&host->client,host->request_generation);
             chat_ui_set_generation(&host->chat_ui,true,true);
             set_status(host,L"Not enough memory to continue the reasoning.");
             return;
@@ -925,22 +1054,24 @@ static void append_reasoning_delta(ChatHost *host, OpenRouterEvent *event) {
     }
 }
 
-static void finish_request(ChatHost *host, OpenRouterEvent *event) {
+static void finish_request(ChatHost *host, CompletionEvent *event) {
     end_reasoning(host);
     double reasoning_ms=pending(host)->generation.reasoning_ms;
-    openrouter_complete(&host->client,event->generation);
+    completion_complete(&host->client,event->generation);
     ChatMessage *m=pending(host);
     m->generation=event->metadata;
     m->generation.reasoning_ms=reasoning_ms;
     ChatGeneration *g=&m->generation;
-    g->state=host->stopping ? host->stop_state : event->type==OPENROUTER_DONE ?
-        CHAT_GENERATION_COMPLETE : event->type==OPENROUTER_CANCELLED ?
-        CHAT_GENERATION_CANCELLED : event->type==OPENROUTER_INTERRUPTED ?
+    g->state=host->stopping ? host->stop_state : event->type==COMPLETION_DONE ?
+        CHAT_GENERATION_COMPLETE : event->type==COMPLETION_CANCELLED ?
+        CHAT_GENERATION_CANCELLED : event->type==COMPLETION_INTERRUPTED ?
         CHAT_GENERATION_INTERRUPTED : CHAT_GENERATION_FAILED;
     if (event->text) wcsncpy(g->error,event->text,511);
     if (g->state==CHAT_GENERATION_COMPLETE && !wcscmp(g->finish_reason,L"error")) g->state=CHAT_GENERATION_FAILED;
     if (g->state==CHAT_GENERATION_COMPLETE && !chat_message_text(m)[0]) {
-        g->state=CHAT_GENERATION_FAILED; wcscpy(g->error,L"OpenRouter completed without text.");
+        g->state=CHAT_GENERATION_FAILED;
+        swprintf(g->error,512,L"%ls completed without text.",
+            chat_backend_name(g->backend));
     }
     /* Terminal generation metadata is observable: mark the message changed. */
     chat_message_touch(m);
@@ -958,14 +1089,14 @@ static void finish_request(ChatHost *host, OpenRouterEvent *event) {
     chat_ui_sync(&host->chat_ui); flush(host);
 }
 
-static void handle_event(ChatHost *host, OpenRouterEvent *event) {
+static void handle_event(ChatHost *host, CompletionEvent *event) {
     if (!event) return;
     if (event->generation==host->request_generation && host->generating) {
-        if (event->type==OPENROUTER_DELTA) append_stream_delta(host,event);
-        else if (event->type==OPENROUTER_REASONING) append_reasoning_delta(host,event);
+        if (event->type==COMPLETION_DELTA) append_stream_delta(host,event);
+        else if (event->type==COMPLETION_REASONING) append_reasoning_delta(host,event);
         else finish_request(host,event);
     }
-    openrouter_event_free(event);
+    completion_event_free(event);
 }
 
 static void command(void *user, ChatCommand code, int index) {
@@ -1196,32 +1327,45 @@ static void action(ChatHost *host, int code) {
            marks the session dirty; returning here skips the common tail. */
         open_model_picker(host);
         return;
-    } else if (code==ACTION_ROUTING_SORT_DEFAULT || code==ACTION_ROUTING_SORT_PRICE ||
-        code==ACTION_ROUTING_SORT_THROUGHPUT || code==ACTION_ROUTING_SORT_LATENCY) {
-        chat->provider_routing.sort =
-            code==ACTION_ROUTING_SORT_PRICE ? CHAT_PROVIDER_SORT_PRICE :
-            code==ACTION_ROUTING_SORT_THROUGHPUT ? CHAT_PROVIDER_SORT_THROUGHPUT :
-            code==ACTION_ROUTING_SORT_LATENCY ? CHAT_PROVIDER_SORT_LATENCY :
-            CHAT_PROVIDER_SORT_DEFAULT;
-        set_status(host,L"Provider sorting updated for future requests.");
-    } else if (code==ACTION_ROUTING_ALLOW_FALLBACKS) {
-        chat->provider_routing.disallow_fallbacks=
-            !chat->provider_routing.disallow_fallbacks;
-        set_status(host,chat->provider_routing.disallow_fallbacks ?
-            L"Fallback providers disabled; a request may fail if the primary is unavailable." :
-            L"Fallback providers allowed.");
-    } else if (code==ACTION_ROUTING_DATA_COLLECTION) {
-        chat->provider_routing.data_collection =
-            chat->provider_routing.data_collection==CHAT_DATA_COLLECTION_DENY ?
-            CHAT_DATA_COLLECTION_ALLOW : CHAT_DATA_COLLECTION_DENY;
-        set_status(host,chat->provider_routing.data_collection==CHAT_DATA_COLLECTION_DENY ?
-            L"Routing restricted to providers that do not store data." :
-            L"Providers that may store data are allowed.");
-    } else if (code==ACTION_ROUTING_ZDR) {
-        chat->provider_routing.zdr=!chat->provider_routing.zdr;
-        set_status(host,chat->provider_routing.zdr ?
-            L"Request-level zero data retention required; account settings may also apply." :
-            L"DarkChat adds no request-level zero data retention requirement.");
+    } else if (code==ACTION_BACKEND_OPENROUTER || code==ACTION_BACKEND_OLLAMA) {
+        select_backend(host,code==ACTION_BACKEND_OLLAMA ?
+            CHAT_BACKEND_OLLAMA : CHAT_BACKEND_OPENROUTER);
+        return;
+    } else if (code>=ACTION_ROUTING_SORT_DEFAULT && code<=ACTION_ROUTING_ZDR) {
+        /* OpenRouter provider routing has no meaning for a local Ollama
+           request. The menu items are grayed while Ollama is active; a stale
+           menu activation is ignored here with a clear reason. */
+        if (chat->backend==CHAT_BACKEND_OLLAMA) {
+            set_status(host,L"Provider routing applies to OpenRouter only.");
+            return;
+        }
+        if (code==ACTION_ROUTING_SORT_DEFAULT || code==ACTION_ROUTING_SORT_PRICE ||
+            code==ACTION_ROUTING_SORT_THROUGHPUT || code==ACTION_ROUTING_SORT_LATENCY) {
+            chat->provider_routing.sort =
+                code==ACTION_ROUTING_SORT_PRICE ? CHAT_PROVIDER_SORT_PRICE :
+                code==ACTION_ROUTING_SORT_THROUGHPUT ? CHAT_PROVIDER_SORT_THROUGHPUT :
+                code==ACTION_ROUTING_SORT_LATENCY ? CHAT_PROVIDER_SORT_LATENCY :
+                CHAT_PROVIDER_SORT_DEFAULT;
+            set_status(host,L"Provider sorting updated for future requests.");
+        } else if (code==ACTION_ROUTING_ALLOW_FALLBACKS) {
+            chat->provider_routing.disallow_fallbacks=
+                !chat->provider_routing.disallow_fallbacks;
+            set_status(host,chat->provider_routing.disallow_fallbacks ?
+                L"Fallback providers disabled; a request may fail if the primary is unavailable." :
+                L"Fallback providers allowed.");
+        } else if (code==ACTION_ROUTING_DATA_COLLECTION) {
+            chat->provider_routing.data_collection =
+                chat->provider_routing.data_collection==CHAT_DATA_COLLECTION_DENY ?
+                CHAT_DATA_COLLECTION_ALLOW : CHAT_DATA_COLLECTION_DENY;
+            set_status(host,chat->provider_routing.data_collection==CHAT_DATA_COLLECTION_DENY ?
+                L"Routing restricted to providers that do not store data." :
+                L"Providers that may store data are allowed.");
+        } else if (code==ACTION_ROUTING_ZDR) {
+            chat->provider_routing.zdr=!chat->provider_routing.zdr;
+            set_status(host,chat->provider_routing.zdr ?
+                L"Request-level zero data retention required; account settings may also apply." :
+                L"DarkChat adds no request-level zero data retention requirement.");
+        }
     }
     mark_dirty(host); save(host); chat_ui_sync(&host->chat_ui); flush(host);
 }
@@ -1543,7 +1687,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         if (!rich_text_create_composer(&host->composer, window, 2,
             &host->rich_theme, host->dpi)) return -1;
         if (!rich_text_create_field(&host->field, window, 3, &host->rich_theme,
-            host->dpi, host->config.chat->model)) return -1;
+            host->dpi, chat_active_model(host->config.chat))) return -1;
         if (!rich_text_create_field_limit(&host->search, window, 4,
             &host->rich_theme, host->dpi, CHAT_SEARCH_QUERY_TEXT - 1, L""))
             return -1;
@@ -1571,11 +1715,13 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         host->search.on_submit = search_submit;
         host->search.on_key = surface_key;
         host->search.user = host;
-        openrouter_init(&host->client, window, CHAT_WM_OPENROUTER_EVENT);
+        completion_init(&host->client, window, CHAT_WM_COMPLETION_EVENT);
         model_catalog_client_init(&host->catalog_client, window,
             CHAT_WM_CATALOG_EVENT);
-        chat_model_catalog_init(&host->catalog);
+        for (int i = 0; i < CHAT_BACKEND_COUNT; i++)
+            chat_model_catalog_init(&host->catalog[i]);
         chat_model_catalog_init(&host->picker_source);
+        host->backend_target = host->config.chat->backend;
         if (!ui_accessible_name(u, u->root)[0])
             ui_set_accessible_name(u, u->root, host->config.title);
         host->accessibility = ui_accessibility_create(window, u);
@@ -1641,11 +1787,11 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             if (host->generating && host->client.thread &&
                 WaitForSingleObject(host->client.thread,0)==WAIT_OBJECT_0) {
                 MSG queued;
-                while (PeekMessageW(&queued,window,CHAT_WM_OPENROUTER_EVENT,CHAT_WM_OPENROUTER_EVENT,PM_REMOVE))
-                    handle_event(host,(OpenRouterEvent *)queued.lParam);
+                while (PeekMessageW(&queued,window,CHAT_WM_COMPLETION_EVENT,CHAT_WM_COMPLETION_EVENT,PM_REMOVE))
+                    handle_event(host,(CompletionEvent *)queued.lParam);
                 if (host->generating) {
-                    OpenRouterEvent lost={0}; lost.generation=host->request_generation;
-                    lost.type=OPENROUTER_ERROR; lost.metadata=pending(host)->generation;
+                    CompletionEvent lost={0}; lost.generation=host->request_generation;
+                    lost.type=COMPLETION_ERROR; lost.metadata=pending(host)->generation;
                     lost.metadata.finished_at=chat_now();
                     lost.metadata.latency_ms=(double)(GetTickCount64()-host->started_tick);
                     lost.text=L"Worker ended without a completion event.";
@@ -1795,8 +1941,8 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             flush(host);
         }
         return 0;
-    case CHAT_WM_OPENROUTER_EVENT:
-        handle_event(host, (OpenRouterEvent *)l);
+    case CHAT_WM_COMPLETION_EVENT:
+        handle_event(host, (CompletionEvent *)l);
         return 0;
     case CHAT_WM_CATALOG_EVENT:
         catalog_event(host, (ModelCatalogEvent *)l);
@@ -1829,13 +1975,13 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             chat_message_touch(pending(host));
             mark_dirty(host);
             save_sync(host);
-            openrouter_shutdown(&host->client);
+            completion_shutdown(&host->client);
             host->generating = false;
             host->context_dropped = 0;
             MSG queued;
-            while (PeekMessageW(&queued, window, CHAT_WM_OPENROUTER_EVENT,
-                CHAT_WM_OPENROUTER_EVENT, PM_REMOVE))
-                openrouter_event_free((OpenRouterEvent *)queued.lParam);
+            while (PeekMessageW(&queued, window, CHAT_WM_COMPLETION_EVENT,
+                CHAT_WM_COMPLETION_EVENT, PM_REMOVE))
+                completion_event_free((CompletionEvent *)queued.lParam);
         }
         /* Join and drain the catalog worker while the main window still
            exists, so a late completion is freed here instead of leaking into a
@@ -1992,7 +2138,7 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
     UnregisterClassW(view_cls.lpszClassName, instance);
 cleanup:
     /* Never exit under a running worker: it still owns its request snapshot. */
-    openrouter_shutdown(&host->client);
+    completion_shutdown(&host->client);
     /* Cancel and join the catalog fetch, then drain any completion it managed
        to post before the window went away, so no event body leaks. */
     model_catalog_shutdown(&host->catalog_client);
@@ -2022,7 +2168,8 @@ cleanup:
        reachable. Only now may the slot pool be freed; never dispose from the
        parent window procedure, whose WM_DESTROY runs while children exist. */
     transcript_dispose(&host->transcript);
-    chat_model_catalog_dispose(&host->catalog);
+    for (int i = 0; i < CHAT_BACKEND_COUNT; i++)
+        chat_model_catalog_dispose(&host->catalog[i]);
     chat_model_catalog_dispose(&host->picker_source);
     rich_text_library_close();
     storage_close(&host->storage);
