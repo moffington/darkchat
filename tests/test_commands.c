@@ -78,6 +78,12 @@ static void test_labels(void) {
     check(chat_action_menu_label(ACTION_NEW) != NULL, "menu label lookup resolves");
     check(chat_action_menu_label(0) == NULL && chat_action_shortcut(0) == NULL,
         "unknown label and shortcut lookups are safe");
+    check(chat_action_shortcut(ACTION_RENAME) != NULL &&
+        !wcscmp(chat_action_shortcut(ACTION_RENAME), L"F2"),
+        "Rename exposes the F2 binding");
+    check(chat_action_shortcut(ACTION_DELETE) != NULL &&
+        !wcscmp(chat_action_shortcut(ACTION_DELETE), L"Del"),
+        "Delete exposes the Del binding");
     wchar_t tiny[6];
     check(!chat_action_plain_label(ACTION_REGENERATE, tiny, 6),
         "truncated plain label reports failure");

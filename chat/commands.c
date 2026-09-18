@@ -6,9 +6,9 @@
 static const ChatActionInfo table[] = {
     { ACTION_NEW, L"&New conversation", NULL,
         CHAT_ACTION_GROUP_CONVERSATION, CHAT_ACTION_FLAG_NONE },
-    { ACTION_RENAME, L"&Rename...", NULL,
+    { ACTION_RENAME, L"&Rename...", L"F2",
         CHAT_ACTION_GROUP_CONVERSATION, CHAT_ACTION_FLAG_NONE },
-    { ACTION_DELETE, L"&Delete...", NULL,
+    { ACTION_DELETE, L"&Delete...", L"Del",
         CHAT_ACTION_GROUP_CONVERSATION, CHAT_ACTION_FLAG_NONE },
     { ACTION_DELETE_ALL, L"Delete &all...", NULL,
         CHAT_ACTION_GROUP_CONVERSATION, CHAT_ACTION_FLAG_NONE },

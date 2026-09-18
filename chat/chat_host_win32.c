@@ -1525,14 +1525,295 @@ static void action(ChatHost *host, int code) {
     mark_dirty(host); save(host); chat_ui_sync(&host->chat_ui); flush(host);
 }
 
-static bool surface_key(void *user, WPARAM key, bool shift, bool control,
-    bool down) {
-    ChatHost *host = (ChatHost *)user;
-    if (control && (key == L'F' || key == L'f') && down) {
+/* ---- Deliberate keyboard navigation -------------------------------------- */
+
+/* Named focus regions for F6 / Ctrl+T. Regions are not Tab stops: Tab still
+   spans the native fields and the retained chrome, and the transcript stays a
+   deliberate region reached only by region navigation or a mouse focus. */
+typedef enum {
+    CHAT_REGION_SIDEBAR,
+    CHAT_REGION_TRANSCRIPT,
+    CHAT_REGION_COMPOSER,
+    CHAT_REGION_HEADER,
+    CHAT_REGION_COUNT
+} ChatRegion;
+
+static bool ui_descends_from(Ui *ui, UiId id, UiId ancestor) {
+    for (UiId p = id; p; ) {
+        if (p == ancestor) return true;
+        UiNode *item = ui_node(ui, p);
+        p = item ? item->parent : UI_NONE;
+    }
+    return false;
+}
+
+static bool is_transcript_window(const ChatHost *host, HWND window) {
+    if (!window) return false;
+    for (int s = 0; s < host->transcript.slot_capacity; s++)
+        for (int k = 0; k < TRANSCRIPT_SURFACE_COUNT; k++)
+            if (host->transcript.slots[s].surface[k].window == window)
+                return true;
+    return false;
+}
+
+/* True while the retained tree owns keyboard focus (the top-level window has
+   it). A stale ui->focus from a native field must not be mistaken for it. */
+static bool retained_focus_active(const ChatHost *host) {
+    return GetFocus() == host->window;
+}
+
+static ChatRegion focus_region_of(const ChatHost *host) {
+    HWND focus = GetFocus();
+    if (focus == host->composer.window) return CHAT_REGION_COMPOSER;
+    if (focus == host->field.window) return CHAT_REGION_HEADER;
+    if (focus == host->search.window) return CHAT_REGION_SIDEBAR;
+    if (is_transcript_window(host, focus)) return CHAT_REGION_TRANSCRIPT;
+    UiId id = host->config.ui->focus;
+    if (id) {
+        if (ui_descends_from(host->config.ui, id, host->chat_ui.sidebar))
+            return CHAT_REGION_SIDEBAR;
+        if (ui_descends_from(host->config.ui, id, host->chat_ui.header))
+            return CHAT_REGION_HEADER;
+        if (ui_descends_from(host->config.ui, id, host->chat_ui.composer_area))
+            return CHAT_REGION_COMPOSER;
+    }
+    return CHAT_REGION_COMPOSER;
+}
+
+/* The conversation id bound to the focused retained row, or 0 when focus is
+   not on a realized sidebar row. */
+static uint64_t focused_sidebar_id(const ChatHost *host) {
+    UiId focus = host->config.ui->focus;
+    for (int j = 0; j < host->chat_ui.pool_count; j++)
+        if (host->chat_ui.rows[j] == focus) {
+            UiNode *item = ui_node(host->config.ui, focus);
+            return item ? (uint64_t)item->tag : 0;
+        }
+    return 0;
+}
+
+static bool sidebar_row_focused(const ChatHost *host) {
+    UiId focus = host->config.ui->focus;
+    for (int j = 0; j < host->chat_ui.pool_count; j++)
+        if (host->chat_ui.rows[j] == focus) return true;
+    return false;
+}
+
+static bool focus_sidebar_row_by_id(ChatHost *host, uint64_t id) {
+    if (!id) return false;
+    for (int j = 0; j < host->chat_ui.pool_count; j++) {
+        UiNode *item = ui_node(host->config.ui, host->chat_ui.rows[j]);
+        if (item && (uint64_t)item->tag == id) {
+            ui_focus(host->config.ui, host->chat_ui.rows[j], true);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Focuses the realized row bound to a conversation index, advancing the
+   windowed pool first when the row is outside it. Identity, never a recycled
+   pool slot, is what is focused: a handling flush may rebind every row, so
+   the identity is re-verified after the flush settles and the reveal is
+   always applied before the focus (a focus on a partly visible row would
+   itself scroll and rebind the row away from its conversation). */
+static bool focus_conversation_row(ChatHost *host, int target) {
+    Chat *chat = host->config.chat;
+    if (target < 0 || target >= chat->conversation_count) return false;
+    uint64_t id = chat->conversations[target].id;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (focused_sidebar_id(host) == id) return true;
+        chat_ui_request_reveal(&host->chat_ui, id);
+        flush(host);
+        if (!focus_sidebar_row_by_id(host, id)) continue;
+        flush(host);
+        if (focused_sidebar_id(host) == id) return true;
+    }
+    return focused_sidebar_id(host) == id;
+}
+
+/* Roving focus within the sidebar: one conversation step per key. Inside the
+   realized pool the toolkit's ui_focus_move supplies the movement and the
+   reveal (with identity verified afterwards, since the reveal can rebind the
+   pool); at the pool edge the window is advanced or retreated by identity. */
+static bool sidebar_roving(ChatHost *host, int delta) {
+    Chat *chat = host->config.chat;
+    if (!delta || !sidebar_row_focused(host)) return false;
+    int index = chat_index_of_id(chat, focused_sidebar_id(host));
+    if (index < 0) return false;
+    int target = index + delta;
+    if (target < 0 || target >= chat->conversation_count) return false;
+    uint64_t wanted = chat->conversations[target].id;
+    int offset = host->chat_ui.window_offset;
+    int end = offset + host->chat_ui.pool_count;
+    if (target >= offset && target < end) {
+        ui_focus_move(host->config.ui, delta);
+        /* The remap runs at the next flush, so row tags still name the
+           pre-move binding until then: flush before verifying identity. */
+        flush(host);
+        if (focused_sidebar_id(host) == wanted) return true;
+    }
+    return focus_conversation_row(host, target);
+}
+
+static bool sidebar_roving_edge(ChatHost *host, bool last) {
+    Chat *chat = host->config.chat;
+    if (!sidebar_row_focused(host) || chat->conversation_count <= 0)
+        return false;
+    return focus_conversation_row(host,
+        last ? chat->conversation_count - 1 : 0);
+}
+
+/* Validates one realized transcript body as a focus candidate. A record at
+   the right array index can still describe an older message (replacement,
+   invalidation, or rebinding), so the record's identity must name both the
+   active conversation and the live message at that index, the surface must be
+   live (not merely bound), and its window must be the visible one. */
+static RichTextControl *transcript_focus_body(ChatHost *host, int index) {
+    Transcript *t = &host->transcript;
+    const ChatConversation *active = chat_active(host->config.chat);
+    if (!active || index < 0 || (size_t)index >= active->message_count)
+        return NULL;
+    if (index >= t->record_count) return NULL;
+    TranscriptRecord *rec = &t->records[index];
+    if (rec->conversation != active->id) return NULL;
+    if (rec->message != active->messages[index].id) return NULL;
+    if (!rec->body_live) return NULL;
+    RichTextControl *body = transcript_surface(t, index, TRANSCRIPT_BODY);
+    if (!body || !body->window) return NULL;
+    if (!(GetWindowLongPtrW(body->window, GWL_STYLE) & WS_VISIBLE))
+        return NULL;
+    return body;
+}
+
+/* The turn whose body entering the Transcript region should focus: the
+   reader's anchor turn when its body is realized, otherwise the nearest
+   realized body. Identity is resolved from the live message list; a record
+   slot is never trusted. Traversal is bounded by both the record list and
+   the live message list. */
+static int transcript_focus_index(ChatHost *host) {
+    Transcript *t = &host->transcript;
+    Chat *chat = host->config.chat;
+    const ChatConversation *active = chat_active(chat);
+    if (!active || active->message_count == 0) return -1;
+    int count = t->record_count;
+    if (count < 0) count = 0;
+    if (count > CHAT_MAX_MESSAGES) count = CHAT_MAX_MESSAGES;
+    if ((size_t)count > active->message_count)
+        count = (int)active->message_count;
+    if (t->anchor.valid && t->anchor.conversation == active->id) {
+        int index = chat_message_index_by_id(chat, chat->active,
+            t->anchor.message);
+        if (index >= 0 && index < count && transcript_focus_body(host, index))
+            return index;
+    }
+    int best = -1, best_distance = 0;
+    for (int i = 0; i < count; i++) {
+        if (!transcript_focus_body(host, i)) continue;
+        int top = t->records[i].y;
+        int bottom = t->records[i].y + t->records[i].height;
+        int distance = 0;
+        if (bottom <= t->view_scroll) distance = t->view_scroll - bottom;
+        else if (top >= t->view_scroll + t->view_page)
+            distance = top - (t->view_scroll + t->view_page);
+        if (best < 0 || distance < best_distance) {
+            best = i;
+            best_distance = distance;
+        }
+    }
+    return best;
+}
+
+static void focus_transcript_region(ChatHost *host) {
+    int index = transcript_focus_index(host);
+    RichTextControl *body =
+        index >= 0 ? transcript_focus_body(host, index) : NULL;
+    if (body) { SetFocus(body->window); return; }
+    if (native_child_usable(host->composer.window))
+        SetFocus(host->composer.window);
+}
+
+static void focus_region(ChatHost *host, ChatRegion region) {
+    Ui *ui = host->config.ui;
+    switch (region) {
+    case CHAT_REGION_SIDEBAR: {
+        if (!chat_ui_sidebar_visible(&host->chat_ui)) {
+            if (chat_ui_reveal_sidebar(&host->chat_ui)) {
+                mark_dirty(host);
+                save(host);
+            }
+            flush(host);
+        }
+        SetFocus(host->window);
+        const ChatConversation *active = chat_active(host->config.chat);
+        uint64_t id = active ? active->id : 0;
+        if (id) chat_ui_request_reveal(&host->chat_ui, id);
+        flush(host);
+        if (!focus_sidebar_row_by_id(host, id)) {
+            if (host->chat_ui.pool_count > 0)
+                ui_focus(ui, host->chat_ui.rows[0], true);
+            else
+                ui_focus(ui, host->chat_ui.new_conversation, true);
+        }
+        flush(host);
+        return;
+    }
+    case CHAT_REGION_TRANSCRIPT:
+        focus_transcript_region(host);
+        return;
+    case CHAT_REGION_COMPOSER:
+        if (native_child_usable(host->composer.window))
+            SetFocus(host->composer.window);
+        return;
+    case CHAT_REGION_HEADER:
+        SetFocus(host->window);
+        ui_focus(ui, host->chat_ui.hamburger, true);
+        flush(host);
+        return;
+    default:
+        return;
+    }
+}
+
+static void cycle_region(ChatHost *host, bool reverse) {
+    ChatRegion current = focus_region_of(host);
+    int next = ((int)current + (reverse ? -1 : 1) + CHAT_REGION_COUNT) %
+        CHAT_REGION_COUNT;
+    focus_region(host, (ChatRegion)next);
+}
+
+/* F2 / Delete act on the conversation under sidebar focus. The target is
+   resolved first and an unresolvable row is ignored outright: falling through
+   to the active conversation would break the stable-identity promise (and is
+   especially dangerous for Delete). Availability is checked before any
+   selection change, so an action the host would reject -- during generation,
+   say -- never renders, saves, or leaves edit mode for a different
+   conversation first; action() itself reports the existing status. */
+static void action_focused_conversation(ChatHost *host, int code) {
+    Chat *chat = host->config.chat;
+    int index = chat_index_of_id(chat, focused_sidebar_id(host));
+    if (index < 0) return;
+    if (index != chat->active) {
+        if (host->generating) {
+            action(host, code);
+            return;
+        }
+        command(host, CHAT_COMMAND_SELECT, index);
+    }
+    action(host, code);
+}
+
+/* The single shortcut registry consulted by both key paths: surface_key for
+   keys arriving from the native edits and transcript surfaces, and window_proc
+   for keys arriving at the top level. `from_surface` distinguishes the Tab
+   semantics the two paths have always had. */
+static bool host_shortcut(ChatHost *host, WPARAM key, bool shift,
+    bool control, bool from_surface) {
+    if (control && (key == L'F' || key == L'f')) {
         action(host, ACTION_SEARCH);
         return true;
     }
-    if (key == VK_F3 && down) {
+    if (key == VK_F3) {
         wchar_t query[CHAT_SEARCH_QUERY_TEXT];
         rich_text_get_text(&host->search, query, CHAT_SEARCH_QUERY_TEXT);
         const wchar_t *searched = host->search_results.query
@@ -1541,20 +1822,63 @@ static bool surface_key(void *user, WPARAM key, bool shift, bool control,
         search_step(host, shift);
         return true;
     }
-    if (control && key == VK_SPACE && down) { action(host,ACTION_MODELS); return true; }
+    if (control && key == VK_SPACE) { action(host, ACTION_MODELS); return true; }
     /* Ctrl+B toggles the sidebar; F10 / the context-menu key open the
        retained command menu, the replacement route to every command that the
        removed menu bar used to carry. */
-    if (control && (key == L'B' || key == L'b') && down) {
+    if (control && (key == L'B' || key == L'b')) {
         command(host, CHAT_COMMAND_TOGGLE_SIDEBAR, -1);
         return true;
     }
-    if ((key == VK_F10 || key == VK_APPS) && down) {
+    if (key == VK_F10 || key == VK_APPS) {
         command(host, CHAT_COMMAND_OVERFLOW, -1);
         return true;
     }
-    if (key == VK_TAB && down) { focus_surface(host, shift); return true; }
+    /* F6 / Ctrl+T cycle the named regions. Shift reverses the direction. */
+    if (key == VK_F6 || (control && (key == L'T' || key == L't'))) {
+        cycle_region(host, shift);
+        return true;
+    }
+    if (key == VK_ESCAPE) {
+        if (chat_ui_narrow_drawer_open(&host->chat_ui)) {
+            chat_ui_close_drawer(&host->chat_ui);
+            flush(host);
+            return true;
+        }
+        HWND before = GetFocus();
+        transcript_focus_release(&host->transcript);
+        return GetFocus() != before;
+    }
+    if (key == VK_TAB) {
+        if (from_surface) { focus_surface(host, shift); return true; }
+        if (ui_focus_boundary(host->config.ui, shift)) {
+            focus_native_edge(host, shift);
+            return true;
+        }
+        return false;
+    }
+    if (!from_surface && retained_focus_active(host) &&
+        sidebar_row_focused(host)) {
+        if (key == VK_DOWN) { sidebar_roving(host, 1); return true; }
+        if (key == VK_UP) { sidebar_roving(host, -1); return true; }
+        if (key == VK_HOME) { sidebar_roving_edge(host, false); return true; }
+        if (key == VK_END) { sidebar_roving_edge(host, true); return true; }
+        if (key == VK_F2) {
+            action_focused_conversation(host, ACTION_RENAME);
+            return true;
+        }
+        if (key == VK_DELETE) {
+            action_focused_conversation(host, ACTION_DELETE);
+            return true;
+        }
+    }
     return false;
+}
+
+static bool surface_key(void *user, WPARAM key, bool shift, bool control,
+    bool down) {
+    if (!down) return false;
+    return host_shortcut((ChatHost *)user, key, shift, control, true);
 }
 
 /* Ends a scrollbar thumb drag: the final position is reader input, so it
@@ -2121,41 +2445,15 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
     case WM_KEYDOWN:
     case WM_KEYUP: {
         bool down = message == WM_KEYDOWN;
-        bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        /* Escape dismisses the narrow-width temporary drawer before any
-           other Escape handling; the explicit wide-width preference is not
-           affected. */
-        if (down && w == VK_ESCAPE &&
-            chat_ui_narrow_drawer_open(&host->chat_ui)) {
-            chat_ui_close_drawer(&host->chat_ui);
-            flush(host);
-            return 0;
-        }
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-        if (down && ((control && (w == L'F' || w == L'f')) || w == VK_F3)) {
-            surface_key(host, w, shift, control, true);
-            return 0;
-        }
-        /* Keyboard routes for the retained chrome: Ctrl+B toggles the
-           sidebar, F10 / the context-menu key open the command menu, and Tab
-           hands off to the native fields when retained focus reaches an
-           edge, so the two focus systems form one cycle. */
-        if (down && control && (w == L'B' || w == L'b')) {
-            command(host, CHAT_COMMAND_TOGGLE_SIDEBAR, -1);
-            return 0;
-        }
-        if (down && (w == VK_F10 || w == VK_APPS)) {
-            command(host, CHAT_COMMAND_OVERFLOW, -1);
-            return 0;
-        }
-        if (down && w == VK_TAB && ui_focus_boundary(u, shift)) {
-            focus_native_edge(host, shift);
-            return 0;
-        }
+        bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        /* One registry consulted here and by surface_key: every shortcut,
+           the Escape/drawer dismissal, region navigation and the Tab
+           hand-off between retained chrome and native fields. */
+        if (down && host_shortcut(host, w, shift, control, false)) return 0;
         UiKey key;
         if (key_from_win32(w, &key)) {
-            ui_key(u, key, message == WM_KEYDOWN,
-                (GetKeyState(VK_SHIFT) & 0x8000) != 0, (l & (1L << 30)) != 0);
+            ui_key(u, key, down, shift, (l & (1L << 30)) != 0);
             flush(host);
             return 0;
         }

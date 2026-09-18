@@ -2000,7 +2000,7 @@ static int default_suite(void) {
     CHECK(!IsWindow(window) && !IsWindow(h->view));
     transcript_dispose(&h->transcript);
     CHECK(!h->transcript.slots && !h->transcript.slot_capacity);
-    rich_text_library_close();
+    /* Msftedit stays loaded for the process (see main). */
     chat_dispose(loaded); chat_dispose(chat);
     free(loaded); free(chat); free(ui); free(h); CoUninitialize();
     return 0;
@@ -2067,7 +2067,7 @@ static int seam_toggle_suite(void) {
     DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
     ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
-    transcript_dispose(&h->transcript); rich_text_library_close();
+    transcript_dispose(&h->transcript); /* Msftedit stays loaded for the process (see main). */
     chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
     return 0;
 }
@@ -2277,7 +2277,7 @@ static int catalog_suite(void) {
     DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
     ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
-    transcript_dispose(&h->transcript); rich_text_library_close();
+    transcript_dispose(&h->transcript); /* Msftedit stays loaded for the process (see main). */
     chat_model_catalog_dispose(&h->catalog[CHAT_BACKEND_OPENROUTER]); chat_model_catalog_dispose(&h->picker_source);
     chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
     return 0;
@@ -3642,7 +3642,7 @@ static int bounded_suite(void) {
             CHECK(!IsWindow(h->transcript.slots[s].surface[k].window));
     transcript_dispose(&h->transcript);
     CHECK(!h->transcript.slots && !h->transcript.slot_capacity);
-    rich_text_library_close();
+    /* Msftedit stays loaded for the process (see main). */
     chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
     return 0;
 }
@@ -3935,14 +3935,231 @@ static int backend_suite(void) {
     DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
     ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
-    transcript_dispose(&h->transcript); rich_text_library_close();
+    transcript_dispose(&h->transcript); /* Msftedit stays loaded for the process (see main). */
     for (int i=0;i<CHAT_BACKEND_COUNT;i++) chat_model_catalog_dispose(&h->catalog[i]);
     chat_model_catalog_dispose(&h->picker_source);
     chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
     return 0;
 }
 
+/* ---- Deliberate keyboard navigation suite (separate clean fixture) -------- */
+
+static int navigation_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Navigation host",1100,720,720,480,NULL,
+        false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    /* Production wiring: retained events reach the host command dispatcher and
+       native key activation therefore selects the row under focus. */
+    ui->on_event=host_event; ui->event_user=h;
+    h->chat_ui.command=command; h->chat_ui.command_user=h;
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-nav-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Navigation integration",
+        WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+
+    /* A conversation with realized turns gives the transcript region a body
+       to focus. */
+    for (int t=0;t<8;t++) add_turn(chat,L"nav question",L"nav answer body",NULL,-1);
+    render_transcript(h);
+    flush(h);
+
+    /* Region cycle order and focus ownership: Sidebar -> Transcript ->
+       Composer -> Header, with F6 and Ctrl+T sharing one registry binding. */
+    {
+        SetFocus(h->composer.window);
+        CHECK(focus_region_of(h)==CHAT_REGION_COMPOSER);
+        CHECK(host_shortcut(h,VK_F6,false,false,false));
+        CHECK(focus_region_of(h)==CHAT_REGION_HEADER && GetFocus()==window &&
+            ui->focus==h->chat_ui.hamburger);
+        CHECK(host_shortcut(h,VK_F6,false,false,false));
+        CHECK(focus_region_of(h)==CHAT_REGION_SIDEBAR && GetFocus()==window &&
+            focused_sidebar_id(h)==chat->conversations[chat->active].id);
+        CHECK(host_shortcut(h,VK_F6,false,false,false));
+        CHECK(focus_region_of(h)==CHAT_REGION_TRANSCRIPT &&
+            is_transcript_window(h,GetFocus()));
+        CHECK(host_shortcut(h,VK_F6,false,false,false));
+        CHECK(focus_region_of(h)==CHAT_REGION_COMPOSER &&
+            GetFocus()==h->composer.window);
+        CHECK(host_shortcut(h,L'T',false,true,false));
+        CHECK(focus_region_of(h)==CHAT_REGION_HEADER);
+    }
+
+    /* Entering the transcript focuses the reader's anchor turn body when it
+       is realized, and never a stale record slot. */
+    {
+        transcript_note_user_scroll(&h->transcript,0);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(h->transcript.anchor.valid);
+        int anchor_index=chat_message_index_by_id(chat,chat->active,
+            h->transcript.anchor.message);
+        CHECK(anchor_index>=0);
+        focus_region(h,CHAT_REGION_TRANSCRIPT);
+        CHECK(GetFocus()==body_window(h,anchor_index));
+        CHECK(h->transcript.focus_window==body_window(h,anchor_index));
+        /* A stale anchor resolves to a realized body of the active
+           conversation instead of a recycled slot. */
+        h->transcript.anchor.valid=true;
+        h->transcript.anchor.conversation=chat->conversations[chat->active].id;
+        h->transcript.anchor.message=0x7fffffffffffffffULL;
+        focus_region(h,CHAT_REGION_TRANSCRIPT);
+        HWND focused=GetFocus();
+        CHECK(focused && is_transcript_window(h,focused));
+        bool bound=false;
+        for (int i=0;i<h->transcript.record_count;i++) {
+            RichTextControl *body=transcript_surface(&h->transcript,i,
+                TRANSCRIPT_BODY);
+            if (body && body->window==focused &&
+                h->transcript.records[i].conversation==
+                    chat->conversations[chat->active].id) bound=true;
+        }
+        CHECK(bound);
+    }
+
+    /* A record at the right index that describes an older message is not a
+       valid candidate even while its body window is still bound: entering the
+       region must focus a different, current body. */
+    {
+        transcript_note_user_scroll(&h->transcript,0);
+        transcript_position(&h->transcript,feed_arg(h),false);
+        CHECK(h->transcript.anchor.valid);
+        int stale_index=chat_message_index_by_id(chat,chat->active,
+            h->transcript.anchor.message);
+        CHECK(stale_index>=0);
+        HWND stale_body=body_window(h,stale_index);
+        CHECK(stale_body);
+        uint64_t saved_message=h->transcript.records[stale_index].message;
+        h->transcript.records[stale_index].message=0x7fffffffffffffffULL;
+        SetFocus(h->composer.window);
+        focus_region(h,CHAT_REGION_TRANSCRIPT);
+        CHECK(GetFocus()!=stale_body);
+        h->transcript.records[stale_index].message=saved_message;
+    }
+
+    /* Escape from a transcript surface returns to the composer through the
+       existing focus-release callback. */
+    {
+        SetFocus(body_window(h,0));
+        CHECK(h->transcript.focus_window==body_window(h,0));
+        CHECK(surface_key(h,VK_ESCAPE,false,false,true));
+        CHECK(GetFocus()==h->composer.window && h->transcript.focus_window==NULL);
+    }
+
+    /* Tab still spans the native fields and the retained chrome; the
+       transcript is deliberately not part of that ring. */
+    {
+        SetFocus(h->field.window);
+        CHECK(surface_key(h,VK_TAB,false,false,true));
+        CHECK(GetFocus()==h->search.window);
+        CHECK(surface_key(h,VK_TAB,false,false,true));
+        CHECK(GetFocus()==h->composer.window);
+        CHECK(surface_key(h,VK_TAB,false,false,true));
+        CHECK(GetFocus()==window && ui->focus==h->chat_ui.hamburger);
+        ui_focus_edge(ui,true);                    /* last retained stop */
+        SetFocus(window);
+        CHECK(ui_focus_boundary(ui,false));
+        SendMessageW(window,WM_KEYDOWN,VK_TAB,0);
+        CHECK(GetFocus()==h->field.window);
+    }
+
+    /* Sidebar arrows rove by conversation identity across the windowed pool,
+       and Enter selects the row under focus. */
+    {
+        while (chat->conversation_count<60) chat_new_conversation(chat);
+        command(h,CHAT_COMMAND_SELECT,0);
+        pump_messages(20);
+        focus_region(h,CHAT_REGION_SIDEBAR);
+        CHECK(GetFocus()==window);
+        CHECK(focused_sidebar_id(h)==chat->conversations[0].id);
+        int start_offset=h->chat_ui.window_offset;
+        int limit=h->chat_ui.pool_count+4;
+        bool advanced=false;
+        for (int step=1;step<=limit;step++) {
+            CHECK(sidebar_roving(h,1));
+            CHECK(focused_sidebar_id(h)==chat->conversations[step].id);
+            if (h->chat_ui.window_offset>start_offset) advanced=true;
+        }
+        CHECK(advanced);
+        int focused_index=chat_index_of_id(chat,focused_sidebar_id(h));
+        CHECK(focused_index>0 && focused_index!=chat->active);
+        SendMessageW(window,WM_KEYDOWN,VK_RETURN,0);
+        SendMessageW(window,WM_KEYUP,VK_RETURN,0);
+        CHECK(chat->active==focused_index);
+        /* Roving back up preserves identity across the boundary too. */
+        for (int step=0;step<6;step++) {
+            int before=chat_index_of_id(chat,focused_sidebar_id(h));
+            CHECK(before>0);
+            CHECK(sidebar_roving(h,-1));
+            CHECK(focused_sidebar_id(h)==chat->conversations[before-1].id);
+        }
+    }
+
+    /* Focused-row actions resolve their target and check availability before
+       touching the active conversation: a rejection must not select/render/
+       save a different conversation first, and an unresolvable row must never
+       fall through to the active one. */
+    {
+        command(h,CHAT_COMMAND_SELECT,0);
+        pump_messages(20);
+        focus_region(h,CHAT_REGION_SIDEBAR);
+        CHECK(sidebar_roving(h,1));            /* focus conversation 1 */
+        CHECK(focused_sidebar_id(h)==chat->conversations[1].id);
+        int active_before=chat->active;
+        CHECK(active_before==0);
+        /* Generating: F2 and Delete are unavailable, so neither the selection
+           nor history may change; action() reports the existing status. */
+        h->generating=true;
+        SendMessageW(window,WM_KEYDOWN,VK_F2,0);
+        CHECK(chat->active==active_before);
+        CHECK(wcsstr(chat->status,L"Stop generation")!=NULL);
+        SendMessageW(window,WM_KEYDOWN,VK_DELETE,0);
+        CHECK(chat->active==active_before);
+        CHECK(wcsstr(chat->status,L"Stop generation")!=NULL);
+        h->generating=false;
+        /* An unresolvable focused-row tag is ignored outright: a non-modal
+           probe action is never invoked on the active conversation. */
+        UiNode *row=ui_node(ui,ui->focus);
+        CHECK(row && row->tag!=0);
+        uintptr_t saved_tag=row->tag;
+        row->tag=0;
+        int count_before=chat->conversation_count;
+        wchar_t status_before[CHAT_STATUS_TEXT];
+        wcscpy(status_before,chat->status);
+        action_focused_conversation(h,ACTION_COPY);
+        CHECK(chat->active==active_before);
+        CHECK(chat->conversation_count==count_before);
+        CHECK(!wcscmp(chat->status,status_before));
+        row=ui_node(ui,ui->focus);
+        if (row) row->tag=saved_tag;
+    }
+
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(!IsWindow(window));
+    saver_shutdown(&h->saver); storage_close(&h->storage);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
+    transcript_dispose(&h->transcript);
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
 int main(void) {
+    /* The fixtures share one process and never unload Msftedit: repeated
+       unload/reload cycles across fixtures can fail its DllMain with
+       ERROR_DLL_INIT_FAILED (1114), so the first fixture's load is kept for
+       the whole run (each fixture frees only its own windows and bookkeeping). */
     int failed=default_suite();
     if (failed) return failed;
     failed=seam_toggle_suite();
@@ -3953,6 +4170,8 @@ int main(void) {
     if (failed) return failed;
     failed=backend_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded + catalog + backend fixtures) passed");
+    failed=navigation_suite();
+    if (failed) return failed;
+    puts("Hidden host (default + bounded + catalog + backend + navigation fixtures) passed");
     return failed;
 }
