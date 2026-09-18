@@ -5,6 +5,58 @@ static UiRect inset(UiRect r, float p) {
 }
 static UiColor color(const Ui *u, UiColorRole role) { return u->theme.colors[role]; }
 static UiRect text_inset(UiRect r) { r.x+=8; r.w=r.w>16?r.w-16:0; return r; }
+static float glyph_min(float a, float b) { return a < b ? a : b; }
+
+/* Line-art glyphs drawn from the painter primitives. Every coordinate is
+   derived from the target rect, so an icon scales with its control and no
+   asset or icon font is involved. */
+static void draw_icon(const UiPainter *p, UiRect r, UiIcon icon, UiColor c) {
+    if (icon == UI_ICON_NONE) return;
+    float cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    float s = glyph_min(r.w, r.h) / 2;
+    if (s > 9) s = 9;
+    switch (icon) {
+    case UI_ICON_HAMBURGER:
+        for (int i = -1; i <= 1; i++)
+            p->line(p->user, cx - s, cy + i * 4, cx + s, cy + i * 4, c, 1.6f);
+        break;
+    case UI_ICON_SEND:
+        p->line(p->user, cx, cy + s, cx, cy - s, c, 1.7f);
+        p->line(p->user, cx, cy - s, cx - s * .55f, cy - s * .3f, c, 1.7f);
+        p->line(p->user, cx, cy - s, cx + s * .55f, cy - s * .3f, c, 1.7f);
+        break;
+    case UI_ICON_STOP:
+        p->fill(p->user, (UiRect){cx - s * .62f, cy - s * .62f, s * 1.24f,
+            s * 1.24f}, c, 2);
+        break;
+    case UI_ICON_OVERFLOW:
+        for (int i = -1; i <= 1; i++)
+            p->fill(p->user, (UiRect){cx + i * 6 - 1.5f, cy - 1.5f, 3, 3}, c, 1.5f);
+        break;
+    case UI_ICON_PLUS:
+        p->line(p->user, cx - s, cy, cx + s, cy, c, 1.6f);
+        p->line(p->user, cx, cy - s, cx, cy + s, c, 1.6f);
+        break;
+    case UI_ICON_SEARCH: {
+        float ring = s * .78f;
+        p->stroke(p->user, (UiRect){cx - ring - 1, cy - ring - 1,
+            ring * 2, ring * 2}, c, ring, 1.5f);
+        p->line(p->user, cx + ring * .55f, cy + ring * .55f,
+            cx + s, cy + s, c, 1.5f);
+        break;
+    }
+    case UI_ICON_CHEVRON_DOWN:
+        p->line(p->user, cx - s * .55f, cy - s * .28f, cx, cy + s * .3f, c, 1.6f);
+        p->line(p->user, cx, cy + s * .3f, cx + s * .55f, cy - s * .28f, c, 1.6f);
+        break;
+    case UI_ICON_CLOSE:
+        p->line(p->user, cx - s * .6f, cy - s * .6f, cx + s * .6f, cy + s * .6f, c, 1.6f);
+        p->line(p->user, cx - s * .6f, cy + s * .6f, cx + s * .6f, cy - s * .6f, c, 1.6f);
+        break;
+    default:
+        break;
+    }
+}
 static void draw(Ui *u, const UiPainter *p, UiId id) {
     UiNode *n=ui_node(u,id);
     UiRect r=n->rect;
@@ -19,12 +71,28 @@ static void draw(Ui *u, const UiPainter *p, UiId id) {
         p->fill(p->user,r,color(u,(UiColorRole)n->style.background),0);
     switch (n->kind) {
     case UI_LABEL:
-        p->text(p->user,r,n->text,n->style.font,fg,false); break;
+        p->text(p->user,r,n->text,n->style.font,fg,
+            n->style.text_centered); break;
     case UI_BUTTON: {
         UiColorRole bg=down?UI_BUTTON_DOWN:hot?UI_BUTTON_HOT:n->selected?UI_ACCENT_SOFT:UI_BUTTON_BG;
         p->fill(p->user,inset(r,1),color(u,bg),radius);
         if (n->selected) p->stroke(p->user,inset(r,.5f),color(u,UI_ACCENT_SOFT),radius,1);
         p->text(p->user,text_inset(r),n->text,n->style.font,n->selected && enabled?color(u,UI_BRIGHT):fg,true);
+        break;
+    }
+    case UI_ICON:
+        draw_icon(p,r,n->icon,fg);
+        break;
+    case UI_ICON_BUTTON: {
+        /* A transparent icon button (background -1) shows only its hover,
+           pressed and selected surfaces; an explicit background keeps the
+           idle fill as well. */
+        int role = down ? UI_BUTTON_DOWN : hot ? (n->style.background >= 0 ?
+            UI_BUTTON_HOT : UI_HOVER) : n->selected ? UI_ACCENT_SOFT :
+            n->style.background;
+        if (role >= 0) p->fill(p->user,inset(r,1),color(u,(UiColorRole)role),radius);
+        if (n->selected) p->stroke(p->user,inset(r,.5f),color(u,UI_ACCENT_SOFT),radius,1);
+        draw_icon(p,r,n->icon,n->selected && enabled ? color(u,UI_BRIGHT) : fg);
         break;
     }
     case UI_CHECKBOX: {
@@ -81,7 +149,12 @@ static void draw(Ui *u, const UiPainter *p, UiId id) {
         thumb.x+=2; thumb.w=thumb.w>4?thumb.w-4:0;
         p->fill(p->user,thumb,color(u,u->drag_scroll==id?UI_ACCENT:hot?UI_MUTED:UI_FAINT),3);
     }
-    if (n->style.border) p->stroke(p->user,inset(n->rect,.5f),color(u,UI_BORDER),radius,1);
+    /* A selected or keyboard-focused bordered surface uses the accent family,
+       so native-input placeholders (model field, composer, search) can show
+       focus without a bespoke painting path. */
+    if (n->style.border)
+        p->stroke(p->user,inset(n->rect,.5f),
+            color(u,(n->selected || focused) ? UI_ACCENT : UI_BORDER),radius,1);
     if (focused && u->keyboard_focus && n->kind!=UI_TEXTBOX)
         p->stroke(p->user,inset(n->rect,1.5f),color(u,UI_ACCENT),radius,1);
     p->pop_clip(p->user);

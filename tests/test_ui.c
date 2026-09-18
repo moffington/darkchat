@@ -80,6 +80,24 @@ static void input_test(void) {
     ui_key(&u,UI_KEY_SPACE,false,false,false); CHECK(activated==1);
     ui_key(&u,UI_KEY_TAB,true,false,false); CHECK(u.focus==b);
 }
+static void focus_bridge_test(void) {
+    UiId root=init(UI_COLUMN);
+    UiId a=ui_add(&u,root,UI_BUTTON,L"A");
+    UiId b=ui_add(&u,root,UI_BUTTON,L"B");
+    UiId c=ui_add(&u,root,UI_BUTTON,L"C");
+    (void)b;
+    ui_layout(&u,200,200);
+    /* Forward focuses the first, reverse the last focusable. */
+    CHECK(ui_focus_edge(&u,false) && u.focus==a);
+    CHECK(!ui_focus_boundary(&u,false) && ui_focus_boundary(&u,true));
+    ui_focus(&u,b,true);
+    CHECK(!ui_focus_boundary(&u,false) && !ui_focus_boundary(&u,true));
+    CHECK(ui_focus_edge(&u,true) && u.focus==c);
+    CHECK(ui_focus_boundary(&u,false) && !ui_focus_boundary(&u,true));
+    /* An empty tree has no edge to hand focus to. */
+    ui_init(&u,NULL,NULL);
+    CHECK(!ui_focus_edge(&u,false) && !ui_focus_boundary(&u,false));
+}
 static void scrolling_test(void) {
     UiId outer=init(UI_SCROLL); NODE(outer).style.gap=0;
     UiId inner=ui_add(&u,outer,UI_SCROLL,L"Inner"); NODE(inner).style.height=ui_fixed(100); NODE(inner).style.gap=0;
@@ -220,19 +238,45 @@ static void accessibility_metadata_test(void) {
     CHECK(ui_remove(&u,label)); CHECK(!wcscmp(ui_accessible_name(&u,field),L"draft"));
 }
 typedef struct { unsigned pushes,pops,depth,draws; } PaintCheck;
+static bool last_text_centered;
 static void fill(void *user, UiRect r, UiColor c, float radius) {
     (void)c; (void)radius; PaintCheck *p=user;
     CHECK(p->depth>0); CHECK(isfinite(r.x) && isfinite(r.y) && r.w>=0 && r.h>=0); p->draws++;
 }
 static void stroke(void *user, UiRect r, UiColor c, float radius, float width) { (void)width; fill(user,r,c,radius); }
 static void text_draw(void *user, UiRect r, const wchar_t *s, UiFont f, UiColor c, bool centered) {
-    (void)s; (void)f; (void)centered; fill(user,r,c,0);
+    (void)s; (void)f; last_text_centered=centered; fill(user,r,c,0);
 }
 static void line(void *user, float x, float y, float xx, float yy, UiColor c, float width) {
     (void)user; (void)c; (void)width; CHECK(isfinite(x+y+xx+yy));
 }
 static void push(void *user, UiRect r) { PaintCheck *p=user; p->depth++; p->pushes++; CHECK(r.w>0 && r.h>0); }
 static void pop(void *user) { PaintCheck *p=user; CHECK(p->depth>0); p->depth--; p->pops++; }
+static void icon_test(void) {
+    UiId root=init(UI_COLUMN);
+    UiId icon=ui_add(&u,root,UI_ICON,L"");
+    ui_set_icon(&u,icon,UI_ICON_SEARCH);
+    UiId button=ui_add(&u,root,UI_ICON_BUTTON,L"");
+    ui_set_icon(&u,button,UI_ICON_SEND);
+    ui_set_accessible_name(&u,button,L"Send message");
+    UiId centered=ui_add(&u,root,UI_LABEL,L"Centered");
+    NODE(centered).style.text_centered=true;
+    ui_layout(&u,200,140);
+    CHECK(NODE(icon).measured.w>0 && NODE(icon).measured.h>0);
+    /* The static icon is not focusable; the icon button is a Tab stop and
+       activates like a text button. */
+    ui_key(&u,UI_KEY_TAB,true,false,false); CHECK(u.focus==button);
+    click(button); CHECK(activated==1);
+    CHECK(ui_invoke(&u,button) && activated==2);
+    ui_set_icon(&u,button,UI_ICON_STOP);
+    CHECK(NODE(button).icon==UI_ICON_STOP);
+    CHECK(!ui_invoke(&u,icon));   /* static icons never invoke */
+    PaintCheck check={0}; UiPainter painter={&check,fill,stroke,text_draw,line,push,pop,0};
+    last_text_centered=false;
+    ui_paint(&u,&painter);
+    CHECK(last_text_centered);
+    CHECK(check.draws>0 && check.pushes==check.pops && check.depth==0);
+}
 static void showcase_test(void) {
     ui_init(&u,NULL,NULL); Showcase s; CHECK(showcase_init(&s,&u));
     CHECK(u.count<UI_CAPACITY-32);
@@ -259,7 +303,7 @@ static void showcase_test(void) {
     CHECK(visible==1 && !NODE(s.catalog_rows[4]).hidden);
 }
 int main(void) {
-    layout_test(); input_test(); scrolling_test(); scroll_api_test(); slider_test(); text_and_capacity_test(); lifetime_test(); accessibility_metadata_test(); showcase_test();
-    printf("PASS: %u assertions (layout, input, nested scroll, focus reveal, values, lifetime, capacity, showcase breakpoints)\n",assertions);
+    layout_test(); input_test(); focus_bridge_test(); scrolling_test(); scroll_api_test(); slider_test(); text_and_capacity_test(); lifetime_test(); accessibility_metadata_test(); icon_test(); showcase_test();
+    printf("PASS: %u assertions (layout, input, nested scroll, focus reveal, values, lifetime, capacity, icons, showcase breakpoints)\n",assertions);
     return 0;
 }

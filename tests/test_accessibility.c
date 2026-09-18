@@ -41,6 +41,9 @@ int main(void) {
     UiId label=ui_add(&ui,root,UI_LABEL,L"PRIMARY ACTION");
     UiId button=ui_add(&ui,root,UI_BUTTON,L"Run");
     UiId button2=ui_add(&ui,root,UI_BUTTON,L"Second");
+    UiId icon_button=ui_add(&ui,root,UI_ICON_BUTTON,L"");
+    ui_set_icon(&ui,icon_button,UI_ICON_SEND);
+    ui_set_accessible_name(&ui,icon_button,L"Send message");
     ui_set_labelled_by(&ui,button,label); ui_set_help_text(&ui,button,L"Runs the primary action.");
     ui_layout(&ui,320,200);
     accessibility=ui_accessibility_create(window,&ui); CHECK(accessibility);
@@ -106,6 +109,25 @@ int main(void) {
     check_string(button2_simple,UIA_NamePropertyId,L"Second");
     ui_set_text(&ui,button2,L"Rebound");
     check_string(button2_simple,UIA_NamePropertyId,L"Rebound");
+
+    /* An icon-only button exposes the Button control type, its accessible
+       name and the Invoke pattern exactly like a text button. */
+    IRawElementProviderFragment *icon_fragment=navigate(button2_fragment,NavigateDirection_NextSibling);
+    IRawElementProviderSimple *icon_simple=NULL;
+    CHECK(SUCCEEDED(IRawElementProviderFragment_QueryInterface(icon_fragment,&IID_IRawElementProviderSimple,(void **)&icon_simple)));
+    check_string(icon_simple,UIA_NamePropertyId,L"Send message");
+    CHECK(SUCCEEDED(IRawElementProviderSimple_GetPropertyValue(icon_simple,UIA_ControlTypePropertyId,&value)));
+    CHECK(V_VT(&value)==VT_I4 && V_I4(&value)==UIA_ButtonControlTypeId); VariantClear(&value);
+    IUnknown *icon_pattern=NULL;
+    CHECK(SUCCEEDED(IRawElementProviderSimple_GetPatternProvider(icon_simple,UIA_InvokePatternId,&icon_pattern)) && icon_pattern);
+    IInvokeProvider *icon_invoke=NULL;
+    CHECK(SUCCEEDED(IUnknown_QueryInterface(icon_pattern,&IID_IInvokeProvider,(void **)&icon_invoke)));
+    CHECK(SUCCEEDED(IInvokeProvider_Invoke(icon_invoke)));
+    while (PeekMessageW(&message,NULL,0,0,PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
+    CHECK(invoked==2);
+    IInvokeProvider_Release(icon_invoke); IUnknown_Release(icon_pattern);
+    IRawElementProviderSimple_Release(icon_simple); IRawElementProviderFragment_Release(icon_fragment);
+
     ui_accessibility_property_changed(accessibility,button2,L"Second",L"Rebound");
     ui_accessibility_children_invalidated(accessibility,root);
     ui_accessibility_property_changed(accessibility,UI_NONE,L"A",L"B");

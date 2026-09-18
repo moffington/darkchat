@@ -62,7 +62,9 @@ static HRESULT provider_query(UiProvider *p, REFIID iid, void **result) {
     if (IsEqualIID(iid,&IID_IUnknown) || IsEqualIID(iid,&IID_IRawElementProviderSimple)) *result=&p->simple;
     else if (IsEqualIID(iid,&IID_IRawElementProviderFragment)) *result=&p->fragment;
     else if (IsEqualIID(iid,&IID_IRawElementProviderFragmentRoot) && p->accessibility->ui && p->id==p->accessibility->ui->root) *result=&p->root;
-    else if (IsEqualIID(iid,&IID_IInvokeProvider) && available(p) && ui_node(p->accessibility->ui,p->id)->kind==UI_BUTTON) *result=&p->invoke;
+    else if (IsEqualIID(iid,&IID_IInvokeProvider) && available(p) &&
+        (ui_node(p->accessibility->ui,p->id)->kind==UI_BUTTON ||
+         ui_node(p->accessibility->ui,p->id)->kind==UI_ICON_BUTTON)) *result=&p->invoke;
     else return E_NOINTERFACE;
     provider_add_ref(p); return S_OK;
 }
@@ -93,12 +95,13 @@ static HRESULT STDMETHODCALLTYPE pattern(IRawElementProviderSimple *i, PATTERNID
     return S_OK;
 }
 static bool keyboard_focusable(UiKind kind) {
-    return kind==UI_BUTTON || kind==UI_CHECKBOX || kind==UI_SWITCH ||
-        kind==UI_SLIDER || kind==UI_TEXTBOX || kind==UI_SCROLL;
+    return kind==UI_BUTTON || kind==UI_ICON_BUTTON || kind==UI_CHECKBOX ||
+        kind==UI_SWITCH || kind==UI_SLIDER || kind==UI_TEXTBOX ||
+        kind==UI_SCROLL;
 }
 static int control_type(UiKind kind) {
     switch (kind) {
-    case UI_BUTTON: return UIA_ButtonControlTypeId;
+    case UI_BUTTON: case UI_ICON_BUTTON: return UIA_ButtonControlTypeId;
     case UI_CHECKBOX: case UI_SWITCH: return UIA_CheckBoxControlTypeId;
     case UI_SLIDER: return UIA_SliderControlTypeId;
     case UI_TEXTBOX: return UIA_EditControlTypeId;

@@ -36,8 +36,16 @@ UiTheme ui_theme_dark(void);
 
 typedef enum {
     UI_COLUMN, UI_ROW, UI_SCROLL, UI_LABEL, UI_BUTTON, UI_CHECKBOX,
-    UI_SWITCH, UI_SLIDER, UI_TEXTBOX, UI_PROGRESS, UI_SEPARATOR
+    UI_SWITCH, UI_SLIDER, UI_TEXTBOX, UI_PROGRESS, UI_SEPARATOR,
+    UI_ICON, UI_ICON_BUTTON
 } UiKind;
+/* Line-art glyphs drawn with the painter primitives, so no icon font or
+   external asset is required. UI_ICON_NONE draws nothing. */
+typedef enum {
+    UI_ICON_NONE = 0, UI_ICON_HAMBURGER, UI_ICON_SEND, UI_ICON_STOP,
+    UI_ICON_OVERFLOW, UI_ICON_PLUS, UI_ICON_SEARCH, UI_ICON_CHEVRON_DOWN,
+    UI_ICON_CLOSE, UI_ICON_COUNT
+} UiIcon;
 typedef enum { UI_AUTO, UI_FIXED, UI_FLEX } UiSizeKind;
 typedef struct { UiSizeKind kind; float value; } UiSize;
 UiSize ui_auto(void);
@@ -51,6 +59,7 @@ typedef struct {
     UiColorRole foreground;
     UiFont font;
     bool border;
+    bool text_centered; /* labels only: center horizontally in their rect */
 } UiStyle;
 
 typedef struct {
@@ -63,6 +72,7 @@ typedef struct {
     wchar_t accessible_name[UI_TEXT_CAPACITY];
     wchar_t help_text[UI_TEXT_CAPACITY];
     UiId labelled_by;
+    UiIcon icon; /* UI_ICON / UI_ICON_BUTTON glyph */
     bool hidden, disabled, checked, selected;
     float value; /* slider/progress: normalized [0,1] */
     float scroll, content_height;
@@ -120,6 +130,9 @@ bool ui_reparent(Ui *ui, UiId id, UiId parent);
 UiNode *ui_node(Ui *ui, UiId id);
 void ui_invalidate(Ui *ui, bool layout);
 void ui_set_text(Ui *ui, UiId id, const wchar_t *text);
+/* Sets the glyph of a UI_ICON / UI_ICON_BUTTON node. Paint-only: never
+   affects layout, so a state swap (Send <-> Stop) repaints in place. */
+void ui_set_icon(Ui *ui, UiId id, UiIcon icon);
 void ui_set_accessible_name(Ui *ui, UiId id, const wchar_t *name);
 void ui_set_help_text(Ui *ui, UiId id, const wchar_t *help_text);
 void ui_set_labelled_by(Ui *ui, UiId id, UiId label);
@@ -141,6 +154,14 @@ void ui_cancel_input(Ui *ui);
 void ui_scroll(Ui *ui, float x, float y, float delta_dips);
 void ui_key(Ui *ui, UiKey key, bool down, bool shift, bool repeat);
 void ui_focus(Ui *ui, UiId id, bool keyboard);
+/* Focuses the first focusable node in tree order (forward) or the last
+   (reverse). Returns false when nothing is focusable. */
+bool ui_focus_edge(Ui *ui, bool reverse);
+/* True when the focused node is the last focusable in tree order (forward)
+   or the first (reverse), i.e. a Tab in that direction leaves the tree.
+   A host that mixes retained controls with native child windows uses this to
+   hand focus across the boundary instead of wrapping inside the tree. */
+bool ui_focus_boundary(const Ui *ui, bool reverse);
 void ui_set_active(Ui *ui, bool active);
 UiRect ui_scroll_thumb(const Ui *ui, UiId id);
 float ui_scroll_max(const Ui *ui, UiId id);

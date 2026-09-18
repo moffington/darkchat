@@ -15,8 +15,8 @@ static UiNode *node(Ui *u, UiId id) { return &u->nodes[slot(id)]; }
 static const UiNode *const_node(const Ui *u, UiId id) { return &u->nodes[slot(id)]; }
 static bool container(UiKind k) { return k == UI_ROW || k == UI_COLUMN || k == UI_SCROLL; }
 static bool focusable(UiKind k) {
-    return k == UI_BUTTON || k == UI_CHECKBOX || k == UI_SWITCH ||
-           k == UI_SLIDER || k == UI_TEXTBOX || k == UI_SCROLL;
+    return k == UI_BUTTON || k == UI_ICON_BUTTON || k == UI_CHECKBOX ||
+           k == UI_SWITCH || k == UI_SLIDER || k == UI_TEXTBOX || k == UI_SCROLL;
 }
 bool ui_visible(const Ui *u, UiId id) {
     if (!valid(u, id)) return false;
@@ -45,6 +45,12 @@ void ui_init(Ui *u, UiMeasureFn measure, void *user) {
     u->theme = ui_theme_dark(); u->measure = measure; u->measure_user = user;
     u->window_active = true;
     ui_invalidate(u,true);
+}
+void ui_set_icon(Ui *u, UiId id, UiIcon icon) {
+    UiNode *n = ui_node(u,id);
+    if (!n || n->icon == icon) return;
+    n->icon = icon;
+    ui_invalidate(u,false);
 }
 void ui_set_text(Ui *u, UiId id, const wchar_t *text) {
     UiNode *n = ui_node(u,id);
@@ -180,6 +186,10 @@ static UiExtent measure(Ui *u, UiId id) {
         if (n->kind != UI_LABEL && n->kind != UI_SEPARATOR) {
             w+=24; h=u->theme.control_height;
         }
+        if (n->kind == UI_ICON || n->kind == UI_ICON_BUTTON) {
+            w=maxf(w,u->theme.control_height);
+            h=u->theme.control_height;
+        }
         if (n->kind == UI_CHECKBOX) w+=24;
         if (n->kind == UI_SWITCH) w+=40;
         if (n->kind == UI_SLIDER || n->kind == UI_TEXTBOX) w=maxf(160,w);
@@ -313,11 +323,12 @@ static void activate(Ui *u, UiId id) {
     if (!ui_enabled(u,id)) return;
     UiNode *n=node(u,id);
     if (n->kind==UI_CHECKBOX || n->kind==UI_SWITCH) { n->checked=!n->checked; emit(u,id,UI_CHANGE); }
-    else if (n->kind==UI_BUTTON) emit(u,id,UI_ACTIVATE);
+    else if (n->kind==UI_BUTTON || n->kind==UI_ICON_BUTTON) emit(u,id,UI_ACTIVATE);
 }
 bool ui_invoke(Ui *u, UiId id) {
-    UiNode *n=ui_node(u,id);
-    if (!n || n->kind!=UI_BUTTON || !ui_enabled(u,id)) return false;
+    UiNode *n = ui_node(u,id);
+    if (!n || (n->kind!=UI_BUTTON && n->kind!=UI_ICON_BUTTON) ||
+        !ui_enabled(u,id)) return false;
     activate(u,id); return true;
 }
 static void reveal(Ui *u, UiId id) {
@@ -414,6 +425,20 @@ static void focus_next(Ui *u, bool reverse) {
     }
     ui_focus(u,UI_NONE,true);
 }
+bool ui_focus_edge(Ui *u, bool reverse) {
+    UiId order[UI_CAPACITY]; int count=0;
+    if (u->root) focus_order(u,u->root,order,&count);
+    if (!count) return false;
+    ui_focus(u,order[reverse?count-1:0],true);
+    return true;
+}
+bool ui_focus_boundary(const Ui *u, bool reverse) {
+    UiId order[UI_CAPACITY]; int count=0;
+    if (!u->root) return false;
+    focus_order(u,u->root,order,&count);
+    if (!count) return false;
+    return u->focus==order[reverse?0:count-1];
+}
 void ui_key(Ui *u, UiKey key, bool down, bool shift, bool repeat) {
     ensure_layout(u);
     if (key==UI_KEY_TAB && down) { focus_next(u,shift); return; }
@@ -422,7 +447,8 @@ void ui_key(Ui *u, UiKey key, bool down, bool shift, bool repeat) {
     if (!ui_enabled(u,id)) return;
     UiNode *n=node(u,id); u->keyboard_focus=true;
     if (key==UI_KEY_ENTER || key==UI_KEY_SPACE) {
-        if (n->kind==UI_BUTTON || n->kind==UI_CHECKBOX || n->kind==UI_SWITCH) {
+        if (n->kind==UI_BUTTON || n->kind==UI_ICON_BUTTON ||
+            n->kind==UI_CHECKBOX || n->kind==UI_SWITCH) {
             if (down && !repeat && !u->pressed) { u->pressed=id; u->key_pressed=true; u->activation_key=key; }
             else if (!down && u->pressed==id && u->key_pressed && u->activation_key==key) { ui_cancel_input(u); activate(u,id); }
             ui_invalidate(u,false);
