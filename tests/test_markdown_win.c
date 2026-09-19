@@ -78,6 +78,31 @@ static void read_text(const RichTextControl *c, wchar_t *out, size_t cap) {
     if (c->window) rich_text_get_text(c, out, cap);
 }
 
+/* Reads the control text with CRLF collapsed to LF, matching the coordinate
+   space the code-block ranges use. Returns the LF-only length. */
+static size_t read_lf(const RichTextControl *c, wchar_t *out, size_t cap) {
+    wchar_t raw[4096];
+    read_text(c, raw, sizeof raw / sizeof raw[0]);
+    size_t n = 0;
+    for (size_t i = 0; raw[i] && n + 1 < cap; i++) {
+        if (raw[i] == L'\r' && raw[i + 1] == L'\n') continue;
+        out[n++] = raw[i];
+    }
+    out[n] = 0;
+    return n;
+}
+
+/* Checks that code block `index` covers exactly `expect` in the control. */
+static bool code_block_is(const RichTextControl *c, int index,
+    const wchar_t *expect) {
+    size_t start = 0, length = 0;
+    if (!rich_text_code_block_range(c, index, &start, &length)) return false;
+    wchar_t lf[4096];
+    size_t total = read_lf(c, lf, 4096);
+    if (start + length > total) return false;
+    return length == wcslen(expect) && !wmemcmp(lf + start, expect, length);
+}
+
 int main(void) {
     CHECK(rich_text_library_open());
     rich_text_test_set_open(capture_open);
@@ -719,15 +744,150 @@ int main(void) {
     read_text(&probe, text, 512);
     CHECK(!wcscmp(text, L"x\r\ny\r\nz\r\nw"));
 
+    /* Rendered code-block ranges: one per fence, in control coordinates,
+       markers and the separator before the fence excluded. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"```\nx\ny\n```");
+    CHECK(rich_text_code_block_count(&probe) == 1);
+    CHECK(code_block_is(&probe, 0, L"x\ny"));
+    {
+        size_t start = 0, length = 0;
+        CHECK(rich_text_code_block_range(&probe, 0, &start, &length));
+        CHECK(start == 0 && length == 3);
+        CHECK(rich_text_code_block_at_char(&probe, 0) == 0);   /* first char */
+        CHECK(rich_text_code_block_at_char(&probe, 1) == 0);   /* interior LF */
+        CHECK(rich_text_code_block_at_char(&probe, 2) == 0);   /* last char */
+        CHECK(rich_text_code_block_at_char(&probe, 3) == -1);  /* one past */
+        /* Outputs are optional: a valid index with either or both NULL still
+           reports true. */
+        CHECK(rich_text_code_block_range(&probe, 0, NULL, NULL));
+        size_t only_start = 0, only_length = 0;
+        CHECK(rich_text_code_block_range(&probe, 0, &only_start, NULL));
+        CHECK(only_start == 0);
+        CHECK(rich_text_code_block_range(&probe, 0, NULL, &only_length));
+        CHECK(only_length == 3);
+    }
+
+    /* The separator before a fence is never part of its range. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"prose\n```\nx\n```");
+    CHECK(rich_text_code_block_count(&probe) == 1);
+    {
+        size_t start = 0, length = 0;
+        CHECK(rich_text_code_block_range(&probe, 0, &start, &length));
+        CHECK(start == wcslen(L"prose\n") && length == 1);
+        CHECK(rich_text_code_block_at_char(&probe, start - 1) == -1);
+    }
+
+    /* Adjacent fences stay distinct; the shared separator is in neither. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
+        L"```\na\n```\n```\nb\n```");
+    CHECK(rich_text_code_block_count(&probe) == 2);
+    CHECK(code_block_is(&probe, 0, L"a"));
+    CHECK(code_block_is(&probe, 1, L"b"));
+    CHECK(rich_text_code_block_at_char(&probe, 1) == -1);
+
+    /* A fence that emits no character records nothing; blank fence lines after
+       text emit an interior newline, which is part of the range. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"```\n```");
+    CHECK(rich_text_code_block_count(&probe) == 0);
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"prose\n```\n\n```");
+    CHECK(rich_text_code_block_count(&probe) == 0);
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"prose\n```\n\n\n```");
+    CHECK(rich_text_code_block_count(&probe) == 1);
+    CHECK(code_block_is(&probe, 0, L"\n"));
+
+    /* Unterminated and tilde fences record; inline code does not. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"~~~\nx\ny");
+    CHECK(rich_text_code_block_count(&probe) == 1);
+    CHECK(code_block_is(&probe, 0, L"x\ny"));
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"a `x` b");
+    CHECK(rich_text_code_block_count(&probe) == 0);
+
+    /* A fence beside a flattened table maps through the plan: one span per
+       code paragraph plus gap spans coalesce to one range. */
+    rich_text_set_markdown_width(&probe, CHAT_ROLE_ASSISTANT,
+        L"| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```\nx\ny\n```", 600);
+    CHECK(rich_text_code_block_count(&probe) == 1);
+    CHECK(code_block_is(&probe, 0, L"x\ny"));
+    rich_text_set_markdown_width(&probe, CHAT_ROLE_ASSISTANT,
+        L"```\nbefore\n```\n\n| a | b |\n| --- | --- |\n| 1 | 2 |", 600);
+    CHECK(rich_text_code_block_count(&probe) == 1);
+    CHECK(code_block_is(&probe, 0, L"before"));
+    /* A table forced to literal fallback still maps the fence correctly. */
+    rich_text_set_markdown_width(&probe, CHAT_ROLE_ASSISTANT,
+        L"```\ncode\n```\n\n| a | b |\n| --- | --- |\n| 1 | 2 |", 40);
+    CHECK(rich_text_code_block_count(&probe) == 1);
+    CHECK(code_block_is(&probe, 0, L"code"));
+    /* Restore the width the remaining tests assume. */
+    rich_text_set_markdown_width(&probe, CHAT_ROLE_ASSISTANT, L"", 600);
+
+    /* Invalidation and retention: rewrite, verbatim writes, and append. */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"```\nkept\n```");
+    CHECK(rich_text_code_block_count(&probe) == 1);
+    rich_text_append_body(&probe, L"\nmore");
+    CHECK(rich_text_code_block_count(&probe) == 1);   /* tail-only append */
+    rich_text_set_body(&probe, CHAT_ROLE_USER, L"```\nraw\n```");
+    CHECK(rich_text_code_block_count(&probe) == 0);   /* verbatim body */
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"```\nback\n```");
+    CHECK(rich_text_code_block_count(&probe) == 1);
+    rich_text_set_text(&probe, L"```\nplain\n```");
+    CHECK(rich_text_code_block_count(&probe) == 0);
+    CHECK(!rich_text_code_block_range(&probe, 0, NULL, NULL));
+    CHECK(rich_text_code_block_count(NULL) == 0);
+    CHECK(rich_text_code_block_at_char(NULL, 0) == -1);
+
+    /* Whole-body parser failure (any allocation or fence growth) writes the
+       body verbatim with no ranges. */
+    markdown_test_fail_allocations(true);
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"```\nx\n```");
+    markdown_test_fail_allocations(false);
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"```\r\nx\r\n```"));
+    CHECK(rich_text_code_block_count(&probe) == 0);
+    markdown_test_fail_fences(true);
+    rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, L"```\nx\n```");
+    markdown_test_fail_fences(false);
+    read_text(&probe, text, 512);
+    CHECK(!wcscmp(text, L"```\r\nx\r\n```"));
+    CHECK(rich_text_code_block_count(&probe) == 0);
+
+    /* Every plan arena allocation fails in turn: verbatim body, no links and no
+       ranges; the first index beyond all allocations succeeds with the fence
+       range populated. */
+    {
+        const wchar_t *combo =
+            L"```\ncode\n```\n\n| name | value |\n| :--- | ---: |\n"
+            L"| [alpha](https://example.com/a) | 1 |\n| beta | 22 |";
+        const wchar_t *verbatim =
+            L"```\r\ncode\r\n```\r\n\r\n| name | value |\r\n| :--- | ---: |\r\n"
+            L"| [alpha](https://example.com/a) | 1 |\r\n| beta | 22 |";
+        int arena = 0;
+        for (; arena < 4000; arena++) {
+            markdown_plan_test_fail_after(arena);
+            rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, combo);
+            if (rich_text_code_block_count(&probe) == 1) break;
+            read_text(&probe, text, 512);
+            CHECK(!wcscmp(text, verbatim));
+            CHECK(probe.link_count == 0);
+        }
+        CHECK(arena < 4000);
+        CHECK(code_block_is(&probe, 0, L"code"));
+        markdown_plan_test_fail_after(-1);
+        rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT, combo);
+        CHECK(rich_text_code_block_count(&probe) == 1);
+        CHECK(probe.link_count == 1);
+    }
+
     /* Destruction frees the transferred metadata (WM_NCDESTROY). */
 
 
     rich_text_set_markdown(&probe, CHAT_ROLE_ASSISTANT,
-        L"[x](https://example.com/x)");
+        L"[x](https://example.com/x)\n\n```\ncode\n```");
     CHECK(probe.link_count == 1);
+    CHECK(probe.code_block_count == 1);
     DestroyWindow(probe.window);
     CHECK(probe.links == NULL && probe.link_count == 0 &&
         probe.link_targets == NULL);
+    CHECK(probe.code_blocks == NULL && probe.code_block_count == 0);
     DestroyWindow(parent);
     rich_text_test_set_open(NULL);
     rich_text_library_close();

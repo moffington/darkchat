@@ -18,6 +18,7 @@ static bool test_fail_cells;
 static bool test_fail_rows;
 static bool test_fail_tables;
 static bool test_fail_literals;
+static bool test_fail_fences;
 static int test_scratch_allocations;
 
 void markdown_test_fail_allocations(bool enable) {
@@ -48,6 +49,10 @@ void markdown_test_fail_literals(bool enable) {
     test_fail_literals = enable;
 }
 
+void markdown_test_fail_fences(bool enable) {
+    test_fail_fences = enable;
+}
+
 /* Test-only: how many times the per-cell normalization scratch buffer had to
    grow since the last reset. Reuse means one render needs only a handful of
    allocations, never one per cell. */
@@ -70,6 +75,7 @@ void markdown_dispose(MdDocument *doc) {
     free(doc->rows);
     free(doc->tables);
     free(doc->literals);
+    free(doc->fences);
     memset(doc, 0, sizeof *doc);
 }
 
@@ -97,6 +103,8 @@ typedef struct {
     int table_count, table_capacity;
     wchar_t *literals;
     size_t literals_length, literals_capacity;
+    MdCodeFence *fences;
+    int fence_count, fence_capacity;
     wchar_t *scratch;                   /* reused per-cell normalization buffer */
     size_t scratch_capacity;
     bool failed;
@@ -200,6 +208,19 @@ static bool grow_tables(MdBuilder *b) {
     if (!grown) { b->failed = true; return false; }
     b->tables = grown;
     b->table_capacity = capacity;
+    return true;
+}
+
+static bool grow_fences(MdBuilder *b) {
+    if (b->failed) return false;
+    if (test_fail_allocations || test_fail_fences) { b->failed = true; return false; }
+    if (b->fence_count < b->fence_capacity) return true;
+    int capacity = b->fence_capacity ? b->fence_capacity * 2 : 8;
+    MdCodeFence *grown = (MdCodeFence *)realloc(b->fences,
+        (size_t)capacity * sizeof *grown);
+    if (!grown) { b->failed = true; return false; }
+    b->fences = grown;
+    b->fence_capacity = capacity;
     return true;
 }
 
@@ -545,6 +566,12 @@ static void parse_inline(MdBuilder *b, const wchar_t *s, size_t n,
 typedef struct {
     wchar_t delimiter;
     size_t length, indent;
+    /* Render recording: an open fence accumulates the emitted range of its
+       content lines (including interior newlines) so a completed fence can be
+       recorded as one MdCodeFence. `start` is fixed after the separator before
+       the first content line; `end` advances after every content line. */
+    bool recording;
+    size_t start, end;
 } MdFence;
 
 /* Openers keep the subset's permissive hidden info strings. Closing validation
@@ -565,7 +592,7 @@ static bool fence_marker(const wchar_t *line, size_t n, MdFence *marker) {
 }
 
 static bool fence_closes(const wchar_t *line, size_t n, const MdFence *fence) {
-    MdFence marker;
+    MdFence marker = {0};
     if (!fence_marker(line, n, &marker) || marker.delimiter != fence->delimiter ||
         marker.length < fence->length) return false;
     for (size_t i = marker.indent + marker.length; i < n; i++)
@@ -716,7 +743,7 @@ static bool line_is_blank(const wchar_t *line, size_t n) {
 
 /* A fence opener (up to three leading spaces). */
 static bool line_fence_open(const wchar_t *line, size_t n) {
-    MdFence marker;
+    MdFence marker = {0};
     return fence_marker(line, n, &marker);
 }
 
@@ -751,6 +778,19 @@ static bool line_starts_block(const wchar_t *line, size_t n) {
     return p.quote_depth != 0 || p.has_marker;
 }
 
+/* Records the open fence's accumulated range when it emitted any character,
+   then clears the fence state. The separator newline before the first content
+   line is never included; interior newlines (including those of blank content
+   lines) are. A fence that emitted nothing records nothing. */
+static void close_fence_record(MdBuilder *b, MdFence *fence) {
+    if (fence->recording && fence->end > fence->start && grow_fences(b)) {
+        MdCodeFence *record = &b->fences[b->fence_count++];
+        record->offset = fence->start;
+        record->length = fence->end - fence->start;
+    }
+    memset(fence, 0, sizeof *fence);
+}
+
 /* One source line; blocks are recognized line-by-line and fences hide their
    marker lines. Newlines are normalized to LF. */
 static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
@@ -758,7 +798,7 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
     MdStyle plain = {0};
     if (fence->delimiter) {
         if (fence_closes(line, n, fence)) {
-            memset(fence, 0, sizeof *fence); /* closing fence is hidden */
+            close_fence_record(b, fence);   /* closing fence is hidden */
         } else {
             MdStyle code = {0};
             code.style = MD_STYLE_MONO | MD_STYLE_CODE;
@@ -766,13 +806,20 @@ static void render_line(MdBuilder *b, const wchar_t *line, size_t n,
             while (from < n && from < fence->indent && line[from] == L' ')
                 ++from;
             emit_break(b, code.style);
+            if (!fence->recording) {
+                /* Start after the separator so the break before the fence is
+                   never copied, even when this first content line is empty. */
+                fence->recording = true;
+                fence->start = b->length;
+            }
             size_t start = b->length;
             emit(b, line + from, n - from, code);
+            fence->end = b->length;
             close_block(b, start, MD_BLOCK_CODE, 0, 0, 0, 0, 0);
         }
         return;
     }
-    MdFence marker;
+    MdFence marker = {0};
     if (fence_marker(line, n, &marker)) {
         *fence = marker;                    /* opening fence is hidden */
         return;
@@ -1186,6 +1233,8 @@ static void render_document(MdBuilder *b, const wchar_t *source) {
         line = end + 1;
         if (*end == L'\r' && *line == L'\n') ++line;
     }
+    /* An unterminated fence still records what it emitted. */
+    close_fence_record(b, &fence);
 }
 
 bool markdown_render(const wchar_t *source, MdDocument *doc) {
@@ -1206,6 +1255,7 @@ bool markdown_render(const wchar_t *source, MdDocument *doc) {
         free(b.rows);
         free(b.tables);
         free(b.literals);
+        free(b.fences);
         free(b.scratch);
         return false;                       /* *doc stays zeroed */
     }
@@ -1237,5 +1287,8 @@ bool markdown_render(const wchar_t *source, MdDocument *doc) {
     doc->literals = b.literals;
     doc->literals_length = b.literals_length;
     doc->literals_capacity = b.literals_capacity;
+    doc->fences = b.fences;
+    doc->fence_count = b.fence_count;
+    doc->fence_capacity = b.fence_capacity;
     return true;
 }

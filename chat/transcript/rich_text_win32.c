@@ -246,8 +246,9 @@ static void run(RichTextControl *control, const wchar_t *text, unsigned style,
         style & MD_STYLE_MONO ? control->theme.mono_size : control->theme.ui_size);
 }
 
-/* Releases the control's Markdown link metadata. Every content mutation calls
-   it so stale ranges or destinations can never survive a write, and
+/* Releases the control's Markdown metadata: link label ranges with their
+   destination arena, and the rendered code-block ranges. Every content
+   mutation calls it so stale metadata can never survive a write, and
    WM_NCDESTROY calls it so nothing outlives the window. */
 static void clear_links(RichTextControl *control) {
     free(control->links);
@@ -256,6 +257,9 @@ static void clear_links(RichTextControl *control) {
     control->link_count = 0;
     control->link_targets = NULL;
     control->link_targets_length = 0;
+    free(control->code_blocks);
+    control->code_blocks = NULL;
+    control->code_block_count = 0;
 }
 
 static LRESULT CALLBACK rich_proc(HWND window, UINT message, WPARAM w,
@@ -508,6 +512,27 @@ bool rich_text_has_selection(const RichTextControl *control) {
     return selection.cpMax > selection.cpMin;
 }
 
+int rich_text_code_block_count(const RichTextControl *control) {
+    return control ? control->code_block_count : 0;
+}
+
+bool rich_text_code_block_range(const RichTextControl *control, int index,
+    size_t *start, size_t *length) {
+    if (!control || index < 0 || index >= control->code_block_count) return false;
+    if (start) *start = control->code_blocks[index].offset;
+    if (length) *length = control->code_blocks[index].length;
+    return true;
+}
+
+int rich_text_code_block_at_char(const RichTextControl *control, size_t cp) {
+    if (!control) return -1;
+    for (int i = 0; i < control->code_block_count; i++) {
+        const MdCodeFence *block = &control->code_blocks[i];
+        if (cp >= block->offset && cp - block->offset < block->length) return i;
+    }
+    return -1;
+}
+
 void rich_text_scroll_to_end(RichTextControl *control) {
     if (!control->window) return;
     /* Move the caret to the end without leaving a visible selection, then
@@ -672,6 +697,17 @@ static void take_links(RichTextControl *control, MdDocument *document) {
     document->targets_capacity = 0;
 }
 
+/* Takes ownership of a rendered document's code-block metadata. The document
+   text is inserted verbatim on the no-table path, so the fence ranges already
+   address control characters and transfer as-is. */
+static void take_code_fences(RichTextControl *control, MdDocument *document) {
+    control->code_blocks = document->fences;
+    control->code_block_count = document->fence_count;
+    document->fences = NULL;
+    document->fence_count = 0;
+    document->fence_capacity = 0;
+}
+
 /* Face size (DIPs) for one run, shared by the direct path and the table plan so
    a measured span and its rendered run always agree. */
 static float run_size(const RichTextTheme *theme, unsigned style, int heading) {
@@ -746,6 +782,7 @@ typedef struct {
     MdParagraph *paragraphs; int paragraph_count, paragraph_capacity;
     MdTableFormat *table_formats; int table_format_count, table_format_capacity;
     MdLink *links; int link_count, link_capacity;   /* control coords */
+    MdCodeFence *code_blocks; int code_block_count, code_block_capacity;
     PlanSegment *segments; int segment_count, segment_capacity;
     wchar_t *link_targets;              /* adopted document target arena */
     size_t link_targets_length;
@@ -890,6 +927,20 @@ static bool plan_append_format(MarkdownPlan *p, const MdTableFormat *format,
     return true;
 }
 
+static bool plan_append_code_block(MarkdownPlan *p, const MdCodeFence *fence) {
+    if (p->failed) return false;
+    if (p->code_block_count == p->code_block_capacity) {
+        int capacity = p->code_block_capacity ? p->code_block_capacity * 2 : 8;
+        MdCodeFence *grown = (MdCodeFence *)plan_realloc(p->code_blocks,
+            (size_t)capacity * sizeof(MdCodeFence));
+        if (!grown) { p->failed = true; return false; }
+        p->code_blocks = grown;
+        p->code_block_capacity = capacity;
+    }
+    p->code_blocks[p->code_block_count++] = *fence;
+    return true;
+}
+
 static bool plan_append_link(MarkdownPlan *p, const MdLink *link) {
     if (p->failed) return false;
     if (p->link_count == p->link_capacity) {
@@ -929,6 +980,7 @@ static void plan_dispose(MarkdownPlan *p) {
     free(p->paragraphs);
     free(p->table_formats);
     free(p->links);
+    free(p->code_blocks);
     free(p->segments);
     if (p->owns_targets) free(p->link_targets);
     memset(p, 0, sizeof *p);
@@ -1388,6 +1440,43 @@ done:
     return !p->failed;
 }
 
+/* Maps one document fence through the plan's segments. A multiline fence is
+   emitted as one span per code paragraph plus one for each separator gap, so
+   the source range must be covered completely and every mapped piece must be
+   adjacent to the previous one; the pieces then coalesce into a single control
+   range. Returns false when the coverage or adjacency invariant breaks (never
+   expected: a table cannot occur inside a fence), letting the caller drop only
+   this record. */
+static bool map_fence(const MarkdownPlan *p, const MdCodeFence *fence,
+    MdCodeFence *mapped) {
+    size_t to = fence->offset + fence->length;
+    size_t cursor = fence->offset;
+    bool have = false;
+    size_t plan_start = 0, plan_end = 0;
+    for (int s = 0; s < p->segment_count && cursor < to; s++) {
+        const PlanSegment *segment = &p->segments[s];
+        size_t seg_from = segment->src;
+        size_t seg_to = segment->src + segment->length;
+        if (seg_to <= cursor) continue;
+        if (seg_from > cursor) return false;            /* source gap */
+        size_t high = to < seg_to ? to : seg_to;
+        size_t piece_start = segment->plan + (cursor - seg_from);
+        size_t piece_end = segment->plan + (high - seg_from);
+        if (!have) {
+            plan_start = piece_start;
+            have = true;
+        } else if (piece_start != plan_end) {
+            return false;                               /* not adjacent */
+        }
+        plan_end = piece_end;
+        cursor = high;
+    }
+    if (!have || cursor != to) return false;
+    mapped->offset = plan_start;
+    mapped->length = plan_end - plan_start;
+    return true;
+}
+
 /* Builds the transactional flatten plan. Returns false for every
    document-wide failure (allocation, metric, character overflow): the caller
    then writes the entire original source verbatim. A per-table failure is
@@ -1452,6 +1541,17 @@ static bool build_plan(RichTextControl *control, const MdDocument *document,
         }
     }
 
+    /* Map every document fence through the emitted segments. The mapped range
+       is in plan (control) coordinates; an unmappable fence is dropped, which
+       leaves body rendering unaffected. */
+    if (!plan->failed) {
+        for (int i = 0; i < document->fence_count && !plan->failed; i++) {
+            MdCodeFence mapped;
+            if (map_fence(plan, &document->fences[i], &mapped))
+                plan_append_code_block(plan, &mapped);
+        }
+    }
+
     if (ctx.metric_failed) plan->failed = true;
     metric_end(&ctx);
     return !plan->failed && !plan->overflow;
@@ -1496,6 +1596,14 @@ static void take_plan_links(RichTextControl *control, MarkdownPlan *plan) {
     plan->link_targets = NULL;
     plan->link_targets_length = 0;
     plan->owns_targets = false;
+}
+
+static void take_plan_code_blocks(RichTextControl *control, MarkdownPlan *plan) {
+    control->code_blocks = plan->code_blocks;
+    control->code_block_count = plan->code_block_count;
+    plan->code_blocks = NULL;
+    plan->code_block_count = 0;
+    plan->code_block_capacity = 0;
 }
 
 /* Formats the plan text already inserted at the control's caret into the
@@ -1578,6 +1686,7 @@ bool rich_text_set_markdown_width(RichTextControl *control, ChatRole role,
         } else {
             apply_document(control, &document, body);
             take_links(control, &document);
+            take_code_fences(control, &document);
         }
     } else {
         MarkdownPlan plan;
@@ -1603,6 +1712,7 @@ bool rich_text_set_markdown_width(RichTextControl *control, ChatRole role,
             } else {
                 apply_plan_format(control, &plan, body);
                 take_plan_links(control, &plan);
+                take_plan_code_blocks(control, &plan);
             }
             plan_dispose(&plan);
         }

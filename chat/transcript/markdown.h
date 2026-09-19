@@ -74,6 +74,18 @@ typedef struct {
     int table_index;                    /* MD_BLOCK_TABLE -> tables[]; else -1 */
 } MdBlock;
 
+/* One rendered fenced code block: the emitted range of a complete fence,
+    markers excluded, in document order. A fence emits one MdCodeFence spanning
+    every content line and the newline separators between them; the separator
+    newline before the fence's first content line is never included, so adjacent
+    fences stay distinct records. An empty fence, or one that emits no
+    characters at all, records nothing. A blank fence line still emits its
+    interior newline when the fence follows preceding text, and that newline is
+    part of the range. */
+typedef struct {
+    size_t offset, length;               /* control/document text range */
+} MdCodeFence;
+
 /* GFM-style tables. A recognized table is recorded as one MD_BLOCK_TABLE block
    plus an MdTable, one MdTableRow per source row and one MdTableCell per
    column. Recognized tables emit parsed cell contents into the document buffer
@@ -129,6 +141,8 @@ typedef struct {
     int table_count, table_capacity;
     wchar_t *literals;  /* arena: normalized source slice of each table */
     size_t literals_length, literals_capacity;
+    MdCodeFence *fences; /* rendered fenced blocks, in document order */
+    int fence_count, fence_capacity;
 } MdDocument;
 
 /* Transactional: on success returns true and *doc owns the rendered
@@ -146,6 +160,10 @@ void markdown_test_fail_blocks(bool enable);
 /* Test-only hook: while enabled only link metadata growth fails, so the link
     path is exercised on its own. */
 void markdown_test_fail_links(bool enable);
+/* Test-only hook: while enabled only fence-record growth fails, so the fence
+    path is exercised on its own. A body with no rendered fence allocates
+    nothing here, so the hook leaves it unaffected. */
+void markdown_test_fail_fences(bool enable);
 /* Test-only hooks for the table arenas: while enabled the matching growth
     fails, so each table path is exercised on its own. */
 void markdown_test_fail_cells(bool enable);

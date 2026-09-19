@@ -59,6 +59,18 @@ static void block_is(const MdBlock *k, int kind, unsigned char quote,
         what);
 }
 
+/* Checks one recorded fence's range is valid and its slice equals expect. */
+static void fence_is(const MdDocument *d, int index, const wchar_t *expect,
+    const char *what) {
+    check(index >= 0 && index < d->fence_count, what);
+    if (index < 0 || index >= d->fence_count) return;
+    const MdCodeFence *f = &d->fences[index];
+    check(f->offset <= d->length && f->length <= d->length - f->offset, what);
+    check(f->length == wcslen(expect) &&
+        (f->length == 0 || !wmemcmp(d->text + f->offset, expect, f->length)),
+        what);
+}
+
 /* The destination of the stored link whose label covers needle, or NULL. */
 static const wchar_t *link_over(const MdDocument *d, const wchar_t *needle,
     size_t *length) {
@@ -571,6 +583,100 @@ int main(void) {
         check(d.run_count == 1, "fenced lines coalesce into one run");
         check(d.block_count == 2, "one code block per fenced line");
         blocks_sane(&d, "fence blocks are sane");
+        markdown_dispose(&d); }
+    { /* A fence records one range for its whole content: markers excluded,
+         interior newlines included. */
+        MdDocument d; render_ok(L"```\nx\ny\n```", &d, "multi-line fence renders");
+        check(d.fence_count == 1, "one range per fence");
+        fence_is(&d, 0, L"x\ny", "multi-line fence range spans its lines");
+        markdown_dispose(&d); }
+    { /* The separator newline before a fence is never part of its range. */
+        MdDocument d; render_ok(L"prose\n```\nx\n```", &d, "prose then fence");
+        text_is(&d, L"prose\nx", "prose and fenced content");
+        check(d.fence_count == 1, "prose fence recorded once");
+        check(d.fences[0].offset == wcslen(L"prose\n"),
+            "fence range starts after the separator");
+        fence_is(&d, 0, L"x", "prose fence range excludes the separator");
+        markdown_dispose(&d); }
+    { /* Fences at the document start begin at offset zero. */
+        MdDocument d; render_ok(L"```\nx\n```", &d, "leading fence renders");
+        check(d.fence_count == 1 && d.fences[0].offset == 0,
+            "leading fence starts at the first content character");
+        markdown_dispose(&d); }
+    { /* Two fences with prose between them record two independent ranges. */
+        MdDocument d; render_ok(L"```\na\n```\nmid\n```\nb\n```", &d,
+            "two separated fences render");
+        check(d.fence_count == 2, "separated fences record twice");
+        fence_is(&d, 0, L"a", "first separated fence range");
+        fence_is(&d, 1, L"b", "second separated fence range");
+        markdown_dispose(&d); }
+    { /* Non-empty adjacent fences stay distinct; the shared separator newline
+         belongs to neither. */
+        MdDocument d; render_ok(L"```\na\n```\n```\nb\n```", &d,
+            "adjacent fences render");
+        text_is(&d, L"a\nb", "adjacent fences keep their separator");
+        check(d.fence_count == 2, "adjacent fences record twice");
+        fence_is(&d, 0, L"a", "first adjacent fence range");
+        fence_is(&d, 1, L"b", "second adjacent fence range");
+        check(d.fences[0].offset + d.fences[0].length == 1 &&
+            d.fences[1].offset == 2, "shared separator is in neither range");
+        markdown_dispose(&d); }
+    { /* A fence that emits no character records nothing. */
+        MdDocument d; render_ok(L"```\n```", &d, "empty fence renders");
+        check(d.fence_count == 0, "empty fence records no range");
+        markdown_dispose(&d);
+        render_ok(L"prose\n```\n\n```", &d, "single blank fence line renders");
+        check(d.fence_count == 0,
+            "a blank first line with no interior newline records nothing");
+        markdown_dispose(&d); }
+    { /* Blank fence lines after preceding text emit interior newlines, which
+         belong to the range even with no visible content. */
+        MdDocument d; render_ok(L"prose\n```\n\n\n```", &d,
+            "blank fence lines render");
+        check(d.fence_count == 1, "interior blank lines still record");
+        fence_is(&d, 0, L"\n", "range holds the interior newline");
+        markdown_dispose(&d); }
+    { /* An unterminated fence records the content it emitted before EOF. */
+        MdDocument d; render_ok(L"prose\n```\nx\ny", &d,
+            "unterminated fence renders");
+        check(d.fence_count == 1, "unterminated fence recorded once");
+        fence_is(&d, 0, L"x\ny", "unterminated fence range reaches EOF");
+        markdown_dispose(&d); }
+    { /* Tilde fences record like backtick fences. */
+        MdDocument d; render_ok(L"~~~\nx\ny\n~~~", &d, "tilde fence renders");
+        check(d.fence_count == 1, "tilde fence recorded once");
+        fence_is(&d, 0, L"x\ny", "tilde fence range");
+        markdown_dispose(&d); }
+    { /* Inline code and in-quote fence markers are not fenced blocks. */
+        MdDocument d; render_ok(L"a `x` b", &d, "inline code renders");
+        check(d.fence_count == 0, "inline code records no fence");
+        markdown_dispose(&d);
+        render_ok(L"> ```\n> x", &d, "quoted fence markers render");
+        check(d.fence_count == 0, "fences inside quotes are not recognized");
+        markdown_dispose(&d); }
+    { /* Fence-record growth alone is transactional: a body that emits no fence
+         needs no allocation, while any rendered fence discards the whole
+         document on failure. */
+        MdDocument d;
+        markdown_test_fail_fences(true);
+        render_ok(L"", &d, "empty document needs no fence records");
+        check(d.fence_count == 0, "empty document has no fences");
+        markdown_dispose(&d);
+        render_ok(L"```\n```", &d, "empty fence needs no fence allocation");
+        check(d.fence_count == 0, "empty fence has no records");
+        markdown_dispose(&d);
+        render_ok(L"prose\n```\n\n```", &d,
+            "zero-character fence needs no fence allocation");
+        check(d.fence_count == 0, "zero-character fence has no records");
+        markdown_dispose(&d);
+        check(!markdown_render(L"```\nx\n```", &d), "fence failure reported");
+        check(d.text == NULL && d.runs == NULL && d.blocks == NULL &&
+            d.fences == NULL && d.fence_count == 0 && d.length == 0,
+            "fence failure document zeroed");
+        markdown_test_fail_fences(false);
+        render_ok(L"```\nx\n```", &d, "render works after fence failure");
+        check(d.fence_count == 1, "post-failure fence recorded");
+        fence_is(&d, 0, L"x", "post-failure fence range");
         markdown_dispose(&d); }
     { /* Nested unordered lists: depth, indentation and wrapped-line column. */
         MdDocument d; render_ok(L"- a\n  - b\n    - c", &d, "nesting renders");

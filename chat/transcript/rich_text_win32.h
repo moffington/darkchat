@@ -51,6 +51,16 @@ struct RichTextControl {
     int link_count;
     wchar_t *link_targets;      /* arena: NUL-terminated destinations */
     size_t link_targets_length; /* wchar units in link_targets, NULs included */
+    /* Rendered fenced-code-block metadata for the current Markdown body,
+       transferred from the document that produced it and owned by the control:
+       each entry is a half-open character range in the control's LF-only
+       coordinate space, marker lines and the separator before the fence
+       excluded. Cleared on every content mutation and freed on WM_NCDESTROY,
+       exactly like the link metadata. Only the stable range is stored; the
+       current display line for a position is derived from the control at the
+       point of use, so wrapping, width, DPI and font changes cannot stale it. */
+    MdCodeFence *code_blocks;
+    int code_block_count;
     /* Enter without Shift. Return true to consume the key. */
     bool (*on_submit)(void *user);
     /* Down/up translation of any key. Return true to consume it. */
@@ -132,6 +142,21 @@ void rich_text_scroll_to_end(RichTextControl *control);
 bool rich_text_pinned(const RichTextControl *control);
 /* True when the surface currently holds a non-empty selection. */
 bool rich_text_has_selection(const RichTextControl *control);
+
+/* Rendered code-block metadata for the current body, valid from the last
+   completed write and cleared whenever the link metadata is. Count is zero for
+   bodies with no rendered fence, verbatim writes and failed renders. */
+int rich_text_code_block_count(const RichTextControl *control);
+/* Half-open control character range of code block `index`; false when the
+   control is NULL or the index is out of range. Either output may be NULL when
+   the caller needs only the other, so a valid index with both NULL still
+   reports true. */
+bool rich_text_code_block_range(const RichTextControl *control, int index,
+    size_t *start, size_t *length);
+/* Index of the code block whose range contains `cp`, or -1. Membership is
+   half-open, so neither the separator newline between adjacent fences nor the
+   character after a block belongs to it. */
+int rich_text_code_block_at_char(const RichTextControl *control, size_t cp);
 /* Handles EN_LINK (opens the target) and EN_VSCROLL. Returns true if consumed.
    lparam is the WM_NOTIFY lParam; the caller checks the source handle. */
 bool rich_text_handle_notify(RichTextControl *control, LPARAM lparam);
