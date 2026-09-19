@@ -60,6 +60,15 @@ typedef struct {
     UiFont font;
     bool border;
     bool text_centered; /* labels only: center horizontally in their rect */
+    /* Extra label text inset beyond the built-in 8 DIPs, applied on both
+       sides (0 by default): keeps boxed labels such as filter fields off
+       their border without palette-specific painting. */
+    float text_inset;
+    /* Opt-in flat button style (off by default): a transparent idle surface
+       with soft fills only for hover, press and selection, and left-aligned
+       text unless text_centered is set. Intended for list-like rows (the
+       command palette); the default keeps the classic filled button. */
+    bool flat;
 } UiStyle;
 
 typedef struct {

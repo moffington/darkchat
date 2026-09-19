@@ -70,10 +70,33 @@ static void draw(Ui *u, const UiPainter *p, UiId id) {
     if (n->style.background>=0 && n->style.background<UI_COLOR_COUNT)
         p->fill(p->user,r,color(u,(UiColorRole)n->style.background),0);
     switch (n->kind) {
-    case UI_LABEL:
-        p->text(p->user,r,n->text,n->style.font,fg,
-            n->style.text_centered); break;
+    case UI_LABEL: {
+        /* The style may add a symmetric extra inset to the built-in 8 DIPs,
+           so boxed labels can keep their text off the border. Centered text
+           stays centered: both sides shrink equally. */
+        UiRect text=text_inset(r);
+        float extra=n->style.text_inset;
+        if (extra>0) {
+            text.x+=extra;
+            text.w=text.w>2*extra?text.w-2*extra:0;
+        }
+        p->text(p->user,text,n->text,n->style.font,fg,
+            n->style.text_centered);
+        break;
+    }
     case UI_BUTTON: {
+        if (n->style.flat) {
+            /* Flat rows are transparent when idle; only hover, press and
+               selection receive a soft background, and no stroke: the row
+               reads as part of the list, not as a filled button. */
+            if (down) p->fill(p->user,inset(r,1),color(u,UI_BUTTON_DOWN),radius);
+            else if (hot) p->fill(p->user,inset(r,1),color(u,UI_HOVER),radius);
+            else if (n->selected) p->fill(p->user,inset(r,1),color(u,UI_SELECTED),radius);
+            p->text(p->user,text_inset(r),n->text,n->style.font,
+                n->selected && enabled?color(u,UI_BRIGHT):fg,
+                n->style.text_centered);
+            break;
+        }
         UiColorRole bg=down?UI_BUTTON_DOWN:hot?UI_BUTTON_HOT:n->selected?UI_ACCENT_SOFT:UI_BUTTON_BG;
         p->fill(p->user,inset(r,1),color(u,bg),radius);
         if (n->selected) p->stroke(p->user,inset(r,.5f),color(u,UI_ACCENT_SOFT),radius,1);
@@ -84,9 +107,19 @@ static void draw(Ui *u, const UiPainter *p, UiId id) {
         draw_icon(p,r,n->icon,fg);
         break;
     case UI_ICON_BUTTON: {
+        if (n->style.flat) {
+            /* Same flat semantics as the flat text button: transparent when
+               idle, soft fill for hover/press/selection. */
+            int flat_role = down ? UI_BUTTON_DOWN : hot ? UI_HOVER :
+                n->selected ? UI_SELECTED : -1;
+            if (flat_role >= 0)
+                p->fill(p->user,inset(r,1),color(u,(UiColorRole)flat_role),radius);
+            draw_icon(p,r,n->icon,n->selected && enabled ? color(u,UI_BRIGHT) : fg);
+            break;
+        }
         /* A transparent icon button (background -1) shows only its hover,
-           pressed and selected surfaces; an explicit background keeps the
-           idle fill as well. */
+            pressed and selected surfaces; an explicit background keeps the
+            idle fill as well. */
         int role = down ? UI_BUTTON_DOWN : hot ? (n->style.background >= 0 ?
             UI_BUTTON_HOT : UI_HOVER) : n->selected ? UI_ACCENT_SOFT :
             n->style.background;
@@ -150,12 +183,15 @@ static void draw(Ui *u, const UiPainter *p, UiId id) {
         p->fill(p->user,thumb,color(u,u->drag_scroll==id?UI_ACCENT:hot?UI_MUTED:UI_FAINT),3);
     }
     /* A selected or keyboard-focused bordered surface uses the accent family,
-       so native-input placeholders (model field, composer, search) can show
-       focus without a bespoke painting path. */
+        so native-input placeholders (model field, composer, search) can show
+        focus without a bespoke painting path. */
     if (n->style.border)
         p->stroke(p->user,inset(n->rect,.5f),
             color(u,(n->selected || focused) ? UI_ACCENT : UI_BORDER),radius,1);
-    if (focused && u->keyboard_focus && n->kind!=UI_TEXTBOX)
+    /* The generic focus outline is suppressed for flat buttons: their
+        selection fill is the primary focus indication (list rows such as the
+        command palette), and a second ring would double the highlight. */
+    if (focused && u->keyboard_focus && n->kind!=UI_TEXTBOX && !n->style.flat)
         p->stroke(p->user,inset(n->rect,1.5f),color(u,UI_ACCENT),radius,1);
     p->pop_clip(p->user);
 }

@@ -365,6 +365,145 @@ static void icon_test(void) {
     CHECK(last_text_centered);
     CHECK(check.draws>0 && check.pushes==check.pops && check.depth==0);
 }
+/* Flat-row paint probe: records the first fill and text covering a probe
+   point, plus any stroke covering it. */
+static float probe_x, probe_y;
+static unsigned probe_hits, probe_stroke_hits;
+static bool probe_color_valid, probe_text_centered;
+static UiColor probe_color, probe_text_color;
+static UiRect probe_text_rect;
+static void probe_fill(void *user, UiRect r, UiColor c, float radius) {
+    (void)user; (void)radius;
+    if (!ui_contains(r,probe_x,probe_y)) return;
+    if (!probe_color_valid) probe_color=c;
+    probe_color_valid=true;
+    probe_hits++;
+}
+static void probe_stroke(void *user, UiRect r, UiColor c, float radius, float width) {
+    (void)user; (void)c; (void)radius; (void)width;
+    if (ui_contains(r,probe_x,probe_y)) probe_stroke_hits++;
+}
+static void probe_text(void *user, UiRect r, const wchar_t *s, UiFont f, UiColor c, bool centered) {
+    (void)user; (void)s; (void)f;
+    probe_text_rect=r;
+    if (ui_contains(r,probe_x,probe_y)) {
+        probe_text_color=c; probe_text_centered=centered;
+    }
+}
+static void probe_line(void *user, float x, float y, float xx, float yy, UiColor c, float width) {
+    (void)user; (void)x; (void)y; (void)xx; (void)yy; (void)c; (void)width;
+}
+static void probe_push(void *user, UiRect r) { (void)user; (void)r; }
+static void probe_pop(void *user) { (void)user; }
+static void flat_button_test(void) {
+    UiId root=init(UI_COLUMN);
+    UiId classic=ui_add(&u,root,UI_BUTTON,L"Classic");
+    UiId flat=ui_add(&u,root,UI_BUTTON,L"Flat row");
+    NODE(classic).style.width=ui_flex(1);
+    NODE(flat).style.flat=true;
+    NODE(flat).style.width=ui_flex(1);
+    NODE(flat).style.height=ui_fixed(30);
+    ui_layout(&u,300,200);
+    UiPainter probe={NULL,probe_fill,probe_stroke,probe_text,probe_line,
+        probe_push,probe_pop,0};
+    /* Idle classic button keeps its filled surface... */
+    probe_x=NODE(classic).rect.x+NODE(classic).rect.w/2;
+    probe_y=NODE(classic).rect.y+NODE(classic).rect.h/2;
+    probe_hits=probe_stroke_hits=0; probe_color_valid=false;
+    probe_text_centered=false;
+    ui_paint(&u,&probe);
+    CHECK(probe_hits>=1);
+    CHECK(probe_color.r==u.theme.colors[UI_BUTTON_BG].r &&
+        probe_color.g==u.theme.colors[UI_BUTTON_BG].g &&
+        probe_color.b==u.theme.colors[UI_BUTTON_BG].b);
+    CHECK(probe_text_centered);
+    /* ...while the idle flat row is fully transparent: no fill and no
+       stroke covers it. */
+    probe_x=NODE(flat).rect.x+NODE(flat).rect.w/2;
+    probe_y=NODE(flat).rect.y+NODE(flat).rect.h/2;
+    probe_hits=probe_stroke_hits=0; probe_color_valid=false;
+    probe_text_centered=false;
+    ui_paint(&u,&probe);
+    CHECK(probe_hits==0 && probe_stroke_hits==0);
+    CHECK(probe_text_centered==false);       /* flat rows align left */
+    /* Hover receives a soft fill. */
+    u.hot=flat;
+    probe_hits=0; probe_color_valid=false;
+    ui_paint(&u,&probe);
+    CHECK(probe_hits==1 &&
+        probe_color.r==u.theme.colors[UI_HOVER].r &&
+        probe_color.g==u.theme.colors[UI_HOVER].g &&
+        probe_color.b==u.theme.colors[UI_HOVER].b);
+    /* Selection replaces the hover fill and brightens the text. */
+    u.hot=UI_NONE; NODE(flat).selected=true;
+    probe_hits=probe_stroke_hits=0; probe_color_valid=false;
+    probe_text_color.r=probe_text_color.g=probe_text_color.b=0;
+    ui_paint(&u,&probe);
+    CHECK(probe_hits==1 && probe_stroke_hits==0 &&
+        probe_color.r==u.theme.colors[UI_SELECTED].r &&
+        probe_color.g==u.theme.colors[UI_SELECTED].g &&
+        probe_color.b==u.theme.colors[UI_SELECTED].b);
+    CHECK(probe_text_color.r==u.theme.colors[UI_BRIGHT].r);
+    /* The generic keyboard-focus outline is suppressed on flat rows: the
+        selection fill is the primary focus indication, so keyboard focus
+        adds no second ring. */
+    u.focus=flat; u.keyboard_focus=true;
+    probe_hits=probe_stroke_hits=0; probe_color_valid=false;
+    ui_paint(&u,&probe);
+    CHECK(probe_hits==1 && probe_stroke_hits==0 &&
+        probe_color.r==u.theme.colors[UI_SELECTED].r);
+    /* A classic focused button keeps its generic outline. */
+    u.focus=classic; NODE(flat).selected=false;
+    probe_x=NODE(classic).rect.x+NODE(classic).rect.w/2;
+    probe_y=NODE(classic).rect.y+NODE(classic).rect.h/2;
+    probe_hits=probe_stroke_hits=0; probe_color_valid=false;
+    ui_paint(&u,&probe);
+    CHECK(probe_stroke_hits>=1);
+    u.focus=UI_NONE; u.keyboard_focus=false;
+    /* Press paints the pressed fill. */
+    NODE(flat).selected=false;
+    u.hot=flat; u.pressed=flat; u.key_pressed=true;
+    probe_x=NODE(flat).rect.x+NODE(flat).rect.w/2;
+    probe_y=NODE(flat).rect.y+NODE(flat).rect.h/2;
+    probe_hits=0; probe_color_valid=false;
+    ui_paint(&u,&probe);
+    CHECK(probe_hits==1 &&
+        probe_color.r==u.theme.colors[UI_BUTTON_DOWN].r &&
+        probe_color.g==u.theme.colors[UI_BUTTON_DOWN].g &&
+        probe_color.b==u.theme.colors[UI_BUTTON_DOWN].b);
+    u.hot=u.pressed=UI_NONE; u.key_pressed=false;
+}
+/* Boxed labels can carry an extra symmetric text inset (filter fields keep
+   their text off the border); the default stays at the built-in 8 DIPs. */
+static void label_inset_test(void) {
+    UiId root=init(UI_COLUMN);
+    UiId boxed=ui_add(&u,root,UI_LABEL,L"Boxed");
+    NODE(boxed).style.background=UI_TRACK;
+    NODE(boxed).style.border=true;
+    NODE(boxed).style.text_inset=6;
+    ui_layout(&u,300,120);
+    UiPainter probe={NULL,probe_fill,probe_stroke,probe_text,probe_line,
+        probe_push,probe_pop,0};
+    probe_x=probe_y=-1000; probe_color_valid=false; probe_text_centered=false;
+    ui_paint(&u,&probe);
+    UiRect drawn=probe_text_rect;
+    /* Last text drawn is the boxed label (tree order). */
+    NEAR(drawn.x,NODE(boxed).rect.x+8+6);
+    NEAR(drawn.w,NODE(boxed).rect.w-16-12);
+    /* A plain label keeps the built-in inset... */
+    probe_text_rect=(UiRect){0,0,0,0};
+    { UiPainter probe2={NULL,probe_fill,probe_stroke,probe_text,probe_line,
+        probe_push,probe_pop,0};
+      /* Probe a fresh tree to capture the plain label's own draw. */
+      UiId single=init(UI_COLUMN);
+      UiId hint=ui_add(&u,single,UI_LABEL,L"Hint");
+      NODE(hint).style.height=ui_fixed(40);
+      ui_layout(&u,300,80);
+      probe_x=NODE(hint).rect.x+40; probe_y=NODE(hint).rect.y+20;
+      ui_paint(&u,&probe2);
+      CHECK(ui_contains(probe_text_rect,probe_x,probe_y));
+      NEAR(probe_text_rect.x,NODE(hint).rect.x+8); }
+}
 static void showcase_test(void) {
     ui_init(&u,NULL,NULL); Showcase s; CHECK(showcase_init(&s,&u));
     CHECK(u.count<UI_CAPACITY-32);
@@ -391,7 +530,7 @@ static void showcase_test(void) {
     CHECK(visible==1 && !NODE(s.catalog_rows[4]).hidden);
 }
 int main(void) {
-    layout_test(); input_test(); focus_bridge_test(); scrolling_test(); roving_focus_test(); nested_roving_focus_test(); scroll_api_test(); slider_test(); text_and_capacity_test(); lifetime_test(); accessibility_metadata_test(); icon_test(); showcase_test();
-    printf("PASS: %u assertions (layout, input, nested scroll, focus reveal, values, lifetime, capacity, icons, showcase breakpoints)\n",assertions);
+    layout_test(); input_test(); focus_bridge_test(); scrolling_test(); roving_focus_test(); nested_roving_focus_test(); scroll_api_test(); slider_test(); text_and_capacity_test(); lifetime_test(); accessibility_metadata_test(); icon_test(); flat_button_test(); label_inset_test(); showcase_test();
+    printf("PASS: %u assertions (layout, input, nested scroll, focus reveal, values, lifetime, capacity, icons, flat rows, label inset, showcase breakpoints)\n",assertions);
     return 0;
 }
