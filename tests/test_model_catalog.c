@@ -1,6 +1,8 @@
 /* Pure model-catalog parsing, merging and filtering. Includes the module so
-   the transactional allocation failures can be driven with wrapped malloc and
-   realloc, the same way test_chat exercises growth. */
+   the transactional allocation failures can be driven with wrapped malloc,
+   realloc and free (the same way test_chat exercises growth), and the
+   outstanding-allocation count can prove nothing leaks through failure
+   paths. */
 #include "../chat/model_catalog.c"
 #include <stdio.h>
 #include <string.h>
@@ -8,21 +10,31 @@
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
 
 static long alloc_fail_countdown = -1;
+static long outstanding;
 void *__real_malloc(size_t size);
 void *__real_realloc(void *pointer, size_t size);
+void __real_free(void *pointer);
 void *__wrap_malloc(size_t size) {
     if (alloc_fail_countdown >= 0) {
         if (alloc_fail_countdown == 0) return NULL;
         --alloc_fail_countdown;
     }
-    return __real_malloc(size);
+    void *block = __real_malloc(size);
+    if (block) ++outstanding;
+    return block;
 }
 void *__wrap_realloc(void *pointer, size_t size) {
     if (alloc_fail_countdown >= 0) {
         if (alloc_fail_countdown == 0) return NULL;
         --alloc_fail_countdown;
     }
-    return __real_realloc(pointer, size);
+    void *block = __real_realloc(pointer, size);
+    if (block && !pointer) ++outstanding;
+    return block;
+}
+void __wrap_free(void *pointer) {
+    if (pointer) --outstanding;
+    __real_free(pointer);
 }
 
 static const char *basic_json =
@@ -211,6 +223,36 @@ static int parse_transactional_oom(void) {
     CHECK(!ok && merged.count == 0);
     chat_model_catalog_dispose(&merged);
     chat_model_catalog_dispose(&catalog);
+
+    /* The same contract at every allocation point of a merge big enough to
+       grow twice, with leak accounting: after the loop, every allocation
+       made inside it has been released (wrapped free decrements the
+       outstanding count, so a leaked partial view would show here). */
+    {
+        ChatModelCatalog big;
+        chat_model_catalog_init(&big);
+        for (int i = 0; i < 100; i++) {
+            ChatModelInfo info;
+            memset(&info, 0, sizeof info);
+            info.context_length = -1;
+            swprintf(info.id, CHAT_MODEL_TEXT, L"big/model-%d", i);
+            CHECK(chat_model_catalog_append(&big, &info));
+        }
+        long outstanding_before = outstanding;
+        for (long fail_at = 0; fail_at < 8; fail_at++) {
+            ChatModelCatalog view;
+            chat_model_catalog_init(&view);
+            alloc_fail_countdown = fail_at;
+            ok = chat_model_catalog_merged(&big, L"cur/model", NULL, 0,
+                &view);
+            alloc_fail_countdown = -1;
+            if (ok) CHECK(view.count == 101);
+            else CHECK(view.count == 0);
+            chat_model_catalog_dispose(&view);
+        }
+        CHECK(outstanding == outstanding_before);
+        chat_model_catalog_dispose(&big);
+    }
     return 0;
 }
 

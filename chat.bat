@@ -8,7 +8,7 @@ rem MinGW-w64 / w64devkit; no third-party dependencies.
 if not exist build mkdir build
 windres app.rc -O coff -o build\chat_app.res
 if errorlevel 1 exit /b 1
-gcc -std=c17 -municode -mwindows -Wall -Wextra -Wpedantic -Werror -O2 chat_main.c chat\chat.c chat\context.c chat\provider_routing.c chat\search.c chat\chat_ui.c chat\transcript_policy.c chat\transcript_win32.c chat\chat_host_win32.c chat\storage.c chat\saver.c chat\actions_win32.c chat\commands.c chat\rich_text_win32.c chat\markdown.c chat\table_layout.c chat\json.c chat\sse.c chat\completion_request.c chat\completion_winhttp.c chat\model_catalog.c chat\model_catalog_winhttp.c chat\model_picker_win32.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c build\chat_app.res -o build\darkchat.exe -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp -ladvapi32
+gcc -std=c17 -municode -mwindows -Wall -Wextra -Wpedantic -Werror -O2 chat_main.c chat\chat.c chat\context.c chat\provider_routing.c chat\search.c chat\chat_ui.c chat\transcript_policy.c chat\transcript_win32.c chat\chat_host_win32.c chat\storage.c chat\saver.c chat\actions_win32.c chat\commands.c chat\palette.c chat\rich_text_win32.c chat\markdown.c chat\table_layout.c chat\json.c chat\sse.c chat\completion_request.c chat\completion_winhttp.c chat\model_catalog.c chat\model_catalog_winhttp.c chat\model_picker_win32.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c build\chat_app.res -o build\darkchat.exe -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp -ladvapi32
 if errorlevel 1 exit /b 1
 echo Built build\darkchat.exe
 if /i "%~1"=="run" start "" "build\darkchat.exe"
@@ -65,6 +65,10 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_commands.exe
     if errorlevel 1 exit /b 1
+    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_palette.c chat\commands.c chat\chat.c chat\model_catalog.c chat\json.c -o build\test_palette.exe -Wl,--wrap=malloc -Wl,--wrap=realloc
+    if errorlevel 1 exit /b 1
+    build\test_palette.exe
+    if errorlevel 1 exit /b 1
     gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_search.c chat\search.c chat\chat.c -o build\test_search.exe -Wl,--wrap=malloc -Wl,--wrap=realloc
     if errorlevel 1 exit /b 1
     build\test_search.exe
@@ -77,7 +81,7 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_openrouter.exe
     if errorlevel 1 exit /b 1
-    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_model_catalog.c chat\json.c -o build\test_model_catalog.exe -Wl,--wrap=malloc -Wl,--wrap=realloc
+    gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_model_catalog.c chat\json.c -o build\test_model_catalog.exe -Wl,--wrap=malloc -Wl,--wrap=realloc -Wl,--wrap=free
     if errorlevel 1 exit /b 1
     build\test_model_catalog.exe
     if errorlevel 1 exit /b 1

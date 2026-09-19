@@ -140,17 +140,23 @@ bool chat_model_catalog_merged(const ChatModelCatalog *catalog,
     wchar_t history[][CHAT_MODEL_TEXT], int history_count,
     ChatModelCatalog *out) {
     if (!out) return false;
-    if (!add_id(out, current)) return false;
+    if (!add_id(out, current)) goto fail;
     for (int i = 0; i < history_count; i++)
-        if (!add_id(out, history[i])) return false;
+        if (!add_id(out, history[i])) goto fail;
     if (catalog) {
         for (size_t i = 0; i < catalog->count; i++) {
             const ChatModelInfo *info = &catalog->items[i];
             if (chat_model_catalog_contains(out, info->id)) continue;
-            if (!chat_model_catalog_append(out, info)) return false;
+            if (!chat_model_catalog_append(out, info)) goto fail;
         }
     }
     return true;
+fail:
+    /* The contract is "left empty on allocation failure": release the items
+       appended before the failing growth instead of leaking them. dispose
+       leaves the initialized-empty state. */
+    chat_model_catalog_dispose(out);
+    return false;
 }
 
 static bool substring_fold(const wchar_t *text, const wchar_t *query,
