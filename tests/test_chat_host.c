@@ -1,5 +1,10 @@
 /* Hidden HWND integration of the real host, lifecycle and storage. */
+/* COBJMACROS must precede the first UIA header (pulled in through the host),
+    so the palette suite can drive the popup's provider with C macros. */
+#define COBJMACROS
 #include "../chat/chat_host_win32.c"
+#include <uiautomationclient.h>
+#include <uiautomationcoreapi.h>
 #include "../chat/provider_routing.h"
 #include <process.h>
 #include <stdio.h>
@@ -95,6 +100,15 @@ void __real_model_picker_pump(ModelPicker *picker);
 void __wrap_model_picker_pump(ModelPicker *picker) {
     (void)picker;
     ++picker_pump_calls;
+}
+/* Palette seam (linked with -Wl,--wrap=palette_popup_pump): the modal pump
+   returns at once so the suite can drive open/filter/accept/cancel and
+   inspect the popup's own state between steps without blocking. */
+static int palette_pump_calls;
+void __real_palette_popup_pump(PalettePopup *popup);
+void __wrap_palette_popup_pump(PalettePopup *popup) {
+    (void)popup;
+    ++palette_pump_calls;
 }
 static ModelCatalogEvent *catalog_fixture(ChatHost *h, ModelCatalogResult result,
     const char *json, const wchar_t *error) {
@@ -3942,6 +3956,402 @@ static int backend_suite(void) {
     return 0;
 }
 
+/* ---- Command palette suite (separate clean fixture) ------------------------ */
+
+/* Counts an element's children by walking the provider tree; Navigate
+   returns S_OK with NULL when there are no more siblings. */
+static size_t uia_children(IRawElementProviderFragment *from) {
+    if (!from) return 0;
+    IRawElementProviderFragment *child=NULL;
+    if (FAILED(IRawElementProviderFragment_Navigate(from,
+            NavigateDirection_FirstChild,&child)) || !child) return 0;
+    size_t count=1;
+    for (;;) {
+        IRawElementProviderFragment *next=NULL;
+        HRESULT hr=IRawElementProviderFragment_Navigate(child,
+            NavigateDirection_NextSibling,&next);
+        IRawElementProviderFragment_Release(child);
+        if (FAILED(hr) || !next) return count;
+        child=next; ++count;
+    }
+}
+
+/* Resolves the popup's UI_SCROLL fragment: the query label, the separator
+   and the scroll are the root's three children in tree order. Returns NULL
+   when the tree does not have that shape. */
+static IRawElementProviderFragment *palette_scroll_fragment(
+    IRawElementProviderFragment *root_fragment) {
+    if (!root_fragment) return NULL;
+    IRawElementProviderFragment *query=NULL;
+    if (FAILED(IRawElementProviderFragment_Navigate(root_fragment,
+            NavigateDirection_FirstChild,&query)) || !query) return NULL;
+    IRawElementProviderFragment *separator=NULL;
+    if (FAILED(IRawElementProviderFragment_Navigate(query,
+            NavigateDirection_NextSibling,&separator)) || !separator) {
+        IRawElementProviderFragment_Release(query);
+        return NULL;
+    }
+    IRawElementProviderFragment *scroll=NULL;
+    if (FAILED(IRawElementProviderFragment_Navigate(separator,
+            NavigateDirection_NextSibling,&scroll)) || !scroll) {
+        IRawElementProviderFragment_Release(query);
+        IRawElementProviderFragment_Release(separator);
+        return NULL;
+    }
+    IRawElementProviderFragment_Release(query);
+    IRawElementProviderFragment_Release(separator);
+    return scroll;
+}
+
+static int palette_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Palette host",1100,720,720,480,NULL,
+        false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-palette-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Palette integration",
+        WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+    palette_pump_calls=0;
+
+    /* Ctrl+K opens the palette, pumps once, and closes it: the wrapped pump
+       never finishes, so end_palette destroys the popup directly. */
+    CHECK(host_shortcut(h,L'K',false,true,false));
+    CHECK(palette_pump_calls==1);
+    CHECK(!h->open_palette);
+    /* An action that merely opens a popup must leave no dirty state. */
+    CHECK(!h->dirty);
+
+    /* Open/filter/accept/cancel through the seams: only available commands
+       become rows, the filter narrows by label, and accept resolves the
+       stable action id. */
+    {
+        ChatActionContext context;
+        palette_context(h,&context);
+        PalettePopup *palette=palette_popup_create(window,&context);
+        CHECK(palette && palette_popup_window(palette));
+        CHECK(palette_popup_row_count(palette)>0);
+        /* Empty conversation: ACTION_COPY has no response to copy, so it is
+           excluded up front and navigation can never land on it. */
+        bool copy_row=false;
+        for (size_t i=0;i<palette_popup_row_count(palette);i++)
+            if (!wcscmp(palette_popup_row_label(palette,i),L"Copy response"))
+                copy_row=true;
+        CHECK(!copy_row);
+        /* Filtering is by label; clearing the query restores every row and
+           every previously available row keeps its stable identity. */
+        size_t before=palette_popup_row_count(palette);
+        palette_popup_set_query(palette,L"rename");
+        CHECK(palette_popup_row_count(palette)==1);
+        CHECK(!wcscmp(palette_popup_row_label(palette,0),L"Rename..."));
+        palette_popup_set_query(palette,L"");
+        CHECK(palette_popup_row_count(palette)==before);
+        /* Repeated filter/clear cycles must not accumulate section headers
+           in the retained tree: every child of the scroll container is
+           rebuilt, so the child census is stable. */
+        {
+            IRawElementProviderSimple *root=palette_popup_root_provider(palette);
+            CHECK(root);
+            IRawElementProviderFragment *fragment=NULL;
+            CHECK(SUCCEEDED(IRawElementProviderSimple_QueryInterface(root,
+                &IID_IRawElementProviderFragment,(void **)&fragment)));
+            IRawElementProviderFragment *scroll=palette_scroll_fragment(fragment);
+            CHECK(scroll);
+            size_t stable=uia_children(scroll);
+            CHECK(stable>0);
+            for (int cycle=0;cycle<4;cycle++) {
+                palette_popup_set_query(palette,cycle%2?L"":L"new");
+            }
+            CHECK(palette_popup_row_count(palette)==before);
+            size_t after=uia_children(scroll);
+            CHECK(after==stable);
+            IRawElementProviderFragment_Release(scroll);
+            IRawElementProviderFragment_Release(fragment);
+            IRawElementProviderSimple_Release(root);
+        }
+        /* No match: the palette cannot be accepted. */
+        palette_popup_set_query(palette,L"zzzznope");
+        CHECK(palette_popup_row_count(palette)==0);
+        palette_popup_accept(palette);
+        CHECK(!palette_popup_accepted(palette));
+        /* Accept after typing resolves the row's action id exactly once. */
+        palette_popup_set_query(palette,L"sidebar width");
+        CHECK(palette_popup_row_count(palette)==1);
+        palette_popup_accept(palette);
+        CHECK(palette_popup_accepted(palette));
+        CHECK(palette_popup_action_id(palette)==ACTION_SIDEBAR);
+        palette_popup_accept(palette);            /* idempotent */
+        CHECK(palette_popup_action_id(palette)==ACTION_SIDEBAR);
+        /* The pump re-enables the owner even when it never ran (the wrapped
+           seam skipped it): a stranded disabled owner would dead-end input.
+           This assertion drives the real pump directly. */
+        EnableWindow(window,FALSE);
+        __real_palette_popup_pump(palette);
+        CHECK(IsWindowEnabled(window));
+        palette_popup_destroy(palette);
+    }
+
+    /* The dimmer overlay is created with the palette: owned, layered,
+       click-through, non-activating, hidden until the pump shows it, and
+       destroyed on every exit path. */
+    {
+        ChatActionContext context;
+        palette_context(h,&context);
+        PalettePopup *palette=palette_popup_create(window,&context);
+        CHECK(palette);
+        HWND overlay=palette_popup_overlay(palette);
+        CHECK(overlay && IsWindow(overlay) && overlay!=window &&
+            overlay!=palette_popup_window(palette));
+        LONG exstyle=(LONG)GetWindowLongW(overlay,GWL_EXSTYLE);
+        CHECK((exstyle&WS_EX_LAYERED) && (exstyle&WS_EX_TRANSPARENT) &&
+            (exstyle&WS_EX_NOACTIVATE) && (exstyle&WS_EX_TOOLWINDOW));
+        CHECK(!IsWindowVisible(overlay));     /* parked until the pump */
+        /* Showing the overlay can never take focus from the palette. */
+        SetFocus(h->composer.window);
+        ShowWindow(overlay,SW_SHOWNA);
+        CHECK(GetFocus()==h->composer.window);
+        { BYTE alpha=0; DWORD flags=0;
+          CHECK(GetLayeredWindowAttributes(overlay,NULL,&alpha,&flags));
+          CHECK((flags&LWA_ALPHA) && alpha==30); }   /* ~12% black */
+        /* Every exit path removes it: direct destroy covers cancel/accept
+           teardown; the pump tail hides it. */
+        palette_popup_destroy(palette);
+        CHECK(!IsWindow(overlay));
+    }
+
+    /* Placement: 580x420 DIP centered over the owner's client area, biased
+       above vertical center; a small owner clamps the palette inside its own
+       client area, and a DPI change re-places it around the new scale. */
+    {
+        ChatActionContext context;
+        palette_context(h,&context);
+        PalettePopup *palette=palette_popup_create(window,&context);
+        CHECK(palette);
+        UINT dpi=palette_popup_dpi(palette);
+        CHECK(dpi==96);
+        int margin=MulDiv(16,(int)dpi,96);
+        int width=MulDiv(580,(int)dpi,96), height=MulDiv(420,(int)dpi,96);
+        RECT client; GetClientRect(window,&client);
+        POINT origin={0,0}; ClientToScreen(window,&origin);
+        RECT area={origin.x,origin.y,origin.x+client.right,
+            origin.y+client.bottom};
+        int area_w=area.right-area.left, area_h=area.bottom-area.top;
+        CHECK(width<=area_w-2*margin);      /* no clamp on the fixture size */
+        RECT bounds=palette_popup_bounds(palette);
+        CHECK(bounds.left==area.left+(area_w-width)/2);
+        CHECK(bounds.top==area.top+(int)((float)(area_h-height)*0.40f));
+        CHECK(bounds.right-bounds.left==width);
+        CHECK(bounds.bottom-bounds.top==height);
+        /* DPI change while open: re-scaled, re-centered, still usable. */
+        SendMessageW(palette_popup_window(palette),WM_DPICHANGED,
+            MAKEWPARAM(96,192),0);
+        CHECK(palette_popup_dpi(palette)==192);
+        margin=MulDiv(16,192,96);
+        width=MulDiv(580,192,96); height=MulDiv(420,192,96);
+        if (width>area_w-2*margin) width=area_w-2*margin;
+        if (height>area_h-2*margin) height=area_h-2*margin;
+        bounds=palette_popup_bounds(palette);
+        CHECK(bounds.left==area.left+(area_w-width)/2);
+        CHECK(bounds.top==area.top+(int)((float)(area_h-height)*0.40f));
+        CHECK(bounds.right-bounds.left==width);
+        CHECK(bounds.bottom-bounds.top==height);
+        CHECK(palette_popup_overlay(palette) &&
+            IsWindow(palette_popup_overlay(palette)));
+        CHECK(palette_popup_row_count(palette)>0);
+        /* Capture the overlay handle before teardown: the popup owns its
+           whole Ui arena, so destroy returns it to the OS and any later
+           dereference would fault. */
+        HWND dying_overlay=palette_popup_overlay(palette);
+        palette_popup_destroy(palette);
+        CHECK(!IsWindow(dying_overlay));
+
+        /* A small owner clamps the palette inside its own client area and
+           keeps it centered above vertical center. */
+        WNDCLASSW small_cls={0}; small_cls.lpfnWndProc=DefWindowProcW;
+        small_cls.lpszClassName=L"DarkChat.PaletteSmall";
+        CHECK(RegisterClassW(&small_cls) ||
+            GetLastError()==ERROR_CLASS_ALREADY_EXISTS);
+        HWND small=CreateWindowW(L"DarkChat.PaletteSmall",L"Small",
+            WS_OVERLAPPEDWINDOW,40,40,420,320,NULL,NULL,NULL,NULL);
+        CHECK(small);
+        palette=palette_popup_create(small,&context);
+        CHECK(palette);
+        dpi=palette_popup_dpi(palette);
+        margin=MulDiv(16,(int)dpi,96);
+        GetClientRect(small,&client);
+        origin.x=origin.y=0; ClientToScreen(small,&origin);
+        area.right=area.left=origin.x; area.bottom=area.top=origin.y;
+        area.right+=client.right; area.bottom+=client.bottom;
+        area_w=area.right-area.left; area_h=area.bottom-area.top;
+        CHECK(MulDiv(580,(int)dpi,96)>area_w-2*margin);   /* clamp engages */
+        width=area_w-2*margin; height=area_h-2*margin;
+        bounds=palette_popup_bounds(palette);
+        CHECK(bounds.left==area.left+margin);
+        CHECK(bounds.top==area.top+(int)((float)(area_h-height)*0.40f));
+        CHECK(bounds.right-bounds.left==width);
+        CHECK(bounds.bottom-bounds.top==height);
+        palette_popup_destroy(palette);
+        DestroyWindow(small);
+    }
+
+    /* A disabled/unavailable command cannot be invoked through the popup:
+       during generation the registry excludes it, so an accept lands on the
+       nearest available row instead. */
+    {
+        ChatActionContext context;
+        palette_context(h,&context);
+        context.generating=true;
+        PalettePopup *palette=palette_popup_create(window,&context);
+        CHECK(palette);
+        bool stop_row=false;
+        for (size_t i=0;i<palette_popup_row_count(palette);i++)
+            if (!wcscmp(palette_popup_row_label(palette,i),L"Retry unsuccessful response"))
+                stop_row=true;
+        CHECK(!stop_row);
+        palette_popup_destroy(palette);
+    }
+
+    /* Accepting through the popup dispatches exactly one action through the
+       unchanged action() dispatcher. */
+    {
+        ChatActionContext context;
+        palette_context(h,&context);
+        PalettePopup *palette=palette_popup_create(window,&context);
+        CHECK(palette);
+        palette_popup_set_query(palette,L"new conversation");
+        CHECK(palette_popup_row_count(palette)==1);
+        palette_popup_accept(palette);
+        palette_popup_destroy(palette);
+        /* Applied by hand exactly as end_palette does (the wrapped pump skips
+           the unwind), proving the dispatcher path once. */
+        int conversations_before=chat->conversation_count;
+        action(h,ACTION_NEW);
+        CHECK(chat->conversation_count==conversations_before+1);
+    }
+
+    /* UIA exposure: the popup's own provider names the root and exposes the
+       row buttons with Invoke, and activating a row through the provider
+       fires exactly once. */
+    {
+        add_turn(chat,L"u1",L"a1",NULL,-1);
+        ChatActionContext context;
+        palette_context(h,&context);
+        PalettePopup *palette=palette_popup_create(window,&context);
+        CHECK(palette);
+        IRawElementProviderSimple *root=palette_popup_root_provider(palette);
+        CHECK(root);
+        VARIANT value; VariantInit(&value);
+        CHECK(SUCCEEDED(IRawElementProviderSimple_GetPropertyValue(root,
+            UIA_ControlTypePropertyId,&value)));
+        CHECK(V_VT(&value)==VT_I4 &&
+            V_I4(&value)==UIA_WindowControlTypeId);
+        VariantClear(&value);
+        IRawElementProviderFragment *fragment=NULL;
+        CHECK(SUCCEEDED(IRawElementProviderSimple_QueryInterface(root,
+            &IID_IRawElementProviderFragment,(void **)&fragment)));
+        /* Rows live under the scroll container, not among the root's direct
+           children: root -> query -> separator -> scroll -> rows. */
+        IRawElementProviderFragment *scroll=palette_scroll_fragment(fragment);
+        CHECK(scroll);
+        IRawElementProviderFragment *child=NULL;
+        CHECK(SUCCEEDED(IRawElementProviderFragment_Navigate(scroll,
+            NavigateDirection_FirstChild,&child)) && child);
+        /* Find the "New conversation" row by walking the scroll's children
+           (the first child is the section header label). */
+        IRawElementProviderFragment *row=NULL;
+        for (IRawElementProviderFragment *it=child; it && !row;) {
+            IRawElementProviderSimple *simple=NULL;
+            CHECK(SUCCEEDED(IRawElementProviderFragment_QueryInterface(it,
+                &IID_IRawElementProviderSimple,(void **)&simple)));
+            VARIANT name; VariantInit(&name);
+            bool is_new=false;
+            if (SUCCEEDED(IRawElementProviderSimple_GetPropertyValue(simple,
+                    UIA_NamePropertyId,&name)) && V_VT(&name)==VT_BSTR)
+                is_new=!wcscmp(V_BSTR(&name),L"New conversation");
+            VariantClear(&name);
+            if (is_new) row=it;
+            else {
+                IRawElementProviderFragment *next=NULL;
+                CHECK(SUCCEEDED(IRawElementProviderFragment_Navigate(it,
+                    NavigateDirection_NextSibling,&next)));
+                IRawElementProviderSimple_Release(simple);
+                IRawElementProviderFragment_Release(it);
+                it=next;
+            }
+            if (is_new) IRawElementProviderSimple_Release(simple);
+        }
+        CHECK(row);
+        IRawElementProviderSimple *row_simple=NULL;
+        CHECK(SUCCEEDED(IRawElementProviderFragment_QueryInterface(row,
+            &IID_IRawElementProviderSimple,(void **)&row_simple)));
+        IUnknown *pattern=NULL;
+        CHECK(SUCCEEDED(IRawElementProviderSimple_GetPatternProvider(
+            row_simple,UIA_InvokePatternId,&pattern)) && pattern);
+        IInvokeProvider *invoke=NULL;
+        CHECK(SUCCEEDED(IUnknown_QueryInterface(pattern,
+            &IID_IInvokeProvider,(void **)&invoke)));
+        int conversations_before=chat->conversation_count;
+        CHECK(SUCCEEDED(IInvokeProvider_Invoke(invoke)));
+        /* The invoke is posted; run the popup's message handling. */
+        MSG message;
+        while (PeekMessageW(&message,palette_popup_window(palette),0,0,
+                PM_REMOVE)) {
+            TranslateMessage(&message); DispatchMessageW(&message);
+        }
+        CHECK(palette_popup_accepted(palette));
+        CHECK(palette_popup_action_id(palette)==ACTION_NEW);
+        palette_popup_destroy(palette);
+        /* Applied by hand exactly as end_palette does: the dispatch fires
+           exactly once, so the delta is one conversation. */
+        action(h,ACTION_NEW);
+        CHECK(chat->conversation_count==conversations_before+1);
+        IInvokeProvider_Release(invoke); IUnknown_Release(pattern);
+        IRawElementProviderSimple_Release(row_simple);
+        IRawElementProviderFragment_Release(row);
+        IRawElementProviderFragment_Release(child);
+        IRawElementProviderFragment_Release(scroll);
+        IRawElementProviderFragment_Release(fragment);
+        IRawElementProviderSimple_Release(root);
+    }
+
+    /* A close arriving while the palette is live parks on close_pending and
+       is reposted once end_palette has unwound. */
+    {
+        ChatActionContext context;
+        palette_context(h,&context);
+        h->open_palette=palette_popup_create(window,&context);
+        CHECK(h->open_palette);
+        SendMessageW(window,WM_CLOSE,0,0);
+        CHECK(IsWindow(window) && h->close_pending);
+        h->palette_pumping=true;
+        palette_popup_cancel(h->open_palette);
+        h->palette_pumping=false;
+        end_palette(h);
+        pump_messages(30);
+        CHECK(!IsWindow(window));
+        CHECK(!h->open_palette && !h->close_pending);
+    }
+
+    saver_shutdown(&h->saver); storage_close(&h->storage);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
+    transcript_dispose(&h->transcript);
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
 /* ---- Deliberate keyboard navigation suite (separate clean fixture) -------- */
 
 static int navigation_suite(void) {
@@ -4157,9 +4567,9 @@ static int navigation_suite(void) {
 
 int main(void) {
     /* The fixtures share one process and never unload Msftedit: repeated
-       unload/reload cycles across fixtures can fail its DllMain with
-       ERROR_DLL_INIT_FAILED (1114), so the first fixture's load is kept for
-       the whole run (each fixture frees only its own windows and bookkeeping). */
+        unload/reload cycles across fixtures can fail its DllMain with
+        ERROR_DLL_INIT_FAILED (1114), so the first fixture's load is kept for
+        the whole run (each fixture frees only its own windows and bookkeeping). */
     int failed=default_suite();
     if (failed) return failed;
     failed=seam_toggle_suite();
@@ -4170,8 +4580,10 @@ int main(void) {
     if (failed) return failed;
     failed=backend_suite();
     if (failed) return failed;
+    failed=palette_suite();
+    if (failed) return failed;
     failed=navigation_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded + catalog + backend + navigation fixtures) passed");
+    puts("Hidden host (default + bounded + catalog + backend + palette + navigation fixtures) passed");
     return failed;
 }

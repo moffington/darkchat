@@ -12,6 +12,7 @@
 #include "model_catalog.h"
 #include "model_catalog_winhttp.h"
 #include "model_picker_win32.h"
+#include "palette_win32.h"
 #include "../platform/renderer.h"
 #include "../platform/accessibility.h"
 #include <windowsx.h>
@@ -95,6 +96,11 @@ typedef struct {
     ModelPicker *open_picker;
     bool picker_pumping;
     bool close_pending, model_applied;
+    /* Command palette (Ctrl+K). Mirrors the picker's parked-close machine
+       with palette-specific fields so the model-picker state stays untouched
+       until commit 6 migrates the picker onto the palette. */
+    PalettePopup *open_palette;
+    bool palette_pumping;
 
 } ChatHost;
 
@@ -119,6 +125,8 @@ static bool search_refresh(ChatHost *host, bool reverse);
 static bool search_step(ChatHost *host, bool reverse);
 static void place_container(ChatHost *host);
 static void open_actions_menu(ChatHost *host);
+static void open_palette(ChatHost *host);
+static RichTextControl *transcript_selected_surface(ChatHost *host);
 
 static int px(ChatHost *host, float dips) {
     return (int)lroundf(dips * host->dpi / 96.0f);
@@ -568,6 +576,51 @@ static void open_model_picker(ChatHost *host) {
         host->picker_pumping = false;
     }
     end_model_picker(host);
+}
+
+/* Builds the command palette's availability context from live host state:
+    the same fields WM_INITMENUPOPUP feeds the menu sync, so the palette and
+    the overflow menu can never disagree about what is runnable. */
+static void palette_context(ChatHost *host, ChatActionContext *context) {
+    chat_action_context_init(context, host->config.chat);
+    context->generating = host->generating;
+    context->editing = host->editing;
+    context->has_transcript_selection =
+        transcript_selected_surface(host) != NULL;
+}
+
+/* Destroys the palette and applies its result exactly once: the highlighted
+    command is dispatched through the unchanged action() dispatcher. A close
+    that arrived while the modal loop was live is reposted after the palette
+    call has unwound. */
+static void end_palette(ChatHost *host) {
+    PalettePopup *palette = host->open_palette;
+    if (!palette) return;
+    bool accepted = palette_popup_accepted(palette);
+    int action_id = palette_popup_action_id(palette);
+    palette_popup_destroy(palette);
+    host->open_palette = NULL;
+    if (accepted && action_id) action(host, action_id);
+    if (host->close_pending) {
+        host->close_pending = false;
+        PostMessageW(host->window, WM_CLOSE, 0, 0);
+    }
+}
+
+/* Opens the command palette (Ctrl+K) and runs its modal pump. */
+static void open_palette(ChatHost *host) {
+    if (host->open_palette) return;
+    ChatActionContext context;
+    palette_context(host, &context);
+    host->open_palette = palette_popup_create(host->window, &context);
+    if (!host->open_palette) {
+        set_status(host, L"Could not open the command palette.");
+        return;
+    }
+    host->palette_pumping = true;
+    palette_popup_pump(host->open_palette);
+    host->palette_pumping = false;
+    end_palette(host);
 }
 
 /* Switches the active backend. Switching to Ollama when no local model has
@@ -1823,6 +1876,12 @@ static bool host_shortcut(ChatHost *host, WPARAM key, bool shift,
         return true;
     }
     if (control && key == VK_SPACE) { action(host, ACTION_MODELS); return true; }
+    /* Ctrl+K opens the retained command palette: the same registry the
+       overflow menu renders, filtered as you type. */
+    if (control && (key == L'K' || key == L'k')) {
+        open_palette(host);
+        return true;
+    }
     /* Ctrl+B toggles the sidebar; F10 / the context-menu key open the
        retained command menu, the replacement route to every command that the
        removed menu bar used to carry. */
@@ -2485,9 +2544,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         saver_completed(host,(w&1)!=0,(uint64_t)w>>1,(uint64_t)l);
         return 0;
     case WM_CLOSE:
-        /* A close that lands while the modal picker is live must not destroy
-           the parent under the nested loop. Close the picker, park the close,
-           and repost it once the picker call has unwound. */
+        /* A close that lands while a modal popup is live must not destroy
+           the parent under the nested loop. Close the popup, park the close,
+           and repost it once the popup call has unwound. */
+        if (host->open_palette) {
+            host->close_pending = true;
+            palette_popup_cancel(host->open_palette);
+            return 0;
+        }
         if (host->open_picker) {
             host->close_pending = true;
             model_picker_cancel(host->open_picker);
@@ -2545,14 +2609,25 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         KillTimer(window, 2);
         KillTimer(window, CHAT_TIMER_BODY_FLUSH);
         /* Never free a picker underneath its active nested pump: cancel it so
-           the pump unwinds, and let its completion path destroy it. Only a
-           picker with no live pump is safe to destroy here. */
+            the pump unwinds, and let its completion path destroy it. Only a
+            picker with no live pump is safe to destroy here. */
         if (host->open_picker) {
             if (host->picker_pumping) {
                 model_picker_cancel(host->open_picker);
             } else {
                 model_picker_destroy(host->open_picker);
                 host->open_picker = NULL;
+            }
+        }
+        /* Same pump-safety for the command palette: the end_palette path
+           (close repost, action dispatch) is skipped in WM_DESTROY, since
+           the hierarchy is already collapsing. */
+        if (host->open_palette) {
+            if (host->palette_pumping) {
+                palette_popup_cancel(host->open_palette);
+            } else {
+                palette_popup_destroy(host->open_palette);
+                host->open_palette = NULL;
             }
         }
         chat_search_results_dispose(&host->search_results);
@@ -2680,6 +2755,10 @@ cleanup:
     if (host->open_picker) {
         model_picker_destroy(host->open_picker);
         host->open_picker = NULL;
+    }
+    if (host->open_palette) {
+        palette_popup_destroy(host->open_palette);
+        host->open_palette = NULL;
     }
     /* Join the snapshot writer before the storage lock is released: it alone
        uses the ChatStorage after startup, and pending jobs must be drained
