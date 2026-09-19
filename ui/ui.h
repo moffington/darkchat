@@ -83,6 +83,9 @@ typedef struct {
     UiId labelled_by;
     UiIcon icon; /* UI_ICON / UI_ICON_BUTTON glyph */
     bool hidden, disabled, checked, selected;
+    /* Excluded from the accessibility tree while remaining fully laid out and
+       painted: for layout-only artifacts such as virtual-list spacers. */
+    bool accessibility_hidden;
     float value; /* slider/progress: normalized [0,1] */
     float scroll, content_height;
     uintptr_t tag; /* application-owned identifier */
@@ -148,6 +151,10 @@ void ui_set_labelled_by(Ui *ui, UiId id, UiId label);
 const wchar_t *ui_accessible_name(Ui *ui, UiId id);
 void ui_set_hidden(Ui *ui, UiId id, bool hidden);
 void ui_set_disabled(Ui *ui, UiId id, bool disabled);
+/* Excludes id and its descendants from the accessibility tree. Layout, hit
+   testing and painting are unaffected; only UIA navigation, properties and
+   patterns stop exposing the node. */
+void ui_set_accessibility_hidden(Ui *ui, UiId id, bool hidden);
 bool ui_visible(const Ui *ui, UiId id);
 bool ui_enabled(const Ui *ui, UiId id);
 /* Performs the default action of an enabled button. */

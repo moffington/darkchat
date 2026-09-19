@@ -38,11 +38,20 @@ static UiProvider *from_fragment(IRawElementProviderFragment *i) { return (UiPro
 static UiProvider *from_root(IRawElementProviderFragmentRoot *i) { return (UiProvider *)((char *)i-offsetof(UiProvider,root)); }
 static UiProvider *from_invoke(IInvokeProvider *i) { return (UiProvider *)((char *)i-offsetof(UiProvider,invoke)); }
 
+/* A node is exposed to UIA when it is laid out/visible and neither it nor an
+   ancestor opted out through ui_set_accessibility_hidden. Layout-only spacer
+   nodes are thereby kept out of the accessibility tree entirely. */
+static bool exposed(Ui *u, UiId id) {
+    if (!u || !ui_visible(u,id)) return false;
+    for (UiId p=id;p;p=ui_node(u,p)->parent)
+        if (ui_node(u,p)->accessibility_hidden) return false;
+    return true;
+}
 static bool available(UiProvider *p) {
-    return p->accessibility->ui && ui_node(p->accessibility->ui,p->id) && ui_visible(p->accessibility->ui,p->id);
+    return p->accessibility->ui && ui_node(p->accessibility->ui,p->id) && exposed(p->accessibility->ui,p->id);
 }
 static UiProvider *provider_new(UiAccessibility *a, UiId id) {
-    if (!a || !a->ui || !ui_node(a->ui,id) || !ui_visible(a->ui,id)) return NULL;
+    if (!a || !a->ui || !ui_node(a->ui,id) || !exposed(a->ui,id)) return NULL;
     UiProvider *p=calloc(1,sizeof *p);
     if (!p) return NULL;
     p->simple.lpVtbl=&simple_vtable; p->fragment.lpVtbl=&fragment_vtable;
@@ -147,26 +156,26 @@ static HRESULT STDMETHODCALLTYPE host_provider(IRawElementProviderSimple *i, IRa
 
 static UiId next_visible(Ui *u, UiId id) {
     UiNode *n=ui_node(u,id);
-    for (UiId next=n?n->next:UI_NONE;next;next=ui_node(u,next)->next) if (ui_visible(u,next)) return next;
+    for (UiId next=n?n->next:UI_NONE;next;next=ui_node(u,next)->next) if (exposed(u,next)) return next;
     return UI_NONE;
 }
 static UiId previous_visible(Ui *u, UiId id) {
     UiNode *n=ui_node(u,id), *parent=n?ui_node(u,n->parent):NULL; UiId previous=UI_NONE;
     for (UiId child=parent?parent->first:UI_NONE;child && child!=id;child=ui_node(u,child)->next)
-        if (ui_visible(u,child)) previous=child;
+        if (exposed(u,child)) previous=child;
     return previous;
 }
 static UiId child_visible(Ui *u, UiId id, bool last) {
     UiNode *n=ui_node(u,id); UiId result=UI_NONE;
     for (UiId child=n?n->first:UI_NONE;child;child=ui_node(u,child)->next)
-        if (ui_visible(u,child)) { result=child; if (!last) break; }
+        if (exposed(u,child)) { result=child; if (!last) break; }
     return result;
 }
 static HRESULT fragment_for(UiAccessibility *a, UiId id, IRawElementProviderFragment **result) {
     if (!result) return E_POINTER;
     *result=NULL;
     if (!id) return S_OK;
-    if (!a || !a->ui || !ui_node(a->ui,id) || !ui_visible(a->ui,id)) return UIA_E_ELEMENTNOTAVAILABLE;
+    if (!a || !a->ui || !ui_node(a->ui,id) || !exposed(a->ui,id)) return UIA_E_ELEMENTNOTAVAILABLE;
     UiProvider *provider=provider_new(a,id); if (!provider) return E_OUTOFMEMORY;
     *result=&provider->fragment; return S_OK;
 }
@@ -224,7 +233,7 @@ static HRESULT STDMETHODCALLTYPE fragment_root(IRawElementProviderFragment *i, I
 }
 static UiId element_at(Ui *u, UiId id, float x, float y) {
     UiNode *n=ui_node(u,id);
-    if (!n || !ui_visible(u,id) || !ui_contains(n->clip,x,y)) return UI_NONE;
+    if (!n || !exposed(u,id) || !ui_contains(n->clip,x,y)) return UI_NONE;
     UiId result=id;
     for (UiId child=n->first;child;child=ui_node(u,child)->next) {
         UiId hit=element_at(u,child,x,y); if (hit) result=hit;
@@ -301,3 +310,4 @@ void ui_accessibility_children_invalidated(UiAccessibility *a, UiId id) {
     UiaRaiseStructureChangedEvent(&p->simple,StructureChangeType_ChildrenInvalidated,NULL,0);
     provider_release(p);
 }
+

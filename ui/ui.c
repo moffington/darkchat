@@ -166,6 +166,11 @@ void ui_set_disabled(Ui *u, UiId id, bool disabled) {
     UiNode *n = ui_node(u,id);
     if (n && n->disabled != disabled) { n->disabled=disabled; sanitize(u); ui_invalidate(u,false); }
 }
+void ui_set_accessibility_hidden(Ui *u, UiId id, bool hidden) {
+    UiNode *n = ui_node(u,id);
+    if (n && n->accessibility_hidden != hidden)
+        n->accessibility_hidden = hidden;
+}
 static float limited(float x, float minimum, float maximum) {
     return clamp(x,maxf(0,minimum),maximum > 0 ? maxf(minimum,maximum) : 1e7f);
 }
