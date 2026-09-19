@@ -1,7 +1,7 @@
 /* Rich Edit integration of the Markdown body renderer (hidden windows). */
-#include "../chat/rich_text_win32.h"
-#include "../chat/markdown.h"
-#include "../chat/table_layout.h"
+#include "chat/transcript/rich_text_win32.h"
+#include "chat/transcript/markdown.h"
+#include "chat/transcript/table_layout.h"
 #include <richedit.h>
 #include <stdio.h>
 #include <stdlib.h>

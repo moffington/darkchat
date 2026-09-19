@@ -146,15 +146,15 @@ DarkChat now represents most of the active development in this repository.
 
 | Area | Main files | Responsibility |
 | --- | --- | --- |
-| Chat model | `chat/chat.*` | Conversations, messages, request lifecycle, IDs, metadata, drafts, retry/regenerate/edit behavior |
-| Windows host | `chat/chat_host_win32.*` | Application window, worker coordination, timers, persistence scheduling, native event routing |
-| Application UI | `chat/chat_ui.*`, `chat/actions_win32.*` | Sidebar, composer, menus, settings, commands, and visible application state |
-| Transcript | `chat/transcript_win32.*`, `chat/rich_text_win32.*` | Bounded, recycled native Rich Edit slots; scrolling, selection preservation, reasoning viewports, incremental updates |
-| Markdown | `chat/markdown.*` | Transactional, platform-independent Markdown subset parser |
-| Completion | `chat/completion_request.*`, `chat/completion_winhttp.*`, `chat/sse.*`, `chat/json.*` | Backend-aware request encoding, endpoint descriptors, WinHTTP streaming, SSE framing, response decoding for OpenRouter and Ollama |
-| Model catalog | `chat/model_catalog.*`, `chat/model_catalog_winhttp.*`, `chat/palette_win32.*` | Transient per-backend model-catalog fetch, parse/merge/filter, and the shared command/model palette |
-| Provider routing | `chat/provider_routing.*` | OpenRouter `provider` object construction, sharing exact bytes with the request-context budget |
-| Storage | `chat/storage.*` | Checksummed JSONL snapshots, atomic replacement, backup and recovery |
+| Chat model | `chat/core/chat.*` | Conversations, messages, request lifecycle, IDs, metadata, drafts, retry/regenerate/edit behavior |
+| Windows host | `chat/shell/chat_host_win32.*` | Application window, worker coordination, timers, persistence scheduling, native event routing |
+| Application UI | `chat/shell/chat_ui.*`, `chat/shell/actions_win32.*` | Sidebar, composer, menus, settings, commands, and visible application state |
+| Transcript | `chat/transcript/transcript_win32.*`, `chat/transcript/rich_text_win32.*` | Bounded, recycled native Rich Edit slots; scrolling, selection preservation, reasoning viewports, incremental updates |
+| Markdown | `chat/transcript/markdown.*` | Transactional, platform-independent Markdown subset parser |
+| Completion | `chat/generation/completion_request.*`, `chat/generation/completion_winhttp.*`, `chat/generation/sse.*`, `chat/json.*` | Backend-aware request encoding, endpoint descriptors, WinHTTP streaming, SSE framing, response decoding for OpenRouter and Ollama |
+| Model catalog | `chat/models/model_catalog.*`, `chat/models/model_catalog_winhttp.*`, `chat/shell/palette_win32.*` | Transient per-backend model-catalog fetch, parse/merge/filter, and the shared command/model palette |
+| Provider routing | `chat/generation/provider_routing.*` | OpenRouter `provider` object construction, sharing exact bytes with the request-context budget |
+| Storage | `chat/persistence/storage.*` | Checksummed JSONL snapshots, atomic replacement, backup and recovery |
 | DarkUI foundation | `ui/*`, `platform/*` | Retained controls, theme, painting, layout, Direct2D/DirectWrite rendering, and accessibility infrastructure |
 
 ### Relationship to DarkUI

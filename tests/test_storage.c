@@ -1,5 +1,5 @@
-#include "../chat/storage.h"
-#include "../chat/json.h"
+#include "chat/persistence/storage.h"
+#include "chat/json.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

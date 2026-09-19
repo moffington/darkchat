@@ -2,10 +2,10 @@
 /* COBJMACROS must precede the first UIA header (pulled in through the host),
     so the palette suite can drive the popup's provider with C macros. */
 #define COBJMACROS
-#include "../chat/chat_host_win32.c"
+#include "chat/shell/chat_host_win32.c"
 #include <uiautomationclient.h>
 #include <uiautomationcoreapi.h>
-#include "../chat/provider_routing.h"
+#include "chat/generation/provider_routing.h"
 #include <process.h>
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)

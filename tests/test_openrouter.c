@@ -1,8 +1,8 @@
 /* Includes the client to test its actual request encoder and SSE event decoder
    for both backends. */
-#include "../chat/completion_winhttp.c"
-#include "../chat/completion_request.h"
-#include "../chat/context.h"
+#include "chat/generation/completion_winhttp.c"
+#include "chat/generation/completion_request.h"
+#include "chat/generation/context.h"
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
 static int deltas, reasons, terminal;

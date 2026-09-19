@@ -1,5 +1,5 @@
 /* Pure table-layout primitive tests; no Win32, like test_markdown. */
-#include "../chat/table_layout.h"
+#include "chat/transcript/table_layout.h"
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>

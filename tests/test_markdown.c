@@ -1,5 +1,5 @@
 /* Pure Markdown parser tests; no Win32, like test_json. */
-#include "../chat/markdown.h"
+#include "chat/transcript/markdown.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

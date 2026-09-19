@@ -1,4 +1,4 @@
-#include "../chat/sse.h"
+#include "chat/generation/sse.h"
 #include <stdio.h>
 #include <string.h>
 

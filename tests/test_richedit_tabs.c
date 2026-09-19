@@ -8,7 +8,7 @@
      - LF-only insertion keeps char positions equal to source offsets across
        three or more paragraphs.
      - device metrics for the provisional TABLE_MIN_COLUMN_DIP/TABLE_GUTTER_DIP.
-   No chat/table_layout.h, no parser metadata, no product behavior change. */
+   No chat/transcript/table_layout.h, no parser metadata, no product behavior change. */
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>

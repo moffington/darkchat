@@ -1,4 +1,4 @@
-#include "../chat/chat_ui.h"
+#include "chat/shell/chat_ui.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

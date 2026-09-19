@@ -1,6 +1,6 @@
 /* Deterministic Direct2D/WIC artifacts; no desktop capture or UI automation. */
-#include "../platform/renderer.h"
-#include "../showcase/showcase.h"
+#include "platform/renderer.h"
+#include "showcase/showcase.h"
 #include <wincodec.h>
 #include <stdio.h>
 #include <stdlib.h>

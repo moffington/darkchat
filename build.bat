@@ -12,7 +12,7 @@ start "" /b powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$f='.oOo
 
 windres app.rc -O coff -o build\app.res >> "%progress_log%" 2>&1
 if errorlevel 1 goto failed
-gcc -std=c17 -municode -mwindows -Wall -Wextra -Wpedantic -Werror -O2 main.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c platform\win32.c showcase\showcase.c build\app.res -o build\darkui.exe -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 >> "%progress_log%" 2>&1
+gcc -std=c17 -I. -municode -mwindows -Wall -Wextra -Wpedantic -Werror -O2 main.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c platform\win32.c showcase\showcase.c build\app.res -o build\darkui.exe -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 >> "%progress_log%" 2>&1
 if errorlevel 1 goto failed
 if /i "%~1"=="test" (
     call test.bat >> "%progress_log%" 2>&1

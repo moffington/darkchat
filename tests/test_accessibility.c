@@ -1,5 +1,5 @@
 #define COBJMACROS
-#include "../platform/accessibility.h"
+#include "platform/accessibility.h"
 #include <uiautomationclient.h>
 #include <uiautomationcoreapi.h>
 #include <oleauto.h>

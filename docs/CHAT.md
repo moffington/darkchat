@@ -121,7 +121,7 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
 ## Transcript rendering
 
 The transcript is a native scroll container over per-message layout records.
-Each record (`chat/transcript_win32.h`, `TranscriptRecord`) is lightweight and
+Each record (`chat/transcript/transcript_win32.h`, `TranscriptRecord`) is lightweight and
 owns no windows: it stores the message identity its surfaces were built from
 by value (conversation id, message id, per-message revision and answer-text
 revision), the deferred-write debt per surface, the visibility state, the
@@ -143,7 +143,7 @@ wheel scrolls the viewport first and chains to the transcript at its ends, so
 the target never depends on which control holds focus.
 
 Which records must be realized, how many slots are required, and which slot a
-new binding takes are pure policy decisions (`chat/transcript_policy.h` — no
+new binding takes are pure policy decisions (`chat/transcript/transcript_policy.h` — no
 Win32, no allocation): geometry-derived visibility (edge-touch excluded,
 unmeasured heights read at the minimum height), class protection (streaming,
 focused, selection/debt-bearing, expanded reasoning), rank/index realization
@@ -284,7 +284,7 @@ surface for identical content, width, DPI, theme and formatting: the
 hidden-HWND suite asserts exact quality and equal heights on both surfaces
 and equal cached heights for every family a record owns.
 
-Update bookkeeping lives in its own module (`chat/transcript_win32.c`). Every
+Update bookkeeping lives in its own module (`chat/transcript/transcript_win32.c`). Every
 turn records the message identity its surfaces were built from — conversation
 id, message instance id, a per-message revision counter and the observable
 rendering state. When a rebuild finds a message unchanged, destructive content
@@ -336,7 +336,7 @@ into the streaming answer.
 
 ### Markdown rendering
 
-Terminal assistant output is Markdown-rendered (`chat/markdown.c`, a pure
+Terminal assistant output is Markdown-rendered (`chat/transcript/markdown.c`, a pure
 parser with its own test suite); while a response streams, the visible body is
 rebuilt from the accumulated message at most once every ~100 ms (a scheduled flush
 renders a paused burst), incomplete inline syntax stays literal, an opened fence
@@ -390,7 +390,7 @@ are padded or truncated to the header's column count. Cell content is parsed as
 inline Markdown with bold headers, so emphasis and HTTP(S) links work inside
 cells; tables are root-level only, and a quote/list-prefixed, oversized
 (> 24-column) or malformed candidate header stays literal. A table is rendered
-in-body in the same Rich Edit surface: the pure `chat/table_layout.c` primitive
+in-body in the same Rich Edit surface: the pure `chat/transcript/table_layout.c` primitive
 resolves deterministic column widths (a 48-DIP minimum column and 16-DIP gutter,
 proportional shrink toward the minimum, surrogate-safe wrapping) and the Win32
 layer flattens the table into tab-separated physical lines whose paragraphs own
@@ -498,7 +498,7 @@ never sent as conversation text.
 ### Request context budget
 
 Persisted history and the payload sent to a provider are separate things. A
-request carries a **bounded projection** of the conversation (`chat/context.c`, a
+request carries a **bounded projection** of the conversation (`chat/generation/context.c`, a
 pure, allocation-free module): the system prompt when set, the triggering user
 message, and the newest eligible history messages that fit
 `CHAT_CONTEXT_BUDGET_BYTES` (64 KiB). That constant is a deliberately
@@ -523,7 +523,7 @@ into the transcript or the payload.
   `json_buf_append_json_string`), so the size the drop decision is made on is the
   size actually sent; a test proves equality against the real request encoder
   for both backends. The framing itself comes from the same pure backend-aware
-  builder the transport encodes with (`chat/completion_request.c`), so the
+  builder the transport encodes with (`chat/generation/completion_request.c`), so the
   measured envelope and per-message bytes cannot drift from the body. For
   OpenRouter the body may also carry the optional `provider` object, whose exact
   bytes are added to the measured envelope by the same pure builder the encoder
@@ -612,7 +612,7 @@ replacement, the last validated primary is copied and flushed to
 `state.bak.jsonl`. A failed write/rename leaves the primary intact and reports a
 save error.
 
-Saves run on a background snapshot writer (`chat/saver.c`): the UI thread builds
+Saves run on a background snapshot writer (`chat/persistence/saver.c`): the UI thread builds
 a deep, immutable copy of the whole Chat (`chat_snapshot` — exact live-count
 message arrays, overflow storage reallocated per message so nothing is
 aliased) and hands ownership to one writer thread, which alone calls the

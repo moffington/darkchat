@@ -1,5 +1,5 @@
-#include "../ui/ui.h"
-#include "../showcase/showcase.h"
+#include "ui/ui.h"
+#include "showcase/showcase.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>

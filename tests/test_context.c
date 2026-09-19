@@ -1,7 +1,7 @@
-#include "../chat/context.h"
-#include "../chat/chat.h"
-#include "../chat/json.h"
-#include "../chat/provider_routing.h"
+#include "chat/generation/context.h"
+#include "chat/core/chat.h"
+#include "chat/json.h"
+#include "chat/generation/provider_routing.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +17,7 @@ static void check(int condition, const char *what) {
 }
 
 /* The test keeps its own copy of the request framing, so a divergence in
-   chat/context.c is caught here instead of being hidden behind the same
+   chat/generation/context.c is caught here instead of being hidden behind the same
    helper the implementation uses. */
 #define TEST_ENVELOPE 67u
 #define TEST_MESSAGE 22u

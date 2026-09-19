@@ -1,5 +1,5 @@
 /* Pure transcript realization policy suite: no Win32, no allocation. */
-#include "../chat/transcript_policy.h"
+#include "chat/transcript/transcript_policy.h"
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
 

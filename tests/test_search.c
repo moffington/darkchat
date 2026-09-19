@@ -1,4 +1,4 @@
-#include "../chat/search.h"
+#include "chat/core/search.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

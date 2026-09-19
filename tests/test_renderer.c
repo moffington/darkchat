@@ -1,6 +1,6 @@
 /* Integration test owns its hidden window; it does not interact with user apps. */
-#include "../platform/renderer.h"
-#include "../showcase/showcase.h"
+#include "platform/renderer.h"
+#include "showcase/showcase.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

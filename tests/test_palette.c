@@ -2,7 +2,7 @@
    navigation and transactional source replacement. Includes palette.c so
    transactional allocation failures can be driven with wrapped malloc and
    realloc, the same way test_chat and test_model_catalog exercise growth. */
-#include "../chat/palette.c"
+#include "chat/shell/palette.c"
 #include <stdio.h>
 #include <string.h>
 

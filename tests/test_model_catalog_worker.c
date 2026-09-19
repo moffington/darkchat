@@ -1,7 +1,7 @@
 /* Deterministic worker tests. The module is included so the transport seam
    and the internal response constants are reachable without touching the
    network; malloc is wrapped so the allocation-failure path is exercised. */
-#include "../chat/model_catalog_winhttp.c"
+#include "chat/models/model_catalog_winhttp.c"
 #include <stdio.h>
 #include <string.h>
 

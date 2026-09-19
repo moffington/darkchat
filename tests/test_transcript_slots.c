@@ -2,8 +2,8 @@
    disposal ordering guarantees, and pool-allocation failure under a wrapped
    calloc. No windows and no Rich Edit surfaces are created -- surface
    realization is lazy, so the pool can be exercised headlessly. */
-#include "../chat/transcript_win32.h"
-#include "../chat/transcript_policy.h"
+#include "chat/transcript/transcript_win32.h"
+#include "chat/transcript/transcript_policy.h"
 #include <stdio.h>
 #include <string.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)

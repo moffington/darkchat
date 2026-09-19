@@ -3,7 +3,7 @@
    realloc and free (the same way test_chat exercises growth), and the
    outstanding-allocation count can prove nothing leaks through failure
    paths. */
-#include "../chat/model_catalog.c"
+#include "chat/models/model_catalog.c"
 #include <stdio.h>
 #include <string.h>
 

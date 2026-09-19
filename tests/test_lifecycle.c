@@ -1,4 +1,4 @@
-#include "../chat/chat.h"
+#include "chat/core/chat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

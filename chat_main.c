@@ -1,5 +1,5 @@
-#include "chat/chat_host_win32.h"
-#include "chat/chat.h"
+#include "chat/shell/chat_host_win32.h"
+#include "chat/core/chat.h"
 #include <stdlib.h>
 
 /* The key lives only in this process-lifetime buffer: it is read once from the
