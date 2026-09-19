@@ -17,176 +17,485 @@
    The window is a borderless dark WS_POPUP: the renderer clears the client
    with the theme background and the retained tree paints everything else.
    A separate owned layered dimmer window is parked between the owner and the
-   palette while the modal loop is live. */
+   palette while the modal loop is live.
+
+   Virtualized rows: the controller owns every filtered row, but the tree keeps
+   only a bounded window of presentation nodes around the viewport. Two spacer
+   labels encode the off-screen extents so the scroll container's content
+   height still represents the complete logical list (headers included). The
+   spacers carry a non-breaking-space accessible name so they never surface as
+   unnamed UIA elements. */
 #define PALETTE_WINDOW_WIDTH 580.0f
 #define PALETTE_WINDOW_HEIGHT 420.0f
 #define PALETTE_ROW_HEIGHT 32.0f
 #define PALETTE_HEADER_HEIGHT 26.0f
 #define PALETTE_QUERY_HEIGHT 44.0f
+#define PALETTE_STATUS_HEIGHT 22.0f
 #define PALETTE_EDGE 16.0f        /* clamp margin around the owner */
 #define PALETTE_CENTER_BIAS 0.40f /* vertical placement above center */
 #define PALETTE_CLASS L"DarkChat.Palette"
 #define PALETTE_DIMMER_CLASS L"DarkChat.PaletteDimmer"
 #define PALETTE_DIMMER_ALPHA 30   /* ~12% black over the disabled owner */
-#define PALETTE_QUERY_HINT L"Type to filter commands"
+#define PALETTE_QUERY_HINT_COMMANDS L"Type to filter commands"
+#define PALETTE_QUERY_HINT_MODELS L"Type to filter models"
+/* Presentation nodes realized at once. Sized far above any viewport (the
+   window shows at most ~14 lines) so headers cannot exhaust it, and far below
+   the fixed Ui arena capacity once chrome and spacers are counted. */
+#define PALETTE_SLOT_CAPACITY 64
+
+typedef struct {
+    UiId node;              /* current generation handle, or UI_NONE */
+    PaletteRowKey key;      /* valid for rows; cleared for headers */
+    size_t logical_index;   /* index into the logical line list */
+    bool header;
+} PalettePopupSlot;
 
 struct PalettePopup {
     HWND owner, window;
-    Ui ui;                          /* retained tree: query row + row list */
+    Ui ui;                          /* retained tree: query + status + rows */
     UiRenderer renderer;            /* one HWND target per renderer */
     UiAccessibility *accessibility;
     Palette *controller;            /* pure selection/filter state */
     UiId query_text;                /* shows the live filter query */
+    UiId status_text;               /* model catalog status (models mode) */
     UiId scroll;                    /* row list scroll container */
-    /* Row nodes currently mirrored into the tree, in controller visible
-       order (section headers are extra nodes and not tracked here). */
-    UiId *rows;
-    size_t row_count, row_capacity;
-    UiId selected_row;
+    UiId spacer_top, spacer_bottom; /* off-window logical extent */
+    PalettePopupSlot *slots;        /* bounded presentation pool */
+    size_t slot_capacity, slot_count;
+    size_t bound_first;             /* first logical line currently realized */
+    PaletteMode mode;
     wchar_t query[PALETTE_QUERY_TEXT];
+    wchar_t status[CHAT_STATUS_TEXT];
     HWND overlay;                   /* owned, non-activating dimmer */
     UINT dpi;
-    bool done, accepted, tracking;
+    bool done, accepted, accepted_is_model, tracking;
     int action_id;
+    wchar_t accepted_model[CHAT_MODEL_TEXT];
 };
 
 static LRESULT CALLBACK palette_proc(HWND window, UINT message, WPARAM w,
     LPARAM l);
+static void bind_window(PalettePopup *popup, size_t first);
+static void rebind_if_scroll_changed(PalettePopup *popup);
+static void sync_selection(PalettePopup *popup, bool keyboard);
 
 static UINT popup_dpi(HWND owner) {
     UINT dpi = owner ? GetDpiForWindow(owner) : GetDpiForSystem();
     return dpi ? dpi : 96;
 }
 
-/* Ensures the row-node array can hold `needed` ids. On failure the previous
-   array and capacity stay intact and false is returned. */
-static bool ensure_rows(PalettePopup *popup, size_t needed) {
-    if (needed <= popup->row_capacity) return true;
-    if (!needed) return true;
-    UiId *grown = (UiId *)realloc(popup->rows, needed * sizeof *grown);
-    if (!grown) return false;
-    popup->rows = grown;
-    popup->row_capacity = needed;
-    return true;
+static const wchar_t *query_hint(const PalettePopup *popup) {
+    return popup->mode == PALETTE_MODE_MODELS
+        ? PALETTE_QUERY_HINT_MODELS : PALETTE_QUERY_HINT_COMMANDS;
 }
 
-static void clear_rows(PalettePopup *popup) {
-    /* Every child of the scroll container is rebuilt together: section
-       headers are not tracked in `rows`, so removing only the tracked buttons
-       would accumulate headers across queries until the fixed node arena
-       overflows. */
-    for (;;) {
-        UiNode *list = ui_node(&popup->ui, popup->scroll);
-        if (!list || !list->first) break;
-        if (!ui_remove(&popup->ui, list->first)) break;
+/* One-line model presentation: "<name, truncated if needed>… — <complete id>".
+   The complete routable id always survives; the name is cut (never splitting a
+   UTF-16 surrogate pair) only when the whole string would exceed the toolkit's
+   text capacity, so two long identical names stay distinguishable by their
+   ids in both the visible text and the accessible name. */
+void palette_popup_format_model_row(wchar_t out[UI_TEXT_CAPACITY],
+    const wchar_t *name, const wchar_t *id) {
+    if (!out) return;
+    if (!id) id = L"";
+    size_t id_length = wcslen(id);
+    if (id_length > UI_TEXT_CAPACITY - 1) id_length = UI_TEXT_CAPACITY - 1;
+    if (!name || !name[0] || !wcscmp(name, id)) {
+        wcsncpy(out, id, id_length);
+        out[id_length] = 0;
+        return;
     }
-    popup->row_count = 0;
-    popup->selected_row = UI_NONE;
+    /* Reserve the id, the " — " separator (3) and the ellipsis (1). */
+    size_t budget = UI_TEXT_CAPACITY - 1 - id_length - 4;
+    size_t name_length = wcslen(name);
+    size_t take = name_length;
+    if (take > budget) {
+        take = budget;
+        if (take && name[take - 1] >= 0xd800 && name[take - 1] <= 0xdbff)
+            --take;
+    }
+    size_t at = 0;
+    wmemcpy(out, name, take);
+    at = take;
+    if (name_length > take) out[at++] = 0x2026; /* … */
+    out[at++] = L' ';
+    out[at++] = 0x2014; /* — */
+    out[at++] = L' ';
+    wmemcpy(out + at, id, id_length);
+    at += id_length;
+    out[at] = 0;
 }
 
-/* Mirrors the controller's highlight into the tree: exactly one selected row
-   node, and (for keyboard movement) real retained focus on it so the reveal
-   keeps it inside the scroll viewport and UIA sees the focus change. */
+/* Stable identity comparison, mirroring the controller's rule: kind
+   (command vs model) and the id (or action id) decide; the section tag never
+   participates. */
+static bool key_same(const PaletteRowKey *a, const PaletteRowKey *b) {
+    if (a->action_id != b->action_id) return false;
+    if ((a->kind == PALETTE_ROW_COMMAND) !=
+        (b->kind == PALETTE_ROW_COMMAND))
+        return false;
+    return a->kind == PALETTE_ROW_COMMAND || !wcscmp(a->id, b->id);
+}
+
+/* ---- Logical line model ------------------------------------------------- */
+
+/* A section header precedes row 0 and any row whose group differs from the
+   previous row's. */
+static size_t line_count(const Palette *controller) {
+    return palette_row_count(controller) +
+        palette_section_count(controller);
+}
+
+/* One contiguous section run: rows [start, end) preceded by one header line.
+   All line arithmetic below iterates sections (at most one per registry group
+   or model bucket), never rows, so it is independent of catalog size. */
+static void section_run(const Palette *controller, size_t section,
+    size_t *start, size_t *end) {
+    size_t sections = palette_section_count(controller);
+    *start = palette_section_start(controller, section);
+    *end = section + 1 < sections
+        ? palette_section_start(controller, section + 1)
+        : palette_row_count(controller);
+}
+
+static bool line_is_header(const Palette *controller, size_t line) {
+    size_t sections = palette_section_count(controller);
+    size_t cursor = 0;
+    for (size_t s = 0; s < sections; s++) {
+        size_t start, end;
+        section_run(controller, s, &start, &end);
+        if (line == cursor) return true;
+        cursor += 1 + (end - start);
+        if (line < cursor) return false;
+    }
+    return false;
+}
+
+static float line_height(const Palette *controller, size_t line) {
+    return line_is_header(controller, line)
+        ? PALETTE_HEADER_HEIGHT : PALETTE_ROW_HEIGHT;
+}
+
+static float line_offset(const Palette *controller, size_t line) {
+    float y = 0;
+    size_t cursor = 0;
+    size_t sections = palette_section_count(controller);
+    for (size_t s = 0; s < sections && cursor < line; s++) {
+        size_t start, end;
+        section_run(controller, s, &start, &end);
+        y += PALETTE_HEADER_HEIGHT;
+        ++cursor;
+        size_t count = end - start;
+        size_t remaining = cursor < line ? line - cursor : 0;
+        size_t take = remaining < count ? remaining : count;
+        y += (float)take * PALETTE_ROW_HEIGHT;
+        cursor += take;
+    }
+    return y;
+}
+
+static size_t line_of_offset(const Palette *controller, float offset) {
+    if (offset <= 0) return 0;
+    float y = 0;
+    size_t cursor = 0;
+    size_t sections = palette_section_count(controller);
+    for (size_t s = 0; s < sections; s++) {
+        size_t start, end;
+        section_run(controller, s, &start, &end);
+        if (y + PALETTE_HEADER_HEIGHT > offset) return cursor;
+        y += PALETTE_HEADER_HEIGHT;
+        ++cursor;
+        size_t count = end - start;
+        if (count) {
+            float rows_height = (float)count * PALETTE_ROW_HEIGHT;
+            if (y + rows_height > offset) {
+                size_t skip = (size_t)((offset - y) / PALETTE_ROW_HEIGHT);
+                if (skip >= count) skip = count - 1;
+                return cursor + skip;
+            }
+            y += rows_height;
+            cursor += count;
+        }
+    }
+    size_t total = line_count(controller);
+    return total ? total - 1 : 0;
+}
+
+static size_t line_of_row(const Palette *controller, size_t row) {
+    size_t sections = palette_section_count(controller);
+    size_t cursor = 0;
+    for (size_t s = 0; s < sections; s++) {
+        size_t start, end;
+        section_run(controller, s, &start, &end);
+        if (row < end) return cursor + 1 + (row - start);
+        cursor += 1 + (end - start);
+    }
+    return cursor;
+}
+
+/* Section that owns `line` (its header line or one of its row lines). */
+static size_t section_of_line(const Palette *controller, size_t line) {
+    size_t sections = palette_section_count(controller);
+    size_t cursor = 0;
+    for (size_t s = 0; s < sections; s++) {
+        size_t start, end;
+        section_run(controller, s, &start, &end);
+        if (line < cursor + 1 + (end - start)) return s;
+        cursor += 1 + (end - start);
+    }
+    return sections ? sections - 1 : 0;
+}
+
+static void set_spacer(PalettePopup *popup, UiId id, float height) {
+    UiNode *node = ui_node(&popup->ui, id);
+    if (!node) return;
+    node->style.height = ui_fixed(height);
+    node->style.background = -1;
+}
+
+/* ---- Presentation mirror ------------------------------------------------ */
+
+/* Rebuilds the bounded window of presentation nodes starting at logical line
+   `first`. Presentation nodes are removed and re-added so their UiKind always
+   matches the item (header label vs row button) and so a stale handle from the
+   previous window cannot be invoked (ui_remove bumps the generation). All
+   slots are re-added between the fixed top spacer and a freshly added bottom
+   spacer, so sibling order is always top, items, bottom. */
+static void bind_window(PalettePopup *popup, size_t first) {
+    Ui *ui = &popup->ui;
+    const Palette *controller = popup->controller;
+
+    PaletteRowKey focused;
+    bool had_focus = false, was_keyboard = ui->keyboard_focus;
+    if (ui->focus) {
+        for (size_t i = 0; i < popup->slot_count; i++)
+            if (popup->slots[i].node == ui->focus &&
+                !popup->slots[i].header) {
+                focused = popup->slots[i].key;
+                had_focus = true;
+                break;
+            }
+    }
+
+    for (size_t i = 0; i < popup->slot_count; i++) {
+        if (popup->slots[i].node) ui_remove(ui, popup->slots[i].node);
+        popup->slots[i].node = UI_NONE;
+    }
+    popup->slot_count = 0;
+    if (popup->spacer_bottom) {
+        ui_remove(ui, popup->spacer_bottom);
+        popup->spacer_bottom = UI_NONE;
+    }
+
+    size_t total = line_count(controller);
+    if (first > total) first = total;
+    set_spacer(popup, popup->spacer_top, line_offset(controller, first));
+
+    /* Walk the window with a row/section cursor instead of resolving each
+       line independently: one section scan for the whole window, then O(1) per
+       realized node. This keeps a rebuild cost independent of catalog size. */
+    size_t sections = palette_section_count(controller);
+    size_t section = section_of_line(controller, first);
+    size_t section_start = section < sections
+        ? palette_section_start(controller, section) : 0;
+    size_t section_end = section + 1 < sections
+        ? palette_section_start(controller, section + 1)
+        : palette_row_count(controller);
+    bool at_header = false;
+    size_t row = section_start;
+    if (first < total) {
+        /* The section header sits one line before its first row. */
+        size_t header_line = line_of_row(controller, section_start);
+        header_line = header_line ? header_line - 1 : 0;
+        if (first == header_line)
+            at_header = true;
+        else
+            row = section_start + (first - (header_line + 1));
+    }
+
+    size_t realized = 0;
+    for (size_t l = first; l < total && realized < popup->slot_capacity;
+         l++) {
+        bool header = at_header;
+        size_t added_row = row;
+        UiId id = UI_NONE;
+        if (header) {
+            const wchar_t *label = palette_section_label(controller, section);
+            id = ui_add(ui, popup->scroll, UI_LABEL, label ? label : L"");
+            if (id) {
+                UiNode *node = ui_node(ui, id);
+                if (node) {
+                    node->style.height = ui_fixed(PALETTE_HEADER_HEIGHT);
+                    node->style.font = UI_SECTION;
+                    node->style.foreground = UI_MUTED;
+                }
+                ui_set_accessible_name(ui, id, label ? label : L"");
+            }
+            at_header = false;
+        } else {
+            const PaletteRow *source = palette_row(controller, row);
+            if (!source) break;
+            wchar_t text[UI_TEXT_CAPACITY];
+            if (popup->mode == PALETTE_MODE_MODELS)
+                palette_popup_format_model_row(text, source->label,
+                    source->note);
+            else {
+                wcsncpy(text, source->label, UI_TEXT_CAPACITY - 1);
+                text[UI_TEXT_CAPACITY - 1] = 0;
+            }
+            id = ui_add(ui, popup->scroll, UI_BUTTON, text);
+            if (id) {
+                UiNode *node = ui_node(ui, id);
+                if (node) {
+                    node->style.height = ui_fixed(PALETTE_ROW_HEIGHT);
+                    node->style.font = UI_BODY;
+                    node->style.flat = true;
+                }
+                ui_set_accessible_name(ui, id, text);
+            }
+            ++row;
+            if (row >= section_end) {
+                ++section;
+                if (section < sections) {
+                    section_start = section_end;
+                    section_end = section + 1 < sections
+                        ? palette_section_start(controller, section + 1)
+                        : palette_row_count(controller);
+                    row = section_start;
+                    at_header = true;
+                }
+            }
+        }
+        if (!id) break;
+        PalettePopupSlot *slot = &popup->slots[realized];
+        slot->node = id;
+        slot->header = header;
+        slot->logical_index = l;
+        if (header) memset(&slot->key, 0, sizeof slot->key);
+        else slot->key = palette_row(controller, added_row)->key;
+        ++realized;
+    }
+    popup->slot_count = realized;
+
+    float total_height = line_offset(controller, total);
+    float bottom = total_height - line_offset(controller, first + realized);
+    if (bottom < 0) bottom = 0;
+    popup->spacer_bottom = ui_add(ui, popup->scroll, UI_LABEL, L"");
+    if (popup->spacer_bottom) {
+        ui_set_accessibility_hidden(ui, popup->spacer_bottom, true);
+        set_spacer(popup, popup->spacer_bottom, bottom);
+    }
+
+    if (had_focus) {
+        for (size_t i = 0; i < popup->slot_count; i++)
+            if (!popup->slots[i].header &&
+                key_same(&popup->slots[i].key, &focused)) {
+                ui_focus(ui, popup->slots[i].node, was_keyboard);
+                break;
+            }
+    }
+
+    popup->bound_first = first;
+    ui_layout(ui, ui->width, ui->height);
+    sync_selection(popup, false);
+    ui_invalidate(ui, false);
+}
+
+/* Single funnel for every source of scrolling or layout change. The realized
+   nodes depend only on the first logical line, so a fractional offset change
+   inside the same line needs no rebuild (normal layout moves them); query and
+   source replacement force a rebuild by invalidating bound_first. */
+static void rebind_if_scroll_changed(PalettePopup *popup) {
+    Ui *ui = &popup->ui;
+    if (ui_layout_pending(ui)) ui_layout(ui, ui->width, ui->height);
+    float offset = ui_scroll_offset(ui, popup->scroll);
+    size_t first = line_of_offset(popup->controller, offset);
+    if (first == popup->bound_first) return;
+    bind_window(popup, first);
+}
+
+/* Mirrors the controller's highlight into the realized window, refreshing the
+   selected flag on bound slots and (for keyboard movement) real retained focus
+   so UIA sees the focus change and the reveal keeps the row in view. */
 static void sync_selection(PalettePopup *popup, bool keyboard) {
-    for (size_t i = 0; i < popup->row_count; i++) {
-        UiNode *node = ui_node(&popup->ui, popup->rows[i]);
+    Ui *ui = &popup->ui;
+    for (size_t i = 0; i < popup->slot_count; i++) {
+        if (popup->slots[i].header) continue;
+        UiNode *node = ui_node(ui, popup->slots[i].node);
         if (node) node->selected = false;
     }
-    popup->selected_row = UI_NONE;
-    size_t selected = palette_selected(popup->controller);
-    if (selected < popup->row_count) {
-        UiId id = popup->rows[selected];
-        popup->selected_row = id;
-        UiNode *node = ui_node(&popup->ui, id);
+    const PaletteRow *selected = palette_selected_row(popup->controller);
+    if (!selected) { ui_invalidate(ui, false); return; }
+    for (size_t i = 0; i < popup->slot_count; i++) {
+        if (popup->slots[i].header) continue;
+        if (!key_same(&popup->slots[i].key, &selected->key)) continue;
+        UiNode *node = ui_node(ui, popup->slots[i].node);
         if (node) node->selected = true;
-        if (keyboard) ui_focus(&popup->ui, id, true);
+        if (keyboard) ui_focus(ui, popup->slots[i].node, true);
+        break;
     }
-    ui_invalidate(&popup->ui, false);
+    ui_invalidate(ui, false);
 }
 
-/* Mirrors one controller row into the retained tree as a flat row button:
-   transparent when idle, soft fill on hover/press/selection, text flush
-   left. */
-static bool add_row(PalettePopup *popup, const PaletteRow *row) {
-    UiId id = ui_add(&popup->ui, popup->scroll, UI_BUTTON, row->label);
-    if (!id) return false;
-    UiNode *node = ui_node(&popup->ui, id);
-    if (node) {
-        node->style.height = ui_fixed(PALETTE_ROW_HEIGHT);
-        node->style.font = UI_BODY;
-        node->style.flat = true;
-        node->tag = row->key.kind == PALETTE_ROW_COMMAND
-            ? (uintptr_t)row->key.action_id : 0;
+/* Scrolls the highlighted row into the window and rebinds, then refreshes the
+   selection mirror. Used after keyboard navigation and after source changes. */
+static void ensure_selected_bound(PalettePopup *popup, bool keyboard) {
+    Ui *ui = &popup->ui;
+    if (ui_layout_pending(ui)) ui_layout(ui, ui->width, ui->height);
+    size_t selected = palette_selected(popup->controller);
+    if (selected == (size_t)-1) {
+        sync_selection(popup, keyboard);
+        return;
     }
-    popup->rows[popup->row_count++] = id;
-    return true;
-}
-
-static void add_header(PalettePopup *popup, const wchar_t *label) {
-    UiId header = ui_add(&popup->ui, popup->scroll, UI_LABEL, label);
-    if (!header) return;
-    UiNode *node = ui_node(&popup->ui, header);
-    if (node) {
-        node->style.height = ui_fixed(PALETTE_HEADER_HEIGHT);
-        node->style.font = UI_SECTION;
-        node->style.foreground = UI_MUTED;
+    size_t line = line_of_row(popup->controller, selected);
+    float offset = ui_scroll_offset(ui, popup->scroll);
+    float viewport = ui_scroll_viewport_h(ui, popup->scroll);
+    float top = line_offset(popup->controller, line);
+    float height = line_height(popup->controller, line);
+    float next = offset;
+    if (top < offset) next = top;
+    else if (top + height > offset + viewport) next = top + height - viewport;
+    if (next != offset) {
+        ui_scroll_to(ui, popup->scroll, next);
+        popup->bound_first = (size_t)-1;
     }
-}
-
-/* Rebuilds the visible row list from the controller: one header label per
-   section run, then every visible row of that run as a button. The row
-   array is sized for the full visible list first, so the mirror cannot
-   fail halfway. The list is laid out with the established size before the
-   selection is mirrored, so the reveal inside ui_focus reads a real
-   viewport instead of a degenerate zero-size one. */
-static void rebuild_rows(PalettePopup *popup) {
-    if (!ensure_rows(popup, palette_row_count(popup->controller))) return;
-    clear_rows(popup);
-    size_t count = palette_row_count(popup->controller);
-    size_t section = 0;
-    for (size_t i = 0; i < count; i++) {
-        const PaletteRow *row = palette_row(popup->controller, i);
-        if (!row) break;
-        if (i == 0 || row->group !=
-            palette_row(popup->controller, i - 1)->group)
-            add_header(popup,
-                palette_section_label(popup->controller, section++));
-        if (!add_row(popup, row)) break;
-    }
-    ui_layout(&popup->ui, popup->ui.width, popup->ui.height);
-    sync_selection(popup, true);
-    ui_invalidate(&popup->ui, false);
+    rebind_if_scroll_changed(popup);
+    sync_selection(popup, keyboard);
 }
 
 /* Applies the popup's query buffer to the controller and re-mirrors. */
 static void apply_query(PalettePopup *popup) {
+    if (palette_set_query(popup->controller, popup->query)) {
+        popup->bound_first = (size_t)-1;
+        rebind_if_scroll_changed(popup);
+        ensure_selected_bound(popup, false);
+    }
     wchar_t shown[PALETTE_QUERY_TEXT];
-    if (palette_set_query(popup->controller, popup->query))
-        rebuild_rows(popup);
-    /* The filter field echoes the query, or the hint when it is empty. */
     swprintf(shown, PALETTE_QUERY_TEXT, L"%ls",
-        popup->query[0] ? popup->query : PALETTE_QUERY_HINT);
+        popup->query[0] ? popup->query : query_hint(popup));
     ui_set_text(&popup->ui, popup->query_text, shown);
-    ui_set_accessible_name(&popup->ui, popup->query_text,
-        popup->query[0] ? popup->query : PALETTE_QUERY_HINT);
+    ui_set_accessible_name(&popup->ui, popup->query_text, shown);
     InvalidateRect(popup->window, NULL, FALSE);
 }
 
-/* Retained activation (mouse click, UIA Invoke) resolves identity through
-   the controller, never a row index stored elsewhere. */
+/* Retained activation (mouse click, UIA Invoke) resolves identity through the
+   slot's stored key, never a logical index that may have moved, and ignores an
+   event whose identity no longer resolves. */
 static void palette_event(void *user, Ui *ui, UiEvent event) {
     (void)ui;
     PalettePopup *popup = (PalettePopup *)user;
     if (!popup || event.kind != UI_ACTIVATE) return;
-    for (size_t i = 0; i < popup->row_count; i++)
-        if (popup->rows[i] == event.id) {
-            const PaletteRow *row = palette_row(popup->controller, i);
-            if (!row) return;
-            palette_select_key(popup->controller, &row->key);
-            sync_selection(popup, false);
-            palette_popup_accept(popup);
+    for (size_t i = 0; i < popup->slot_count; i++) {
+        if (popup->slots[i].node != event.id || popup->slots[i].header)
+            continue;
+        palette_select_key(popup->controller, &popup->slots[i].key);
+        const PaletteRow *selected = palette_selected_row(popup->controller);
+        if (!selected || !key_same(&selected->key, &popup->slots[i].key))
             return;
-        }
+        sync_selection(popup, false);
+        palette_popup_accept(popup);
+        return;
+    }
 }
 
 void palette_popup_accept(PalettePopup *popup) {
@@ -195,7 +504,16 @@ void palette_popup_accept(PalettePopup *popup) {
     if (!palette_accept_key(popup->controller, &key)) return;
     popup->accepted = true;
     popup->done = true;
-    popup->action_id = key.kind == PALETTE_ROW_COMMAND ? key.action_id : 0;
+    if (key.kind == PALETTE_ROW_COMMAND) {
+        popup->action_id = key.action_id;
+        popup->accepted_is_model = false;
+        popup->accepted_model[0] = 0;
+    } else {
+        popup->action_id = 0;
+        popup->accepted_is_model = true;
+        wcsncpy(popup->accepted_model, key.id, CHAT_MODEL_TEXT - 1);
+        popup->accepted_model[CHAT_MODEL_TEXT - 1] = 0;
+    }
 }
 
 void palette_popup_cancel(PalettePopup *popup) {
@@ -203,6 +521,8 @@ void palette_popup_cancel(PalettePopup *popup) {
     popup->accepted = false;
     popup->done = true;
     popup->action_id = 0;
+    popup->accepted_is_model = false;
+    popup->accepted_model[0] = 0;
 }
 
 bool palette_popup_accepted(const PalettePopup *popup) {
@@ -210,7 +530,22 @@ bool palette_popup_accepted(const PalettePopup *popup) {
 }
 
 int palette_popup_action_id(const PalettePopup *popup) {
-    return popup && popup->accepted ? popup->action_id : 0;
+    return popup && popup->accepted && !popup->accepted_is_model
+        ? popup->action_id : 0;
+}
+
+bool palette_popup_accepted_model(const PalettePopup *popup,
+    wchar_t out[CHAT_MODEL_TEXT]) {
+    if (out) out[0] = 0;
+    if (!popup || !popup->accepted || !popup->accepted_is_model || !out)
+        return false;
+    wcsncpy(out, popup->accepted_model, CHAT_MODEL_TEXT - 1);
+    out[CHAT_MODEL_TEXT - 1] = 0;
+    return true;
+}
+
+PaletteMode palette_popup_mode(const PalettePopup *popup) {
+    return popup ? popup->mode : PALETTE_MODE_COMMANDS;
 }
 
 /* Centers the palette over the owner's client area, slightly above vertical
@@ -274,7 +609,9 @@ static LRESULT CALLBACK palette_proc(HWND window, UINT message, WPARAM w,
     switch (message) {
     case WM_CREATE: {
         popup->dpi = popup_dpi(popup->owner);
-        UiId root = ui_add(ui, UI_NONE, UI_COLUMN, L"Command palette");
+        const wchar_t *title = popup->mode == PALETTE_MODE_MODELS
+            ? L"Choose model" : L"Command palette";
+        UiId root = ui_add(ui, UI_NONE, UI_COLUMN, title);
         if (!root) return -1;
         UiNode *node = ui_node(ui, root);
         if (node) {
@@ -283,7 +620,7 @@ static LRESULT CALLBACK palette_proc(HWND window, UINT message, WPARAM w,
             node->style.background = UI_PANEL;
             node->style.border = true;
         }
-        popup->query_text = ui_add(ui, root, UI_LABEL, PALETTE_QUERY_HINT);
+        popup->query_text = ui_add(ui, root, UI_LABEL, query_hint(popup));
         if (!popup->query_text) return -1;
         node = ui_node(ui, popup->query_text);
         if (node) {
@@ -293,9 +630,20 @@ static LRESULT CALLBACK palette_proc(HWND window, UINT message, WPARAM w,
             node->style.font = UI_BODY;
             /* Keep the hint off the field's border. */
             node->style.text_inset = 6;
-            ui_set_help_text(ui, popup->query_text,
-                L"Type to filter commands");
+            ui_set_help_text(ui, popup->query_text, query_hint(popup));
         }
+        popup->status_text = ui_add(ui, root, UI_LABEL, popup->status);
+        if (!popup->status_text) return -1;
+        node = ui_node(ui, popup->status_text);
+        if (node) {
+            node->style.height = ui_fixed(PALETTE_STATUS_HEIGHT);
+            node->style.font = UI_SMALL;
+            node->style.foreground = UI_MUTED;
+        }
+        /* The status line is model-only chrome; command mode is pixel-identical
+           to the command-only popup. */
+        if (popup->mode != PALETTE_MODE_MODELS)
+            ui_set_hidden(ui, popup->status_text, true);
         UiId separator = ui_add(ui, root, UI_SEPARATOR, L"");
         if (!separator) return -1;
         node = ui_node(ui, separator);
@@ -303,14 +651,23 @@ static LRESULT CALLBACK palette_proc(HWND window, UINT message, WPARAM w,
         popup->scroll = ui_add(ui, root, UI_SCROLL, L"");
         if (!popup->scroll) return -1;
         node = ui_node(ui, popup->scroll);
-        if (node) node->style.height = ui_flex(1);
+        if (node) {
+            node->style.height = ui_flex(1);
+            /* Exact virtual extents: spacers and rows stack with no implicit
+               gap, so spacer heights equal the true off-window offset. */
+            node->style.gap = 0;
+        }
         popup->accessibility = ui_accessibility_create(window, ui);
         if (!popup->accessibility) return -1;
-        /* Establish the layout size before building rows: the selection
-           mirror runs a reveal, and a reveal against a zero-size viewport
-           would scroll the first section header out of view. */
+        /* Establish the layout size before binding rows: the selection mirror
+           runs a reveal, and a reveal against a zero-size viewport would
+           scroll the first section header out of view. */
         ui_layout(ui, PALETTE_WINDOW_WIDTH, PALETTE_WINDOW_HEIGHT);
-        rebuild_rows(popup);
+        popup->spacer_top = ui_add(ui, popup->scroll, UI_LABEL, L"");
+        if (!popup->spacer_top) return -1;
+        ui_set_accessibility_hidden(ui, popup->spacer_top, true);
+        set_spacer(popup, popup->spacer_top, 0);
+        bind_window(popup, 0);
         return 0;
     }
     case WM_PAINT: {
@@ -327,6 +684,7 @@ static LRESULT CALLBACK palette_proc(HWND window, UINT message, WPARAM w,
         renderer_resize(&popup->renderer, (UINT)client.right,
             (UINT)client.bottom, (float)popup->dpi);
         ui_invalidate(ui, true);
+        rebind_if_scroll_changed(popup);
         return 0;
     }
     case WM_DPICHANGED: {
@@ -336,6 +694,7 @@ static LRESULT CALLBACK palette_proc(HWND window, UINT message, WPARAM w,
         /* Placement is recomputed around the new scale, so the palette stays
            centered over the owner instead of chasing the suggested rect. */
         place_popup(popup);
+        rebind_if_scroll_changed(popup);
         InvalidateRect(window, NULL, FALSE);
         return 0;
     }
@@ -378,7 +737,7 @@ static LRESULT CALLBACK palette_proc(HWND window, UINT message, WPARAM w,
             else if (w == VK_HOME) moved = palette_home(popup->controller);
             else moved = palette_end(popup->controller);
             if (moved) {
-                sync_selection(popup, true);
+                ensure_selected_bound(popup, true);
                 InvalidateRect(window, NULL, FALSE);
             }
             return 0;
@@ -416,6 +775,7 @@ static LRESULT CALLBACK palette_proc(HWND window, UINT message, WPARAM w,
         ui_pointer_move(ui, (float)point.x * 96.0f / popup->dpi,
             (float)point.y * 96.0f / popup->dpi);
         InvalidateRect(window, NULL, FALSE);
+        rebind_if_scroll_changed(popup);
         return 0;
     }
     case WM_MOUSELEAVE:
@@ -429,12 +789,14 @@ static LRESULT CALLBACK palette_proc(HWND window, UINT message, WPARAM w,
             (float)GET_Y_LPARAM(l) * 96.0f / popup->dpi);
         if (ui->pressed) SetCapture(window);
         InvalidateRect(window, NULL, FALSE);
+        rebind_if_scroll_changed(popup);
         return 0;
     case WM_LBUTTONUP:
         ui_pointer_up(ui, (float)GET_X_LPARAM(l) * 96.0f / popup->dpi,
             (float)GET_Y_LPARAM(l) * 96.0f / popup->dpi);
         if (GetCapture() == window && !ui->pressed) ReleaseCapture();
         InvalidateRect(window, NULL, FALSE);
+        rebind_if_scroll_changed(popup);
         return 0;
     case WM_MOUSEWHEEL: {
         POINT point = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
@@ -444,6 +806,7 @@ static LRESULT CALLBACK palette_proc(HWND window, UINT message, WPARAM w,
             (float)point.y * 96.0f / popup->dpi,
             -(float)GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA * step);
         InvalidateRect(window, NULL, FALSE);
+        rebind_if_scroll_changed(popup);
         return 0;
     }
     case WM_CLOSE:
@@ -514,42 +877,61 @@ static void hide_overlay(PalettePopup *popup) {
         ShowWindow(popup->overlay, SW_HIDE);
 }
 
-PalettePopup *palette_popup_create(HWND owner,
-    const ChatActionContext *context) {
-    if (!owner || !context) return NULL;
-    register_class();
+/* Allocates the controller, renderer and bounded slot pool; the window is
+   created separately so its WM_CREATE can bind the source already in place. */
+static PalettePopup *popup_new(HWND owner, PaletteMode mode) {
     PalettePopup *popup = (PalettePopup *)calloc(1, sizeof *popup);
     if (!popup) return NULL;
     popup->owner = owner;
+    popup->mode = mode;
     popup->dpi = popup_dpi(owner);
+    popup->bound_first = (size_t)-1;
+    popup->slots = (PalettePopupSlot *)calloc(PALETTE_SLOT_CAPACITY,
+        sizeof *popup->slots);
+    if (!popup->slots) { free(popup); return NULL; }
+    popup->slot_capacity = PALETTE_SLOT_CAPACITY;
     ui_init(&popup->ui, renderer_measure, &popup->renderer);
     popup->ui.on_event = palette_event;
     popup->ui.event_user = popup;
     if (FAILED(renderer_init(&popup->renderer, &popup->ui.theme))) {
+        free(popup->slots);
         free(popup);
         return NULL;
     }
     popup->controller = palette_create();
-    if (!popup->controller ||
-        !palette_set_commands(popup->controller, context)) {
-        palette_dispose(popup->controller);
+    if (!popup->controller) {
         renderer_dispose(&popup->renderer);
+        free(popup->slots);
         free(popup);
         return NULL;
     }
+    palette_set_mode(popup->controller, mode);
+    return popup;
+}
+
+static void popup_release(PalettePopup *popup) {
+    if (!popup) return;
+    if (popup->window && IsWindow(popup->window))
+        DestroyWindow(popup->window);
+    if (popup->overlay && IsWindow(popup->overlay))
+        DestroyWindow(popup->overlay);
+    ui_accessibility_destroy(popup->accessibility);
+    palette_dispose(popup->controller);
+    renderer_dispose(&popup->renderer);
+    free(popup->slots);
+    free(popup);
+}
+
+static bool popup_make_window(PalettePopup *popup) {
+    register_class();
+    const wchar_t *title = popup->mode == PALETTE_MODE_MODELS
+        ? L"Choose model" : L"Command palette";
     popup->window = CreateWindowExW(WS_EX_TOOLWINDOW, PALETTE_CLASS,
-        L"Command palette", WS_POPUP, 0, 0,
+        title, WS_POPUP, 0, 0,
         MulDiv((int)PALETTE_WINDOW_WIDTH, (int)popup->dpi, 96),
         MulDiv((int)PALETTE_WINDOW_HEIGHT, (int)popup->dpi, 96),
-        owner, NULL, GetModuleHandleW(NULL), popup);
-    if (!popup->window) {
-        ui_accessibility_destroy(popup->accessibility);
-        palette_dispose(popup->controller);
-        renderer_dispose(&popup->renderer);
-        free(popup->rows);
-        free(popup);
-        return NULL;
-    }
+        popup->owner, NULL, GetModuleHandleW(NULL), popup);
+    if (!popup->window) return false;
     /* Windows 11 rounds top-level popups on request; older systems fail the
        attribute call and keep square corners (silently ignored here). */
     DWM_WINDOW_CORNER_PREFERENCE preference = DWMWCP_ROUND;
@@ -557,6 +939,53 @@ PalettePopup *palette_popup_create(HWND owner,
         &preference, sizeof preference);
     create_overlay(popup);
     place_popup(popup);
+    return true;
+}
+
+PalettePopup *palette_popup_create(HWND owner,
+    const ChatActionContext *context) {
+    if (!owner || !context) return NULL;
+    PalettePopup *popup = popup_new(owner, PALETTE_MODE_COMMANDS);
+    if (!popup) return NULL;
+    if (!palette_set_commands(popup->controller, context)) {
+        popup_release(popup);
+        return NULL;
+    }
+    if (!popup_make_window(popup)) {
+        popup_release(popup);
+        return NULL;
+    }
+    return popup;
+}
+
+PalettePopup *palette_popup_create_models(HWND owner,
+    const ChatModelCatalog *catalog, const wchar_t *current_id,
+    wchar_t history[][CHAT_MODEL_TEXT], int history_count,
+    const wchar_t *status, const wchar_t *initial_id) {
+    if (!owner) return NULL;
+    PalettePopup *popup = popup_new(owner, PALETTE_MODE_MODELS);
+    if (!popup) return NULL;
+    if (!palette_set_models(popup->controller, catalog, current_id, history,
+            history_count)) {
+        popup_release(popup);
+        return NULL;
+    }
+    if (initial_id && initial_id[0]) {
+        PaletteRowKey key;
+        memset(&key, 0, sizeof key);
+        key.kind = PALETTE_ROW_MODEL_ALL;
+        wcsncpy(key.id, initial_id, CHAT_MODEL_TEXT - 1);
+        key.id[CHAT_MODEL_TEXT - 1] = 0;
+        palette_select_key(popup->controller, &key);
+    }
+    if (status) {
+        wcsncpy(popup->status, status, CHAT_STATUS_TEXT - 1);
+        popup->status[CHAT_STATUS_TEXT - 1] = 0;
+    }
+    if (!popup_make_window(popup)) {
+        popup_release(popup);
+        return NULL;
+    }
     return popup;
 }
 
@@ -569,7 +998,8 @@ void palette_popup_pump(PalettePopup *popup) {
         if (popup->owner) EnableWindow(popup->owner, FALSE);
         MSG message;
         BOOL got = 1;
-        while (!popup->done && (got = GetMessageW(&message, NULL, 0, 0)) > 0) {
+        while (!popup->done &&
+            (got = GetMessageW(&message, NULL, 0, 0)) > 0) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -586,18 +1016,27 @@ void palette_popup_pump(PalettePopup *popup) {
 }
 
 void palette_popup_destroy(PalettePopup *popup) {
-    if (!popup) return;
-    hide_overlay(popup);
-    if (popup->overlay && IsWindow(popup->overlay))
-        DestroyWindow(popup->overlay);
-    popup->overlay = NULL;
-    if (popup->window && IsWindow(popup->window))
-        DestroyWindow(popup->window);
-    ui_accessibility_destroy(popup->accessibility);
-    palette_dispose(popup->controller);
-    renderer_dispose(&popup->renderer);
-    free(popup->rows);
-    free(popup);
+    popup_release(popup);
+}
+
+bool palette_popup_set_models(PalettePopup *popup,
+    const ChatModelCatalog *catalog, const wchar_t *current_id,
+    wchar_t history[][CHAT_MODEL_TEXT], int history_count,
+    const wchar_t *status) {
+    if (!popup) return false;
+    if (!palette_set_models(popup->controller, catalog, current_id, history,
+            history_count))
+        return false;
+    if (status) {
+        wcsncpy(popup->status, status, CHAT_STATUS_TEXT - 1);
+        popup->status[CHAT_STATUS_TEXT - 1] = 0;
+        if (popup->window) ui_set_text(&popup->ui, popup->status_text,
+            popup->status);
+    }
+    popup->bound_first = (size_t)-1;
+    rebind_if_scroll_changed(popup);
+    ensure_selected_bound(popup, false);
+    return true;
 }
 
 HWND palette_popup_window(const PalettePopup *popup) {
@@ -625,6 +1064,10 @@ const wchar_t *palette_popup_query(const PalettePopup *popup) {
     return popup ? palette_query(popup->controller) : L"";
 }
 
+const wchar_t *palette_popup_status(const PalettePopup *popup) {
+    return popup ? popup->status : L"";
+}
+
 size_t palette_popup_row_count(const PalettePopup *popup) {
     return popup ? palette_row_count(popup->controller) : 0;
 }
@@ -636,8 +1079,43 @@ const wchar_t *palette_popup_row_label(const PalettePopup *popup,
     return row ? row->label : NULL;
 }
 
+bool palette_popup_row_key(const PalettePopup *popup, size_t index,
+    PaletteRowKey *out) {
+    const PaletteRow *row =
+        popup ? palette_row(popup->controller, index) : NULL;
+    if (!row || !out) return false;
+    *out = row->key;
+    return true;
+}
+
+bool palette_popup_highlighted_model(const PalettePopup *popup,
+    wchar_t out[CHAT_MODEL_TEXT]) {
+    if (out) out[0] = 0;
+    const PaletteRow *row =
+        popup ? palette_selected_row(popup->controller) : NULL;
+    if (!row || row->key.kind == PALETTE_ROW_COMMAND || !out) return false;
+    wcsncpy(out, row->key.id, CHAT_MODEL_TEXT - 1);
+    out[CHAT_MODEL_TEXT - 1] = 0;
+    return true;
+}
+
+void palette_popup_set_selected_model(PalettePopup *popup, const wchar_t *id) {
+    if (!popup || !id || !id[0]) return;
+    PaletteRowKey key;
+    memset(&key, 0, sizeof key);
+    key.kind = PALETTE_ROW_MODEL_ALL;
+    wcsncpy(key.id, id, CHAT_MODEL_TEXT - 1);
+    key.id[CHAT_MODEL_TEXT - 1] = 0;
+    palette_select_key(popup->controller, &key);
+    ensure_selected_bound(popup, false);
+}
+
 UINT palette_popup_dpi(const PalettePopup *popup) {
     return popup ? popup->dpi : 0;
+}
+
+float palette_popup_scroll_offset(const PalettePopup *popup) {
+    return popup ? ui_scroll_offset(&popup->ui, popup->scroll) : 0;
 }
 
 IRawElementProviderSimple *palette_popup_root_provider(PalettePopup *popup) {

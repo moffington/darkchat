@@ -46,7 +46,7 @@ int __wrap_completion_request(CompletionClient *client, ChatBackend backend,
         count,routing);
 }
 /* Catalog seams (linked with -Wl,--wrap=model_catalog_request and
-   -Wl,--wrap=model_picker_pump): the fetch is counted but never starts a
+   -Wl,--wrap=palette_popup_pump): the fetch is counted but never starts a
    worker, and the modal pump returns at once so the suite can drive accept,
    cancel and a mid-open source refresh itself. With lost_worker set the wrapper
    leaves an already-finished thread handle on the client, exactly as a real
@@ -95,20 +95,29 @@ void *__wrap_realloc(void *pointer, size_t size) {
     }
     return __real_realloc(pointer,size);
 }
-static int picker_pump_calls;
-void __real_model_picker_pump(ModelPicker *picker);
-void __wrap_model_picker_pump(ModelPicker *picker) {
-    (void)picker;
-    ++picker_pump_calls;
-}
 /* Palette seam (linked with -Wl,--wrap=palette_popup_pump): the modal pump
    returns at once so the suite can drive open/filter/accept/cancel and
-   inspect the popup's own state between steps without blocking. */
+   inspect the popup's own state between steps without blocking. Both the
+   command and the model palette share this seam. */
 static int palette_pump_calls;
 void __real_palette_popup_pump(PalettePopup *popup);
 void __wrap_palette_popup_pump(PalettePopup *popup) {
     (void)popup;
     ++palette_pump_calls;
+}
+/* Identity helpers over the popup's visible rows: the controller labels are
+   display text, so id assertions resolve the stable row key instead. */
+static const wchar_t *palette_row_id(PalettePopup *popup, size_t index) {
+    static wchar_t buffer[CHAT_MODEL_TEXT];
+    PaletteRowKey key;
+    if (!popup || !palette_popup_row_key(popup,index,&key)) return NULL;
+    wcsncpy(buffer,key.id,CHAT_MODEL_TEXT-1); buffer[CHAT_MODEL_TEXT-1]=0;
+    return buffer;
+}
+static const wchar_t *palette_highlighted_id(PalettePopup *popup) {
+    static wchar_t buffer[CHAT_MODEL_TEXT];
+    if (!palette_popup_highlighted_model(popup,buffer)) buffer[0]=0;
+    return buffer;
 }
 static ModelCatalogEvent *catalog_fixture(ChatHost *h, ModelCatalogResult result,
     const char *json, const wchar_t *error) {
@@ -2130,7 +2139,7 @@ static int catalog_suite(void) {
     HWND window=CreateWindowW(cls.lpszClassName,L"Catalog integration",WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
     CHECK(window); KillTimer(window,2);
     CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
-    catalog_request_calls=0; catalog_request_generation=0; picker_pump_calls=0;
+    catalog_request_calls=0; catalog_request_generation=0; palette_pump_calls=0;
 
     /* apply_model: rejects empty/over-capacity ids, updates Chat and the field
        together, and dirties only on a real change. It never touches history. */
@@ -2148,10 +2157,10 @@ static int catalog_suite(void) {
     CHECK(!chat->model_history_count);
 
     /* One Ctrl+Space open starts exactly one fetch; a browse applies nothing. */
-    catalog_request_calls=0; picker_pump_calls=0;
+    catalog_request_calls=0; palette_pump_calls=0;
     action(h,ACTION_MODELS);
-    CHECK(picker_pump_calls==1 && catalog_request_calls==1);
-    CHECK(h->catalog_loading && h->catalog_generation>0 && !h->open_picker);
+    CHECK(palette_pump_calls==1 && catalog_request_calls==1);
+    CHECK(h->catalog_loading && h->catalog_generation>0 && !h->open_palette);
     CHECK(!wcscmp(chat->model,L"openai/gpt-4o-mini"));
     CHECK(!h->model_applied);
 
@@ -2164,61 +2173,64 @@ static int catalog_suite(void) {
        filter text and the selected id. The current model is one of the catalog
        entries, so it deduplicates instead of adding a fourth row. */
     CHECK(apply_model(h,L"openai/gpt-4"));
-    begin_model_picker(h);
-    CHECK(h->open_picker && catalog_request_calls==1);
-    CHECK(model_picker_match_count(h->open_picker)==3);
-    model_picker_set_filter(h->open_picker,L"gpt");
-    CHECK(model_picker_match_count(h->open_picker)==1);
-    CHECK(!wcscmp(model_picker_match_id(h->open_picker,0),L"openai/gpt-4"));
+    begin_model_palette(h);
+    CHECK(h->open_palette && catalog_request_calls==1);
+    CHECK(palette_popup_row_count(h->open_palette)==3);
+    palette_popup_set_query(h->open_palette,L"gpt");
+    CHECK(palette_popup_row_count(h->open_palette)==1);
+    CHECK(!wcscmp(palette_row_id(h->open_palette,0),L"openai/gpt-4"));
     catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_second_json,NULL));
-    CHECK(h->open_picker);
-    CHECK(!wcscmp(model_picker_filter(h->open_picker),L"gpt"));
-    CHECK(model_picker_match_count(h->open_picker)==1);
-    model_picker_set_filter(h->open_picker,L"");
-    model_picker_set_selected(h->open_picker,L"openai/gpt-4");
+    CHECK(h->open_palette);
+    CHECK(!wcscmp(palette_popup_query(h->open_palette),L"gpt"));
+    CHECK(palette_popup_row_count(h->open_palette)==1);
+    palette_popup_set_query(h->open_palette,L"");
+    palette_popup_set_selected_model(h->open_palette,L"openai/gpt-4");
     catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_first_json,NULL));
-    CHECK(!wcscmp(model_picker_selected_id(h->open_picker),L"openai/gpt-4"));
+    CHECK(!wcscmp(palette_highlighted_id(h->open_palette),L"openai/gpt-4"));
 
-    /* A source refresh is transactional across the snapshot and the filter
-       array: an allocation failure at either step keeps the old source and a
-       fully usable old list, with no out-of-capacity pointer. */
+    /* A source refresh is transactional: an allocation failure inside the
+       rebuild keeps the old source, the query, the selection and the display
+       fully usable (the popup reports the failure instead of half-swapping). */
     {
         ChatModelCatalog big;
         chat_model_catalog_init(&big);
         ChatModelParseStats stats;
         CHECK(chat_model_catalog_parse(&big,catalog_five_json,&stats));
-        size_t before=model_picker_match_count(h->open_picker);
+        size_t before=palette_popup_row_count(h->open_palette);
         CHECK(before==3);
-        alloc_fail_realloc=0;
-        model_picker_source_updated(h->open_picker,&big,L"oom");
-        alloc_fail_realloc=-1;
-        CHECK(model_picker_match_count(h->open_picker)==before);
-        CHECK(model_picker_match_id(h->open_picker,before-1)!=NULL);
-        CHECK(model_picker_match_id(h->open_picker,99)==NULL);
+        palette_popup_set_selected_model(h->open_palette,L"openai/gpt-4");
+        CHECK(!wcscmp(palette_highlighted_id(h->open_palette),L"openai/gpt-4"));
         alloc_fail_malloc=0;
-        model_picker_source_updated(h->open_picker,&big,L"oom");
+        CHECK(!palette_popup_set_models(h->open_palette,&big,NULL,NULL,0,
+            L"oom"));
         alloc_fail_malloc=-1;
-        CHECK(model_picker_match_count(h->open_picker)==before);
-        CHECK(model_picker_match_id(h->open_picker,before-1)!=NULL);
+        CHECK(palette_popup_row_count(h->open_palette)==before);
+        CHECK(palette_row_id(h->open_palette,before-1)!=NULL);
+        CHECK(palette_row_id(h->open_palette,99)==NULL);
+        CHECK(!wcscmp(palette_highlighted_id(h->open_palette),L"openai/gpt-4"));
+        /* A later successful refresh works normally. */
+        CHECK(palette_popup_set_models(h->open_palette,&big,NULL,NULL,0,
+            L"reloaded"));
+        CHECK(palette_popup_row_count(h->open_palette)==5);
         chat_model_catalog_dispose(&big);
     }
 
     /* Accepting applies the id to both values and marks dirty once. */
-    model_picker_set_selected(h->open_picker,L"anthropic/claude-3");
+    palette_popup_set_selected_model(h->open_palette,L"anthropic/claude-3");
     h->dirty=false;
-    model_picker_accept(h->open_picker);
-    end_model_picker(h);
-    CHECK(!h->open_picker && h->model_applied && h->dirty);
+    palette_popup_accept(h->open_palette);
+    end_palette(h);
+    CHECK(!h->open_palette && h->model_applied && h->dirty);
     CHECK(!wcscmp(chat->model,L"anthropic/claude-3"));
     { wchar_t shown[CHAT_MODEL_TEXT]; rich_text_get_text(&h->field,shown,CHAT_MODEL_TEXT);
       CHECK(!wcscmp(shown,L"anthropic/claude-3")); }
 
     /* Cancelling applies nothing. */
-    begin_model_picker(h);
-    CHECK(h->open_picker && catalog_request_calls==1);
-    model_picker_cancel(h->open_picker);
+    begin_model_palette(h);
+    CHECK(h->open_palette && catalog_request_calls==1);
+    palette_popup_cancel(h->open_palette);
     h->dirty=false;
-    end_model_picker(h);
+    end_palette(h);
     CHECK(!h->model_applied && !h->dirty);
     CHECK(!wcscmp(chat->model,L"anthropic/claude-3"));
 
@@ -2240,19 +2252,19 @@ static int catalog_suite(void) {
     wcscpy(chat->model_history[0],L"history/model"); chat->model_history_count=1;
     CHECK(apply_model(h,L"typed/model"));
     catalog_request_calls=0;
-    begin_model_picker(h);
-    CHECK(catalog_request_calls==1 && h->open_picker);
+    begin_model_palette(h);
+    CHECK(catalog_request_calls==1 && h->open_palette);
     catalog_event(h,catalog_fixture(h,MODEL_CATALOG_NETWORK_ERROR,NULL,L"offline"));
     CHECK(h->catalog_failed[CHAT_BACKEND_OPENROUTER] && !h->catalog_loading && h->catalog[CHAT_BACKEND_OPENROUTER].count==0);
-    CHECK(h->open_picker && model_picker_match_count(h->open_picker)>=2);
-    CHECK(!wcscmp(model_picker_match_id(h->open_picker,0),L"typed/model"));
-    model_picker_cancel(h->open_picker);
-    end_model_picker(h);
+    CHECK(h->open_palette && palette_popup_row_count(h->open_palette)>=2);
+    CHECK(!wcscmp(palette_row_id(h->open_palette,0),L"typed/model"));
+    palette_popup_cancel(h->open_palette);
+    end_palette(h);
     catalog_request_calls=0;
-    begin_model_picker(h);
-    CHECK(catalog_request_calls==1 && h->open_picker);
-    model_picker_cancel(h->open_picker);
-    end_model_picker(h);
+    begin_model_palette(h);
+    CHECK(catalog_request_calls==1 && h->open_palette);
+    palette_popup_cancel(h->open_palette);
+    end_palette(h);
 
     /* A worker whose completion was lost (the event could not be allocated or
        posted) must be reaped so the next open starts a fresh request, without
@@ -2263,28 +2275,28 @@ static int catalog_suite(void) {
     h->catalog_loading=false; h->catalog_generation=0;
     catalog_request_lost_worker=true;
     catalog_request_calls=0;
-    begin_model_picker(h);
-    CHECK(catalog_request_calls==1 && h->catalog_loading && h->open_picker);
+    begin_model_palette(h);
+    CHECK(catalog_request_calls==1 && h->catalog_loading && h->open_palette);
     CHECK(h->catalog_client.thread!=NULL);   /* lost completion still held */
-    model_picker_cancel(h->open_picker);
-    end_model_picker(h);
-    begin_model_picker(h);
-    CHECK(catalog_request_calls==2 && h->catalog_loading && h->open_picker);
+    palette_popup_cancel(h->open_palette);
+    end_palette(h);
+    begin_model_palette(h);
+    CHECK(catalog_request_calls==2 && h->catalog_loading && h->open_palette);
     CHECK(h->catalog_client.thread!=NULL);   /* request #2's worker is unjoined */
-    model_picker_cancel(h->open_picker);
-    end_model_picker(h);
+    palette_popup_cancel(h->open_palette);
+    end_palette(h);
     catalog_request_lost_worker=false;
 
     /* A close arriving while the picker is live is deferred until the picker
        has unwound, so the parent is never destroyed under the modal loop. */
-    begin_model_picker(h);
-    CHECK(h->open_picker);
+    begin_model_palette(h);
+    CHECK(h->open_palette);
     SendMessageW(window,WM_CLOSE,0,0);
     CHECK(IsWindow(window) && h->close_pending && !h->generating);
-    end_model_picker(h);
+    end_palette(h);
     pump_messages(30);
     CHECK(!IsWindow(window));
-    CHECK(!h->open_picker && !h->close_pending);
+    CHECK(!h->open_palette && !h->close_pending);
 
     saver_shutdown(&h->saver); storage_close(&h->storage);
     model_catalog_shutdown(&h->catalog_client);
@@ -2292,7 +2304,7 @@ static int catalog_suite(void) {
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
     ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
     transcript_dispose(&h->transcript); /* Msftedit stays loaded for the process (see main). */
-    chat_model_catalog_dispose(&h->catalog[CHAT_BACKEND_OPENROUTER]); chat_model_catalog_dispose(&h->picker_source);
+    chat_model_catalog_dispose(&h->catalog[CHAT_BACKEND_OPENROUTER]);
     chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
     return 0;
 }
@@ -3681,7 +3693,7 @@ static int backend_suite(void) {
     HWND window=CreateWindowW(cls.lpszClassName,L"Backend integration",WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
     CHECK(window); KillTimer(window,2);
     CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
-    catalog_request_calls=0; catalog_request_generation=0; picker_pump_calls=0;
+    catalog_request_calls=0; catalog_request_generation=0; palette_pump_calls=0;
 
     /* Defaults: OpenRouter with the historical model as the active model. */
     CHECK(chat->backend==CHAT_BACKEND_OPENROUTER);
@@ -3804,12 +3816,12 @@ static int backend_suite(void) {
     /* Complete the catalogue fetch the cancelled switch started. */
     catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_ollama_json,NULL));
     h->backend_target=CHAT_BACKEND_OLLAMA; h->backend_switch_pending=true;
-    begin_model_picker(h);
-    CHECK(h->open_picker);
+    begin_model_palette(h);
+    CHECK(h->open_palette);
     CHECK(!wcscmp(current_model(chat,CHAT_BACKEND_OLLAMA),L""));
-    model_picker_set_selected(h->open_picker,L"llama3.2:latest");
-    model_picker_accept(h->open_picker);
-    end_model_picker(h);
+    palette_popup_set_selected_model(h->open_palette,L"llama3.2:latest");
+    palette_popup_accept(h->open_palette);
+    end_palette(h);
     CHECK(chat->backend==CHAT_BACKEND_OLLAMA);
     CHECK(!wcscmp(chat->ollama_model,L"llama3.2:latest"));
     { wchar_t shown[CHAT_MODEL_TEXT]; rich_text_get_text(&h->field,shown,CHAT_MODEL_TEXT);
@@ -3820,15 +3832,15 @@ static int backend_suite(void) {
     /* Separate last-good catalogs and status per backend. */
     chat->backend=CHAT_BACKEND_OPENROUTER; h->backend_target=CHAT_BACKEND_OPENROUTER;
     catalog_request_calls=0;
-    begin_model_picker(h);
+    begin_model_palette(h);
     CHECK(catalog_request_calls==1);
     catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_first_json,NULL));
     CHECK(h->catalog[CHAT_BACKEND_OPENROUTER].count==3 &&
         h->catalog_loaded[CHAT_BACKEND_OPENROUTER]);
-    CHECK(h->open_picker &&
-        !wcscmp(model_picker_match_id(h->open_picker,0),L"openrouter/model"));
-    model_picker_cancel(h->open_picker);
-    end_model_picker(h);
+    CHECK(h->open_palette &&
+        !wcscmp(palette_row_id(h->open_palette,0),L"openrouter/model"));
+    palette_popup_cancel(h->open_palette);
+    end_palette(h);
     /* A fresh Ollama open fetches Ollama's own catalogue and leaves the
        OpenRouter one untouched. */
     chat_model_catalog_dispose(&h->catalog[CHAT_BACKEND_OLLAMA]);
@@ -3836,33 +3848,33 @@ static int backend_suite(void) {
     h->catalog_failed[CHAT_BACKEND_OLLAMA]=false;
     chat->backend=CHAT_BACKEND_OLLAMA; h->backend_target=CHAT_BACKEND_OLLAMA;
     catalog_request_calls=0;
-    begin_model_picker(h);
+    begin_model_palette(h);
     CHECK(catalog_request_calls==1);
     catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_ollama_json,NULL));
     CHECK(h->catalog[CHAT_BACKEND_OLLAMA].count==2 &&
         h->catalog[CHAT_BACKEND_OPENROUTER].count==3);
     CHECK(!wcscmp(h->catalog[CHAT_BACKEND_OLLAMA].items[0].id,L"llama3.2:latest"));
     CHECK(!wcscmp(h->catalog[CHAT_BACKEND_OPENROUTER].items[0].id,L"openai/gpt-4"));
-    CHECK(h->open_picker &&
-        !wcscmp(model_picker_match_id(h->open_picker,0),L"llama3.2:latest"));
-    model_picker_cancel(h->open_picker);
-    end_model_picker(h);
+    CHECK(h->open_palette &&
+        !wcscmp(palette_row_id(h->open_palette,0),L"llama3.2:latest"));
+    palette_popup_cancel(h->open_palette);
+    end_palette(h);
 
-    /* Cross-backend history isolation: a backend's picker never shows the
+    /* Cross-backend history isolation: a backend's palette never shows the
        other backend's recent models, and chat_remember_model tags the active
-       backend while preserving each backend's MRU subsequence. */
+       backend while preserving each backend's MRU subsequence. The host
+       filters the history before the palette ever sees it. */
     {
+        wchar_t history[CHAT_MODEL_HISTORY][CHAT_MODEL_TEXT];
         wcsncpy(chat->model_history[0],L"openrouter/only",CHAT_MODEL_TEXT-1);
         chat->model_history_backend[0]=CHAT_BACKEND_OPENROUTER;
         wcsncpy(chat->model_history[1],L"local/only",CHAT_MODEL_TEXT-1);
         chat->model_history_backend[1]=CHAT_BACKEND_OLLAMA;
         chat->model_history_count=2;
-        build_picker_source(h,CHAT_BACKEND_OPENROUTER);
-        CHECK(chat_model_catalog_contains(&h->picker_source,L"openrouter/only"));
-        CHECK(!chat_model_catalog_contains(&h->picker_source,L"local/only"));
-        build_picker_source(h,CHAT_BACKEND_OLLAMA);
-        CHECK(chat_model_catalog_contains(&h->picker_source,L"local/only"));
-        CHECK(!chat_model_catalog_contains(&h->picker_source,L"openrouter/only"));
+        int count=build_backend_history(h,CHAT_BACKEND_OPENROUTER,history);
+        CHECK(count==1 && !wcscmp(history[0],L"openrouter/only"));
+        count=build_backend_history(h,CHAT_BACKEND_OLLAMA,history);
+        CHECK(count==1 && !wcscmp(history[0],L"local/only"));
         chat->model_history_count=0;
         chat->backend=CHAT_BACKEND_OPENROUTER;
         wcscpy(chat->model,L"or/one"); chat_remember_model(chat);
@@ -3891,7 +3903,7 @@ static int backend_suite(void) {
         h->catalog_failed[CHAT_BACKEND_OLLAMA]=false;
         chat->backend=CHAT_BACKEND_OPENROUTER; h->backend_target=CHAT_BACKEND_OPENROUTER;
         catalog_request_calls=0;
-        begin_model_picker(h);
+        begin_model_palette(h);
         CHECK(catalog_request_calls==1 &&
             h->catalog_loading && h->catalog_backend==CHAT_BACKEND_OPENROUTER);
         /* The OR worker is still running while the user opens Ollama. */
@@ -3900,11 +3912,11 @@ static int backend_suite(void) {
         { uintptr_t thread=_beginthreadex(NULL,0,parked_worker,parked_release,0,NULL);
           CHECK(thread);
           h->catalog_client.thread=(HANDLE)thread; }
-        model_picker_cancel(h->open_picker);
-        end_model_picker(h);
+        palette_popup_cancel(h->open_palette);
+        end_palette(h);
         h->backend_target=CHAT_BACKEND_OLLAMA;
-        begin_model_picker(h);
-        CHECK(h->open_picker && catalog_request_calls==1);
+        begin_model_palette(h);
+        CHECK(h->open_palette && catalog_request_calls==1);
         /* The OpenRouter completion settles; Ollama's fetch is now queued. */
         SetEvent(parked_release); CloseHandle(parked_release); parked_release=NULL;
         catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_first_json,NULL));
@@ -3913,11 +3925,16 @@ static int backend_suite(void) {
             h->catalog_loading && h->catalog_backend==CHAT_BACKEND_OLLAMA);
         catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_ollama_json,NULL));
         CHECK(h->catalog[CHAT_BACKEND_OLLAMA].count==2);
-        CHECK(h->open_picker &&
-            chat_model_catalog_contains(&h->picker_source,L"llama3.2:latest") &&
-            chat_model_catalog_contains(&h->picker_source,L"qwen2.5:7b"));
-        model_picker_cancel(h->open_picker);
-        end_model_picker(h);
+        bool found_llama=false, found_qwen=false;
+        if (h->open_palette)
+            for (size_t i=0;i<palette_popup_row_count(h->open_palette);i++) {
+                const wchar_t *id=palette_row_id(h->open_palette,i);
+                if (id && !wcscmp(id,L"llama3.2:latest")) found_llama=true;
+                if (id && !wcscmp(id,L"qwen2.5:7b")) found_qwen=true;
+            }
+        CHECK(found_llama && found_qwen);
+        palette_popup_cancel(h->open_palette);
+        end_palette(h);
     }
 
     /* Metadata names the backend and marks local generations. */
@@ -3951,7 +3968,6 @@ static int backend_suite(void) {
     ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
     transcript_dispose(&h->transcript); /* Msftedit stays loaded for the process (see main). */
     for (int i=0;i<CHAT_BACKEND_COUNT;i++) chat_model_catalog_dispose(&h->catalog[i]);
-    chat_model_catalog_dispose(&h->picker_source);
     chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
     return 0;
 }
@@ -3976,30 +3992,16 @@ static size_t uia_children(IRawElementProviderFragment *from) {
     }
 }
 
-/* Resolves the popup's UI_SCROLL fragment: the query label, the separator
-   and the scroll are the root's three children in tree order. Returns NULL
-   when the tree does not have that shape. */
+/* Resolves the popup's UI_SCROLL fragment: the scroll container is always the
+   root's last child (command mode hides the model-only status label, so the
+   visible sibling count differs between modes). Returns NULL when the tree
+   does not have that shape. */
 static IRawElementProviderFragment *palette_scroll_fragment(
     IRawElementProviderFragment *root_fragment) {
     if (!root_fragment) return NULL;
-    IRawElementProviderFragment *query=NULL;
-    if (FAILED(IRawElementProviderFragment_Navigate(root_fragment,
-            NavigateDirection_FirstChild,&query)) || !query) return NULL;
-    IRawElementProviderFragment *separator=NULL;
-    if (FAILED(IRawElementProviderFragment_Navigate(query,
-            NavigateDirection_NextSibling,&separator)) || !separator) {
-        IRawElementProviderFragment_Release(query);
-        return NULL;
-    }
     IRawElementProviderFragment *scroll=NULL;
-    if (FAILED(IRawElementProviderFragment_Navigate(separator,
-            NavigateDirection_NextSibling,&scroll)) || !scroll) {
-        IRawElementProviderFragment_Release(query);
-        IRawElementProviderFragment_Release(separator);
-        return NULL;
-    }
-    IRawElementProviderFragment_Release(query);
-    IRawElementProviderFragment_Release(separator);
+    if (FAILED(IRawElementProviderFragment_Navigate(root_fragment,
+            NavigateDirection_LastChild,&scroll)) || !scroll) return NULL;
     return scroll;
 }
 
@@ -4565,6 +4567,469 @@ static int navigation_suite(void) {
     return 0;
 }
 
+/* Returns the first scroll-fragment child whose UIA Name equals `name`; the
+   caller owns the returned reference. NULL when absent. */
+static IRawElementProviderFragment *palette_named_child(PalettePopup *popup,
+    const wchar_t *name) {
+    IRawElementProviderSimple *root=palette_popup_root_provider(popup);
+    if (!root) return NULL;
+    IRawElementProviderFragment *fragment=NULL;
+    IRawElementProviderFragment *found=NULL;
+    if (SUCCEEDED(IRawElementProviderSimple_QueryInterface(root,
+            &IID_IRawElementProviderFragment,(void **)&fragment))) {
+        IRawElementProviderFragment *scroll=palette_scroll_fragment(fragment);
+        if (scroll) {
+            IRawElementProviderFragment *child=NULL;
+            if (SUCCEEDED(IRawElementProviderFragment_Navigate(scroll,
+                    NavigateDirection_FirstChild,&child)))
+                while (child) {
+                    IRawElementProviderSimple *simple=NULL;
+                    if (SUCCEEDED(IRawElementProviderFragment_QueryInterface(
+                            child,&IID_IRawElementProviderSimple,
+                            (void **)&simple))) {
+                        VARIANT value; VariantInit(&value);
+                        if (SUCCEEDED(IRawElementProviderSimple_GetPropertyValue(
+                                simple,UIA_NamePropertyId,&value)) &&
+                            V_VT(&value)==VT_BSTR &&
+                            !wcscmp(V_BSTR(&value),name)) {
+                            found=child;
+                            child=NULL;
+                        }
+                        VariantClear(&value);
+                        IRawElementProviderSimple_Release(simple);
+                    }
+                    if (!child) break;
+                    IRawElementProviderFragment *next=NULL;
+                    if (FAILED(IRawElementProviderFragment_Navigate(child,
+                            NavigateDirection_NextSibling,&next))) next=NULL;
+                    IRawElementProviderFragment_Release(child);
+                    child=next;
+                }
+            IRawElementProviderFragment_Release(scroll);
+        }
+        IRawElementProviderFragment_Release(fragment);
+    }
+    IRawElementProviderSimple_Release(root);
+    return found;
+}
+
+/* True when the scroll fragment exposes a child with this accessible name. */
+static bool palette_has_named_child(PalettePopup *popup, const wchar_t *name) {
+    IRawElementProviderFragment *found=palette_named_child(popup,name);
+    if (!found) return false;
+    IRawElementProviderFragment_Release(found);
+    return true;
+}
+
+/* Resolves the scroll container's screen rectangle through the popup's own
+   UIA provider (the same geometry assistive tech sees). */
+static bool palette_scroll_bounds(PalettePopup *popup, RECT *out) {
+    bool ok=false;
+    IRawElementProviderSimple *root=palette_popup_root_provider(popup);
+    if (!root) return false;
+    IRawElementProviderFragment *fragment=NULL;
+    if (SUCCEEDED(IRawElementProviderSimple_QueryInterface(root,
+            &IID_IRawElementProviderFragment,(void **)&fragment))) {
+        IRawElementProviderFragment *scroll=palette_scroll_fragment(fragment);
+        if (scroll) {
+            struct UiaRect bounds={0};
+            if (SUCCEEDED(IRawElementProviderFragment_get_BoundingRectangle(scroll,
+                    &bounds)) && bounds.width>0 && bounds.height>0) {
+                out->left=(LONG)bounds.left;
+                out->top=(LONG)bounds.top;
+                out->right=(LONG)(bounds.left+bounds.width);
+                out->bottom=(LONG)(bounds.top+bounds.height);
+                ok=true;
+            }
+            IRawElementProviderFragment_Release(scroll);
+        }
+        IRawElementProviderFragment_Release(fragment);
+    }
+    IRawElementProviderSimple_Release(root);
+    return ok;
+}
+
+/* Activates a retained row with real mouse messages at its center: a single
+   click must accept, exactly as assistive tech and the mouse behave. */
+static bool palette_click_named(PalettePopup *popup, const wchar_t *name) {
+    IRawElementProviderFragment *found=palette_named_child(popup,name);
+    if (!found) return false;
+    struct UiaRect bounds={0};
+    bool clicked=false;
+    if (SUCCEEDED(IRawElementProviderFragment_get_BoundingRectangle(found,
+            &bounds)) && bounds.width>0 && bounds.height>0) {
+        POINT point={ (LONG)(bounds.left+bounds.width/2),
+            (LONG)(bounds.top+bounds.height/2) };
+        HWND window=palette_popup_window(popup);
+        ScreenToClient(window,&point);
+        LPARAM lparam=MAKELPARAM(point.x,point.y);
+        SendMessageW(window,WM_MOUSEMOVE,0,lparam);
+        SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,lparam);
+        SendMessageW(window,WM_LBUTTONUP,0,lparam);
+        clicked=true;
+    }
+    IRawElementProviderFragment_Release(found);
+    return clicked;
+}
+
+/* Walks the scroll fragment's children, returning the count and whether every
+   one exposed a non-empty accessible name. Layout-only spacers are hidden from
+   UIA, so they must not appear at all. */
+static size_t palette_scroll_children_named(PalettePopup *popup,
+    bool *all_named) {
+    *all_named=true;
+    size_t count=0;
+    IRawElementProviderSimple *root=palette_popup_root_provider(popup);
+    if (!root) { *all_named=false; return 0; }
+    IRawElementProviderFragment *fragment=NULL;
+    if (SUCCEEDED(IRawElementProviderSimple_QueryInterface(root,
+            &IID_IRawElementProviderFragment,(void **)&fragment))) {
+        IRawElementProviderFragment *scroll=palette_scroll_fragment(fragment);
+        if (scroll) {
+            IRawElementProviderFragment *child=NULL;
+            if (SUCCEEDED(IRawElementProviderFragment_Navigate(scroll,
+                    NavigateDirection_FirstChild,&child)))
+                while (child) {
+                    IRawElementProviderSimple *simple=NULL;
+                    if (SUCCEEDED(IRawElementProviderFragment_QueryInterface(
+                            child,&IID_IRawElementProviderSimple,
+                            (void **)&simple))) {
+                        VARIANT value; VariantInit(&value);
+                        bool named=false;
+                        if (SUCCEEDED(IRawElementProviderSimple_GetPropertyValue(
+                                simple,UIA_NamePropertyId,&value)) &&
+                            V_VT(&value)==VT_BSTR && V_BSTR(&value)[0])
+                            named=true;
+                        VariantClear(&value);
+                        if (!named) *all_named=false;
+                        IRawElementProviderSimple_Release(simple);
+                    }
+                    ++count;
+                    IRawElementProviderFragment *next=NULL;
+                    if (FAILED(IRawElementProviderFragment_Navigate(child,
+                            NavigateDirection_NextSibling,&next))) next=NULL;
+                    IRawElementProviderFragment_Release(child);
+                    child=next;
+                }
+            IRawElementProviderFragment_Release(scroll);
+        }
+        IRawElementProviderFragment_Release(fragment);
+    }
+    IRawElementProviderSimple_Release(root);
+    return count;
+}
+
+/* True when `text` (length `n`) contains an unpaired UTF-16 surrogate. */
+static bool has_lone_surrogate(const wchar_t *text, size_t n) {
+    for (size_t i=0;i<n;i++) {
+        if (text[i]>=0xD800 && text[i]<=0xDBFF) {
+            if (i+1>=n || text[i+1]<0xDC00 || text[i+1]>0xDFFF) return true;
+            ++i;
+        } else if (text[i]>=0xDC00 && text[i]<=0xDFFF) return true;
+    }
+    return false;
+}
+
+/* ---- Model palette / virtualized rows suite ------------------------------ */
+
+static int model_palette_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Model palette host",1100,720,720,480,NULL,
+        false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-modelpal-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Model palette integration",
+        WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+
+    /* 4,096-entry catalog: only a bounded window of retained nodes is ever
+       created, the last entry is reachable, and acceptance returns its exact
+       id. The UIA census stays constant across deep scrolling and every
+       exposed child is named. */
+    {
+        ChatModelCatalog big; chat_model_catalog_init(&big);
+        for (unsigned i=0;i<4096;i++) {
+            ChatModelInfo info; memset(&info,0,sizeof info);
+            info.context_length=-1;
+            swprintf(info.id,CHAT_MODEL_TEXT,L"vendor/model-%04u",i);
+            swprintf(info.name,CHAT_MODEL_NAME_TEXT,L"Model %04u",i);
+            CHECK(chat_model_catalog_append(&big,&info));
+        }
+        CHECK(big.count==4096);
+        PalettePopup *palette=palette_popup_create_models(window,&big,
+            L"vendor/model-0000",NULL,0,L"4096 models",L"vendor/model-0000");
+        CHECK(palette && palette_popup_mode(palette)==PALETTE_MODE_MODELS);
+        CHECK(palette_popup_row_count(palette)==4096);
+        CHECK(!wcscmp(palette_popup_status(palette),L"4096 models"));
+        bool all_named=true;
+        size_t census=palette_scroll_children_named(palette,&all_named);
+        CHECK(all_named && census>0 && census<=80);
+        /* Deep path: End reaches the final row and rebinds the bounded pool. */
+        SendMessageW(palette_popup_window(palette),WM_KEYDOWN,VK_END,0);
+        CHECK(!wcscmp(palette_highlighted_id(palette),L"vendor/model-4095"));
+        bool all_named2=true;
+        size_t census2=palette_scroll_children_named(palette,&all_named2);
+        /* The window is bounded (never growing with the catalog) and stays
+           named; it can be smaller at the very end of the list. */
+        CHECK(all_named2 && census2>0 && census2<=80);
+        /* Virtualization correctness, not just controller correctness: the
+           final row's composed label is actually present in the accessibility
+           tree after the deep rebind. */
+        { wchar_t expected[UI_TEXT_CAPACITY];
+          palette_popup_format_model_row(expected,L"Model 4095",
+              L"vendor/model-4095");
+          CHECK(palette_has_named_child(palette,expected)); }
+        palette_popup_accept(palette);
+        { wchar_t id[CHAT_MODEL_TEXT];
+          CHECK(palette_popup_accepted_model(palette,id) &&
+              !wcscmp(id,L"vendor/model-4095")); }
+        palette_popup_destroy(palette);
+        chat_model_catalog_dispose(&big);
+    }
+
+    /* Duplicate display names stay distinguishable: the composed row keeps the
+       complete id, and activating each returns its own id. */
+    {
+        ChatModelCatalog cat; chat_model_catalog_init(&cat);
+        ChatModelInfo one; memset(&one,0,sizeof one); one.context_length=-1;
+        wcscpy(one.id,L"dup/one"); wcscpy(one.name,L"Same Name");
+        ChatModelInfo two=one; wcscpy(two.id,L"dup/two");
+        CHECK(chat_model_catalog_append(&cat,&one));
+        CHECK(chat_model_catalog_append(&cat,&two));
+        /* No current id: both catalog entries keep their display name, so the
+           two rows really do share one name and differ only by id. */
+        PalettePopup *palette=palette_popup_create_models(window,&cat,
+            NULL,NULL,0,NULL,NULL);
+        CHECK(palette && palette_popup_row_count(palette)==2);
+        wchar_t label_a[UI_TEXT_CAPACITY], label_b[UI_TEXT_CAPACITY];
+        palette_popup_format_model_row(label_a,L"Same Name",L"dup/one");
+        palette_popup_format_model_row(label_b,L"Same Name",L"dup/two");
+        CHECK(wcscmp(label_a,label_b)!=0);
+        CHECK(wcsstr(label_a,L"dup/one") && wcsstr(label_b,L"dup/two"));
+        /* Both same-name rows are exposed to UIA, and a real single click on
+           each retained node accepts that exact id. */
+        CHECK(palette_has_named_child(palette,label_a));
+        CHECK(palette_has_named_child(palette,label_b));
+        CHECK(palette_click_named(palette,label_b));
+        { wchar_t id[CHAT_MODEL_TEXT];
+          CHECK(palette_popup_accepted_model(palette,id) &&
+              !wcscmp(id,L"dup/two")); }
+        palette_popup_destroy(palette);
+        /* The other duplicate activates to its own id in a fresh popup. */
+        palette=palette_popup_create_models(window,&cat,NULL,NULL,0,
+            NULL,NULL);
+        CHECK(palette && palette_click_named(palette,label_a));
+        { wchar_t id[CHAT_MODEL_TEXT];
+          CHECK(palette_popup_accepted_model(palette,id) &&
+              !wcscmp(id,L"dup/one")); }
+        palette_popup_destroy(palette);
+        chat_model_catalog_dispose(&cat);
+    }
+
+    /* Long names are cut so the complete id always survives, without splitting
+       a UTF-16 surrogate pair. */
+    {
+        wchar_t name[CHAT_MODEL_NAME_TEXT], id[CHAT_MODEL_TEXT];
+        wchar_t out[UI_TEXT_CAPACITY];
+        for (int i=0;i<CHAT_MODEL_NAME_TEXT-1;i++) name[i]=L'A';
+        name[CHAT_MODEL_NAME_TEXT-1]=0;
+        for (int i=0;i<CHAT_MODEL_TEXT-1;i++) id[i]=L'b';
+        id[CHAT_MODEL_TEXT-1]=0;
+        palette_popup_format_model_row(out,name,id);
+        CHECK(wcslen(out)<=UI_TEXT_CAPACITY-1);
+        size_t id_length=wcslen(id);
+        CHECK(wcslen(out)>=id_length &&
+            !wcscmp(out+wcslen(out)-id_length,id));   /* id tail intact */
+        /* A name made of surrogate pairs is never split at the cut. */
+        wchar_t emoji[CHAT_MODEL_NAME_TEXT];
+        int at=0;
+        while (at+2<CHAT_MODEL_NAME_TEXT-1) { emoji[at++]=0xD83D; emoji[at++]=0xDE00; }
+        emoji[at]=0;
+        palette_popup_format_model_row(out,emoji,L"vendor/emoji");
+        CHECK(wcslen(out)<=UI_TEXT_CAPACITY-1);
+        wchar_t *separator=wcsstr(out,L" \u2014 ");
+        CHECK(separator!=NULL);
+        CHECK(!has_lone_surrogate(out,(size_t)(separator-out)));
+        CHECK(!wcscmp(separator+3,L"vendor/emoji"));
+    }
+
+    /* A source refresh failure keeps the old source, query, selection, scroll
+       and display fully intact; a later success commits. */
+    {
+        ChatModelCatalog cat; chat_model_catalog_init(&cat);
+        for (unsigned i=0;i<50;i++) {
+            ChatModelInfo info; memset(&info,0,sizeof info); info.context_length=-1;
+            swprintf(info.id,CHAT_MODEL_TEXT,L"stable/%02u",i);
+            swprintf(info.name,CHAT_MODEL_NAME_TEXT,L"Stable %02u",i);
+            CHECK(chat_model_catalog_append(&cat,&info));
+        }
+        PalettePopup *palette=palette_popup_create_models(window,&cat,
+            L"stable/00",NULL,0,L"50 models",NULL);
+        CHECK(palette && palette_popup_row_count(palette)==50);
+        palette_popup_set_query(palette,L"Stable 1");
+        size_t filtered=palette_popup_row_count(palette);
+        palette_popup_set_selected_model(palette,L"stable/10");
+        float offset=palette_popup_scroll_offset(palette);
+        ChatModelCatalog more; chat_model_catalog_init(&more);
+        for (unsigned i=0;i<60;i++) {
+            ChatModelInfo info; memset(&info,0,sizeof info); info.context_length=-1;
+            swprintf(info.id,CHAT_MODEL_TEXT,L"extra/%02u",i);
+            swprintf(info.name,CHAT_MODEL_NAME_TEXT,L"Extra %02u",i);
+            CHECK(chat_model_catalog_append(&more,&info));
+        }
+        alloc_fail_malloc=0;
+        CHECK(!palette_popup_set_models(palette,&more,NULL,NULL,0,L"oom"));
+        alloc_fail_malloc=-1;
+        CHECK(!wcscmp(palette_popup_query(palette),L"Stable 1"));
+        CHECK(palette_popup_row_count(palette)==filtered);
+        CHECK(!wcscmp(palette_highlighted_id(palette),L"stable/10"));
+        CHECK(palette_popup_scroll_offset(palette)==offset);
+        CHECK(!wcscmp(palette_popup_status(palette),L"50 models"));
+        CHECK(palette_popup_set_models(palette,&more,NULL,NULL,0,L"60 models"));
+        CHECK(!wcscmp(palette_popup_query(palette),L"Stable 1")); /* query kept */
+        CHECK(!wcscmp(palette_popup_status(palette),L"60 models"));
+        palette_popup_destroy(palette);
+        chat_model_catalog_dispose(&more);
+        chat_model_catalog_dispose(&cat);
+    }
+
+    /* A stale handle from before a rebind cannot fire: ui_remove advanced the
+       generation, so the queued UIA invoke fails instead of resolving a
+       rebound slot. */
+    {
+        ChatActionContext context; palette_context(h,&context);
+        PalettePopup *palette=palette_popup_create(window,&context);
+        CHECK(palette);
+        IRawElementProviderFragment *row=palette_named_child(palette,
+            L"New conversation");
+        CHECK(row);
+        IRawElementProviderSimple *simple=NULL;
+        CHECK(SUCCEEDED(IRawElementProviderFragment_QueryInterface(row,
+            &IID_IRawElementProviderSimple,(void **)&simple)));
+        IUnknown *pattern=NULL;
+        CHECK(SUCCEEDED(IRawElementProviderSimple_GetPatternProvider(simple,
+            UIA_InvokePatternId,&pattern)) && pattern);
+        IInvokeProvider *invoke=NULL;
+        CHECK(SUCCEEDED(IUnknown_QueryInterface(pattern,&IID_IInvokeProvider,
+            (void **)&invoke)));
+        int conversations_before=chat->conversation_count;
+        /* Rebuild the visible list, invalidating every realized handle. */
+        palette_popup_set_query(palette,L"zzzznope");
+        CHECK(palette_popup_row_count(palette)==0);
+        CHECK(FAILED(IInvokeProvider_Invoke(invoke)));
+        /* Drain any posted accessibility message; nothing may fire. */
+        MSG message;
+        while (PeekMessageW(&message,palette_popup_window(palette),0,0,
+                PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
+        CHECK(!palette_popup_accepted(palette));
+        CHECK(chat->conversation_count==conversations_before);
+        IInvokeProvider_Release(invoke); IUnknown_Release(pattern);
+        IRawElementProviderSimple_Release(simple);
+        IRawElementProviderFragment_Release(row);
+        palette_popup_destroy(palette);
+    }
+
+    /* Wheel scrolling rebinds the window and a DPI change re-places and
+       rebinds without losing the source. */
+    {
+        ChatModelCatalog cat; chat_model_catalog_init(&cat);
+        for (unsigned i=0;i<200;i++) {
+            ChatModelInfo info; memset(&info,0,sizeof info); info.context_length=-1;
+            swprintf(info.id,CHAT_MODEL_TEXT,L"scroll/%03u",i);
+            swprintf(info.name,CHAT_MODEL_NAME_TEXT,L"Scroll %03u",i);
+            CHECK(chat_model_catalog_append(&cat,&info));
+        }
+        PalettePopup *palette=palette_popup_create_models(window,&cat,
+            L"scroll/000",NULL,0,L"200 models",NULL);
+        CHECK(palette && palette_popup_row_count(palette)==200);
+        float before=palette_popup_scroll_offset(palette);
+        RECT bounds=palette_popup_bounds(palette);
+        int sx=bounds.left+100, sy=bounds.top+300;
+        SendMessageW(palette_popup_window(palette),WM_MOUSEWHEEL,
+            MAKEWPARAM(0,(WPARAM)(-WHEEL_DELTA)),MAKELPARAM(sx,sy));
+        CHECK(palette_popup_scroll_offset(palette)>before);
+        SendMessageW(palette_popup_window(palette),WM_DPICHANGED,
+            MAKEWPARAM(96,192),0);
+        CHECK(palette_popup_dpi(palette)==192);
+        CHECK(palette_popup_row_count(palette)==200);
+        palette_popup_destroy(palette);
+        chat_model_catalog_dispose(&cat);
+    }
+
+    /* Dragging the scrollbar thumb rebinds the window: the drag path mutates
+       the offset through ui_pointer_move(), not the wheel handler. */
+    {
+        ChatModelCatalog cat; chat_model_catalog_init(&cat);
+        for (unsigned i=0;i<200;i++) {
+            ChatModelInfo info; memset(&info,0,sizeof info); info.context_length=-1;
+            swprintf(info.id,CHAT_MODEL_TEXT,L"drag/%03u",i);
+            swprintf(info.name,CHAT_MODEL_NAME_TEXT,L"Drag %03u",i);
+            CHECK(chat_model_catalog_append(&cat,&info));
+        }
+        PalettePopup *palette=palette_popup_create_models(window,&cat,
+            L"drag/000",NULL,0,L"200 models",NULL);
+        CHECK(palette && palette_popup_row_count(palette)==200);
+        RECT scroll; CHECK(palette_scroll_bounds(palette,&scroll));
+        HWND popup_window=palette_popup_window(palette);
+        POINT grab={ scroll.right-4, scroll.top+8 };
+        POINT drop={ scroll.right-4, scroll.top+(scroll.bottom-scroll.top)/2 };
+        ScreenToClient(popup_window,&grab);
+        ScreenToClient(popup_window,&drop);
+        float before=palette_popup_scroll_offset(palette);
+        SendMessageW(popup_window,WM_MOUSEMOVE,0,MAKELPARAM(grab.x,grab.y));
+        SendMessageW(popup_window,WM_LBUTTONDOWN,MK_LBUTTON,
+            MAKELPARAM(grab.x,grab.y));
+        SendMessageW(popup_window,WM_MOUSEMOVE,MK_LBUTTON,
+            MAKELPARAM(drop.x,drop.y));
+        SendMessageW(popup_window,WM_LBUTTONUP,0,MAKELPARAM(drop.x,drop.y));
+        CHECK(palette_popup_scroll_offset(palette)>before);
+        /* The rebind left a usable, named window at the new position. */
+        bool all_named=true;
+        CHECK(palette_scroll_children_named(palette,&all_named)>0 && all_named);
+        palette_popup_destroy(palette);
+        chat_model_catalog_dispose(&cat);
+    }
+
+    /* Mixed-mode lifecycle: the single popup serves commands and models; each
+       open pumps once, applies nothing on cancel, and leaves no dirty state. */
+    {
+        palette_pump_calls=0; h->dirty=false;
+        CHECK(host_shortcut(h,L'K',false,true,false));
+        CHECK(palette_pump_calls==1 && !h->open_palette);
+        CHECK(!h->dirty);
+        /* Ctrl+Space routes through action(), which captures pending settings
+           first; the palette itself applies nothing on cancel. */
+        CHECK(host_shortcut(h,L' ',false,true,false));
+        CHECK(palette_pump_calls==2 && !h->open_palette);
+        CHECK(!h->model_applied);
+        /* A command palette opened right after is still commands mode: the
+           single popup never leaks the previous mode. */
+        h->dirty=false;
+        CHECK(host_shortcut(h,L'K',false,true,false));
+        CHECK(palette_pump_calls==3 && !h->open_palette);
+        CHECK(!h->dirty);
+    }
+
+    saver_shutdown(&h->saver); storage_close(&h->storage);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
+    transcript_dispose(&h->transcript);
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
 int main(void) {
     /* The fixtures share one process and never unload Msftedit: repeated
         unload/reload cycles across fixtures can fail its DllMain with
@@ -4582,8 +5047,12 @@ int main(void) {
     if (failed) return failed;
     failed=palette_suite();
     if (failed) return failed;
+    failed=model_palette_suite();
+    if (failed) return failed;
     failed=navigation_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded + catalog + backend + palette + navigation fixtures) passed");
+    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation fixtures) passed");
     return failed;
 }
+
+

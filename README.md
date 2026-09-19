@@ -9,7 +9,7 @@ It provides streaming responses, per-turn reasoning views, progressive Markdown 
 ## Current capabilities
 
 - Stream responses from any OpenRouter model identifier over SSE, or from a local [Ollama](https://ollama.com) server through its OpenAI-compatible API.
-- Switch backends under Settings > Backend. Each backend remembers its own last-used model, and choosing Ollama with no remembered local model opens the Ollama picker first.
+- Switch backends under Settings > Backend. Each backend remembers its own last-used model, and choosing Ollama with no remembered local model opens the model palette first.
 - Display reasoning separately for each assistant turn.
   - Reasoning is collapsed by default.
   - Live reasoning can be opened, scrolled, collapsed, and reopened without losing its place.
@@ -28,7 +28,7 @@ It provides streaming responses, per-turn reasoning views, progressive Markdown 
 - Stop an active request while retaining its partial response.
 - Copy responses, transcript selections, and composer text.
 - Configure the backend, the model, the global system prompt, sidebar width, and OpenRouter provider routing.
-- Browse and search the active backend's model catalog with `Ctrl+Space`; offline or without a key it falls back to the current model and that backend's 16 most recently used identifiers (history is tagged per backend, so the two pickers stay isolated).
+- Browse and search the active backend's model catalog with `Ctrl+Space`; offline or without a key it falls back to the current model and that backend's 16 most recently used identifiers (history is tagged per backend, so the two model lists stay isolated).
 - Apply global provider routing to future OpenRouter requests: sort by price, throughput, or latency; allow or disable fallback providers; allow or deny providers that may store data; and require Zero Data Retention. Every control defaults to OpenRouter's own default and is disabled while Ollama is active.
 - Show completion metadata including:
   - Time to first token
@@ -79,7 +79,7 @@ You can instead create `OPENROUTER_API_KEY` as a Windows User environment variab
 
 The key is never written to conversation state or included in persisted history, and temporary key buffers are cleared before release.
 
-Enter any valid OpenRouter model identifier in the model field, or press `Ctrl+Space` to search OpenRouter's model catalog. The catalog is fetched on demand with the same key, cached in memory for one hour, and never persisted; offline or without a key, the picker falls back to the current model and recent history. Provider routing is configured under Settings > Provider routing.
+Enter any valid OpenRouter model identifier in the model field, or press `Ctrl+Space` to search OpenRouter's model catalog. The catalog is fetched on demand with the same key, cached in memory for one hour, and never persisted; offline or without a key, the model palette falls back to the current model and recent history. Provider routing is configured under Settings > Provider routing.
 
 ## Ollama setup
 
@@ -92,7 +92,7 @@ http://localhost:11434/v1/models
 
 Start the server (for example `ollama serve`), then choose Settings > Backend > Ollama. No API key, `Authorization` header, HTTP-Referer, X-Title, TLS, or OpenRouter provider object is used; DarkChat opens a direct, no-proxy WinHTTP session for localhost. A missing `OPENROUTER_API_KEY` never blocks Ollama.
 
-The first time you switch to Ollama with no remembered local model, the Ollama picker opens and the switch commits only after you select a model. Ollama generation metadata shows `Ollama · model`, uses streamed usage via `stream_options.include_usage`, and reports its cost as `local`. If the server is not running, the failure reads `Ollama is not reachable at localhost:11434.`
+The first time you switch to Ollama with no remembered local model, the model palette opens in Ollama mode and the switch commits only after you select a model. Ollama generation metadata shows `Ollama · model`, uses streamed usage via `stream_options.include_usage`, and reports its cost as `local`. If the server is not running, the failure reads `Ollama is not reachable at localhost:11434.`
 
 The Ollama endpoint is fixed at `localhost:11434`; there is no configurable endpoint.
 
@@ -100,7 +100,7 @@ The Ollama endpoint is fixed at `localhost:11434`; there is no configurable endp
 
 - `Enter` sends a message.
 - `Shift+Enter` inserts a newline.
-- `Ctrl+Space` opens the searchable model picker for the active backend (current model, recent models, then the backend's catalog). Type to filter by id or name, use Up/Down, then Enter or double-click to select; Escape cancels.
+- `Ctrl+Space` opens the searchable model palette for the active backend (current model, recent models, then the backend's catalog), and `Ctrl+K` opens the command palette. Both are the same retained dark popup: type to filter (by id or name for models), use Up/Down/PageUp/PageDown/Home/End, then Enter or a single click to select; Escape cancels.
 - `Ctrl+F` focuses conversation search. Enter refreshes the search and jumps to
   its first result; `F3` / `Shift+F3` move through message and reasoning hits.
 - The Send button becomes Stop during generation.
@@ -152,7 +152,7 @@ DarkChat now represents most of the active development in this repository.
 | Transcript | `chat/transcript_win32.*`, `chat/rich_text_win32.*` | Bounded, recycled native Rich Edit slots; scrolling, selection preservation, reasoning viewports, incremental updates |
 | Markdown | `chat/markdown.*` | Transactional, platform-independent Markdown subset parser |
 | Completion | `chat/completion_request.*`, `chat/completion_winhttp.*`, `chat/sse.*`, `chat/json.*` | Backend-aware request encoding, endpoint descriptors, WinHTTP streaming, SSE framing, response decoding for OpenRouter and Ollama |
-| Model catalog | `chat/model_catalog.*`, `chat/model_catalog_winhttp.*`, `chat/model_picker_win32.*` | Transient per-backend model-catalog fetch, parse/merge/filter, and the searchable picker |
+| Model catalog | `chat/model_catalog.*`, `chat/model_catalog_winhttp.*`, `chat/palette_win32.*` | Transient per-backend model-catalog fetch, parse/merge/filter, and the shared command/model palette |
 | Provider routing | `chat/provider_routing.*` | OpenRouter `provider` object construction, sharing exact bytes with the request-context budget |
 | Storage | `chat/storage.*` | Checksummed JSONL snapshots, atomic replacement, backup and recovery |
 | DarkUI foundation | `ui/*`, `platform/*` | Retained controls, theme, painting, layout, Direct2D/DirectWrite rendering, and accessibility infrastructure |
@@ -191,7 +191,7 @@ Coverage includes:
 - OpenRouter and Ollama request and response fixtures, including byte-for-byte
   OpenRouter bodies, Ollama request bytes with no credentials or provider
   routing, and context/body size equality for both backends
-- Model-catalog parsing and picker merge/filter per backend, and offline or keyless OpenRouter fallback
+- Model-catalog parsing and model-list merge/filter per backend, and offline or keyless OpenRouter fallback
 - Provider-routing serialization, request-context budget accounting, persistence round-trips, and the settings-to-request seam
 - Backend and per-backend model persistence, old-snapshot OpenRouter defaults, and routing-menu state under Ollama
 - Reasoning ownership and live reasoning viewports
@@ -237,7 +237,7 @@ does not make live network requests.
 - Message text and reasoning use 255-code-unit inline residues, then heap storage;
   they have no fixed per-message length cap
 - 128 MB maximum persisted snapshot
-- 16 recently used model identifiers (the offline picker fallback)
+- 16 recently used model identifiers (the offline model-list fallback)
 - Provider routing exposes sorting, fallback, data-collection, and ZDR controls only; per-provider `only`/`ignore`/`order` selection is not exposed, and the controls apply to OpenRouter only
 - Ollama is reached at the fixed OpenAI-compatible endpoint `localhost:11434/v1`; the endpoint is not configurable
 - No response branches or retained variants
@@ -256,3 +256,4 @@ a total in-memory-content limit.
 Interactive clipboard and IME behavior, modal appearance, physical multi-monitor DPI transitions, and live provider behavior still require manual desktop verification. Hidden-window tests cover the underlying contracts but are not a replacement for visual review.
 
 For the detailed behavioral and persistence contract, see [`docs/CHAT.md`](docs/CHAT.md).
+

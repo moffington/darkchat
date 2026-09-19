@@ -11,7 +11,6 @@
 #include "actions_win32.h"
 #include "model_catalog.h"
 #include "model_catalog_winhttp.h"
-#include "model_picker_win32.h"
 #include "palette_win32.h"
 #include "../platform/renderer.h"
 #include "../platform/accessibility.h"
@@ -77,12 +76,12 @@ typedef struct {
        by the host (chat_ui.c itself knows nothing about accessibility). */
     ChatUiRemapReport remap;
     /* Transient model catalogs: the last-good parsed list and status per
-       backend, a merged view built for the picker, and the one-shot fetch
-       worker. Never persisted. When no catalog is available the picker falls
-       back to the model history. `backend_target` is the backend the picker is
-       choosing for; it equals the active backend except while an Ollama switch
-       waits for a model selection. */
-    ChatModelCatalog catalog[CHAT_BACKEND_COUNT], picker_source;
+       backend and the one-shot fetch worker. Never persisted. When no catalog
+       is available the palette falls back to the model history.
+       `backend_target` is the backend the model palette is choosing for; it
+       equals the active backend except while an Ollama switch waits for a
+       model selection. */
+    ChatModelCatalog catalog[CHAT_BACKEND_COUNT];
     ChatModelParseStats catalog_stats[CHAT_BACKEND_COUNT];
     ModelCatalogClient catalog_client;
     int catalog_generation;
@@ -93,12 +92,12 @@ typedef struct {
     wchar_t catalog_error[CHAT_BACKEND_COUNT][CHAT_STATUS_TEXT];
     ChatBackend backend_target;
     bool backend_switch_pending;
-    ModelPicker *open_picker;
-    bool picker_pumping;
     bool close_pending, model_applied;
-    /* Command palette (Ctrl+K). Mirrors the picker's parked-close machine
-       with palette-specific fields so the model-picker state stays untouched
-       until commit 6 migrates the picker onto the palette. */
+    /* One retained popup serves commands (Ctrl+K) and models (Ctrl+Space):
+       `open_palette` is the single open-popup field and its mode is read from
+       the popup itself. `palette_pumping` guards against freeing it under a
+       live modal loop; a close that lands while the pump is live parks on
+       `close_pending` and is reposted once the pump has unwound. */
     PalettePopup *open_palette;
     bool palette_pumping;
 
@@ -126,6 +125,9 @@ static bool search_step(ChatHost *host, bool reverse);
 static void place_container(ChatHost *host);
 static void open_actions_menu(ChatHost *host);
 static void open_palette(ChatHost *host);
+static void end_palette(ChatHost *host);
+static void end_model_palette(ChatHost *host, bool accepted,
+    const wchar_t *id);
 static RichTextControl *transcript_selected_surface(ChatHost *host);
 
 static int px(ChatHost *host, float dips) {
@@ -430,26 +432,18 @@ static bool should_fetch_catalog(ChatHost *host, ChatBackend backend) {
     return GetTickCount64() - host->catalog_success_tick[(int)backend] >= 3600000ULL;
 }
 
-/* Rebuilds the merged picker list (current, history, catalog) for `backend`
-   into its own storage; the previous view is kept if the rebuild cannot
-   allocate. History is tagged by backend and filtered here, so an OpenRouter
-   model never appears in the Ollama picker or vice versa. */
-static void build_picker_source(ChatHost *host, ChatBackend backend) {
-    Chat *chat = host->config.chat;
-    wchar_t history[CHAT_MODEL_HISTORY][CHAT_MODEL_TEXT];
-    int history_count = 0;
-    for (int i = 0; i < chat->model_history_count; i++)
+/* Copies the remembered history for `backend` only. The palette builds its own
+   merged view internally, so it never receives the combined history: an
+   OpenRouter model can never appear in the Ollama model list or vice versa. */
+static int build_backend_history(const ChatHost *host, ChatBackend backend,
+    wchar_t out[][CHAT_MODEL_TEXT]) {
+    const Chat *chat = host->config.chat;
+    int count = 0;
+    for (int i = 0; i < chat->model_history_count &&
+         count < CHAT_MODEL_HISTORY; i++)
         if (chat->model_history_backend[i] == backend)
-            wcscpy(history[history_count++], chat->model_history[i]);
-    ChatModelCatalog merged;
-    chat_model_catalog_init(&merged);
-    if (chat_model_catalog_merged(&host->catalog[(int)backend],
-            current_model(chat, backend), history, history_count, &merged)) {
-        chat_model_catalog_dispose(&host->picker_source);
-        host->picker_source = merged;
-    } else {
-        chat_model_catalog_dispose(&merged);
-    }
+            wcscpy(out[count++], chat->model_history[i]);
+    return count;
 }
 
 /* True when a catalog completion is already queued for the host window: it will
@@ -506,8 +500,8 @@ static void maybe_start_catalog_fetch(ChatHost *host, ChatBackend backend) {
 /* Opens the picker for the backend `backend_target`: builds the merged view,
    starts at most one fetch, and creates the popup. The caller drives the
    pump. */
-static void begin_model_picker(ChatHost *host) {
-    if (host->open_picker) return;
+static void begin_model_palette(ChatHost *host) {
+    if (host->open_palette) return;
     Chat *chat = host->config.chat;
     ChatBackend backend = host->backend_target;
     bool has_key = host->config.api_key_utf8 && host->config.api_key_utf8[0];
@@ -521,28 +515,24 @@ static void begin_model_picker(ChatHost *host) {
         recover_lost_catalog(host);
         maybe_start_catalog_fetch(host, backend);
     }
-    build_picker_source(host, backend);
+    wchar_t history[CHAT_MODEL_HISTORY][CHAT_MODEL_TEXT];
+    int history_count = build_backend_history(host, backend, history);
     wchar_t status[CHAT_STATUS_TEXT];
     picker_status(host, backend, status, CHAT_STATUS_TEXT);
-    host->open_picker = model_picker_create(host->window, &host->picker_source,
-        status, current_model(chat, backend));
-    if (!host->open_picker) set_status(host, L"Could not open the model picker.");
+    host->open_palette = palette_popup_create_models(host->window,
+        &host->catalog[(int)backend], current_model(chat, backend), history,
+        history_count, status, current_model(chat, backend));
+    if (!host->open_palette)
+        set_status(host, L"Could not open the model palette.");
 }
 
-/* Applies the picker's result, destroys it, and reposts a close that arrived
-   while the modal loop was live. A confirmed selection for a pending backend
-   switch commits the switch only now. */
-static void end_model_picker(ChatHost *host) {
-    ModelPicker *picker = host->open_picker;
-    if (!picker) return;
+/* Applies the model palette's result and reposts a close that arrived while
+   the modal loop was live. A confirmed selection for a pending backend switch
+   commits the switch only now; cancelling leaves the target uncommitted. */
+static void end_model_palette(ChatHost *host, bool accepted, const wchar_t *id) {
     Chat *chat = host->config.chat;
-    bool accepted = model_picker_accepted(picker);
-    wchar_t id[CHAT_MODEL_TEXT];
-    wcscpy(id, accepted ? model_picker_selected_id(picker) : L"");
-    model_picker_destroy(picker);
-    host->open_picker = NULL;
     bool changed = false;
-    if (accepted) {
+    if (accepted && id && id[0]) {
         changed = apply_model(host, id);
         if (host->backend_switch_pending) {
             chat->backend = host->backend_target;
@@ -550,7 +540,7 @@ static void end_model_picker(ChatHost *host) {
             changed = true;
         }
     }
-    /* Cancelling a pending switch leaves no pending state behind; the picker
+    /* Cancelling a pending switch leaves no pending state behind; the palette
        never leaves the target pointing at an uncommitted backend. */
     host->backend_switch_pending = false;
     host->backend_target = chat->backend;
@@ -560,22 +550,18 @@ static void end_model_picker(ChatHost *host) {
         chat_ui_sync(&host->chat_ui);
     }
     flush(host);
-    if (host->close_pending) {
-        host->close_pending = false;
-        PostMessageW(host->window, WM_CLOSE, 0, 0);
-    }
 }
 
-static void open_model_picker(ChatHost *host) {
+static void open_model_palette(ChatHost *host) {
     if (!host->backend_switch_pending)
         host->backend_target = host->config.chat->backend;
-    begin_model_picker(host);
-    if (host->open_picker) {
-        host->picker_pumping = true;
-        model_picker_pump(host->open_picker);
-        host->picker_pumping = false;
+    begin_model_palette(host);
+    if (host->open_palette) {
+        host->palette_pumping = true;
+        palette_popup_pump(host->open_palette);
+        host->palette_pumping = false;
     }
-    end_model_picker(host);
+    end_palette(host);
 }
 
 /* Builds the command palette's availability context from live host state:
@@ -589,18 +575,28 @@ static void palette_context(ChatHost *host, ChatActionContext *context) {
         transcript_selected_surface(host) != NULL;
 }
 
-/* Destroys the palette and applies its result exactly once: the highlighted
-    command is dispatched through the unchanged action() dispatcher. A close
-    that arrived while the modal loop was live is reposted after the palette
-    call has unwound. */
+/* Destroys the palette and applies its result exactly once. Command mode
+    dispatches the highlighted command through the unchanged action()
+    dispatcher; model mode applies the accepted model (and commits a pending
+    backend switch). A close that arrived while the modal loop was live is
+    reposted once, after the palette call has unwound. */
 static void end_palette(ChatHost *host) {
     PalettePopup *palette = host->open_palette;
     if (!palette) return;
+    PaletteMode mode = palette_popup_mode(palette);
     bool accepted = palette_popup_accepted(palette);
     int action_id = palette_popup_action_id(palette);
+    wchar_t model[CHAT_MODEL_TEXT];
+    model[0] = 0;
+    if (accepted && mode == PALETTE_MODE_MODELS)
+        palette_popup_accepted_model(palette, model);
     palette_popup_destroy(palette);
     host->open_palette = NULL;
-    if (accepted && action_id) action(host, action_id);
+    if (mode == PALETTE_MODE_COMMANDS) {
+        if (accepted && action_id) action(host, action_id);
+    } else {
+        end_model_palette(host, accepted, model);
+    }
     if (host->close_pending) {
         host->close_pending = false;
         PostMessageW(host->window, WM_CLOSE, 0, 0);
@@ -637,13 +633,13 @@ static void select_backend(ChatHost *host, ChatBackend backend) {
     if (backend == CHAT_BACKEND_OLLAMA && !chat->ollama_model[0]) {
         host->backend_target = CHAT_BACKEND_OLLAMA;
         host->backend_switch_pending = true;
-        begin_model_picker(host);
-        if (host->open_picker) {
-            host->picker_pumping = true;
-            model_picker_pump(host->open_picker);
-            host->picker_pumping = false;
+        begin_model_palette(host);
+        if (host->open_palette) {
+            host->palette_pumping = true;
+            palette_popup_pump(host->open_palette);
+            host->palette_pumping = false;
         }
-        end_model_picker(host);
+        end_palette(host);
         if (chat->backend == CHAT_BACKEND_OLLAMA)
             set_status(host, L"Switched to Ollama.");
         return;
@@ -697,19 +693,24 @@ static void catalog_event(ChatHost *host, ModelCatalogEvent *event) {
     model_catalog_event_free(event);
     model_catalog_complete(&host->catalog_client, generation);
     host->catalog_generation = 0;
-    if (host->open_picker) {
+    if (host->open_palette &&
+        palette_popup_mode(host->open_palette) == PALETTE_MODE_MODELS) {
         ChatBackend target = host->backend_target;
-        /* Only a completion for the other backend leaves the open picker
+        /* Only a completion for the other backend leaves the open palette
            without its own fetch; queue that fetch so a switch completes in
            place. A fetch for the target itself is never auto-retried here, so
            a failure cannot spin. */
         if (target != backend)
             maybe_start_catalog_fetch(host, target);
-        build_picker_source(host, target);
+        wchar_t history[CHAT_MODEL_HISTORY][CHAT_MODEL_TEXT];
+        int history_count = build_backend_history(host, target, history);
         wchar_t status[CHAT_STATUS_TEXT];
         picker_status(host, target, status, CHAT_STATUS_TEXT);
-        model_picker_source_updated(host->open_picker, &host->picker_source,
-            status);
+        if (!palette_popup_set_models(host->open_palette,
+                &host->catalog[(int)target],
+                current_model(host->config.chat, target), history,
+                history_count, status))
+            set_status(host, L"Could not refresh the model list.");
     }
 }
 
@@ -1275,7 +1276,7 @@ static void command(void *user, ChatCommand code, int index) {
         PostMessageW(host->window, CHAT_WM_ACTIONS_MENU, 0, 0);
         return;
     }
-    if (code == CHAT_COMMAND_MODEL_PICKER) { open_model_picker(host); return; }
+    if (code == CHAT_COMMAND_MODEL_PICKER) { open_model_palette(host); return; }
     if (code != CHAT_COMMAND_SEND) {
         capture_settings(host);
         host->editing=false;
@@ -1533,7 +1534,7 @@ static void action(ChatHost *host, int code) {
     } else if (code==ACTION_MODELS) {
         /* The picker owns its own conditional save so a mere browse never
            marks the session dirty; returning here skips the common tail. */
-        open_model_picker(host);
+        open_model_palette(host);
         return;
     } else if (code==ACTION_BACKEND_OPENROUTER || code==ACTION_BACKEND_OLLAMA) {
         select_backend(host,code==ACTION_BACKEND_OLLAMA ?
@@ -2280,7 +2281,6 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             CHAT_WM_CATALOG_EVENT);
         for (int i = 0; i < CHAT_BACKEND_COUNT; i++)
             chat_model_catalog_init(&host->catalog[i]);
-        chat_model_catalog_init(&host->picker_source);
         host->backend_target = host->config.chat->backend;
         if (!ui_accessible_name(u, u->root)[0])
             ui_set_accessible_name(u, u->root, host->config.title);
@@ -2552,11 +2552,6 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             palette_popup_cancel(host->open_palette);
             return 0;
         }
-        if (host->open_picker) {
-            host->close_pending = true;
-            model_picker_cancel(host->open_picker);
-            return 0;
-        }
         capture_settings(host);
         cancel_body_flush(host);
         if (host->generating) {
@@ -2608,20 +2603,11 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         KillTimer(window, 1);
         KillTimer(window, 2);
         KillTimer(window, CHAT_TIMER_BODY_FLUSH);
-        /* Never free a picker underneath its active nested pump: cancel it so
-            the pump unwinds, and let its completion path destroy it. Only a
-            picker with no live pump is safe to destroy here. */
-        if (host->open_picker) {
-            if (host->picker_pumping) {
-                model_picker_cancel(host->open_picker);
-            } else {
-                model_picker_destroy(host->open_picker);
-                host->open_picker = NULL;
-            }
-        }
-        /* Same pump-safety for the command palette: the end_palette path
-           (close repost, action dispatch) is skipped in WM_DESTROY, since
-           the hierarchy is already collapsing. */
+        /* Never free the palette underneath its active nested pump: cancel it
+            so the pump unwinds, and let its completion path destroy it. Only a
+            palette with no live pump is safe to destroy here. The end_palette
+            path (close repost, action dispatch) is skipped in WM_DESTROY, since
+            the hierarchy is already collapsing. */
         if (host->open_palette) {
             if (host->palette_pumping) {
                 palette_popup_cancel(host->open_palette);
@@ -2752,10 +2738,6 @@ cleanup:
             CHAT_WM_CATALOG_EVENT, PM_REMOVE))
             model_catalog_event_free((ModelCatalogEvent *)queued.lParam);
     }
-    if (host->open_picker) {
-        model_picker_destroy(host->open_picker);
-        host->open_picker = NULL;
-    }
     if (host->open_palette) {
         palette_popup_destroy(host->open_palette);
         host->open_palette = NULL;
@@ -2778,7 +2760,6 @@ cleanup:
     transcript_dispose(&host->transcript);
     for (int i = 0; i < CHAT_BACKEND_COUNT; i++)
         chat_model_catalog_dispose(&host->catalog[i]);
-    chat_model_catalog_dispose(&host->picker_source);
     rich_text_library_close();
     storage_close(&host->storage);
     free(host);

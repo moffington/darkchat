@@ -44,7 +44,7 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   and `/v1/models`), never its native `/api/chat`; the endpoint is fixed and not
   configurable. Each backend remembers its own last-used model. Switching to
   Ollama with a remembered local model applies it immediately and sends future
-  requests to Ollama; switching with no remembered model opens the Ollama picker
+  requests to Ollama; switching with no remembered model opens the model palette
   and commits the switch only after a model is selected (cancelling leaves the
   active backend unchanged). A missing `OPENROUTER_API_KEY` never blocks Ollama,
   and no API key, `Authorization` header, HTTP-Referer, X-Title, TLS or provider
@@ -63,28 +63,34 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   surfaces through the ordinary Failed/Retry path. Provider routing is
   OpenRouter-only: while Ollama is active the controls are grayed and an
   activation is ignored with an explicit status.
-- Ctrl+Space opens the model picker (Settings > Choose model...) for the active
-  backend. It opens immediately with the backend's current model and that
+- Ctrl+Space opens the model palette (also available as Settings > Choose
+  model...) for the active backend, and Ctrl+K opens the command palette. Both
+  are the same retained dark popup, in models or commands mode respectively. The
+  model palette opens immediately with the backend's current model and that
   backend's recent-model history, then fills in from that backend's catalog when
   the fetch completes, refreshing in place without losing the filter text or the
-  selected
-  id. The filter matches case-insensitively against a model's id and display
-  name; Up/Down move, Enter or a double-click selects, Escape cancels. The
-  merged list is the current model (when set), then history in most-recent
-  order, then the catalog in API order, deduplicated by id; ids longer than the
-  model field are skipped and counted. History entries are tagged with the
-  backend that produced them, so an OpenRouter model never appears in the Ollama
-  picker or vice versa. The picker never blocks startup: it
+  selected id. The filter matches case-insensitively against a model's id and
+  display name; Up/Down/PageUp/PageDown/Home/End move, Enter or a single click
+  selects, Escape cancels. The merged list is the current model (when set), then
+  history in most-recent order, then the catalog in API order, deduplicated by
+  id; ids longer than the model field are skipped and counted. History entries
+  are tagged with the backend that produced them, so an OpenRouter model never
+  appears in the Ollama list or vice versa. The palette never blocks startup: it
   fetches on first open, caches in memory for one hour, retries on a later open
   after a failure, and falls back to the current model and history when offline
   or when OpenRouter's key is unset. Each backend keeps its own last-good
   transient catalog and status; Ollama's keyless catalog parses the same
   `data[].id` shape. Only one fetch runs at a time, and if the other backend's
-  fetch is in flight when the picker opens, that backend's fetch is queued as
-  soon as the in-flight one settles, so the picker fills in without a reopen.
-  Only a confirmed selection replaces the active backend's
-  model; a model joins history only when a request is sent, and the catalog is
-  never persisted.
+  fetch is in flight when the palette opens, that backend's fetch is queued as
+  soon as the in-flight one settles, so the palette fills in without a reopen.
+  Only a confirmed selection replaces the active backend's model; a model joins
+  history only when a request is sent, and the catalog is never persisted. The
+  palette realizes only a bounded window of rows around the viewport and rebinds
+  it as the list scrolls, so a catalog of thousands of models costs the same
+  fixed node budget; each row shows `name — id` with the complete id always
+  preserved. The palette is keyboard/mouse driven and filters on typed
+  characters; IME composition in the filter is not yet supported (tracked for
+  the accessibility/IME hardening pass).
 - Ctrl+F focuses the sidebar search field. Enter performs a fresh on-demand
   search over every live message body and reasoning field; F3 and Shift+F3 move
   between retained results. Matching is locale-independent ordinal Unicode
@@ -546,7 +552,7 @@ into the transcript or the payload.
    (`backend`, `ollama_model`).
 2. Zero or more `type: "model"` history records, each carrying its backend tag
    (`"backend"`) when it is not OpenRouter; an untagged record loads as
-   OpenRouter. The tags keep each backend's picker history isolated, and an
+   OpenRouter. The tags keep each backend's model-list history isolated, and an
    Ollama-active snapshot whose `ollama_model` is missing or empty is rejected
    as corruption.
 3. For each conversation, a `type: "conversation"` record followed by its declared
@@ -808,11 +814,11 @@ The complete coverage includes:
   proves the active model
   and request backend switch together, that an Ollama request starts without
   `OPENROUTER_API_KEY` while an OpenRouter request still refuses, that switching
-  to Ollama with no remembered model opens the picker and commits only on a
-  selection, that each backend keeps its own last-good catalog, that a backend's
-  picker history never contains the other backend's models (and remembers by
-  backend tag), that an in-flight fetch for the other backend queues the open
-  picker's own fetch as soon as it settles, and that provider
+  to Ollama with no remembered model opens the model palette and commits only on
+  a selection, that each backend keeps its own last-good catalog, that a
+  backend's model-list history never contains the other backend's models (and
+  remembers by backend tag), that an in-flight fetch for the other backend
+  queues the open palette's own fetch as soon as it settles, and that provider
   routing is ignored (with an explicit status) and grayed while Ollama is active.
   The metadata footer names the backend and shows `local` for local turns.
 - Provider routing: an all-default routing sends no `provider` object at all;
@@ -832,11 +838,16 @@ The complete coverage includes:
   for success, non-2xx, oversized bodies, a missing OpenRouter key, an
   Ollama request that needs no key, allocation failure,
   duplicate-start rejection, failed completion post and cancel-and-join
-  shutdown. The hidden host exercises the picker seam for exactly one fetch on
-  first open, success refresh, filter/selection preservation across an open
-  refresh, accept/cancel, stale-generation rejection, keyed-offline history
-  fallback with retry, backend-specific fetch routing and last-good catalogs for
-  OpenRouter and Ollama, and a close deferred until the modal loop unwinds.
+   shutdown. The hidden host exercises the palette for exactly one fetch on
+   first open, success refresh, filter/selection preservation across an open
+   refresh, accept/cancel, stale-generation rejection, keyed-offline history
+   fallback with retry, backend-specific fetch routing and last-good catalogs for
+   OpenRouter and Ollama, a close deferred until the modal loop unwinds, a
+   4,096-entry catalog whose virtualized window stays bounded while the last row
+   is reachable and accepted by exact id, duplicate display names resolving to
+   their own ids, surrogate-safe name truncation, a stale UIA handle failing
+   after a rebind, and transactional refresh failure leaving the old list
+   intact.
 - Per-turn reasoning ownership (hidden HWND host): two assistant turns keep
   independent rows and viewports; expanding one does not affect another;
   collapsed by default while streaming; explicit expansion streams live; a
