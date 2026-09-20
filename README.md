@@ -119,7 +119,7 @@ DarkChat stores its state at:
 %LOCALAPPDATA%\DarkChat\state.jsonl
 ```
 
-The snapshot contains conversations, messages, drafts, model history, generation metadata (including the originating backend), settings (the active backend, one last-used model per backend, and provider routing), and window geometry. It does not contain the OpenRouter API key.
+The snapshot contains conversations, messages, drafts, model history, generation metadata (including the originating backend), settings (the active backend, one last-used model per backend, and provider routing), prompt profiles, per-conversation model and system-prompt overrides, and window geometry. It does not contain the OpenRouter API key.
 
 Persistence uses a checksummed UTF-8 JSONL format with:
 
@@ -130,11 +130,15 @@ Persistence uses a checksummed UTF-8 JSONL format with:
 - Strict validation before loaded data is adopted
 - An exclusive directory lock to prevent two instances from overwriting one another
 
-Current writes use format 3. DarkChat loads formats 1 through 3 and rewrites
-older valid snapshots as format 3 on the next save; an unsupported newer format
-fails closed without overwriting it from a backup. The active backend, the
-per-backend models, and each generation's backend are additive optional fields
-at format 3: an older snapshot decodes as OpenRouter with no Ollama model.
+Current writes use format 3 for an entirely uncustomized store, and format 4
+once any prompt profile or per-conversation override exists. DarkChat loads
+formats 1 through 4 and rewrites older valid snapshots in the current format
+on the next save; an unsupported newer format fails closed without
+overwriting it from a backup. The active backend, the per-backend models, and
+each generation's backend are additive optional fields: an older snapshot
+decodes as OpenRouter with no Ollama model. Customization (prompt profiles
+and per-conversation overrides) is only legal at format 4 in both
+directions, so an older binary can never silently erase it.
 
 State is autosaved roughly once per second while dirty and immediately after important lifecycle actions such as sending, stopping, completing, deleting, or closing.
 

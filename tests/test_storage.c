@@ -15,20 +15,30 @@
    - fail_malloc_size / fail_big_mallocs: fail the next N mallocs of at least
      that size (targets one message's UTF-16 expansion mid-decode).
    - fail_realloc_index: fail the nth realloc call (the conversation
-     message-array reservations are the only reallocs a load performs). */
+     message-array reservations are the only reallocs a load performs).
+   The seam also tracks live wrapped allocations (malloc + calloc minus free),
+   so a decode-failure test can assert that the quarantine released exactly
+   everything it built — a missed dispose shows up as a leaked allocation. */
 void *__real_malloc(size_t size);
 void *__real_realloc(void *pointer, size_t size);
+void *__real_calloc(size_t count, size_t size);
+void __real_free(void *pointer);
 static long pass_mallocs, fail_mallocs;
 static size_t fail_malloc_size;
 static long fail_big_mallocs;
 static long fail_realloc_index, realloc_seen;
+static long live_allocs;
 void *__wrap_malloc(size_t size) {
-    if (pass_mallocs > 0) { --pass_mallocs; return __real_malloc(size); }
+    if (pass_mallocs > 0) { --pass_mallocs; goto pass; }
     if (fail_mallocs > 0) { --fail_mallocs; return NULL; }
     if (fail_big_mallocs > 0 && fail_malloc_size && size >= fail_malloc_size) {
         --fail_big_mallocs; return NULL;
     }
-    return __real_malloc(size);
+pass: {
+    void *result = __real_malloc(size);
+    if (result) ++live_allocs;
+    return result;
+}
 }
 void *__wrap_realloc(void *pointer, size_t size) {
     ++realloc_seen;
@@ -36,6 +46,15 @@ void *__wrap_realloc(void *pointer, size_t size) {
     void *grown = __real_realloc(pointer, size);
     if (grown && !pointer) memset(grown, 0x5C, size);
     return grown;
+}
+void *__wrap_calloc(size_t count, size_t size) {
+    void *result = __real_calloc(count, size);
+    if (result) ++live_allocs;
+    return result;
+}
+void __wrap_free(void *pointer) {
+    if (pointer) --live_allocs;
+    __real_free(pointer);
 }
 static void seam_reset(void) {
     pass_mallocs = fail_mallocs = fail_big_mallocs = 0;
@@ -69,7 +88,17 @@ static bool same_message(const ChatMessage *a, const ChatMessage *b) {
 }
 /* Compares every logically persisted field, including the stable message ids.
     View bookkeeping (revisions, expansion) and runtime-only state (status,
-    reply counter) are deliberately excluded: they are not part of a snapshot. */
+    reply counter) are deliberately excluded: they are not part of a snapshot.
+    Format 4 adds the profile library and the per-conversation customization;
+    both are part of the persisted state, so both are compared here. */
+static bool same_text(const ChatText *a, const ChatText *b) {
+    return (a->data == NULL) == (b->data == NULL) &&
+        (a->data == NULL || !wcscmp(a->data, b->data));
+}
+static bool same_profile(const ChatPromptProfile *a,
+    const ChatPromptProfile *b) {
+    return !wcscmp(a->name, b->name) && same_text(&a->prompt, &b->prompt);
+}
 static bool same_chat(const Chat *a, const Chat *b) {
     if (a->next_id != b->next_id || a->active != b->active ||
         a->conversation_count != b->conversation_count ||
@@ -86,7 +115,10 @@ static bool same_chat(const Chat *a, const Chat *b) {
         a->provider_routing.sort != b->provider_routing.sort ||
         a->provider_routing.disallow_fallbacks != b->provider_routing.disallow_fallbacks ||
         a->provider_routing.data_collection != b->provider_routing.data_collection ||
-        a->provider_routing.zdr != b->provider_routing.zdr) return false;
+        a->provider_routing.zdr != b->provider_routing.zdr ||
+        a->profile_count != b->profile_count) return false;
+    for (int i = 0; i < a->profile_count; i++)
+        if (!same_profile(&a->profiles[i], &b->profiles[i])) return false;
     for (int i = 0; i < a->model_history_count; i++)
         if (wcscmp(a->model_history[i], b->model_history[i]) ||
             a->model_history_backend[i] != b->model_history_backend[i])
@@ -97,7 +129,10 @@ static bool same_chat(const Chat *a, const Chat *b) {
         if (ca->id != cb->id || ca->created_at != cb->created_at ||
             ca->modified_at != cb->modified_at || ca->renamed != cb->renamed ||
             ca->message_count != cb->message_count ||
-            wcscmp(ca->title, cb->title) || wcscmp(ca->draft, cb->draft))
+            wcscmp(ca->title, cb->title) || wcscmp(ca->draft, cb->draft) ||
+            wcscmp(ca->model, cb->model) ||
+            wcscmp(ca->ollama_model, cb->ollama_model) ||
+            !same_text(&ca->system_prompt, &cb->system_prompt))
             return false;
         if (ca->message_count && (!ca->messages || !cb->messages)) return false;
         for (size_t j = 0; j < ca->message_count; j++)
@@ -242,6 +277,51 @@ static int load_backend_case(const char *backend_fields, Chat *dest) {
     remove_store(&store, dir);
     return result;
 }
+/* Builds a format-4-shaped snapshot: `settings_extra` is spliced into the
+    settings record before its closing brace, each `profiles` entry is a
+    complete profile record line emitted between the (empty) model history
+    and the conversation record, and `conversation_extra` is spliced into
+    the conversation record before its closing brace. Two messages with ids
+    2 and 3 follow the conversation. Loads and removes the store; returns
+    storage_load's result, or -2 when building failed. */
+static int load_v4_case(const wchar_t *tag, int version,
+    const char *settings_extra, const char *const *profiles,
+    size_t profile_count, const char *conversation_extra, Chat *dest) {
+    wchar_t dir[256];
+    swprintf(dir, 256, L"build\\storage-v4-%ls-%lu", tag,
+        GetCurrentProcessId());
+    ChatStorage store;
+    if (!storage_open(&store, dir)) return -2;
+    if (!settings_extra) settings_extra = "";
+    if (!conversation_extra) conversation_extra = "";
+    char settings[768], conversation[512], a[512], b[512];
+    snprintf(settings, sizeof settings,
+        "{\"type\":\"settings\",\"version\":%d,\"next_id\":100,\"active\":0,"
+        "\"conversation_count\":1,\"model_history_count\":0,\"window_x\":0,"
+        "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+        "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+        "\"system_prompt\":\"\"%s%s}", version,
+        settings_extra[0] ? "," : "", settings_extra);
+    snprintf(conversation, sizeof conversation,
+        "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
+        "\"modified_at\":1000,\"renamed\":0,\"message_count\":2,"
+        "\"title\":\"c\",\"draft\":\"\"%s%s}",
+        conversation_extra[0] ? "," : "", conversation_extra);
+    msg_raw(a, sizeof a, "\"id\":2,"); msg_raw(b, sizeof b, "\"id\":3,");
+    const char **lines = malloc((4 + profile_count) * sizeof *lines);
+    if (!lines) { storage_close(&store); remove_store(&store, dir); return -2; }
+    lines[0] = settings;
+    for (size_t i = 0; i < profile_count; i++) lines[1 + i] = profiles[i];
+    lines[1 + profile_count] = conversation;
+    lines[2 + profile_count] = a;
+    lines[3 + profile_count] = b;
+    int result = write_snapshot(store.path, lines, 4 + profile_count) ?
+        storage_load(&store, dest) : -2;
+    free(lines);
+    storage_close(&store);
+    remove_store(&store, dir);
+    return result;
+}
 /* Downgrade simulation: removes the stable id field from every message
     record, recomputes the commit checksum and rewrites the file, so an older
     build could have written it. */
@@ -296,6 +376,81 @@ static bool downgrade_strip_ids(const wchar_t *path) {
     ok = f && fwrite(out, 1, (size_t)(body_end - out), f) ==
         (size_t)(body_end - out) &&
         fwrite(commit, 1, strlen(commit), f) == strlen(commit) &&
+        fwrite("\n", 1, 1, f) == 1;
+    if (f) fclose(f);
+    free(data); free(out);
+    return ok;
+}
+/* Downgrade surgery for format 4: drops every profile record line, cuts the
+    customization fields off each conversation record (they are the record
+    tail), rewrites the settings version to 3, recomputes the checksum and
+    rewrites the file — exactly the snapshot a v3-only build would have
+    produced had the customization never existed. */
+static bool strip_customization(const wchar_t *path) {
+    FILE *f = _wfopen(path, L"rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0) { fclose(f); return false; }
+    char *data = malloc((size_t)size + 1), *out = malloc((size_t)size + 128);
+    bool ok = data && out && fread(data, 1, (size_t)size, f) == (size_t)size;
+    fclose(f);
+    if (!ok) { free(data); free(out); return false; }
+    data[size] = 0;
+    size_t used = 0;
+    char *body_end = NULL;
+    char *cursor = data;
+    while (cursor < data + size) {
+        char *end = strchr(cursor, '\n');
+        if (!end) end = data + size;
+        size_t len = (size_t)(end - cursor);
+        char *line = malloc(len + 1);
+        if (!line) { free(data); free(out); return false; }
+        memcpy(line, cursor, len);
+        line[len] = 0;
+        bool commit = strstr(line, "\"type\":\"commit\"") != NULL;
+        bool drop = false;
+        if (!commit && strstr(line, "\"type\":\"profile\"")) {
+            drop = true;
+        } else if (!commit && strstr(line, "\"type\":\"conversation\"")) {
+            static const char *const overrides[] = {
+                "\"system_prompt\":", "\"model\":", "\"ollama_model\":"};
+            /* The customization fields are the record tail: cutting at the
+               earliest one removes every field after it. */
+            char *cut = NULL;
+            for (int i = 0; i < 3; i++) {
+                char *field = strstr(line, overrides[i]);
+                if (field && (!cut || field < cut)) cut = field;
+            }
+            if (cut) { cut[-1] = '}'; cut[0] = 0; }
+        } else if (!commit) {
+            char *version = strstr(line, "\"version\":4");
+            if (version) version[strlen("\"version\":")] = '3';
+            /* The settings record must lose its profile_count too: present
+               at v3 it is corruption. It is the record tail. */
+            char *count = strstr(line, "\"profile_count\":");
+            if (count) { count[-1] = '}'; count[0] = 0; }
+        }
+        cursor = end + 1;
+        if (drop) { free(line); continue; }
+        size_t written = strlen(line);
+        memcpy(out + used, line, written);
+        used += written;
+        out[used++] = '\n';
+        free(line);
+        if (commit) { body_end = out + used - (written + 1); break; }
+    }
+    if (!body_end) { free(data); free(out); return false; }
+    char commit_record[96];
+    snprintf(commit_record, sizeof commit_record,
+        "{\"type\":\"commit\",\"checksum\":%u}",
+        fnv1a(out, (size_t)(body_end - out)));
+    f = _wfopen(path, L"wb");
+    ok = f && fwrite(out, 1, (size_t)(body_end - out), f) ==
+        (size_t)(body_end - out) &&
+        fwrite(commit_record, 1, strlen(commit_record), f) ==
+            strlen(commit_record) &&
         fwrite("\n", 1, 1, f) == 1;
     if (f) fclose(f);
     free(data); free(out);
@@ -583,13 +738,15 @@ int main(void) {
     CHECK(storage_open(&store,dir));
     CHECK(storage_save(&store,chat)); CHECK(storage_save(&store,chat));
     CHECK(read_file_bytes(store.path,&first_bytes,&first_size));
-    CHECK(strstr(first_bytes,"\"version\":3")); /* this build writes format 3 */
+    CHECK(strstr(first_bytes,"\"version\":3")); /* uncustomized state stays format 3 */
     free(first_bytes);
     FILE *future=_wfopen(store.path,L"r+b"); CHECK(future);
     char header[64]={0}; CHECK(fread(header,1,63,future)==63);
     char *version=strstr(header,"\"version\":3"); CHECK(version);
     CHECK(fseek(future,(long)(version-header)+(long)strlen("\"version\":"),SEEK_SET)==0);
-    fputc('4',future); fclose(future);
+    /* This build writes format 4, so the unsupported-boundary fixture must
+       claim a version beyond what this build decodes. */
+    fputc('5',future); fclose(future);
     CHECK(storage_load(&store,loaded)==-1 && !store.writable);
     storage_close(&store);
     DeleteFileW(store.path); DeleteFileW(store.backup); DeleteFileW(store.temporary);
@@ -743,6 +900,256 @@ int main(void) {
         chat_dispose(back); free(back);
         storage_close(&f3store);
         remove_store(&f3store,f3dir);
+    }
+    /* Format 4 boundary, encoder side: an entirely uncustomized snapshot
+        remains byte-for-byte format 3 — no profile_count field, no profile
+        records and no per-conversation override fields. */
+    {
+        CHECK(storage_open(&store,dir));   /* the earlier store was closed */
+        CHECK(storage_save(&store,chat));
+        char *plain=NULL; size_t plain_size=0;
+        CHECK(read_file_bytes(store.path,&plain,&plain_size));
+        CHECK(strstr(plain,"\"version\":3")!=NULL);
+        CHECK(strstr(plain,"\"profile_count\"")==NULL);
+        CHECK(strstr(plain,"\"type\":\"profile\"")==NULL);
+        free(plain);
+        CHECK(storage_load(&store,loaded)==1 && !store.recovered);
+    }
+    /* Per-conversation customization forces format 4: the fields are not
+        v3-additive, because an older binary would ignore them and silently
+        erase them on its next save. Clearing every override returns the
+        file to the v3 byte shape. */
+    {
+        CHECK(chat_conversation_set_system_prompt(chat,0,L"Concise replies only."));
+        CHECK(chat_conversation_set_model(chat,0,CHAT_BACKEND_OPENROUTER,L"override/model"));
+        CHECK(chat_conversation_set_model(chat,0,CHAT_BACKEND_OLLAMA,L"override:local"));
+        CHECK(storage_save(&store,chat));
+        char *saved=NULL; size_t saved_size=0;
+        CHECK(read_file_bytes(store.path,&saved,&saved_size));
+        CHECK(strstr(saved,"\"version\":4")!=NULL);
+        CHECK(strstr(saved,"\"profile_count\":0")!=NULL);
+        CHECK(strstr(saved,"\"type\":\"profile\"")==NULL);
+        CHECK(strstr(saved,"\"system_prompt\":\"Concise replies only.\"")!=NULL);
+        CHECK(strstr(saved,"\"model\":\"override/model\"")!=NULL);
+        CHECK(strstr(saved,"\"ollama_model\":\"override:local\"")!=NULL);
+        free(saved);
+        CHECK(storage_load(&store,loaded)==1 && !store.recovered);
+        CHECK(same_chat(loaded,chat));
+        CHECK(chat_conversation_set_system_prompt(chat,0,L""));
+        CHECK(chat_conversation_set_model(chat,0,CHAT_BACKEND_OPENROUTER,L""));
+        CHECK(chat_conversation_set_model(chat,0,CHAT_BACKEND_OLLAMA,L""));
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&saved,&saved_size));
+        CHECK(strstr(saved,"\"version\":3")!=NULL);
+        CHECK(strstr(saved,"\"Concise replies only.\"")==NULL);
+        free(saved);
+        CHECK(storage_load(&store,loaded)==1);
+    }
+    /* Prompt profiles force format 4: profile records sit between the model
+        history and the first conversation, the round trip is logically
+        exact, repeated saves are byte-stable, and removal of the last
+        profile returns the file to format 3. */
+    {
+        CHECK(chat_profile_add(chat,L"Terse",L"You are terse.")==0);
+        CHECK(chat_profile_add(chat,L"Plain",L"")==1);
+        CHECK(chat_profile_add(chat,L"Unicode \x03bb",L"prompt \xd83d\xde80")==2);
+        CHECK(storage_save(&store,chat));
+        char *saved=NULL; size_t saved_size=0;
+        CHECK(read_file_bytes(store.path,&saved,&saved_size));
+        CHECK(strstr(saved,"\"version\":4")!=NULL);
+        CHECK(strstr(saved,"\"profile_count\":3")!=NULL);
+        CHECK(strstr(saved,"\"type\":\"profile\"")!=NULL);
+        free(saved);
+        CHECK(storage_load(&store,loaded)==1 && !store.recovered);
+        CHECK(same_chat(loaded,chat));
+        CHECK(loaded->profile_count==3);
+        CHECK(!wcscmp(loaded->profiles[1].name,L"Plain") &&
+            loaded->profiles[1].prompt.data==NULL);
+        char *first=NULL,*second=NULL; size_t fs=0,ss=0;
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&first,&fs));
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&second,&ss));
+        CHECK(fs==ss && !memcmp(first,second,fs));
+        free(first); free(second);
+        /* Removing a profile renumbers the survivors and stays at v4. */
+        CHECK(chat_profile_remove(chat,0));
+        CHECK(storage_save(&store,chat));
+        CHECK(storage_load(&store,loaded)==1 && !store.recovered);
+        CHECK(same_chat(loaded,chat) && loaded->profile_count==2 &&
+            !wcscmp(loaded->profiles[0].name,L"Plain"));
+        CHECK(chat_profile_remove(chat,0));
+        CHECK(chat_profile_remove(chat,0));
+        CHECK(chat->profile_count==0);
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&saved,&saved_size));
+        CHECK(strstr(saved,"\"version\":3")!=NULL);
+        free(saved);
+        storage_close(&store);
+        remove_store(&store,dir);
+    }
+    /* Format 4 grammar is version-gated and strictly validated: every
+        malformed shape below rejects the snapshot. Overrides are legal only
+        at v4 in both directions, and the profile count must match the
+        profile records exactly, in order. */
+    {
+        Chat *dest=calloc(1,sizeof *dest); CHECK(dest);
+        static const char *one_profile[1] = {
+            "{\"type\":\"profile\",\"name\":\"A\",\"prompt\":\"p\"}"};
+        static const char *two_profiles[2] = {
+            "{\"type\":\"profile\",\"name\":\"A\",\"prompt\":\"\"}",
+            "{\"type\":\"profile\",\"name\":\"B\",\"prompt\":\"p\"}"};
+        /* profile_count present at v3 is corruption. */
+        CHECK(load_v4_case(L"v3count",3,"\"profile_count\":1",NULL,0,NULL,dest)==-1);
+        /* A profile record at v3 is corruption. */
+        CHECK(load_v4_case(L"v3profile",3,NULL,one_profile,1,NULL,dest)==-1);
+        /* Overrides present at v3 are corruption, each field. */
+        CHECK(load_v4_case(L"v3sp",3,NULL,NULL,0,"\"system_prompt\":\"x\"",dest)==-1);
+        CHECK(load_v4_case(L"v3model",3,NULL,NULL,0,"\"model\":\"x\"",dest)==-1);
+        CHECK(load_v4_case(L"v3oll",3,NULL,NULL,0,"\"ollama_model\":\"x\"",dest)==-1);
+        /* The count and the records must match exactly. */
+        CHECK(load_v4_case(L"count2one",4,"\"profile_count\":2",one_profile,1,NULL,dest)==-1);
+        CHECK(load_v4_case(L"count0one",4,"\"profile_count\":0",one_profile,1,NULL,dest)==-1);
+        CHECK(load_v4_case(L"count1none",4,"\"profile_count\":1",NULL,0,NULL,dest)==-1);
+        CHECK(load_v4_case(L"count1two",4,"\"profile_count\":1",two_profiles,2,NULL,dest)==-1);
+        /* Out-of-range and malformed counts. */
+        CHECK(load_v4_case(L"count25",4,"\"profile_count\":25",two_profiles,2,NULL,dest)==-1);
+        CHECK(load_v4_case(L"countneg",4,"\"profile_count\":-1",NULL,0,NULL,dest)==-1);
+        CHECK(load_v4_case(L"countfrac",4,"\"profile_count\":0.5",NULL,0,NULL,dest)==-1);
+        CHECK(load_v4_case(L"countstr",4,"\"profile_count\":\"1\"",NULL,0,NULL,dest)==-1);
+        /* Profile names are unique up to ordinal case-insensitive
+           comparison, the invariant the chat_profile_* API enforces: a
+           stored duplicate, exact or case-variant, is corruption because no
+           snapshot the API accepts could have written one. */
+        static const char *dup_exact[2] = {
+            "{\"type\":\"profile\",\"name\":\"A\",\"prompt\":\"p\"}",
+            "{\"type\":\"profile\",\"name\":\"A\",\"prompt\":\"q\"}"};
+        static const char *dup_case[2] = {
+            "{\"type\":\"profile\",\"name\":\"A\",\"prompt\":\"p\"}",
+            "{\"type\":\"profile\",\"name\":\"a\",\"prompt\":\"q\"}"};
+        CHECK(load_v4_case(L"dupexact",4,"\"profile_count\":2",dup_exact,2,NULL,dest)==-1);
+        CHECK(load_v4_case(L"dupcase",4,"\"profile_count\":2",dup_case,2,NULL,dest)==-1);
+        /* A malformed later profile must not leak the earlier profiles'
+           already-decoded prompts: every profile becomes live (profile_count
+           tracks it) before any fallible decoding, so the quarantine
+           disposes exactly what it built. The allocation-balance seam
+           proves it: the failing load returns the live wrapped-allocation
+           count to its starting value and performs no realloc at all
+           (profile records decode before any message-array reservation). */
+        {
+            static const char *leak[3] = {
+                "{\"type\":\"profile\",\"name\":\"A\",\"prompt\":\"kept one\"}",
+                "{\"type\":\"profile\",\"name\":\"B\",\"prompt\":\"kept two\"}",
+                "{\"type\":\"profile\",\"name\":\"\",\"prompt\":\"\"}"};
+            long before = live_allocs, seen = realloc_seen;
+            CHECK(load_v4_case(L"leak",4,"\"profile_count\":3",leak,3,NULL,dest)==-1);
+            CHECK(live_allocs == before);
+            CHECK(realloc_seen == seen);
+        }
+        /* A profile record after the first conversation record is the wrong
+           order: the trailing line is neither a conversation nor the commit. */
+        {
+            wchar_t odir[256]; swprintf(odir,256,L"build\\storage-v4-order-%lu",GetCurrentProcessId());
+            ChatStorage ostore;
+            CHECK(storage_open(&ostore,odir));
+            char a[512], b[512];
+            msg_raw(a,sizeof a,"\"id\":2,"); msg_raw(b,sizeof b,"\"id\":3,");
+            const char *lines[5] = {
+                "{\"type\":\"settings\",\"version\":4,\"next_id\":100,\"active\":0,"
+                "\"conversation_count\":1,\"model_history_count\":0,\"window_x\":0,"
+                "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+                "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+                "\"system_prompt\":\"\",\"profile_count\":1}",
+                "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
+                "\"modified_at\":1000,\"renamed\":0,\"message_count\":2,"
+                "\"title\":\"c\",\"draft\":\"\"}",
+                a, b,
+                "{\"type\":\"profile\",\"name\":\"A\",\"prompt\":\"\"}"};
+            CHECK(write_snapshot(ostore.path,lines,5));
+            CHECK(storage_load(&ostore,dest)==-1);
+            storage_close(&ostore); remove_store(&ostore,odir);
+        }
+        /* Malformed names and prompts. */
+        static const char *empty_name[1] = {
+            "{\"type\":\"profile\",\"name\":\"\",\"prompt\":\"p\"}"};
+        CHECK(load_v4_case(L"emptyname",4,"\"profile_count\":1",empty_name,1,NULL,dest)==-1);
+        {
+            static char name100[128], longname_line[256];
+            for (int i=0;i<100;i++) name100[i]='n';
+            name100[100]=0;
+            snprintf(longname_line,sizeof longname_line,
+                "{\"type\":\"profile\",\"name\":\"%s\",\"prompt\":\"p\"}",name100);
+            const char *over[1]={longname_line};
+            CHECK(load_v4_case(L"longname",4,"\"profile_count\":1",over,1,NULL,dest)==-1);
+        }
+        static const char *numname[1] = {
+            "{\"type\":\"profile\",\"name\":7,\"prompt\":\"\"}"};
+        CHECK(load_v4_case(L"numname",4,"\"profile_count\":1",numname,1,NULL,dest)==-1);
+        static const char *numprompt[1] = {
+            "{\"type\":\"profile\",\"name\":\"A\",\"prompt\":7}"};
+        CHECK(load_v4_case(L"numprompt",4,"\"profile_count\":1",numprompt,1,NULL,dest)==-1);
+        {
+            static char big[70000];
+            size_t used = (size_t)snprintf(big,64,
+                "{\"type\":\"profile\",\"name\":\"A\",\"prompt\":\"");
+            for (int i=0;i<CHAT_COMPOSER_TEXT;i++) big[used++]='p';
+            snprintf(big+used,sizeof big-used,"\"}");
+            const char *overp[1]={big};
+            CHECK(load_v4_case(L"bigprompt",4,"\"profile_count\":1",overp,1,NULL,dest)==-1);
+            used = (size_t)snprintf(big,64,
+                "{\"type\":\"profile\",\"name\":\"A\",\"prompt\":\"");
+            for (int i=0;i<CHAT_COMPOSER_TEXT-1;i++) big[used++]='p';
+            snprintf(big+used,sizeof big-used,"\"}");
+            CHECK(load_v4_case(L"maxprompt",4,"\"profile_count\":1",overp,1,NULL,dest)==1);
+            CHECK(wcslen(chat_text_value(&dest->profiles[0].prompt))==CHAT_COMPOSER_TEXT-1);
+        }
+        /* Valid v4 customization decodes, including empty → unset. */
+        CHECK(load_v4_case(L"oksp",4,"\"profile_count\":1",one_profile,1,
+            "\"system_prompt\":\"Concise\",\"model\":\"ov/m\",\"ollama_model\":\"ov:local\"",dest)==1);
+        CHECK(!wcscmp(chat_text_value(&dest->conversations[0].system_prompt),L"Concise"));
+        CHECK(!wcscmp(dest->conversations[0].model,L"ov/m"));
+        CHECK(!wcscmp(dest->conversations[0].ollama_model,L"ov:local"));
+        CHECK(!wcscmp(dest->profiles[0].name,L"A") &&
+            !wcscmp(chat_text_value(&dest->profiles[0].prompt),L"p"));
+        CHECK(load_v4_case(L"empties",4,"\"profile_count\":0",NULL,0,
+            "\"system_prompt\":\"\",\"model\":\"\",\"ollama_model\":\"\"",dest)==1);
+        CHECK(dest->conversations[0].system_prompt.data==NULL &&
+            !dest->conversations[0].model[0] &&
+            !dest->conversations[0].ollama_model[0]);
+        /* An absent profile prompt decodes as unset. */
+        static const char *no_prompt[1] = {
+            "{\"type\":\"profile\",\"name\":\"A\"}"};
+        CHECK(load_v4_case(L"noprompt",4,"\"profile_count\":1",no_prompt,1,NULL,dest)==1);
+        CHECK(dest->profiles[0].prompt.data==NULL);
+        chat_dispose(dest); free(dest);
+    }
+    /* Downgrade surgery: a format 4 file whose customization is removed
+        (profile records dropped, override fields cut, version rewritten to
+        3, checksum recomputed) is exactly what a v3-only build would have
+        produced, so it loads and re-saves as format 3. */
+    {
+        wchar_t ddir[256]; swprintf(ddir,256,L"build\\storage-v4-down-%lu",GetCurrentProcessId());
+        ChatStorage dstore;
+        CHECK(storage_open(&dstore,ddir));
+        CHECK(chat_profile_add(chat,L"Down",L"downgrade prompt")==0);
+        CHECK(chat_conversation_set_system_prompt(chat,0,L"override before downgrade"));
+        CHECK(chat_conversation_set_model(chat,0,CHAT_BACKEND_OPENROUTER,L"down/model"));
+        CHECK(storage_save(&dstore,chat));
+        CHECK(strip_customization(dstore.path));
+        CHECK(storage_load(&dstore,loaded)==1 && !dstore.recovered);
+        CHECK(loaded->profile_count==0);
+        CHECK(loaded->conversations[0].system_prompt.data==NULL);
+        CHECK(!loaded->conversations[0].model[0] &&
+            !loaded->conversations[0].ollama_model[0]);
+        char *again=NULL; size_t asize=0;
+        CHECK(storage_save(&dstore,loaded));
+        CHECK(read_file_bytes(dstore.path,&again,&asize));
+        CHECK(strstr(again,"\"version\":3")!=NULL);
+        free(again);
+        CHECK(chat_profile_remove(chat,0));
+        CHECK(chat_conversation_set_system_prompt(chat,0,L""));
+        CHECK(chat_conversation_set_model(chat,0,CHAT_BACKEND_OPENROUTER,L""));
+        storage_close(&dstore); remove_store(&dstore,ddir);
     }
     /* A checksummed format 3 snapshot declaring 513 messages exceeds the
         persisted bound. With no recovery copies the load fails closed:

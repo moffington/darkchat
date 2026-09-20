@@ -10,10 +10,10 @@
 #include <stdint.h>
 
 /* Up to 128 conversations; snapshot format 2 raised this bound from 16.
-   Snapshot format 3 raised the per-conversation message bound from 64 to 512.
-   The storage decode accepts formats 1-3 and enforces these bounds; older
-   builds reject newer snapshots as unsupported. The downgrade contract is
-   documented in docs/CHAT.md. */
+    Snapshot format 3 raised the per-conversation message bound from 64 to 512.
+    The storage decode accepts formats 1-4 and enforces these bounds; older
+    builds reject newer snapshots as unsupported. The downgrade contract is
+    documented in docs/CHAT.md. */
 #define CHAT_MAX_CONVERSATIONS 128
 #define CHAT_MAX_MESSAGES 512
 /* Every persisted identity (conversation and stable message ids) comes from
@@ -35,6 +35,14 @@
 #define CHAT_MODEL_TEXT 96
 #define CHAT_STATUS_TEXT 160
 #define CHAT_MODEL_HISTORY 16
+/* Prompt profiles: a bounded inline library of named system prompts. A name
+   holds at most CHAT_PROFILE_NAME_TEXT - 1 stored UTF-16 code units plus the
+   terminator (63 stored units). The prompt keeps the CHAT_COMPOSER_TEXT
+   product limit and is heap-backed through ChatText, so an unused profile
+   costs only its inline name slot; the array itself is inline so structural
+   copies stay proportional to the shipped bound, not to content. */
+#define CHAT_MAX_PROMPT_PROFILES 24
+#define CHAT_PROFILE_NAME_TEXT 64
 /* Shared composition metric: the centered transcript and composer columns
    never exceed this width in DIPs. Kept here so the DarkUI chrome and the
    native transcript container agree on the readable measure. */
@@ -70,6 +78,37 @@ typedef struct {
        when the turn supplied no reasoning. Persisted with the message. */
     double reasoning_ms;
 } ChatGeneration;
+
+/* Heap-backed owned text for the few customization strings that must not
+    inflate every structural copy: per-conversation system-prompt overrides
+    and prompt-profile prompts. `data` is NULL exactly when the text is
+    unset, which reads as the empty string; setting an empty value therefore
+    disposes back to unset. A non-NULL data always owns exactly
+    (length + 1) wide characters. The set and clone operations are
+    transactional: an allocation failure leaves the previous content
+    untouched, and clone builds its copy before releasing the destination,
+    so a failed clone can never strand the destination empty. */
+typedef struct {
+    wchar_t *data;
+    size_t length, capacity;
+} ChatText;
+
+bool chat_text_set(ChatText *text, const wchar_t *value);
+/* Overwrites `destination` with an owned copy of `source`; on failure the
+   destination keeps its previous content. Cloning an unset source leaves the
+   destination unset. */
+bool chat_text_clone(ChatText *destination, const ChatText *source);
+void chat_text_dispose(ChatText *text);
+/* Borrowed view, never NULL; L"" for unset text. */
+const wchar_t *chat_text_value(const ChatText *text);
+
+/* One named system prompt: the prompt is owned heap text (unset or empty
+   means "apply no system prompt"); the name is inline and holds at most
+   CHAT_PROFILE_NAME_TEXT - 1 stored code units. */
+typedef struct {
+    wchar_t name[CHAT_PROFILE_NAME_TEXT];
+    ChatText prompt;
+} ChatPromptProfile;
 
 typedef enum {
     CHAT_ROLE_USER, CHAT_ROLE_ASSISTANT, CHAT_ROLE_SYSTEM, CHAT_ROLE_ERROR
@@ -182,6 +221,20 @@ typedef struct {
     ChatMessage *messages;
     size_t message_count;
     size_t message_capacity;
+    /* Per-conversation customization, persisted from format 4 (empty or
+       NULL = inherit the global slot). The model overrides are inline —
+       empty means inherit, and models are bounded by CHAT_MODEL_TEXT. The
+       system-prompt override is heap-backed ChatText: NULL inherits the
+       global prompt. Like title/renamed, an override survives Clear
+       (chat_clear) and is released only when the conversation itself is
+       deleted or the whole Chat is disposed. Ownership follows the same
+       bytewise-move rules as the messages allocation: deleting a
+       conversation disposes its own override before the move, and a moved
+       conversation transfers its override pointer to the vacated-and-zeroed
+       scheme exactly once. */
+    wchar_t model[CHAT_MODEL_TEXT];
+    wchar_t ollama_model[CHAT_MODEL_TEXT];
+    ChatText system_prompt;
 } ChatConversation;
 
 typedef struct {
@@ -206,6 +259,14 @@ typedef struct {
        older snapshot without the tag decodes every entry as OpenRouter. */
     ChatBackend model_history_backend[CHAT_MODEL_HISTORY];
     int model_history_count;
+    /* Named system-prompt library (format 4). Only [0, profile_count) is
+       live; the tail slots are zeroed backing storage. Profile order is
+       meaningful (save order and menu order) and `prompt` is owned heap
+       text released by chat_dispose exactly once. Names are unique up to
+       ordinal case-insensitive comparison. Profiles are library data:
+       chat_delete_all preserves them, only chat_dispose releases them. */
+    ChatPromptProfile profiles[CHAT_MAX_PROMPT_PROFILES];
+    int profile_count;
     int window_x, window_y, window_width, window_height, maximized, sidebar_width;
     /* Explicit user preference for the collapsible conversation sidebar:
        0 = expanded (the historical default and the meaning of an absent
@@ -253,6 +314,38 @@ bool chat_message_append_reasoning(ChatMessage *message, const wchar_t *text);
 void chat_message_touch(ChatMessage *message);
 void chat_message_dispose(ChatMessage *message);
 void chat_dispose(Chat *chat);
+
+/* Prompt-profile library. Names are unique up to locale-independent ordinal
+   case-insensitive comparison (the comparison the profile picker reuses), so
+   adding or renaming to a name that differs from an existing profile only by
+   case fails. A name is required, non-empty and bounded by
+   CHAT_PROFILE_NAME_TEXT - 1 stored code units; the prompt may be empty
+   (clears to unset) and is bounded by CHAT_COMPOSER_TEXT. Setters are
+   transactional: on failure neither the profile list nor the edited profile
+   changes. */
+int chat_profile_count(const Chat *chat);
+const ChatPromptProfile *chat_profile(const Chat *chat, int index);
+/* Appends a profile and returns its index, or -1 at the cap, on a duplicate
+   name, an invalid name or an allocation failure. */
+int chat_profile_add(Chat *chat, const wchar_t *name, const wchar_t *prompt);
+/* Replaces the name and prompt of `index` after both new values validate;
+   a failure changes nothing. A rename colliding with a different profile's
+   name (case-insensitively) fails. */
+bool chat_profile_set(Chat *chat, int index, const wchar_t *name,
+    const wchar_t *prompt);
+/* Removes a profile, shifting the survivors down; false when the index is
+   out of range. The removed profile's owned prompt is disposed exactly
+   once and the vacated tail slot is zeroed. */
+bool chat_profile_remove(Chat *chat, int index);
+
+/* Per-conversation customization setters. An empty or NULL value clears the
+   override back to inherit (the inline model arrays become empty, the
+   ChatText becomes unset); a value is validated against the same bounds the
+   storage format enforces. The setters never touch anything else. */
+bool chat_conversation_set_system_prompt(Chat *chat, int conversation,
+    const wchar_t *text);
+bool chat_conversation_set_model(Chat *chat, int conversation,
+    ChatBackend backend, const wchar_t *text);
 
 void chat_init(Chat *chat);
 /* Creates an empty conversation, selects it and returns its index, or -1. */

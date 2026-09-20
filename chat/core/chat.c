@@ -2,6 +2,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+/* The one Win32 use in this module: CompareStringOrdinal provides the
+   locale-independent ordinal case-insensitive comparison that profile-name
+   uniqueness and the future profile picker share. No window, graphics or
+   UI dependency comes with it. */
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 
 static const wchar_t *const welcome =
     L"Welcome to DarkChat.\n\n"
@@ -106,8 +113,7 @@ bool chat_message_set_reasoning(ChatMessage *m,const wchar_t *text) {
     if (!unchanged) ++m->revision;
     return true;
 }
-bool chat_message_append_text(ChatMessage *m,const wchar_t *text) {
-    if (!m) return false;
+bool chat_message_append_text(ChatMessage *m,const wchar_t *text) {    if (!m) return false;
     if (!append_message_value(m->text,CHAT_MESSAGE_INLINE,&m->text_overflow,
         &m->text_length,&m->text_capacity,text)) return false;
     if (text && text[0]) { ++m->revision; ++m->body_revision; }
@@ -131,6 +137,51 @@ void chat_message_dispose(ChatMessage *m) {
     free(m->text_overflow); free(m->reasoning_overflow);
     m->text_overflow=m->reasoning_overflow=NULL;
     m->text_capacity=m->reasoning_capacity=0;
+}
+
+/* Owned customization text. The set/clone pair is transactional exactly like
+   the message setters: the new allocation is built and filled before the old
+   one is released, so a failure never destroys the previous content. */
+bool chat_text_set(ChatText *t, const wchar_t *value) {
+    if (!t) return false;
+    if (!value) value=L"";
+    size_t needed=wcslen(value);
+    /* Never store a dangling high surrogate. */
+    if (needed && value[needed-1]>=0xd800 && value[needed-1]<=0xdbff) --needed;
+    if (!needed) { chat_text_dispose(t); return true; }  /* empty == unset */
+    if (needed==SIZE_MAX/sizeof(wchar_t)) return false;
+    wchar_t *next=(wchar_t *)malloc((needed+1)*sizeof *next);
+    if (!next) return false;
+    wmemcpy(next,value,needed);
+    next[needed]=0;
+    free(t->data);
+    t->data=next; t->length=needed; t->capacity=needed+1;
+    return true;
+}
+
+bool chat_text_clone(ChatText *destination, const ChatText *source) {
+    if (!destination || !source) return false;
+    wchar_t *copy=NULL;
+    if (source->data) {
+        copy=(wchar_t *)malloc((source->length+1)*sizeof *copy);
+        if (!copy) return false;
+        wmemcpy(copy,source->data,source->length+1);
+    }
+    free(destination->data);
+    destination->data=copy;
+    destination->length=source->length;
+    destination->capacity=copy ? source->length+1 : 0;
+    return true;
+}
+
+void chat_text_dispose(ChatText *text) {
+    if (!text) return;
+    free(text->data);
+    text->data=NULL; text->length=0; text->capacity=0;
+}
+
+const wchar_t *chat_text_value(const ChatText *text) {
+    return text && text->data ? text->data : L"";
 }
 
 /* Initial reservation for a conversation that starts receiving messages:
@@ -161,20 +212,31 @@ bool chat_reserve_messages(ChatConversation *c, size_t count) {
     return c && chat_ensure_capacity(c, count);
 }
 
-/* Releases everything a Chat owns: every live message's overflow allocations,
-   then each conversation's message array itself, leaving all three dynamic
-   fields reset so a later overwrite cannot double-free. */
+/* Releases one conversation's dynamic storage and owned override text,
+   leaving the fields reset so a later overwrite cannot double-free. Shared
+   by chat_dispose (everything goes) and chat_delete_all (conversations go,
+   the profile library survives). */
+static void dispose_conversation(ChatConversation *c) {
+    chat_text_dispose(&c->system_prompt);
+    for (size_t j=0;j<c->message_count;j++)
+        chat_message_dispose(&c->messages[j]);
+    free(c->messages);
+    c->messages=NULL;
+    c->message_count=0;
+    c->message_capacity=0;
+}
+
+/* Releases everything a Chat owns: every conversation's message overflow
+   allocations and owned prompt override, then each conversation's message
+   array itself, then the profile library's owned prompts, leaving every
+   dynamic field reset. */
 void chat_dispose(Chat *chat) {
     if (!chat) return;
-    for (int i=0;i<chat->conversation_count;i++) {
-        ChatConversation *c=&chat->conversations[i];
-        for (size_t j=0;j<c->message_count;j++)
-            chat_message_dispose(&c->messages[j]);
-        free(c->messages);
-        c->messages=NULL;
-        c->message_count=0;
-        c->message_capacity=0;
-    }
+    for (int i=0;i<chat->conversation_count;i++)
+        dispose_conversation(&chat->conversations[i]);
+    for (int i=0;i<chat->profile_count;i++)
+        chat_text_dispose(&chat->profiles[i].prompt);
+    chat->profile_count=0;
 }
 
 /* Bounded append that never overruns the destination. */
@@ -397,19 +459,39 @@ Chat *chat_snapshot(const Chat *chat) {
     if (!copy) return NULL;
     *copy=*chat;
     /* Detach every conversation's dynamic fields before any fallible step:
-       from here the copy owns nothing, so a failure disposes only what this
-       function allocated and can never reach the source's pointers. */
+        from here the copy owns nothing, so a failure disposes only what this
+        function allocated and can never reach the source's pointers. This
+        includes every owned ChatText: the struct copy aliased the profile
+        prompts and the per-conversation prompt overrides. */
+    for (int i=0;i<chat->profile_count;i++) {
+        copy->profiles[i].prompt.data=NULL;
+        copy->profiles[i].prompt.length=0;
+        copy->profiles[i].prompt.capacity=0;
+    }
     for (int i=0;i<chat->conversation_count;i++) {
         copy->conversations[i].messages=NULL;
         copy->conversations[i].message_count=0;
         copy->conversations[i].message_capacity=0;
+        copy->conversations[i].system_prompt.data=NULL;
+        copy->conversations[i].system_prompt.length=0;
+        copy->conversations[i].system_prompt.capacity=0;
+    }
+    for (int i=0;i<chat->profile_count;i++) {
+        if (!chat_text_clone(&copy->profiles[i].prompt,
+                &chat->profiles[i].prompt)) {
+            chat_dispose(copy); free(copy); return NULL;
+        }
     }
     for (int i=0;i<chat->conversation_count;i++) {
         const ChatConversation *source=&chat->conversations[i];
         ChatConversation *destination=&copy->conversations[i];
+        if (!chat_text_clone(&destination->system_prompt,
+                &source->system_prompt)) {
+            chat_dispose(copy); free(copy); return NULL;
+        }
         /* The snapshot carries exactly the live messages: allocate the exact
-           count rather than reusing the growth policy, so a snapshot never
-           reserves spare slots for a state that is already frozen. */
+            count rather than reusing the growth policy, so a snapshot never
+            reserves spare slots for a state that is already frozen. */
         if (source->message_count) {
             destination->messages=(ChatMessage *)malloc(
                 source->message_count*sizeof *destination->messages);
@@ -495,6 +577,106 @@ void chat_remember_model(Chat *chat) {
         ++chat->model_history_count;
 }
 
+/* Profile-name uniqueness uses locale-independent ordinal
+   case-insensitive comparison, the same folding the model catalog filter
+   and the future profile picker use. */
+static bool profile_name_taken(const Chat *chat, const wchar_t *name,
+    int except_index) {
+    for (int i = 0; i < chat->profile_count; i++) {
+        if (i == except_index) continue;
+        if (CompareStringOrdinal(chat->profiles[i].name, -1, name, -1,
+                TRUE) == CSTR_EQUAL) return true;
+    }
+    return false;
+}
+
+static bool profile_arguments_valid(const wchar_t *name,
+    const wchar_t *prompt) {
+    if (!name || !name[0] || wcslen(name) >= CHAT_PROFILE_NAME_TEXT)
+        return false;
+    if (!prompt) prompt = L"";
+    return wcslen(prompt) < CHAT_COMPOSER_TEXT;
+}
+
+int chat_profile_count(const Chat *chat) {
+    return chat ? chat->profile_count : 0;
+}
+
+const ChatPromptProfile *chat_profile(const Chat *chat, int index) {
+    if (!chat || index < 0 || index >= chat->profile_count) return NULL;
+    return &chat->profiles[index];
+}
+
+int chat_profile_add(Chat *chat, const wchar_t *name, const wchar_t *prompt) {
+    if (!chat || chat->profile_count >= CHAT_MAX_PROMPT_PROFILES) return -1;
+    if (!profile_arguments_valid(name, prompt)) return -1;
+    if (profile_name_taken(chat, name, -1)) return -1;
+    ChatText next = {0};
+    if (!chat_text_set(&next, prompt)) return -1;   /* allocation checked first */
+    ChatPromptProfile *profile = &chat->profiles[chat->profile_count];
+    memset(profile, 0, sizeof *profile);
+    wcscpy(profile->name, name);   /* length validated above */
+    profile->prompt = next;
+    return chat->profile_count++;
+}
+
+bool chat_profile_set(Chat *chat, int index, const wchar_t *name,
+    const wchar_t *prompt) {
+    if (!chat || index < 0 || index >= chat->profile_count) return false;
+    if (!profile_arguments_valid(name, prompt)) return false;
+    if (profile_name_taken(chat, name, index)) return false;
+    /* Both new values validate and the new prompt is allocated before
+       either the existing name or the existing prompt changes. */
+    ChatText next = {0};
+    if (!chat_text_set(&next, prompt)) return false;
+    ChatPromptProfile *profile = &chat->profiles[index];
+    wcscpy(profile->name, name);
+    chat_text_dispose(&profile->prompt);
+    profile->prompt = next;
+    return true;
+}
+
+bool chat_profile_remove(Chat *chat, int index) {
+    if (!chat || index < 0 || index >= chat->profile_count) return false;
+    /* The same ownership pattern as conversation deletion: dispose the
+       removed profile's owned prompt, memmove the survivors (their prompt
+       pointers transfer bytewise), decrement, and zero the vacated tail
+       slot so nothing can be freed twice. */
+    chat_text_dispose(&chat->profiles[index].prompt);
+    --chat->profile_count;
+    memmove(&chat->profiles[index], &chat->profiles[index + 1],
+        (size_t)(chat->profile_count - index) * sizeof(ChatPromptProfile));
+    memset(&chat->profiles[chat->profile_count], 0, sizeof(ChatPromptProfile));
+    return true;
+}
+
+bool chat_conversation_set_system_prompt(Chat *chat, int conversation,
+    const wchar_t *text) {
+    if (!chat || conversation < 0 ||
+        conversation >= chat->conversation_count) return false;
+    if (!text) text = L"";
+    if (wcslen(text) >= CHAT_COMPOSER_TEXT) return false;
+    return chat_text_set(&chat->conversations[conversation].system_prompt,
+        text);
+}
+
+bool chat_conversation_set_model(Chat *chat, int conversation,
+    ChatBackend backend, const wchar_t *text) {
+    if (!chat || conversation < 0 ||
+        conversation >= chat->conversation_count) return false;
+    if (backend != CHAT_BACKEND_OPENROUTER && backend != CHAT_BACKEND_OLLAMA)
+        return false;
+    if (!text) text = L"";
+    /* Validate before touching the slot: a too-long model leaves the
+       previous override in place. */
+    if (wcslen(text) >= CHAT_MODEL_TEXT) return false;
+    wchar_t *slot = backend == CHAT_BACKEND_OLLAMA
+        ? chat->conversations[conversation].ollama_model
+        : chat->conversations[conversation].model;
+    wcscpy(slot, text);   /* empty clears back to inherit */
+    return true;
+}
+
 bool chat_rename(Chat *chat, const wchar_t *title) {
     if (!chat_active(chat) || !title || !title[0] || wcslen(title) >= CHAT_TITLE_TEXT) return false;
     ChatConversation *c = &chat->conversations[chat->active];
@@ -509,15 +691,12 @@ bool chat_delete(Chat *chat) {
     int index = chat->active;
     ChatConversation *removed=&chat->conversations[index];
     /* Release the removed conversation's storage before the move: the
-       memmove transfers ownership of the surviving conversations' allocations
-       over this slot, and the vacated tail slot is zeroed so the moved
-       pointers can never be freed twice. */
-    for (size_t i=0;i<removed->message_count;i++)
-        chat_message_dispose(&removed->messages[i]);
-    free(removed->messages);
-    removed->messages=NULL;
-    removed->message_count=0;
-    removed->message_capacity=0;
+        memmove transfers ownership of the surviving conversations' allocations
+        over this slot, and the vacated tail slot is zeroed so the moved
+        pointers can never be freed twice. The owned prompt override is
+        released here too; the surviving conversations' overrides move
+        bytewise with their structs. */
+    dispose_conversation(removed);
     --chat->conversation_count;
     memmove(&chat->conversations[index], &chat->conversations[index + 1],
         (chat->conversation_count - index) * sizeof(ChatConversation));
@@ -529,7 +708,10 @@ bool chat_delete(Chat *chat) {
 
 bool chat_delete_all(Chat *chat) {
     if (!chat_active(chat)) return false;
-    chat_dispose(chat);
+    /* Delete-all wipes the conversations, not the profile library: profiles
+       are app-level data, so they survive and stay owned until chat_dispose. */
+    for (int i=0;i<chat->conversation_count;i++)
+        dispose_conversation(&chat->conversations[i]);
     memset(chat->conversations, 0, sizeof chat->conversations);
     chat->conversation_count = 0;
     chat->active = -1;
@@ -537,8 +719,11 @@ bool chat_delete_all(Chat *chat) {
 }
 
 /* Clear wipes the conversation's message content, so it releases the dynamic
-   message storage entirely, restoring the never-allocated NULL/0/0 shape
-   rather than opportunistically shrinking mid-use allocations. */
+    message storage entirely, restoring the never-allocated NULL/0/0 shape
+    rather than opportunistically shrinking mid-use allocations. The
+    conversation's customization (title, rename flag, model and prompt
+    overrides) deliberately survives: Clear empties history, it does not
+    delete the conversation. */
 void chat_clear(Chat *chat) {
     if (!chat_active(chat)) return;
     ChatConversation *c = &chat->conversations[chat->active];

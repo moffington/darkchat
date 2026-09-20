@@ -336,7 +336,7 @@ static int child_controls(HWND parent,bool visible_only) {
     return count;
 }
 /* Every record that strictly intersects the viewport is bound and shows its
-    own body â€” the qualified I-GAP probe used across the bounded suite. */
+    own body — the qualified I-GAP probe used across the bounded suite. */
 static bool visible_realized(ChatHost *h) {
     Transcript *tr=&h->transcript;
     int count=tr->record_count;
@@ -1728,7 +1728,7 @@ static int default_suite(void) {
         /* Result ordering, per attempt: an older attempt's success never
            marks newer mutations durable, a stale result never re-interprets,
            and a failure older than the newest submitted attempt is
-           superseded â€” it must not latch failure, because that newer attempt
+           superseded — it must not latch failure, because that newer attempt
            is guaranteed to complete and report authoritatively. The
            synthetic attempt ids stay above the real ones while the sequence
            plays out and both real counters are restored afterwards. */
@@ -2381,7 +2381,7 @@ static int bounded_suite(void) {
         CHECK(wcsstr(shown,L"A answer")==NULL);      /* never foreign */
     }
     /* Pure replacement: B's window rebinds onto A's departed slots with
-       matching shapes â€” zero pristine consumptions, zero new HWNDs. */
+       matching shapes — zero pristine consumptions, zero new HWNDs. */
     CHECK(transcript_created_windows(&h->transcript)==created_before_r1);
     CHECK(transcript_created_windows(&h->transcript)<=4*h->transcript.slot_limit+1);
     /* A returns intact: switching back re-renders A's own content on the

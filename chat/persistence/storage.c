@@ -9,12 +9,14 @@
    Individual model outputs have no smaller fixed-size truncation point. */
 #define STORAGE_LIMIT (128u * 1024u * 1024u)
 /* Format 2 raised the conversation bound to 128; format 3 raised the
-   per-conversation message bound from 64 to 512. The record layout is
-   unchanged across all three versions. Formats 1-3 all decode, so old
-   snapshots migrate on their next save; version 4+ is unsupported and fails
-   the load closed (writes disabled, backup never tried) so an older build can
-   never silently restore stale state over a newer primary. See docs/CHAT.md. */
-#define FORMAT_VERSION 3
+    per-conversation message bound from 64 to 512. Format 4 added the
+    `profile` record type, the `profile_count` settings field, and the
+    per-conversation customization fields (system_prompt/model/ollama_model).
+    Formats 1-4 all decode, so old snapshots migrate on their next save;
+    version 5+ is unsupported and fails the load closed (writes disabled,
+    backup never tried) so an older build can never silently restore stale
+    state over a newer primary. See docs/CHAT.md. */
+#define FORMAT_VERSION 4
 #define FORMAT_VERSION_MIN 1
 
 static uint32_t checksum(const char *s, size_t n) {
@@ -68,6 +70,31 @@ static bool optional_string(const char *s, const char *name, wchar_t *out,
     free(text);
     return ok;
 }
+/* Optional heap-backed text field decoded through chat_text_set. Absence
+   leaves the destination unset (not corruption); an empty string decodes as
+   unset; a present value that is not a decodable string or exceeds `cap`
+   rejects the snapshot. */
+static bool optional_text(const char *s, const char *name, ChatText *out,
+    size_t cap) {
+    JsonFieldKind kind;
+    double value;
+    if (!json_query_field(s, name, &kind, &value)) return false;
+    if (kind == JSON_FIELD_ABSENT) return true;
+    char *text = malloc(strlen(s) + 1);
+    if (!text) return false;
+    bool ok = json_query_string(s, name, text, strlen(s) + 1);
+    if (ok) {
+        wchar_t *wide = json_utf8_to_utf16(text, strlen(text));
+        if (!wide) ok = false;
+        else {
+            if (wcslen(wide) >= cap) ok = false;
+            else ok = chat_text_set(out, wide);
+            free(wide);
+        }
+    }
+    free(text);
+    return ok;
+}
 static bool get_message_string(const char *s, const char *name,
     ChatMessage *message, bool reasoning, bool required) {
     size_t size=strlen(s)+1;
@@ -102,6 +129,17 @@ static bool optional_int(const char *line, const char *name, double min,
         floor(value) != value) return false;
     *out = (int)value;
     return true;
+}
+/* True when the profile at `index` duplicates an earlier decoded profile's
+   name under ordinal case-insensitive comparison — the exact invariant the
+   chat_profile_* API enforces, so a stored duplicate (exact or case-variant)
+   is corruption: no snapshot the API accepts could have written one. */
+static bool profile_name_taken(const Chat *chat, int index) {
+    for (int i = 0; i < index; i++)
+        if (CompareStringOrdinal(chat->profiles[i].name, -1,
+                chat->profiles[index].name, -1, TRUE) == CSTR_EQUAL)
+            return true;
+    return false;
 }
 /* True when `id` already belongs to a decoded conversation id or to any live
    message decoded before the record now being decoded (conversation `ci`,
@@ -138,12 +176,29 @@ static bool conversation_id_taken(const Chat *chat, uint64_t id, int ci) {
 #define READ_NUM(obj,field) do { if (!json_query_number(line,#field,&v) || v < -1) goto bad; (obj)->field = v; } while (0)
 #define READ_STR(obj,field) do { if (!get_string(line,#field,(obj)->field,sizeof (obj)->field / sizeof(wchar_t))) goto bad; } while (0)
 
+/* The emitted version is the canonical format definition: version 4 once any
+   prompt profile or per-conversation customization exists, otherwise the
+   unchanged format 3 byte shape. Per-conversation overrides deliberately do
+   NOT ride as v3-additive fields: an older v3 binary would tolerate the
+   unknown fields, ignore them, and silently erase them on its next save, so
+   customization is only legal at version 4 in both directions. */
+static int format_version_for(const Chat *chat) {
+    if (chat->profile_count > 0) return 4;
+    for (int i = 0; i < chat->conversation_count; i++) {
+        const ChatConversation *c = &chat->conversations[i];
+        if (c->system_prompt.data || c->model[0] || c->ollama_model[0])
+            return 4;
+    }
+    return 3;
+}
+
 static bool encode(const Chat *chat, JsonBuf *b) {
     json_buf_init(b, 8192);
     /* The emitted version is always the canonical format definition. */
+    int version = format_version_for(chat);
     char header[64];
     snprintf(header, sizeof header,
-        "{\"type\":\"settings\",\"version\":%d", FORMAT_VERSION);
+        "{\"type\":\"settings\",\"version\":%d", version);
     raw(b, header);
     NUM(b, chat, next_id);
     NUM(b, chat, active);
@@ -182,6 +237,10 @@ static bool encode(const Chat *chat, JsonBuf *b) {
         number(b, "backend", (double)chat->backend);
     if (chat->ollama_model[0])
         string(b, "ollama_model", chat->ollama_model);
+    /* Format 4 only: the profile-library count, appended last so a v3-shaped
+       uncustomized settings record keeps its exact byte shape. */
+    if (version >= 4)
+        number(b, "profile_count", (double)chat->profile_count);
     raw(b, "}\n");
     for (int i = 0; i < chat->model_history_count; i++) {
         raw(b, "{\"type\":\"model\"");
@@ -190,6 +249,17 @@ static bool encode(const Chat *chat, JsonBuf *b) {
            entry so an OpenRouter-only snapshot keeps the older byte shape. */
         if (chat->model_history_backend[i] != CHAT_BACKEND_OPENROUTER)
             number(b, "backend", (double)chat->model_history_backend[i]);
+        raw(b, "}\n");
+    }
+    for (int i = 0; i < chat->profile_count; i++) {
+        const ChatPromptProfile *p = &chat->profiles[i];
+        /* Profile records sit between the model history and the first
+           conversation record; the decoder reads them at exactly this
+           position. The prompt is emitted even when empty: empty means
+           "apply no system prompt", a meaningful profile value. */
+        raw(b, "{\"type\":\"profile\"");
+        string(b, "name", p->name);
+        string(b, "prompt", chat_text_value(&p->prompt));
         raw(b, "}\n");
     }
     for (int i = 0; i < chat->conversation_count; i++) {
@@ -202,6 +272,12 @@ static bool encode(const Chat *chat, JsonBuf *b) {
         NUM(b, c, message_count);
         STR(b, c, title);
         STR(b, c, draft);
+        /* Format 4 customization, appended last and emitted only when set
+           so an uncustomized conversation keeps the older byte shape. */
+        if (c->system_prompt.data)
+            string(b, "system_prompt", chat_text_value(&c->system_prompt));
+        if (c->model[0]) string(b, "model", c->model);
+        if (c->ollama_model[0]) string(b, "ollama_model", c->ollama_model);
         raw(b, "}\n");
         for (size_t j = 0; j < c->message_count; j++) {
             const ChatMessage *m = &c->messages[j];
@@ -272,6 +348,8 @@ static bool decode(char *data, Chat *chat) {
     char *cursor = data, *line = next_line(&cursor);
     if (!type_is(line,"settings") ||
         !integer(line,"version",FORMAT_VERSION_MIN,FORMAT_VERSION,&v)) return false;
+    int version = (int)v;
+    bool v4 = version >= 4;
     memset(chat,0,sizeof *chat);
     READ_INT(chat, next_id, 1, (double)CHAT_MAX_ID);
     /* The counter exactly as it was persisted: every persisted identity is
@@ -327,9 +405,24 @@ static bool decode(char *data, Chat *chat) {
     if (!optional_string(line,"ollama_model",chat->ollama_model,CHAT_MODEL_TEXT))
         goto bad;
     /* An Ollama-active snapshot must remember the local model it will send:
-       an empty slot would make the next request unusable and is corruption. */
+        an empty slot would make the next request unusable and is corruption. */
     if (chat->backend == CHAT_BACKEND_OLLAMA && !chat->ollama_model[0])
         goto bad;
+    /* Format 4 gate: the profile count is a required settings field at v4,
+       and a version gate on the record grammar — a v1-v3 snapshot carrying
+       either the field or a profile record is corruption, because the
+       structural grammar is version-gated exactly like the bounded counts. */
+    int profile_count = 0;
+    if (v4) {
+        if (!integer(line,"profile_count",0,CHAT_MAX_PROMPT_PROFILES,&v))
+            goto bad;
+        profile_count = (int)v;
+    } else {
+        JsonFieldKind kind;
+        double value;
+        if (json_query_field(line,"profile_count",&kind,&value) &&
+            kind != JSON_FIELD_ABSENT) goto bad;
+    }
     if (chat->active >= chat->conversation_count || !chat->model[0]) goto bad;
     for (int i=0; i<chat->model_history_count; i++) {
         line=next_line(&cursor);
@@ -338,6 +431,24 @@ static bool decode(char *data, Chat *chat) {
         if (!optional_int(line,"backend",0,CHAT_BACKEND_OLLAMA,
                 CHAT_BACKEND_OPENROUTER,&history_backend)) goto bad;
         chat->model_history_backend[i]=(ChatBackend)history_backend;
+    }
+    for (int i=0; i<profile_count; i++) {
+        /* Exactly profile_count profile records, in order, between the model
+           history and the first conversation: a wrong type, order or count
+           rejects the snapshot. Each profile becomes live (profile_count
+           tracks it) before any fallible decoding, and its fields start
+           zeroed by the settings memset, so the quarantine disposes exactly
+           the prompts this decode built — including every earlier profile's
+           prompt when a later record is malformed. */
+        line=next_line(&cursor);
+        if (!type_is(line,"profile")) goto bad;
+        ChatPromptProfile *p=&chat->profiles[i];
+        chat->profile_count = i + 1;
+        if (!get_string(line,"name",p->name,CHAT_PROFILE_NAME_TEXT)) goto bad;
+        if (!p->name[0]) goto bad;   /* a name is required */
+        if (profile_name_taken(chat, i)) goto bad;
+        if (!optional_text(line,"prompt",&p->prompt,CHAT_COMPOSER_TEXT))
+            goto bad;
     }
     for (int i=0; i<chat->conversation_count; i++) {
         ChatConversation *c=&chat->conversations[i];
@@ -361,6 +472,28 @@ static bool decode(char *data, Chat *chat) {
         READ_STR(c, title);
         READ_STR(c, draft);
         if (conversation_id_taken(chat, c->id, i)) goto bad;
+        if (v4) {
+            /* Per-conversation customization exists only at format 4, in
+               both directions: at v4 the fields are optional and absent
+               means inherit; below v4 any of them present is corruption,
+               not an ignorable additive field — an older binary would drop
+               them on its next save. */
+            if (!optional_text(line,"system_prompt",&c->system_prompt,
+                    CHAT_COMPOSER_TEXT)) goto bad;
+            if (!optional_string(line,"model",c->model,CHAT_MODEL_TEXT))
+                goto bad;
+            if (!optional_string(line,"ollama_model",c->ollama_model,
+                    CHAT_MODEL_TEXT)) goto bad;
+        } else {
+            static const char *const override_names[] = {
+                "system_prompt", "model", "ollama_model"};
+            for (int k = 0; k < 3; k++) {
+                JsonFieldKind kind;
+                double value;
+                if (json_query_field(line,override_names[k],&kind,&value) &&
+                    kind != JSON_FIELD_ABSENT) goto bad;
+            }
+        }
         for (size_t j=0; j<declared; j++) {
             ChatMessage *m=&c->messages[j]; ChatGeneration *g=&m->generation;
             memset(m, 0, sizeof *m);

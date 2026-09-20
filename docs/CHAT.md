@@ -543,29 +543,48 @@ into the transcript or the payload.
 
 ## Persistence format and recovery
 
-`%LOCALAPPDATA%\DarkChat\state.jsonl` is a UTF-8, version-3 JSONL snapshot:
+`%LOCALAPPDATA%\DarkChat\state.jsonl` is a UTF-8, version-3 or version-4 JSONL
+snapshot. An entirely uncustomized store (no prompt profiles, no
+per-conversation overrides) is byte-for-byte format 3; format 4 is emitted
+only when customization exists:
 
-1. A settings record with `type: "settings"`, `version: 3`, selected conversation
-   index, next ID counter, record counts, model/system prompt, geometry, the
-   optional provider-routing fields (`provider_sort`, `provider_no_fallbacks`,
-   `provider_data_collection`, `provider_zdr`), and the optional backend fields
-   (`backend`, `ollama_model`).
+1. A settings record with `type: "settings"`, `version: 3` (or `4`), selected
+   conversation index, next ID counter, record counts, model/system prompt,
+   geometry, the optional provider-routing fields (`provider_sort`,
+   `provider_no_fallbacks`, `provider_data_collection`, `provider_zdr`), and
+   the optional backend fields (`backend`, `ollama_model`). At version 4 the
+   record additionally ends with a required `profile_count` field.
 2. Zero or more `type: "model"` history records, each carrying its backend tag
    (`"backend"`) when it is not OpenRouter; an untagged record loads as
    OpenRouter. The tags keep each backend's model-list history isolated, and an
    Ollama-active snapshot whose `ollama_model` is missing or empty is rejected
    as corruption.
-3. For each conversation, a `type: "conversation"` record followed by its declared
-   number of `type: "message"` records, each carrying its stable `"id"` and,
-   when it is not OpenRouter, the generation's `"backend"`.
-4. A `type: "commit"` record containing the 32-bit FNV-1a checksum of every byte
-   before that record (including LF separators).
+3. At version 4 only: exactly `profile_count` `type: "profile"` records,
+   between the model history and the first conversation record, each carrying
+   `name` (required, non-empty, at most 63 stored UTF-16 code units, and
+   unique across the library up to ordinal case-insensitive comparison — the
+   invariant the profile API enforces, so a stored duplicate is corruption)
+   and
+   `prompt` (emitted even when empty; an empty or absent prompt means the
+   profile applies no system prompt).
+4. For each conversation, a `type: "conversation"` record followed by its
+   declared number of `type: "message"` records, each carrying its stable
+   `"id"` and, when it is not OpenRouter, the generation's `"backend"`. At
+   version 4 the conversation record may additionally carry customization
+   fields appended last: `system_prompt` (heap-backed override; absent or
+   empty means inherit the global prompt), and `model`/`ollama_model`
+   (per-backend model overrides; absent or empty means inherit the global
+   slot).
+5. A `type: "commit"` record containing the 32-bit FNV-1a checksum of every byte
+    before that record (including LF separators).
 
-The record layout is identical in formats 1–3. Format 2 raised the conversation
-limit from 16 to 128, and format 3 raised the per-conversation message limit
-from 64 to 512. The active backend, the per-backend models, each generation's
-backend, and each history entry's backend are additive optional fields emitted
-only when non-default
+The record layout for v3-shaped snapshots is identical to formats 1–2. Format
+2 raised the conversation limit from 16 to 128, format 3 raised the
+per-conversation message limit from 64 to 512, and format 4 added the profile
+record type, the `profile_count` settings field, and the per-conversation
+customization fields. The active backend, the per-backend models, each
+generation's backend, and each history entry's backend are additive optional
+fields emitted only when non-default
 (`backend` only when Ollama, `ollama_model` only when non-empty) and defaulted
 when absent — to OpenRouter with no remembered Ollama model, and with every
 history entry tagged OpenRouter. A present field of the wrong JSON type is
@@ -573,15 +592,23 @@ corruption, and an Ollama-active snapshot with an empty `ollama_model` is
 rejected. Provider-routing
 settings are additive optional fields appended last, emitted only when
 non-default and defaulted when absent; like the optional
-reasoning fields they do not change the format version, so the emitted version
-stays 3 and older snapshots load with OpenRouter's routing defaults. This build
-decodes all three versions, so an old snapshot
-migrates to format 3 on its next save. **Downgrade contract:** an older
-(version-1 or version-2) build that encounters a format 3 or newer file treats
-it as an unsupported version and stops immediately — it does not fall back to
-`state.bak.jsonl`, never overwrites the newer primary with a stale backup, and
-disables writes until a build that understands the format runs again. (A count
-above an older build's bound in an otherwise current file would be
+reasoning fields they do not change the format version.
+
+Per-conversation overrides are deliberately **not** v3-additive fields. An
+older v3 binary would tolerate the unknown fields, ignore them, and silently
+erase them on its next save, so customization is version-gated in both
+directions: the encoder emits version 4 whenever any profile or override
+exists, and a v1–v3 snapshot carrying `profile_count`, a `profile` record, or
+any conversation override field is rejected as corruption. Profile prompts
+and overrides are heap-backed in memory, so a store that uses none of them
+keeps the exact v3 byte shape and the fixed-residue amplification budget is
+unchanged. This build decodes all four versions, so an old snapshot migrates
+to the current format on its next save. **Downgrade contract:** an older
+(version-1 through version-3) build that encounters a format 4 or newer file
+treats it as an unsupported version and stops immediately — it does not fall
+back to `state.bak.jsonl`, never overwrites the newer primary with a stale
+backup, and disables writes until a build that understands the format runs
+again. (A count above an older build's bound in an otherwise current file would be
 indistinguishable from corruption, which is why each bound change required a
 version bump rather than relying on the count check.)
 
@@ -694,8 +721,10 @@ storage or a cross-machine synchronization format.
   inline-to-overflow boundaries and failures, replacement at the cap, and
   deep snapshot copy/isolation.
 - `test_storage`: format-1/2 migration, format-3 512-message and long-overflow
-  round trips, over-cap rejection, ID validation/migration, recovery and
-  unsupported-version fail-closed behavior.
+  round trips, format-4 profile/override round trips with the v3 emission
+  boundary, the v4 corruption matrix, downgrade stripping, over-cap
+  rejection, ID validation/migration, recovery and unsupported-version
+  fail-closed behavior.
 - `test_transcript_policy` and `test_transcript_slots`: visibility/protection,
   shape-aware slot and forced-victim policy, raise-only capacity formula and
   limits, plus the one-allocation slot arena lifecycle.
@@ -736,8 +765,14 @@ The complete coverage includes:
    capacities of promoted text/reasoning, and the fixed-residue amplification
    gate (4 structural copies × 128 conversations × the 512-message bound
    ≤ 1 GiB of fixed struct/slack cost; heap-backed live text excluded).
-- Stable message identities: new-format id roundtrips, old/new mixed records in
-  both orders, deterministic migration in file order, and rejection of every
+- Format 4 customization data layer: owned-text set/clone/dispose with
+  transactional failure, the prompt-profile library (bounds, ordinal
+  case-insensitive name uniqueness, transactional set, mid-list removal
+  ownership), per-conversation override setters (empty clears to inherit,
+  Clear survival), snapshot detach-then-clone isolation for owned text under
+  injected allocation failures, delete/delete-all ownership (profiles
+  survive delete-all), and the fixed-residue amplification gate unchanged.
+- Stable message identities: new-format id roundtrips, old/new mixed records in  both orders, deterministic migration in file order, and rejection of every
   invalid id form (zero, negative, fractional, string, above the stored
   counter, duplicate, message/conversation collision in both directions, a
   later persisted id equal to a synthesized one, and counter exhaustion),

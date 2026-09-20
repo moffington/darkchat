@@ -98,8 +98,12 @@ int main(void) {
         pending and in-flight snapshots plus the snapshot under construction,
         which is built before the displaced pending copy is disposed (4
         simultaneous structural copies). It deliberately excludes heap-backed
-        live text, which is proportional to actual content, so it is not a
-        complete worst-case memory bound. CHAT_MAX_MESSAGES is the shipped
+        live text — message overflow and, since format 4, the owned
+        customization text (per-conversation prompt overrides and profile
+        prompts), which is proportional to actual content — so it is not a
+        complete worst-case memory bound. The customization structs add only
+        the inline profile name slots and the per-conversation model override
+        arrays to the fixed residue. CHAT_MAX_MESSAGES is the shipped
         bound (512, raised by format 3), and the gate must hold at it. */
     {
         const size_t structural_copies = 4;
@@ -1101,6 +1105,296 @@ int main(void) {
         check_invariants(own);
         free(big); free(thought);
         chat_dispose(own); free(own);
+    }
+
+    /* Format 4 customization data layer: the owned-text primitive, the
+        prompt-profile library and the per-conversation overrides. Nothing
+        here is user-visible yet; the storage round-trips live in
+        test_storage. */
+    {
+        /* ChatText primitive: set/clone/dispose, unset-vs-empty, surrogate
+            trimming and transactional failure. */
+        ChatText t = {0};
+        check(!t.data && t.length == 0 && t.capacity == 0 &&
+            !wcscmp(chat_text_value(&t), L""),
+            "unset text reads as the empty string");
+        check(chat_text_set(&t, L"override") && t.data != NULL &&
+            t.length == 8 && t.capacity == 9 &&
+            !wcscmp(chat_text_value(&t), L"override"),
+            "setting text stores length+1 owned units");
+        check(chat_text_set(&t, L"") && !t.data && t.length == 0 &&
+            t.capacity == 0,
+            "an empty set disposes back to unset");
+        check(chat_text_set(&t, L"kept") &&
+            chat_text_set(&t, L"tail\xd83d") && t.length == 4 &&
+            !wcsncmp(t.data, L"tail", 4),
+            "a dangling high surrogate is trimmed, not stored");
+        ChatText src = {0}, dst = {0};
+        check(chat_text_clone(&dst, &src) && dst.data == NULL,
+            "cloning an unset source leaves the destination unset");
+        check(chat_text_set(&src, L"clone me") &&
+            chat_text_clone(&dst, &src) && dst.data != src.data &&
+            !wcscmp(chat_text_value(&dst), L"clone me"),
+            "a clone owns a fresh copy of the source");
+        check(chat_text_set(&src, L"changed") &&
+            !wcscmp(chat_text_value(&dst), L"clone me"),
+            "a clone never follows later source mutations");
+        fail_next_mallocs = 1;
+        bool stored = chat_text_set(&t, L"a replacement far too long to fail silently");
+        fail_next_mallocs = 0;
+        check(!stored && t.length == 4 && !wcscmp(chat_text_value(&t), L"tail"),
+            "a failed set leaves the previous content untouched");
+        fail_next_mallocs = 1;
+        bool cloned = chat_text_clone(&dst, &src);
+        fail_next_mallocs = 0;
+        check(!cloned && !wcscmp(chat_text_value(&dst), L"clone me"),
+            "a failed clone leaves the previous content untouched");
+        chat_text_dispose(&t); chat_text_dispose(&src); chat_text_dispose(&dst);
+
+        /* Prompt-profile library: bounds, uniqueness, transactional set,
+            removal ownership. */
+        Chat *lib = (Chat *)calloc(1, sizeof *lib);
+        if (!lib) return 2;
+        chat_init(lib);
+        check(chat_profile_count(lib) == 0 && chat_profile(lib, 0) == NULL,
+            "a fresh chat has an empty profile library");
+        check(chat_profile_add(lib, L"", L"p") == -1 &&
+            chat_profile_add(lib, NULL, L"p") == -1,
+            "an empty or missing name is rejected");
+        wchar_t longname[CHAT_PROFILE_NAME_TEXT + 1];
+        for (size_t i = 0; i < CHAT_PROFILE_NAME_TEXT; i++) longname[i] = L'n';
+        longname[CHAT_PROFILE_NAME_TEXT] = 0;
+        check(chat_profile_add(lib, longname, L"p") == -1,
+            "a 64-unit name is rejected (63 stored units plus NUL is the bound)");
+        longname[CHAT_PROFILE_NAME_TEXT - 1] = 0;
+        check(chat_profile_add(lib, longname, L"p") == 0,
+            "a 63-unit name is accepted");
+        check(chat_profile_add(lib, L"Concise", L"Be concise.") == 1,
+            "a second profile is appended");
+        check(chat_profile_count(lib) == 2, "the count tracks adds");
+        check(chat_profile(lib, 1) != NULL &&
+            !wcscmp(chat_profile(lib, 1)->name, L"Concise") &&
+            !wcscmp(chat_text_value(&chat_profile(lib, 1)->prompt),
+                L"Be concise."),
+            "profile content round-trips in memory");
+        check(chat_profile(lib, 2) == NULL && chat_profile(NULL, 0) == NULL,
+            "out-of-range and null-chat profile lookups are rejected");
+        check(chat_profile_add(lib, L"CONCISE", L"x") == -1,
+            "a name differing only by ordinal case is a duplicate");
+        check(chat_profile_count(lib) == 2,
+            "a rejected add grows nothing");
+        fail_next_mallocs = 1;
+        check(chat_profile_add(lib, L"Fresh", L"prompt") == -1,
+            "an add that fails to allocate its prompt is rejected");
+        fail_next_mallocs = 0;
+        check(chat_profile_count(lib) == 2,
+            "a failed add consumes no slot");
+        check(chat_profile_add(lib, L"Fresh", L"") == 2,
+            "an empty prompt is a valid profile (means apply-no-prompt)");
+        check(chat_profile(lib, 2)->prompt.data == NULL,
+            "an empty profile prompt is stored unset");
+        check(chat_profile_set(lib, 0, L"Renamed", L"new prompt"),
+            "set replaces name and prompt");
+        check(!wcscmp(chat_profile(lib, 0)->name, L"Renamed") &&
+            !wcscmp(chat_text_value(&chat_profile(lib, 0)->prompt),
+                L"new prompt"),
+            "set wrote both fields");
+        fail_next_mallocs = 1;
+        check(!chat_profile_set(lib, 0, L"Changed", L"allocating prompt"),
+            "a set that fails to allocate its new prompt changes nothing");
+        fail_next_mallocs = 0;
+        check(!wcscmp(chat_profile(lib, 0)->name, L"Renamed") &&
+            !wcscmp(chat_text_value(&chat_profile(lib, 0)->prompt),
+                L"new prompt"),
+            "a failed set leaves the existing name and prompt intact");
+        check(!chat_profile_set(lib, 0, L"concise", L"x"),
+            "a rename colliding with another profile's name fails");
+        check(!wcscmp(chat_profile(lib, 0)->name, L"Renamed"),
+            "the colliding rename changes nothing");
+        check(!chat_profile_set(lib, 5, L"x", L"") &&
+            !chat_profile_set(NULL, 0, L"x", L""),
+            "out-of-range and null-chat sets are rejected");
+        check(chat_profile_remove(lib, 0), "mid-list removal succeeds");
+        check(chat_profile_count(lib) == 2 &&
+            !wcscmp(chat_profile(lib, 0)->name, L"Concise") &&
+            !wcscmp(chat_text_value(&chat_profile(lib, 0)->prompt),
+                L"Be concise.") &&
+            !wcscmp(chat_profile(lib, 1)->name, L"Fresh"),
+            "survivors shifted down with their heap prompts intact");
+        check(!chat_profile_remove(lib, 2) && !chat_profile_remove(NULL, 0),
+            "out-of-range and null-chat removals are rejected");
+        check(!lib->profiles[2].name[0] && lib->profiles[2].prompt.data == NULL,
+            "the vacated tail slot is zeroed so nothing can be freed twice");
+        check_invariants(lib);
+        chat_dispose(lib); free(lib);
+
+        /* Per-conversation overrides: validation, empty-clears-to-inherit,
+            Clear survival. */
+        Chat *ov = (Chat *)calloc(1, sizeof *ov);
+        if (!ov) return 2;
+        chat_init(ov);
+        check(!chat_conversation_set_system_prompt(ov, 1, L"x") &&
+            !chat_conversation_set_system_prompt(NULL, 0, L"x"),
+            "an out-of-range prompt override is rejected");
+        check(!chat_conversation_set_model(ov, 0, (ChatBackend)9, L"x"),
+            "an unknown backend is rejected");
+        check(chat_conversation_set_system_prompt(ov, 0, L"You are terse.") &&
+            !wcscmp(chat_text_value(&ov->conversations[0].system_prompt),
+                L"You are terse."),
+            "the prompt override is stored");
+        wchar_t longmodel[CHAT_MODEL_TEXT + 1];
+        for (size_t i = 0; i < CHAT_MODEL_TEXT; i++) longmodel[i] = L'm';
+        longmodel[CHAT_MODEL_TEXT] = 0;
+        check(!chat_conversation_set_model(ov, 0, CHAT_BACKEND_OPENROUTER,
+                longmodel),
+            "a 96-unit model override is rejected");
+        check(ov->conversations[0].model[0] == 0,
+            "a rejected model override leaves the slot empty");
+        longmodel[CHAT_MODEL_TEXT - 1] = 0;
+        check(chat_conversation_set_model(ov, 0, CHAT_BACKEND_OPENROUTER,
+                longmodel) && !wcscmp(ov->conversations[0].model, longmodel),
+            "a 95-unit model override is stored");
+        check(chat_conversation_set_model(ov, 0, CHAT_BACKEND_OLLAMA,
+                L"llama3") &&
+            !wcscmp(ov->conversations[0].ollama_model, L"llama3"),
+            "the Ollama override is stored");
+        check(chat_conversation_set_model(ov, 0, CHAT_BACKEND_OPENROUTER,
+            L"") && !ov->conversations[0].model[0],
+            "an empty model override clears back to inherit");
+        check(chat_conversation_set_system_prompt(ov, 0, L"") &&
+            ov->conversations[0].system_prompt.data == NULL,
+            "an empty prompt override clears to unset");
+        check(chat_append(ov, CHAT_ROLE_USER, L"probe") == 1,
+            "override conversation has a message");
+        check(chat_conversation_set_system_prompt(ov, 0, L"survives clear"),
+            "the override is set before Clear");
+        chat_clear(ov);
+        check(!wcscmp(chat_text_value(&ov->conversations[0].system_prompt),
+                L"survives clear"),
+            "the prompt override survives Clear, like the title");
+        check_invariants(ov);
+        chat_dispose(ov); free(ov);
+
+        /* Snapshot ownership: customization is detached then cloned, the
+            snapshot never aliases the source, and failing any allocation in
+            the sequence is transactional. Allocation order for this
+            fixture: 1 = Chat struct, 2 = profile prompt clone, 3 = prompt
+            override clone, 4 = the welcome message's exact live-count
+            array and 5 = its promoted overflow copy (chat_init seeds one
+            long welcome turn). */
+        Chat *cust = (Chat *)calloc(1, sizeof *cust);
+        if (!cust) return 2;
+        chat_init(cust);
+        check(chat_profile_add(cust, L"Terse", L"You are terse.") == 0,
+            "snapshot fixture profile added");
+        check(chat_conversation_set_system_prompt(cust, 0,
+                L"Override prompt"),
+            "snapshot fixture override set");
+        Chat *snap = chat_snapshot(cust);
+        check(snap != NULL, "a snapshot of a customized chat succeeds");
+        if (snap) {
+            check(snap->profiles[0].prompt.data !=
+                    cust->profiles[0].prompt.data &&
+                !wcscmp(chat_text_value(&snap->profiles[0].prompt),
+                    L"You are terse."),
+                "the profile prompt is cloned, never aliased");
+            check(snap->conversations[0].system_prompt.data !=
+                    cust->conversations[0].system_prompt.data &&
+                !wcscmp(chat_text_value(&snap->conversations[0].system_prompt),
+                    L"Override prompt"),
+                "the override prompt is cloned, never aliased");
+            check(chat_profile_set(cust, 0, L"Terse", L"Mutated") &&
+                chat_conversation_set_system_prompt(cust, 0, L"Mutated"),
+                "the source mutates after the snapshot");
+            check(!wcscmp(chat_text_value(&snap->profiles[0].prompt),
+                    L"You are terse.") &&
+                !wcscmp(chat_text_value(&snap->conversations[0].system_prompt),
+                    L"Override prompt"),
+                "the snapshot does not follow source customization mutation");
+            chat_dispose(snap); free(snap);
+            check(!wcscmp(chat_text_value(&cust->profiles[0].prompt),
+                    L"Mutated") &&
+                !wcscmp(chat_text_value(&cust->conversations[0].system_prompt),
+                    L"Mutated") &&
+                cust->profiles[0].prompt.data != NULL &&
+                cust->conversations[0].system_prompt.data != NULL,
+                "disposing the snapshot leaves the source's owned text intact");
+        }
+        {
+            bool saw_failure = false, saw_success = false, damaged = false;
+            for (long i = 1; i <= 6; i++) {
+                alloc_number = 0; fail_allocation = i;
+                Chat *s = chat_snapshot(cust);
+                alloc_number = 0; fail_allocation = 0;
+                if (!s) {
+                    saw_failure = true;
+                    if (wcscmp(chat_text_value(&cust->profiles[0].prompt),
+                            L"Mutated") ||
+                        wcscmp(chat_text_value(
+                            &cust->conversations[0].system_prompt),
+                            L"Mutated") ||
+                        cust->profiles[0].prompt.data == NULL ||
+                        cust->conversations[0].system_prompt.data == NULL)
+                        damaged = true;
+                    continue;
+                }
+                saw_success = true;
+                if (wcscmp(chat_text_value(&s->profiles[0].prompt),
+                        L"Mutated") ||
+                    wcscmp(chat_text_value(&s->conversations[0].system_prompt),
+                        L"Mutated") ||
+                    s->profiles[0].prompt.data ==
+                        cust->profiles[0].prompt.data ||
+                    s->conversations[0].system_prompt.data ==
+                        cust->conversations[0].system_prompt.data)
+                    damaged = true;
+                check_invariants(s);
+                chat_dispose(s); free(s);
+            }
+            check(saw_failure && saw_success && !damaged,
+                "failing any snapshot allocation is transactional for owned text");
+        }
+
+        /* Deletion ownership: a moved conversation keeps its override; the
+            removed one's override is released exactly once; delete-all
+            preserves the profile library. */
+        Chat *own3 = (Chat *)calloc(1, sizeof *own3);
+        if (!own3) return 2;
+        chat_init(own3);
+        check(chat_new_conversation(own3) == 1 &&
+            chat_new_conversation(own3) == 2, "three conversations created");
+        check(chat_conversation_set_system_prompt(own3, 0,
+                L"first override") &&
+            chat_conversation_set_system_prompt(own3, 1,
+                L"second override"),
+            "overrides set on the first two conversations");
+        own3->active = 0;
+        check(chat_delete(own3), "the first conversation deletes");
+        check(own3->conversations[0].system_prompt.data != NULL &&
+            !wcscmp(chat_text_value(&own3->conversations[0].system_prompt),
+                L"second override"),
+            "the moved conversation transferred its owned override");
+        check(own3->conversations[1].system_prompt.data == NULL,
+            "the vacated tail slot is zeroed");
+        check(chat_append(own3, CHAT_ROLE_USER, L"after the move") == 0,
+            "the moved conversation still appends after deletion");
+        check(chat_profile_add(own3, L"Kept", L"profile prompt") == 0,
+            "a profile exists before delete-all");
+        check(chat_delete_all(own3), "delete-all succeeds");
+        check(chat_profile_count(own3) == 1 &&
+            !wcscmp(chat_text_value(&own3->profiles[0].prompt),
+                L"profile prompt"),
+            "delete-all preserves the profile library");
+        check(own3->conversation_count == 1 &&
+            own3->conversations[0].system_prompt.data == NULL &&
+            !own3->conversations[0].model[0] &&
+            !own3->conversations[0].ollama_model[0],
+            "delete-all leaves fresh, uncustomized conversations");
+        check(chat_append(own3, CHAT_ROLE_USER, L"fresh again") == 0,
+            "the fresh conversation works after delete-all");
+        check_invariants(own3);
+        chat_dispose(own3); free(own3);
+        chat_dispose(cust); free(cust);
     }
 
     chat_dispose(chat);
