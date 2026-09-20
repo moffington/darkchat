@@ -561,8 +561,36 @@ int main(void) {
         L"Search conversations"),
         "the search field exposes its accessible name");
 
+    /* Model-chip override marker: keyed on override presence, never on
+        value inequality — an override equal to the global model still
+        edits independently and must keep the marker. */
+    chat_ui_sync(chat_ui);
+    check(wcsstr(ui_accessible_name(ui, chat_ui->model),
+            L"(set for this chat)") == NULL,
+        "an inherited model chip carries no override marker");
+    check(chat_conversation_set_model(chat, chat->active, chat->backend,
+            chat_active_model(chat)),
+        "fixture: an override equal to the global model is set");
+    chat_ui_sync(chat_ui);
+    check(wcsstr(ui_accessible_name(ui, chat_ui->model),
+            L"(set for this chat)") != NULL,
+        "a present override marks the chip even when it equals the global model");
+    check(wcsstr(ui_node(ui, chat_ui->model)->help_text,
+            L"\u00b7 this chat") != NULL,
+        "the chip help text carries the this-chat marker");
+    check(chat_conversation_set_model(chat, chat->active, chat->backend, L""),
+        "fixture: the override is cleared");
+    chat_ui_sync(chat_ui);
+    check(wcsstr(ui_accessible_name(ui, chat_ui->model),
+            L"(set for this chat)") == NULL,
+        "clearing the override removes the marker");
+
     /* Empty state: visible only while the active conversation has no
-       messages. */
+        messages. The sync is explicit: the flag must reflect live state,
+        never a stale one from an earlier sync. */
+    check(chat_append(chat, CHAT_ROLE_ASSISTANT, L"content") >= 0,
+        "fixture: the active conversation has a message");
+    chat_ui_sync(chat_ui);
     UiNode *empty = ui_node(ui, chat_ui->empty);
     UiNode *empty_title = ui_node(ui, chat_ui->empty_title);
     check(empty && empty->hidden,

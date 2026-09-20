@@ -106,10 +106,41 @@ The Ollama endpoint is fixed at `localhost:11434`; there is no configurable endp
 - The Send button becomes Stop during generation.
 - Conversation actions provide New, Rename, Delete, and Clear messages.
 - Response actions provide Retry, Regenerate, Edit latest user message, Cancel edit, Copy response, and Copy transcript selection.
+- The **Customization** group in the overflow menu carries the per-conversation model and prompt overrides and the prompt-profile library, described below. Its override commands and **Save current prompt as profile…** also appear in the `Ctrl+K` command palette under their own section; **Apply prompt profile**, **Edit profile…**, and **Delete profile…** stay in the overflow menu only, because they pick a profile from a submenu.
 
 Changing the system prompt affects future requests only. It does not rewrite existing history.
 
 Retry, regenerate, and edit-and-resend replace the latest response rather than creating branches or retaining response variants.
+
+### Per-conversation model and prompt (Customization)
+
+By default every conversation uses the global settings: the model slot of the
+active backend and the system prompt. The Customization group in the overflow
+menu (and the same commands in the Ctrl+K palette) overrides either for the
+active conversation only:
+
+- **Use model for this chat** copies the current global model into this
+  conversation's override; **Clear conversation model** removes it. While the
+  field and palette always show and edit the *effective* model, the model chip
+  carries a `· this chat` marker whenever the conversation overrides the model
+  — even when the override happens to equal the global model, because edits
+  still target this conversation until it is cleared. Switching conversations
+  switches the effective model with it.
+- **System prompt for this conversation…** replaces the global prompt for this
+  chat only. Submitting an empty field is an explicit *no-prompt* override —
+  this conversation then sends no system message at all, which is distinct
+  from inheriting a nonempty global prompt. Only **Use global system prompt**
+  removes the override and restores inheritance.
+- **Prompt profiles** are named prompts saved in a small library. Save the
+  current effective prompt as a profile, apply a profile either to the global
+  prompt or to the active conversation, and edit or delete profiles through
+  the same submenus (each lists one item per saved profile). Applying an empty
+  profile to a conversation is the explicit "no system prompt in this chat"
+  override; the profile library survives Delete-all-conversations and is only
+  released when the app exits.
+
+Overrides are saved with the conversation: a restart, a message Clear, or
+switching between conversations never loses them.
 
 ## Local persistence
 
@@ -130,15 +161,17 @@ Persistence uses a checksummed UTF-8 JSONL format with:
 - Strict validation before loaded data is adopted
 - An exclusive directory lock to prevent two instances from overwriting one another
 
-Current writes use format 3 for an entirely uncustomized store, and format 4
-once any prompt profile or per-conversation override exists. DarkChat loads
-formats 1 through 4 and rewrites older valid snapshots in the current format
+Current writes use format 3 for an entirely uncustomized store, format 4 once
+any prompt profile or per-conversation override exists, and format 5 once a
+conversation carries the deliberately-empty prompt override. DarkChat loads
+formats 1 through 5 and rewrites older valid snapshots in the current format
 on the next save; an unsupported newer format fails closed without
 overwriting it from a backup. The active backend, the per-backend models, and
 each generation's backend are additive optional fields: an older snapshot
-decodes as OpenRouter with no Ollama model. Customization (prompt profiles
-and per-conversation overrides) is only legal at format 4 in both
-directions, so an older binary can never silently erase it.
+decodes as OpenRouter with no Ollama model. Customization (prompt profiles,
+per-conversation overrides, and the explicitly-empty prompt override) is
+version-gated in both directions, so an older binary can never silently
+erase it.
 
 State is autosaved roughly once per second while dirty and immediately after important lifecycle actions such as sending, stopping, completing, deleting, or closing.
 

@@ -32,16 +32,18 @@ ChatContextResult chat_context_build(const Chat *chat, const ChatConversation *c
     const ChatMessage *trigger = &c->messages[user_index];
     if (trigger->role != CHAT_ROLE_USER) return CHAT_CONTEXT_INVALID;
 
-    bool has_system = chat->system_prompt[0] != 0;
+    const wchar_t *system_prompt = chat_effective_system_prompt(chat, c);
+    bool has_system = system_prompt[0] != 0;
     size_t system_bytes = has_system
-        ? chat_completion_message_bytes(CHAT_ROLE_SYSTEM, chat->system_prompt)
+        ? chat_completion_message_bytes(CHAT_ROLE_SYSTEM, system_prompt)
         : 0;
     size_t trigger_bytes = chat_completion_message_bytes(CHAT_ROLE_USER,
         chat_message_text(trigger));
     size_t comma_for_trigger = has_system
         ? CHAT_COMPLETION_SEPARATOR_BYTES : 0;
     size_t envelope_bytes = chat_completion_envelope_bytes(chat->backend,
-        chat_active_model(chat), &chat->provider_routing);
+        chat_effective_model_for_backend(chat, c, chat->backend),
+        &chat->provider_routing);
     /* The complete body the indispensable content would require: the envelope,
        the system prompt when set, and the triggering message with the
        separator that precedes it. Reported by every OVERSIZE result, and
@@ -90,7 +92,7 @@ ChatContextResult chat_context_build(const Chat *chat, const ChatConversation *c
     int count = 0;
     if (has_system) {
         out->messages[count].role = CHAT_ROLE_SYSTEM;
-        out->messages[count].text = chat->system_prompt;
+        out->messages[count].text = system_prompt;
         ++count;
     }
     for (int i = first_kept; i < user_index; i++) {

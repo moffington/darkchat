@@ -12,11 +12,15 @@
     per-conversation message bound from 64 to 512. Format 4 added the
     `profile` record type, the `profile_count` settings field, and the
     per-conversation customization fields (system_prompt/model/ollama_model).
-    Formats 1-4 all decode, so old snapshots migrate on their next save;
-    version 5+ is unsupported and fails the load closed (writes disabled,
+    Format 5 added the per-conversation `system_prompt_present` flag: the
+    deliberately-empty prompt override is a new record meaning that older
+    v4 readers would silently drop on their next save, so it is gated to
+    v5 in both directions instead of riding as an ignorable field.
+    Formats 1-5 all decode, so old snapshots migrate on their next save;
+    version 6+ is unsupported and fails the load closed (writes disabled,
     backup never tried) so an older build can never silently restore stale
     state over a newer primary. See docs/CHAT.md. */
-#define FORMAT_VERSION 4
+#define FORMAT_VERSION 5
 #define FORMAT_VERSION_MIN 1
 
 static uint32_t checksum(const char *s, size_t n) {
@@ -176,13 +180,17 @@ static bool conversation_id_taken(const Chat *chat, uint64_t id, int ci) {
 #define READ_NUM(obj,field) do { if (!json_query_number(line,#field,&v) || v < -1) goto bad; (obj)->field = v; } while (0)
 #define READ_STR(obj,field) do { if (!get_string(line,#field,(obj)->field,sizeof (obj)->field / sizeof(wchar_t))) goto bad; } while (0)
 
-/* The emitted version is the canonical format definition: version 4 once any
-   prompt profile or per-conversation customization exists, otherwise the
-   unchanged format 3 byte shape. Per-conversation overrides deliberately do
-   NOT ride as v3-additive fields: an older v3 binary would tolerate the
-   unknown fields, ignore them, and silently erase them on its next save, so
-   customization is only legal at version 4 in both directions. */
+/* The emitted version is the canonical format definition: version 5 once the
+    deliberately-empty prompt override exists (a meaning a v4 reader would
+    drop, so it is version-gated in both directions), version 4 once any
+    prompt profile or other per-conversation customization exists, otherwise
+    the unchanged format 3 byte shape. Ordinary overrides deliberately do
+    NOT ride as v3-additive fields: an older v3 binary would tolerate the
+    unknown fields, ignore them, and silently erase them on its next save,
+    so customization is only legal at version 4 in both directions. */
 static int format_version_for(const Chat *chat) {
+    for (int i = 0; i < chat->conversation_count; i++)
+        if (chat->conversations[i].system_prompt_present) return 5;
     if (chat->profile_count > 0) return 4;
     for (int i = 0; i < chat->conversation_count; i++) {
         const ChatConversation *c = &chat->conversations[i];
@@ -273,9 +281,14 @@ static bool encode(const Chat *chat, JsonBuf *b) {
         STR(b, c, title);
         STR(b, c, draft);
         /* Format 4 customization, appended last and emitted only when set
-           so an uncustomized conversation keeps the older byte shape. */
+            so an uncustomized conversation keeps the older byte shape. */
         if (c->system_prompt.data)
             string(b, "system_prompt", chat_text_value(&c->system_prompt));
+        /* The deliberately-empty override: present only when set, and never
+            alongside a system_prompt value (the setters keep them mutually
+            exclusive). Emitted only when set for the same byte-shape reason. */
+        if (c->system_prompt_present)
+            number(b, "system_prompt_present", 1);
         if (c->model[0]) string(b, "model", c->model);
         if (c->ollama_model[0]) string(b, "ollama_model", c->ollama_model);
         raw(b, "}\n");
@@ -474,20 +487,46 @@ static bool decode(char *data, Chat *chat) {
         if (conversation_id_taken(chat, c->id, i)) goto bad;
         if (v4) {
             /* Per-conversation customization exists only at format 4, in
-               both directions: at v4 the fields are optional and absent
-               means inherit; below v4 any of them present is corruption,
-               not an ignorable additive field — an older binary would drop
-               them on its next save. */
+                both directions: at v4 the fields are optional and absent
+                means inherit; below v4 any of them present is corruption,
+                not an ignorable additive field — an older binary would drop
+                them on its next save. */
             if (!optional_text(line,"system_prompt",&c->system_prompt,
                     CHAT_COMPOSER_TEXT)) goto bad;
             if (!optional_string(line,"model",c->model,CHAT_MODEL_TEXT))
                 goto bad;
             if (!optional_string(line,"ollama_model",c->ollama_model,
                     CHAT_MODEL_TEXT)) goto bad;
+            /* The deliberately-empty override exists only at format 5: a
+                v4 reader would ignore the field and erase the override on
+                its next save, so at v4 the field is corruption, exactly
+                like every customization field below v4. The flag and the
+                text are mutually exclusive — the encoder emits a value only
+                when the override carries text, and the flag only when it
+                does not — so a record carrying both is corruption, not an
+                ignorable quirk. */
+            if (version >= 5) {
+                int present;
+                if (!optional_int(line,"system_prompt_present",0,1,0,
+                        &present)) goto bad;
+                c->system_prompt_present = present != 0;
+                JsonFieldKind kind;
+                double value;
+                if (c->system_prompt_present &&
+                    json_query_field(line,"system_prompt",&kind,&value) &&
+                    kind != JSON_FIELD_ABSENT)
+                    goto bad;
+            } else {
+                JsonFieldKind kind;
+                double value;
+                if (json_query_field(line,"system_prompt_present",&kind,
+                        &value) && kind != JSON_FIELD_ABSENT) goto bad;
+            }
         } else {
             static const char *const override_names[] = {
-                "system_prompt", "model", "ollama_model"};
-            for (int k = 0; k < 3; k++) {
+                "system_prompt", "system_prompt_present", "model",
+                "ollama_model"};
+            for (int k = 0; k < 4; k++) {
                 JsonFieldKind kind;
                 double value;
                 if (json_query_field(line,override_names[k],&kind,&value) &&

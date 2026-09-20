@@ -52,7 +52,38 @@ static const ChatActionInfo table[] = {
         CHAT_ACTION_GROUP_ROUTING, CHAT_ACTION_FLAG_NONE },
     { ACTION_ROUTING_ZDR, L"Require &zero data retention", NULL,
         CHAT_ACTION_GROUP_ROUTING, CHAT_ACTION_FLAG_NONE },
+    { ACTION_MODEL_USE_HERE, L"Use model for &this chat", NULL,
+        CHAT_ACTION_GROUP_CUSTOMIZATION, CHAT_ACTION_FLAG_NONE },
+    { ACTION_MODEL_CLEAR_HERE, L"&Clear conversation model", NULL,
+        CHAT_ACTION_GROUP_CUSTOMIZATION, CHAT_ACTION_FLAG_NONE },
+    { ACTION_SYSTEM_HERE, L"System prompt for this con&versation...", NULL,
+        CHAT_ACTION_GROUP_CUSTOMIZATION,
+        CHAT_ACTION_FLAG_SEPARATOR_BEFORE },
+    { ACTION_SYSTEM_CLEAR_HERE, L"Use &global system prompt", NULL,
+        CHAT_ACTION_GROUP_CUSTOMIZATION, CHAT_ACTION_FLAG_NONE },
+    { ACTION_PROFILE_APPLY, L"&Apply prompt profile", NULL,
+        CHAT_ACTION_GROUP_CUSTOMIZATION,
+        CHAT_ACTION_FLAG_SEPARATOR_BEFORE | CHAT_ACTION_FLAG_SUBMENU_ONLY },
+    { ACTION_PROFILE_SAVE, L"&Save current prompt as profile...", NULL,
+        CHAT_ACTION_GROUP_CUSTOMIZATION, CHAT_ACTION_FLAG_NONE },
+    { ACTION_PROFILE_EDIT, L"&Edit profile...", NULL,
+        CHAT_ACTION_GROUP_CUSTOMIZATION,
+        CHAT_ACTION_FLAG_SEPARATOR_BEFORE | CHAT_ACTION_FLAG_SUBMENU_ONLY },
+    { ACTION_PROFILE_DELETE, L"&Delete profile...", NULL,
+        CHAT_ACTION_GROUP_CUSTOMIZATION, CHAT_ACTION_FLAG_SUBMENU_ONLY },
 };
+
+int chat_action_dynamic_profile_index(int id) {
+    if (id < CHAT_ACTION_DYNAMIC_APPLY_GLOBAL_BASE ||
+        id >= CHAT_ACTION_DYNAMIC_END)
+        return -1;
+    for (int range = 0; range < 4; range++) {
+        int base = CHAT_ACTION_DYNAMIC_APPLY_GLOBAL_BASE +
+            range * CHAT_MAX_PROMPT_PROFILES;
+        if (id < base + CHAT_MAX_PROMPT_PROFILES) return id - base;
+    }
+    return -1;
+}
 
 const ChatActionInfo *chat_action_table(size_t *count) {
     if (count) *count = sizeof table / sizeof table[0];
@@ -116,10 +147,29 @@ void chat_action_context_init(ChatActionContext *context, const Chat *chat) {
             break;
         }
     context->response_replaceable = response_is_replaceable(c, user);
+    /* Override state of the active conversation, resolved for the active
+        backend, and the profile census the Customization group needs. */
+    context->backend_openrouter = chat->backend != CHAT_BACKEND_OLLAMA;
+    context->has_model_override = context->backend_openrouter
+        ? c->model[0] != 0 : c->ollama_model[0] != 0;
+    context->has_prompt_override =
+        c->system_prompt.data != NULL || c->system_prompt_present;
+    context->has_global_model =
+        (context->backend_openrouter ? chat->model : chat->ollama_model)[0] != 0;
+    context->profile_count = chat->profile_count;
 }
 
 bool chat_action_available(int id, const ChatActionContext *context) {
     if (!context) return false;
+    /* Dynamic profile submenu items: a valid live index, gated like their
+        submenu headers. Dispatch re-validates the index against the live
+        count, so a stale item can never act on a removed profile. */
+    if (id >= CHAT_ACTION_DYNAMIC_APPLY_GLOBAL_BASE &&
+        id < CHAT_ACTION_DYNAMIC_END) {
+        int index = chat_action_dynamic_profile_index(id);
+        return !context->generating && context->profile_count > 0 &&
+            index >= 0 && index < context->profile_count;
+    }
     switch (id) {
     case ACTION_NEW:
     case ACTION_SEARCH:
@@ -153,6 +203,25 @@ bool chat_action_available(int id, const ChatActionContext *context) {
     case ACTION_ROUTING_DATA_COLLECTION:
     case ACTION_ROUTING_ZDR:
         return !context->generating && context->backend_openrouter;
+    case ACTION_MODEL_USE_HERE:
+        /* Copying the global model into the override is meaningful only
+            when a global model exists and the override is not already
+            active (an active override already shows this exact state). */
+        return !context->generating && context->has_global_model &&
+            !context->has_model_override;
+    case ACTION_MODEL_CLEAR_HERE:
+        return !context->generating && context->has_model_override;
+    case ACTION_SYSTEM_HERE:
+        return !context->generating;
+    case ACTION_SYSTEM_CLEAR_HERE:
+        return !context->generating && context->has_prompt_override;
+    case ACTION_PROFILE_APPLY:
+    case ACTION_PROFILE_EDIT:
+    case ACTION_PROFILE_DELETE:
+        return !context->generating && context->profile_count > 0;
+    case ACTION_PROFILE_SAVE:
+        return !context->generating &&
+            context->profile_count < CHAT_MAX_PROMPT_PROFILES;
     default:
         return false;
     }

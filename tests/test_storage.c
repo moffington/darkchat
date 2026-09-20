@@ -132,6 +132,7 @@ static bool same_chat(const Chat *a, const Chat *b) {
             wcscmp(ca->title, cb->title) || wcscmp(ca->draft, cb->draft) ||
             wcscmp(ca->model, cb->model) ||
             wcscmp(ca->ollama_model, cb->ollama_model) ||
+            ca->system_prompt_present != cb->system_prompt_present ||
             !same_text(&ca->system_prompt, &cb->system_prompt))
             return false;
         if (ca->message_count && (!ca->messages || !cb->messages)) return false;
@@ -744,9 +745,9 @@ int main(void) {
     char header[64]={0}; CHECK(fread(header,1,63,future)==63);
     char *version=strstr(header,"\"version\":3"); CHECK(version);
     CHECK(fseek(future,(long)(version-header)+(long)strlen("\"version\":"),SEEK_SET)==0);
-    /* This build writes format 4, so the unsupported-boundary fixture must
-       claim a version beyond what this build decodes. */
-    fputc('5',future); fclose(future);
+    /* This build writes at most format 5, so the unsupported-boundary
+        fixture must claim a version beyond what this build decodes. */
+    fputc('6',future); fclose(future);
     CHECK(storage_load(&store,loaded)==-1 && !store.writable);
     storage_close(&store);
     DeleteFileW(store.path); DeleteFileW(store.backup); DeleteFileW(store.temporary);
@@ -945,6 +946,40 @@ int main(void) {
         free(saved);
         CHECK(storage_load(&store,loaded)==1);
     }
+    /* The deliberately-empty prompt override forces format 5 (a v4 reader
+        would drop the flag on its next save, so it is version-gated in both
+        directions), round-trips exactly (empty override, not inherit),
+        keeps repeated saves byte-stable, and clears back to the v3 shape. */
+    {
+        CHECK(chat_conversation_apply_system_prompt(chat,0,L""));
+        CHECK(chat->conversations[0].system_prompt_present &&
+            !chat->conversations[0].system_prompt.data);
+        CHECK(storage_save(&store,chat));
+        char *saved=NULL; size_t saved_size=0;
+        CHECK(read_file_bytes(store.path,&saved,&saved_size));
+        CHECK(strstr(saved,"\"version\":5")!=NULL);
+        CHECK(strstr(saved,"\"system_prompt_present\":1")!=NULL);
+        free(saved);
+        CHECK(storage_load(&store,loaded)==1 && !store.recovered);
+        CHECK(same_chat(loaded,chat));
+        CHECK(loaded->conversations[0].system_prompt_present &&
+            !loaded->conversations[0].system_prompt.data);
+        char *first=NULL,*second=NULL; size_t fs=0,ss=0;
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&first,&fs));
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&second,&ss));
+        CHECK(fs==ss && !memcmp(first,second,fs));
+        free(first); free(second);
+        CHECK(chat_conversation_set_system_prompt(chat,0,L""));
+        CHECK(!chat->conversations[0].system_prompt_present);
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&saved,&saved_size));
+        CHECK(strstr(saved,"\"version\":3")!=NULL);
+        CHECK(strstr(saved,"\"system_prompt_present\"")==NULL);
+        free(saved);
+        CHECK(storage_load(&store,loaded)==1);
+    }
     /* Prompt profiles force format 4: profile records sit between the model
         history and the first conversation, the round trip is logically
         exact, repeated saves are byte-stable, and removal of the last
@@ -1005,8 +1040,26 @@ int main(void) {
         CHECK(load_v4_case(L"v3profile",3,NULL,one_profile,1,NULL,dest)==-1);
         /* Overrides present at v3 are corruption, each field. */
         CHECK(load_v4_case(L"v3sp",3,NULL,NULL,0,"\"system_prompt\":\"x\"",dest)==-1);
+        CHECK(load_v4_case(L"v3spflag",3,NULL,NULL,0,
+            "\"system_prompt_present\":1",dest)==-1);
         CHECK(load_v4_case(L"v3model",3,NULL,NULL,0,"\"model\":\"x\"",dest)==-1);
         CHECK(load_v4_case(L"v3oll",3,NULL,NULL,0,"\"ollama_model\":\"x\"",dest)==-1);
+        /* The deliberately-empty override is v5-only: at v4 the field is
+            corruption (a v4 reader would drop it), at v5 it decodes as a
+            present-empty override, and an out-of-range value is corruption. */
+        CHECK(load_v4_case(L"spflagv4",4,"\"profile_count\":0",NULL,0,
+            "\"system_prompt_present\":1",dest)==-1);
+        CHECK(load_v4_case(L"spflag",5,"\"profile_count\":0",NULL,0,
+            "\"system_prompt_present\":1",dest)==1);
+        CHECK(dest->conversations[0].system_prompt_present &&
+            !dest->conversations[0].system_prompt.data);
+        CHECK(load_v4_case(L"spflagbad",5,"\"profile_count\":0",NULL,0,
+            "\"system_prompt_present\":2",dest)==-1);
+        /* The flag and a system_prompt value are mutually exclusive: a
+            record carrying both is corruption (the encoder could never
+            have written it). */
+        CHECK(load_v4_case(L"spboth",5,"\"profile_count\":0",NULL,0,
+            "\"system_prompt\":\"x\",\"system_prompt_present\":1",dest)==-1);
         /* The count and the records must match exactly. */
         CHECK(load_v4_case(L"count2one",4,"\"profile_count\":2",one_profile,1,NULL,dest)==-1);
         CHECK(load_v4_case(L"count0one",4,"\"profile_count\":0",one_profile,1,NULL,dest)==-1);

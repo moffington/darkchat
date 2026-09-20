@@ -221,20 +221,26 @@ typedef struct {
     ChatMessage *messages;
     size_t message_count;
     size_t message_capacity;
-    /* Per-conversation customization, persisted from format 4 (empty or
-       NULL = inherit the global slot). The model overrides are inline —
-       empty means inherit, and models are bounded by CHAT_MODEL_TEXT. The
-       system-prompt override is heap-backed ChatText: NULL inherits the
-       global prompt. Like title/renamed, an override survives Clear
-       (chat_clear) and is released only when the conversation itself is
-       deleted or the whole Chat is disposed. Ownership follows the same
-       bytewise-move rules as the messages allocation: deleting a
-       conversation disposes its own override before the move, and a moved
-       conversation transfers its override pointer to the vacated-and-zeroed
-       scheme exactly once. */
+    /* Per-conversation customization, persisted from format 4 (the
+        deliberately-empty prompt override from format 5; empty or
+        NULL = inherit the global slot). The model overrides are inline —
+        empty means inherit, and models are bounded by CHAT_MODEL_TEXT. The
+        system-prompt override is heap-backed ChatText: NULL inherits the
+        global prompt. `system_prompt_present` distinguishes one further
+        state: an override that is deliberately empty ("apply no system
+        prompt in this conversation"). It is meaningful only while the
+        ChatText is unset (data == NULL means inherit); setters keep the
+        flag and the text mutually consistent. Like title/renamed, an
+        override survives Clear (chat_clear) and is released only when the
+        conversation itself is deleted or the whole Chat is disposed.
+        Ownership follows the same bytewise-move rules as the messages
+        allocation: deleting a conversation disposes its own override before
+        the move, and a moved conversation transfers its override pointer to
+        the vacated-and-zeroed scheme exactly once. */
     wchar_t model[CHAT_MODEL_TEXT];
     wchar_t ollama_model[CHAT_MODEL_TEXT];
     ChatText system_prompt;
+    bool system_prompt_present;
 } ChatConversation;
 
 typedef struct {
@@ -339,13 +345,35 @@ bool chat_profile_set(Chat *chat, int index, const wchar_t *name,
 bool chat_profile_remove(Chat *chat, int index);
 
 /* Per-conversation customization setters. An empty or NULL value clears the
-   override back to inherit (the inline model arrays become empty, the
-   ChatText becomes unset); a value is validated against the same bounds the
-   storage format enforces. The setters never touch anything else. */
+    override back to inherit (the inline model arrays become empty, the
+    ChatText becomes unset); a value is validated against the same bounds the
+    storage format enforces. The setters never touch anything else. */
 bool chat_conversation_set_system_prompt(Chat *chat, int conversation,
     const wchar_t *text);
 bool chat_conversation_set_model(Chat *chat, int conversation,
     ChatBackend backend, const wchar_t *text);
+/* Explicit per-conversation prompt application. Unlike the setter above,
+    an empty value is a meaningful override: it means "apply no system
+    prompt in this conversation" (the presence flag with unset text), not
+    inherit. A non-empty value behaves like the setter. Bounds match the
+    storage format; the call never touches anything else. */
+bool chat_conversation_apply_system_prompt(Chat *chat, int conversation,
+    const wchar_t *text);
+
+/* Effective per-conversation resolution for requests. Every helper returns a
+    borrowed pointer that stays valid while the Chat lives and is consumed
+    synchronously by the context builder and the host; nothing copies.
+    The model resolver prefers the conversation's override for the requested
+    backend (empty = inherit) and falls back to that backend's global slot;
+    chat_effective_model wraps the active backend. The prompt resolver
+    prefers the conversation's override (set text, or the deliberately-empty
+    override via the presence flag) and falls back to the global prompt. */
+const wchar_t *chat_effective_model_for_backend(const Chat *chat,
+    const ChatConversation *conversation, ChatBackend backend);
+const wchar_t *chat_effective_model(const Chat *chat,
+    const ChatConversation *conversation);
+const wchar_t *chat_effective_system_prompt(const Chat *chat,
+    const ChatConversation *conversation);
 
 void chat_init(Chat *chat);
 /* Creates an empty conversation, selects it and returns its index, or -1. */

@@ -117,6 +117,39 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   reasoning ever arrives, the temporary row is removed once answer text begins.
   Each turn's reasoning and duration are independent and persist; expansion is
   per-session view state. Reasoning is never invented locally.
+- The **Customization** menu carries per-conversation overrides and the prompt
+  profile library. Its override commands and **Save current prompt as
+  profile…** also appear in the `Ctrl+K` command palette under their own
+  section; **Apply prompt profile**, **Edit profile…**, and **Delete
+  profile…** are overflow-menu only, because they pick a profile from a
+  submenu and the palette carries single commands only.
+  - By default a conversation uses the global settings: the active backend's
+    model slot and the global system prompt. **Use model for this chat** copies
+    the current global model into this conversation's override, **Clear
+    conversation model** removes it, and the model field and palette always
+    display and edit the *effective* model (override when present, global slot
+    otherwise). While an override is active the model chip carries a `· this
+    chat` marker — keyed on the override's presence, not its value, because an
+    override equal to the global model still edits independently until it is
+    cleared. Switching conversations switches the effective model; the first
+    selection of a fresh backend switch (the Ollama picker) seeds the global
+    slot and aligns any existing override for the new backend.
+  - **System prompt for this conversation…** replaces the global prompt for
+    this chat only. Emptying the field is a deliberate empty override ("apply
+    no system prompt in this conversation"), distinct from **Use global system
+    prompt**, which removes the override and inherits the global prompt again.
+  - **Prompt profiles** are a small named library of prompts (24 at most; names
+    unique up to case-insensitive ordinal comparison). **Save current prompt as
+    profile…** captures the conversation's effective prompt under a name;
+    **Apply prompt profile** offers each profile for the global prompt or for
+    the active conversation (applied verbatim, including the empty one);
+    **Edit profile…** and **Delete profile…** target a profile picked from
+    their submenus. The library survives Clear and Delete-all-conversations
+    and persists in the snapshot (format 4 and above).
+  - Overrides are saved with their conversation: restarts, message Clear and
+    conversation switches never lose them. A request records the effective
+    model in its audit metadata, so a turn always names the model that actually
+    served it.
 
 ## Transcript rendering
 
@@ -543,23 +576,26 @@ into the transcript or the payload.
 
 ## Persistence format and recovery
 
-`%LOCALAPPDATA%\DarkChat\state.jsonl` is a UTF-8, version-3 or version-4 JSONL
-snapshot. An entirely uncustomized store (no prompt profiles, no
+`%LOCALAPPDATA%\DarkChat\state.jsonl` is a UTF-8, version-3 through version-5
+JSONL snapshot. An entirely uncustomized store (no prompt profiles, no
 per-conversation overrides) is byte-for-byte format 3; format 4 is emitted
-only when customization exists:
+when customization exists; format 5 is emitted only when a conversation
+carries the deliberately-empty prompt override (a meaning a v4 reader would
+drop on its next save, so that state is version-gated in both directions):
 
-1. A settings record with `type: "settings"`, `version: 3` (or `4`), selected
+1. A settings record with `type: "settings"`, `version: 3`, `4` (or `5`),
+   selected
    conversation index, next ID counter, record counts, model/system prompt,
    geometry, the optional provider-routing fields (`provider_sort`,
    `provider_no_fallbacks`, `provider_data_collection`, `provider_zdr`), and
-   the optional backend fields (`backend`, `ollama_model`). At version 4 the
-   record additionally ends with a required `profile_count` field.
+   the optional backend fields (`backend`, `ollama_model`). At version 4 or
+   above the record additionally ends with a required `profile_count` field.
 2. Zero or more `type: "model"` history records, each carrying its backend tag
    (`"backend"`) when it is not OpenRouter; an untagged record loads as
    OpenRouter. The tags keep each backend's model-list history isolated, and an
    Ollama-active snapshot whose `ollama_model` is missing or empty is rejected
    as corruption.
-3. At version 4 only: exactly `profile_count` `type: "profile"` records,
+3. At version 4 and above: exactly `profile_count` `type: "profile"` records,
    between the model history and the first conversation record, each carrying
    `name` (required, non-empty, at most 63 stored UTF-16 code units, and
    unique across the library up to ordinal case-insensitive comparison — the
@@ -574,15 +610,19 @@ only when customization exists:
    fields appended last: `system_prompt` (heap-backed override; absent or
    empty means inherit the global prompt), and `model`/`ollama_model`
    (per-backend model overrides; absent or empty means inherit the global
-   slot).
+   slot). At version 5 only, a further optional `system_prompt_present` field
+   marks an override that is deliberately empty ("apply no system prompt in
+   this conversation") rather than inherit; at v4 or below that field is
+   corruption.
 5. A `type: "commit"` record containing the 32-bit FNV-1a checksum of every byte
     before that record (including LF separators).
 
 The record layout for v3-shaped snapshots is identical to formats 1–2. Format
 2 raised the conversation limit from 16 to 128, format 3 raised the
-per-conversation message limit from 64 to 512, and format 4 added the profile
+per-conversation message limit from 64 to 512, format 4 added the profile
 record type, the `profile_count` settings field, and the per-conversation
-customization fields. The active backend, the per-backend models, each
+customization fields, and format 5 added the
+`system_prompt_present` flag. The active backend, the per-backend models, each
 generation's backend, and each history entry's backend are additive optional
 fields emitted only when non-default
 (`backend` only when Ollama, `ollama_model` only when non-empty) and defaulted
@@ -598,13 +638,16 @@ Per-conversation overrides are deliberately **not** v3-additive fields. An
 older v3 binary would tolerate the unknown fields, ignore them, and silently
 erase them on its next save, so customization is version-gated in both
 directions: the encoder emits version 4 whenever any profile or override
-exists, and a v1–v3 snapshot carrying `profile_count`, a `profile` record, or
-any conversation override field is rejected as corruption. Profile prompts
+exists and version 5 whenever the deliberately-empty override exists, and a
+v1–v3 snapshot carrying `profile_count`, a `profile` record, or
+any conversation override field is rejected as corruption (as is a v4
+snapshot carrying `system_prompt_present`). Profile prompts
 and overrides are heap-backed in memory, so a store that uses none of them
 keeps the exact v3 byte shape and the fixed-residue amplification budget is
-unchanged. This build decodes all four versions, so an old snapshot migrates
+unchanged. This build decodes all five versions, so an old snapshot migrates
 to the current format on its next save. **Downgrade contract:** an older
-(version-1 through version-3) build that encounters a format 4 or newer file
+(version-1 through version-4) build that encounters a format 5 or newer file
+(or a version-1-through-3 build that encounters a format 4 or newer file)
 treats it as an unsupported version and stops immediately — it does not fall
 back to `state.bak.jsonl`, never overwrites the newer primary with a stale
 backup, and disables writes until a build that understands the format runs

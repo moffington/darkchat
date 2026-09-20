@@ -498,13 +498,22 @@ void chat_ui_sync(ChatUi *chat_ui) {
     bool empty = !active || active->message_count == 0;
     set_hidden(chat_ui, chat_ui->empty, !empty);
 
+    /* The chip shows the effective model of the active conversation. When a
+        per-conversation override is active (presence, not value: an override
+        equal to the global model still edits independently), a "this chat"
+        marker explains that the field below targets this conversation. */
+    bool model_here = active &&
+        (chat->backend == CHAT_BACKEND_OLLAMA
+            ? active->ollama_model[0] : active->model[0]) != 0;
     wchar_t model[UI_TEXT_CAPACITY];
-    _snwprintf(model, UI_TEXT_CAPACITY, L"%ls \u00b7 %ls",
-        chat_backend_name(chat->backend), chat_active_model(chat));
+    _snwprintf(model, UI_TEXT_CAPACITY, L"%ls \u00b7 %ls%ls",
+        chat_backend_name(chat->backend), chat_effective_model(chat, active),
+        model_here ? L" \u00b7 this chat" : L"");
     model[UI_TEXT_CAPACITY - 1] = 0;
     wchar_t accessible[UI_TEXT_CAPACITY];
-    _snwprintf(accessible, UI_TEXT_CAPACITY, L"Model: %ls",
-        chat_active_model(chat));
+    _snwprintf(accessible, UI_TEXT_CAPACITY, L"Model: %ls%ls",
+        chat_effective_model(chat, active),
+        model_here ? L" (set for this chat)" : L"");
     accessible[UI_TEXT_CAPACITY - 1] = 0;
     ui_set_accessible_name(chat_ui->ui, chat_ui->model, accessible);
     ui_set_help_text(chat_ui->ui, chat_ui->model, model);

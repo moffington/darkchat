@@ -244,6 +244,58 @@ static void test_system_prompt(void) {
     chat_dispose(chat); free(chat);
 }
 
+/* The conversation's effective prompt and model override the global slots:
+    a text override replaces the global prompt, the deliberately-empty
+    override suppresses it entirely, and an empty override inherits it. The
+    oversize diagnostics are measured against the effective prompt. */
+static void test_effective_prompt(void) {
+    Chat *chat = fresh_chat();
+    add_turn(chat, L"one", L"answer one", CHAT_GENERATION_COMPLETE);
+    int trigger = chat_append(chat, CHAT_ROLE_USER, L"two");
+    const ChatConversation *c = active(chat);
+    wcscpy(chat->system_prompt, L"Global persona.");
+    check(chat_conversation_apply_system_prompt(chat, 0, L"Local persona."),
+        "fixture: a text override is applied");
+    ChatRequestContext context;
+    check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) == CHAT_CONTEXT_OK,
+        "an overridden prompt builds");
+    check(context.messages[0].role == CHAT_ROLE_SYSTEM &&
+        !wcscmp(context.messages[0].text, L"Local persona."),
+        "the conversation override replaces the global prompt");
+    check(chat_conversation_apply_system_prompt(chat, 0, L""),
+        "fixture: the deliberately-empty override is applied");
+    check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) == CHAT_CONTEXT_OK &&
+        context.count == 3,
+        "the empty override sends no system message at all");
+    for (int i = 0; i < context.count; i++)
+        check(context.messages[i].role != CHAT_ROLE_SYSTEM,
+            "the empty override contributes no system entry");
+    check(chat_conversation_set_system_prompt(chat, 0, L""),
+        "fixture: the override is cleared");
+    check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) == CHAT_CONTEXT_OK &&
+        context.messages[0].role == CHAT_ROLE_SYSTEM &&
+        !wcscmp(context.messages[0].text, L"Global persona."),
+        "a cleared override inherits the global prompt again");
+
+    /* The oversize diagnostic measures the effective prompt: a huge override
+        fails like a huge global prompt would, and clearing it makes the same
+        budget succeed. */
+    wchar_t *big = long_text(4000, L'\u2014');
+    check(chat_conversation_apply_system_prompt(chat, 0, big),
+        "fixture: an oversized override is applied");
+    size_t base = TEST_ENVELOPE + json_encoded_string_size(chat->model);
+    check(chat_context_build(chat, c, trigger, base + 1000, &context) ==
+        CHAT_CONTEXT_OVERSIZE_SYSTEM,
+        "an oversized override is reported as an oversize system prompt");
+    check(chat_conversation_set_system_prompt(chat, 0, L""),
+        "fixture: the oversized override is cleared");
+    check(chat_context_build(chat, c, trigger, base + 1000, &context) ==
+        CHAT_CONTEXT_OK,
+        "the same budget succeeds once the override is gone");
+    free(big);
+    chat_dispose(chat); free(chat);
+}
+
 static void test_oversize(void) {
     Chat *chat = fresh_chat();
     const ChatConversation *c;
@@ -602,6 +654,7 @@ int main(void) {
     test_oldest_dropped_first();
     test_exclusions();
     test_system_prompt();
+    test_effective_prompt();
     test_oversize();
     test_invalid();
     test_beyond_trigger();

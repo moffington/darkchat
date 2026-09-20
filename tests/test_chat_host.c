@@ -2,6 +2,20 @@
 /* COBJMACROS must precede the first UIA header (pulled in through the host),
     so the palette suite can drive the popup's provider with C macros. */
 #define COBJMACROS
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+/* Confirmation seam: MessageBoxW is dllimport, so --wrap cannot intercept it.
+    The macro redirects every host call site (the host's own translation unit
+    is included below) to this deterministic stub instead of opening a real
+    dialog on the desktop. */
+static int message_box_result = IDYES;
+static int host_MessageBoxW_stub(HWND window, LPCWSTR text, LPCWSTR caption,
+    UINT type) {
+    (void)window; (void)text; (void)caption; (void)type;
+    return message_box_result;
+}
+#define MessageBoxW host_MessageBoxW_stub
 #include "chat/shell/chat_host_win32.c"
 #include <uiautomationclient.h>
 #include <uiautomationcoreapi.h>
@@ -23,6 +37,7 @@ static int completion_request_fake_generation;   /* 0: delegate to the real clie
 static ChatProviderRouting completion_request_last_routing;
 static ChatBackend completion_request_last_backend;
 static bool completion_request_last_had_routing;
+static wchar_t completion_request_last_model[CHAT_MODEL_TEXT];
 int __real_completion_request(CompletionClient *client, ChatBackend backend,
     const char *api_key_utf8, const wchar_t *model,
     const CompletionMessage *messages, int count,
@@ -34,6 +49,10 @@ int __wrap_completion_request(CompletionClient *client, ChatBackend backend,
     ++completion_request_calls;
     completion_request_last_count=count;
     completion_request_last_backend=backend;
+    if (model) {
+        wcsncpy(completion_request_last_model, model, CHAT_MODEL_TEXT - 1);
+        completion_request_last_model[CHAT_MODEL_TEXT - 1] = 0;
+    } else completion_request_last_model[0] = 0;
     for (int i=0;i<count && i<CHAT_CONTEXT_MAX_ENTRIES;i++) {
         completion_request_last_roles[i]=messages[i].role;
         completion_request_last_texts[i]=messages[i].text;
@@ -118,6 +137,38 @@ bool __wrap_chat_copy_text(HWND owner, const wchar_t *text) {
     copied_text[8191] = 0;
     return copy_result;
 }
+/* Edit-dialog seam (linked with -Wl,--wrap=chat_edit_dialog): dialog-opening
+    actions (per-conversation prompts, profile save/edit) are driven
+    deterministically. Each call consumes the next queued answer; with the
+    queue exhausted the dialog is declined, which is the cancel path. */
+static wchar_t edit_dialog_answers[8][CHAT_COMPOSER_TEXT];
+static int edit_dialog_answer_count, edit_dialog_answer_head;
+static wchar_t edit_dialog_last_title[128];
+static int edit_dialog_calls;
+bool __real_chat_edit_dialog(HWND owner, const wchar_t *title, wchar_t *text,
+    size_t capacity, bool multiline);
+bool __wrap_chat_edit_dialog(HWND owner, const wchar_t *title, wchar_t *text,
+    size_t capacity, bool multiline) {
+    (void)owner; (void)multiline;
+    ++edit_dialog_calls;
+    wcsncpy(edit_dialog_last_title, title, 127);
+    edit_dialog_last_title[127] = 0;
+    if (edit_dialog_answer_head >= edit_dialog_answer_count) return false;
+    wcsncpy(text, edit_dialog_answers[edit_dialog_answer_head++],
+        capacity - 1);
+    text[capacity - 1] = 0;
+    return true;
+}
+static void edit_queue_clear(void) {
+    edit_dialog_answer_count = edit_dialog_answer_head = 0;
+    edit_dialog_calls = 0;
+}
+static void edit_queue_push(const wchar_t *text) {
+    if (edit_dialog_answer_count < 8)
+        wcscpy(edit_dialog_answers[edit_dialog_answer_count++], text);
+}
+/* Confirmation seam lives above the host include (MessageBoxW macro
+    redirection must precede the host's call sites). */
 /* Identity helpers over the popup's visible rows: the controller labels are
    display text, so id assertions resolve the stable row key instead. */
 static const wchar_t *palette_row_id(PalettePopup *popup, size_t index) {
@@ -535,6 +586,358 @@ static int default_suite(void) {
         h->request_message=1; h->request_conversation=0;
         h->generating=false; h->context_dropped=0; h->request_generation=0;
         render_transcript(h);
+    }
+    /* ---- Conversation overrides and prompt profiles ---- */
+    {
+        /* The model override reaches the request: the client sees the
+            conversation's model and the audit metadata records the same
+            resolution, and the field/palette path targets the override
+            while it is active. */
+        CHECK(chat_conversation_set_model(chat,chat->active,
+            CHAT_BACKEND_OPENROUTER,L"override/model"));
+        sync_model_field(h);   /* what the UI actions do on override change */
+        int calls=completion_request_calls;
+        rich_text_set_text(&h->composer,L"override question");
+        completion_request_fake_generation=8484;
+        perform_send(h);
+        completion_request_fake_generation=0;
+        CHECK(completion_request_calls==calls+1);
+        CHECK(!wcscmp(completion_request_last_model,L"override/model"));
+        CHECK(!wcscmp(pending(h)->generation.requested_model,
+            L"override/model"));
+        CHECK(h->generating && h->request_generation==8484);
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+        CHECK(!h->generating);
+        /* The chip marks the override by presence, not value. */
+        chat_ui_sync(&h->chat_ui);
+        { UiNode *chip=ui_node(h->config.ui,h->chat_ui.model);
+          CHECK(chip && wcsstr(chip->help_text,L"\u00b7 this chat")!=NULL); }
+        /* The field edits the override while it is active; the global slot
+            is untouched. */
+        rich_text_set_text(&h->field,L"typed/model");
+        sync_model(h);
+        CHECK(!wcscmp(chat->conversations[chat->active].model,
+            L"typed/model"));
+        CHECK(!wcscmp(chat->model,L"openai/gpt-4o-mini"));
+        /* The palette targets the override too, and highlights the
+            effective model when opened. */
+        h->dirty=false;
+        CHECK(apply_model(h,L"palette/model") &&
+            !wcscmp(chat->conversations[chat->active].model,
+                L"palette/model"));
+        CHECK(!wcscmp(chat->model,L"openai/gpt-4o-mini"));
+        CHECK(h->dirty);
+        wcscpy(chat->model_history[0],L"palette/model");
+        chat->model_history_backend[0]=CHAT_BACKEND_OPENROUTER;
+        chat->model_history_count=1;
+        begin_model_palette(h);
+        CHECK(h->open_palette);
+        { wchar_t highlighted[CHAT_MODEL_TEXT];
+          CHECK(palette_popup_highlighted_model(h->open_palette,highlighted));
+          CHECK(!wcscmp(highlighted,L"palette/model")); }
+        palette_popup_cancel(h->open_palette);
+        end_palette(h);
+        /* Clearing the override hands the field back to the global slot. */
+        CHECK(chat_conversation_set_model(chat,chat->active,
+            CHAT_BACKEND_OPENROUTER,L""));
+        sync_model_field(h);
+        chat_ui_sync(&h->chat_ui);
+        { UiNode *chip=ui_node(h->config.ui,h->chat_ui.model);
+          CHECK(chip && wcsstr(chip->help_text,L"\u00b7 this chat")==NULL); }
+        rich_text_set_text(&h->field,L"global/typed");
+        sync_model(h);
+        CHECK(!wcscmp(chat->model,L"global/typed"));
+        CHECK(chat->conversations[chat->active].model[0]==0);
+        CHECK(apply_model(h,L"openai/gpt-4o-mini") &&
+            !wcscmp(chat->model,L"openai/gpt-4o-mini"));
+        /* The prompt override reaches the request in all three states. */
+        wcscpy(chat->system_prompt,L"Global persona.");
+        CHECK(chat_conversation_apply_system_prompt(chat,chat->active,
+            L"Override persona."));
+        calls=completion_request_calls;
+        rich_text_set_text(&h->composer,L"persona question");
+        completion_request_fake_generation=8485;
+        perform_send(h);
+        completion_request_fake_generation=0;
+        CHECK(completion_request_calls==calls+1);
+        CHECK(completion_request_last_count>=1);
+        CHECK(completion_request_last_roles[0]==CHAT_ROLE_SYSTEM &&
+            !wcscmp(completion_request_last_texts[0],L"Override persona."));
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+        /* The deliberately-empty override sends no system message. */
+        CHECK(chat_conversation_apply_system_prompt(chat,chat->active,L""));
+        calls=completion_request_calls;
+        rich_text_set_text(&h->composer,L"empty persona question");
+        completion_request_fake_generation=8486;
+        perform_send(h);
+        completion_request_fake_generation=0;
+        CHECK(completion_request_calls==calls+1);
+        CHECK(completion_request_last_roles[0]!=CHAT_ROLE_SYSTEM);
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+        /* Clearing inherits the global prompt again. */
+        CHECK(chat_conversation_set_system_prompt(chat,chat->active,L""));
+        calls=completion_request_calls;
+        rich_text_set_text(&h->composer,L"inherited persona question");
+        completion_request_fake_generation=8487;
+        perform_send(h);
+        completion_request_fake_generation=0;
+        CHECK(completion_request_calls==calls+1);
+        CHECK(completion_request_last_roles[0]==CHAT_ROLE_SYSTEM &&
+            !wcscmp(completion_request_last_texts[0],L"Global persona."));
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+        /* Trim back to the fixture shape the following checks expect. The
+            global prompt stays set: the profile tests below capture it. */
+        ChatConversation *oc=&chat->conversations[chat->active];
+        for (size_t i=2;i<oc->message_count;i++)
+            chat_message_dispose(&oc->messages[i]);
+        oc->message_count=2;
+        oc->draft[0]=0;
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=chat->active;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+
+        /* A conversation override must not swallow the just-picked model
+            during a pending switch: the switch seeds the global slot and
+            aligns the existing override, so the committed backend uses the
+            model the user selected. Driven through the real end_model_palette
+            path below, together with the backend suite's first-Ollama-switch
+            fixture. */
+
+        /* Profile actions, driven through action() with the dialog and
+            confirmation seams. Save captures the effective prompt. */
+        edit_queue_clear();
+        message_box_result=IDYES;
+        edit_queue_push(L"My Profile");
+        action(h,ACTION_PROFILE_SAVE);
+        CHECK(chat->profile_count==1 &&
+            !wcscmp(chat->profiles[0].name,L"My Profile"));
+        CHECK(!wcscmp(chat_text_value(&chat->profiles[0].prompt),
+            L"Global persona."));
+        /* A duplicate name is rejected with a status and no second profile. */
+        edit_queue_push(L"My Profile");
+        action(h,ACTION_PROFILE_SAVE);
+        CHECK(chat->profile_count==1);
+        CHECK(wcsstr(chat->status,L"Could not save the profile")!=NULL);
+        /* Apply to the global prompt, verbatim. */
+        action(h,CHAT_ACTION_DYNAMIC_APPLY_GLOBAL_BASE);
+        CHECK(!wcscmp(chat->system_prompt,L"Global persona."));
+        /* Apply to this conversation: the text override lands. */
+        action(h,CHAT_ACTION_DYNAMIC_APPLY_HERE_BASE);
+        CHECK(chat->conversations[chat->active].system_prompt.data!=NULL &&
+            !wcscmp(chat_text_value(
+                &chat->conversations[chat->active].system_prompt),
+                L"Global persona."));
+        /* An empty profile applied here is a real empty override. */
+        CHECK(chat_profile_add(chat,L"Silent",L"")==1);
+        action(h,CHAT_ACTION_DYNAMIC_APPLY_HERE_BASE+1);
+        CHECK(chat->conversations[chat->active].system_prompt.data==NULL &&
+            chat->conversations[chat->active].system_prompt_present);
+        /* A stale dynamic id (beyond the live count) does nothing. */
+        action(h,CHAT_ACTION_DYNAMIC_APPLY_HERE_BASE+23);
+        CHECK(chat->conversations[chat->active].system_prompt_present);
+        /* Edit renames and re-prompts through two dialogs; cancel after the
+            first dialog changes nothing. */
+        edit_queue_clear();
+        action(h,CHAT_ACTION_DYNAMIC_EDIT_BASE);
+        CHECK(edit_dialog_calls==1 &&
+            !wcscmp(chat->profiles[0].name,L"My Profile"));
+        edit_queue_push(L"Renamed");
+        action(h,CHAT_ACTION_DYNAMIC_EDIT_BASE);
+        /* Two dialogs ran (the declined prompt counts too); the accepted
+            name alone changes nothing. */
+        CHECK(edit_dialog_calls==3 && edit_dialog_answer_head==1 &&
+            !wcscmp(chat->profiles[0].name,L"My Profile"));
+        edit_queue_push(L"Renamed");
+        edit_queue_push(L"Better prompt");
+        action(h,CHAT_ACTION_DYNAMIC_EDIT_BASE);
+        CHECK(!wcscmp(chat->profiles[0].name,L"Renamed") &&
+            !wcscmp(chat_text_value(&chat->profiles[0].prompt),
+                L"Better prompt"));
+        /* A rename colliding with the other profile fails cleanly. */
+        edit_queue_push(L"Silent");
+        edit_queue_push(L"x");
+        action(h,CHAT_ACTION_DYNAMIC_EDIT_BASE);
+        CHECK(!wcscmp(chat->profiles[0].name,L"Renamed"));
+        /* Delete confirms through the box; declining keeps the profile. */
+        message_box_result=IDNO;
+        action(h,CHAT_ACTION_DYNAMIC_DELETE_BASE);
+        CHECK(chat->profile_count==2);
+        message_box_result=IDYES;
+        action(h,CHAT_ACTION_DYNAMIC_DELETE_BASE);
+        CHECK(chat->profile_count==1 &&
+            !wcscmp(chat->profiles[0].name,L"Silent"));
+        /* Canceled dialogs return before the save tail: the override and
+            the status stay untouched. */
+        edit_queue_clear();
+        { wchar_t before[CHAT_STATUS_TEXT];
+          wcscpy(before,chat->status);
+          action(h,ACTION_SYSTEM_HERE);
+          CHECK(!wcscmp(chat->status,before) &&
+              chat->conversations[chat->active].system_prompt.data==NULL &&
+              chat->conversations[chat->active].system_prompt_present); }
+        /* The per-conversation prompt dialog applies an explicit empty. */
+        edit_queue_push(L"");
+        action(h,ACTION_SYSTEM_HERE);
+        CHECK(chat->conversations[chat->active].system_prompt_present);
+        edit_queue_push(L"This chat only");
+        action(h,ACTION_SYSTEM_HERE);
+        CHECK(!wcscmp(chat_text_value(
+            &chat->conversations[chat->active].system_prompt),
+            L"This chat only"));
+        /* Use global clears the override; a stale no-op dispatch on a
+            submenu header changes nothing. */
+        action(h,ACTION_SYSTEM_CLEAR_HERE);
+        CHECK(chat->conversations[chat->active].system_prompt.data==NULL &&
+            !chat->conversations[chat->active].system_prompt_present);
+        action(h,ACTION_PROFILE_APPLY);
+        action(h,ACTION_PROFILE_EDIT);
+        action(h,ACTION_PROFILE_DELETE);
+        CHECK(chat->profile_count==1);
+        /* "Use model for this chat" copies the global model into the
+            override; clearing restores inherit. */
+        action(h,ACTION_MODEL_USE_HERE);
+        CHECK(!wcscmp(chat->conversations[chat->active].model,
+            chat->model));
+        action(h,ACTION_MODEL_CLEAR_HERE);
+        CHECK(chat->conversations[chat->active].model[0]==0);
+        /* Cleanup: drop the library, restore the global prompt and the
+            fixture shape the following checks expect. */
+        chat_profile_remove(chat,0);
+        CHECK(chat->profile_count==0);
+        chat->system_prompt[0]=0;
+        chat_conversation_set_system_prompt(chat,chat->active,L"");
+        chat->model_history_count=0;
+        oc->messages[1].generation.state=CHAT_GENERATION_FAILED;
+        mark_dirty(h);
+    }
+    /* ---- Overflow menu structure: dynamic profile submenus ---- */
+    /* The dispatch tests above drive dynamic ids directly; this block
+        exercises chat_actions_menu() itself: the nested submenu structure,
+        the item ids, the escaped labels and the header enablement that the
+        implementation depends on through MIIM_ID assignment. */
+    {
+        CHECK(chat_profile_add(chat,L"R&D",L"be terse")==0);
+        CHECK(chat_profile_add(chat,L"Plain",L"")==1);
+        HMENU bar=chat_actions_menu(chat);
+        CHECK(bar);
+        CHECK(GetMenuItemCount(bar)==4);
+        MENUITEMINFOW top; memset(&top,0,sizeof top);
+        top.cbSize=sizeof top; top.fMask=MIIM_SUBMENU;
+        CHECK(GetMenuItemInfoW(bar,GetMenuItemCount(bar)-1,TRUE,&top));
+        HMENU custom=top.hSubMenu;
+        CHECK(custom);
+        /* Eight registry entries plus three flagged separators. */
+        CHECK(GetMenuItemCount(custom)==11);
+        static const struct { int id; bool submenu; bool separator; }
+            expected[] = {
+            { ACTION_MODEL_USE_HERE, false, false },
+            { ACTION_MODEL_CLEAR_HERE, false, false },
+            { 0, false, true },
+            { ACTION_SYSTEM_HERE, false, false },
+            { ACTION_SYSTEM_CLEAR_HERE, false, false },
+            { 0, false, true },
+            { ACTION_PROFILE_APPLY, true, false },
+            { ACTION_PROFILE_SAVE, false, false },
+            { 0, false, true },
+            { ACTION_PROFILE_EDIT, true, false },
+            { ACTION_PROFILE_DELETE, true, false },
+        };
+        for (UINT i=0;
+            i<(UINT)GetMenuItemCount(custom) &&
+            i<sizeof expected/sizeof expected[0];i++) {
+            MENUITEMINFOW info; memset(&info,0,sizeof info);
+            info.cbSize=sizeof info;
+            info.fMask=MIIM_ID|MIIM_SUBMENU|MIIM_FTYPE;
+            CHECK(GetMenuItemInfoW(custom,i,TRUE,&info));
+            CHECK(((info.fType & MFT_SEPARATOR)!=0) ==
+                (int)expected[i].separator);
+            if (expected[i].separator) { CHECK(info.wID==0); continue; }
+            CHECK(info.wID==(UINT)expected[i].id);
+            CHECK((info.hSubMenu!=NULL)==expected[i].submenu);
+        }
+        /* The Apply submenu carries two nested popups, each with one item
+            per live profile; names are mnemonic-escaped. */
+        MENUITEMINFOW apply; memset(&apply,0,sizeof apply);
+        apply.cbSize=sizeof apply;
+        apply.fMask=MIIM_SUBMENU;
+        CHECK(GetMenuItemInfoW(custom,ACTION_PROFILE_APPLY,FALSE,&apply));
+        CHECK(apply.hSubMenu && GetMenuItemCount(apply.hSubMenu)==2);
+        MENUITEMINFOW nested; memset(&nested,0,sizeof nested);
+        nested.cbSize=sizeof nested; nested.fMask=MIIM_SUBMENU;
+        CHECK(GetMenuItemInfoW(apply.hSubMenu,0,TRUE,&nested));
+        HMENU global=nested.hSubMenu;
+        CHECK(global && GetMenuItemCount(global)==2);
+        CHECK(GetMenuItemInfoW(apply.hSubMenu,1,TRUE,&nested));
+        HMENU here=nested.hSubMenu;
+        CHECK(here && GetMenuItemCount(here)==2);
+        for (int i=0;i<2;i++) {
+            wchar_t label[128];
+            MENUITEMINFOW leaf; memset(&leaf,0,sizeof leaf);
+            leaf.cbSize=sizeof leaf;
+            leaf.fMask=MIIM_ID|MIIM_STRING;
+            leaf.dwTypeData=label; leaf.cch=128;
+            CHECK(GetMenuItemInfoW(global,(UINT)i,TRUE,&leaf));
+            CHECK(leaf.wID==(UINT)(CHAT_ACTION_DYNAMIC_APPLY_GLOBAL_BASE+i));
+            CHECK(GetMenuItemInfoW(here,(UINT)i,TRUE,&leaf));
+            CHECK(leaf.wID==(UINT)(CHAT_ACTION_DYNAMIC_APPLY_HERE_BASE+i));
+        }
+        {
+            wchar_t label[128];
+            MENUITEMINFOW leaf; memset(&leaf,0,sizeof leaf);
+            leaf.cbSize=sizeof leaf;
+            leaf.fMask=MIIM_ID|MIIM_STRING;
+            leaf.dwTypeData=label; leaf.cch=128;
+            CHECK(GetMenuItemInfoW(global,0,TRUE,&leaf));
+            CHECK(!wcscmp(label,L"R&&D"));
+            leaf.cch=128;   /* the call overwrites cch with the copied count */
+            CHECK(GetMenuItemInfoW(global,1,TRUE,&leaf));
+            CHECK(!wcscmp(label,L"Plain"));
+        }
+        /* Edit and Delete submenus carry one item per profile. */
+        MENUITEMINFOW edit; memset(&edit,0,sizeof edit);
+        edit.cbSize=sizeof edit; edit.fMask=MIIM_SUBMENU;
+        CHECK(GetMenuItemInfoW(custom,ACTION_PROFILE_EDIT,FALSE,&edit));
+        CHECK(edit.hSubMenu && GetMenuItemCount(edit.hSubMenu)==2);
+        { MENUITEMINFOW leaf; memset(&leaf,0,sizeof leaf);
+          leaf.cbSize=sizeof leaf; leaf.fMask=MIIM_ID;
+          CHECK(GetMenuItemInfoW(edit.hSubMenu,1,TRUE,&leaf));
+          CHECK(leaf.wID==(UINT)(CHAT_ACTION_DYNAMIC_EDIT_BASE+1)); }
+        MENUITEMINFOW del; memset(&del,0,sizeof del);
+        del.cbSize=sizeof del; del.fMask=MIIM_SUBMENU;
+        CHECK(GetMenuItemInfoW(custom,ACTION_PROFILE_DELETE,FALSE,&del));
+        CHECK(del.hSubMenu && GetMenuItemCount(del.hSubMenu)==2);
+        { MENUITEMINFOW leaf; memset(&leaf,0,sizeof leaf);
+          leaf.cbSize=sizeof leaf; leaf.fMask=MIIM_ID;
+          CHECK(GetMenuItemInfoW(del.hSubMenu,0,TRUE,&leaf));
+          CHECK(leaf.wID==(UINT)(CHAT_ACTION_DYNAMIC_DELETE_BASE+0)); }
+        /* Sync enables live profile leaves and headers, and grays stale
+            indexes; with no profiles the headers gray. */
+        ChatActionContext ctx;
+        chat_action_context_init(&ctx,chat);
+        chat_actions_sync(custom,&ctx);
+        CHECK(!(GetMenuState(custom,ACTION_PROFILE_APPLY,MF_BYCOMMAND)&MF_GRAYED));
+        CHECK(!(GetMenuState(custom,ACTION_PROFILE_EDIT,MF_BYCOMMAND)&MF_GRAYED));
+        CHECK(!(GetMenuState(custom,ACTION_PROFILE_DELETE,MF_BYCOMMAND)&MF_GRAYED));
+        CHECK(!(GetMenuState(custom,CHAT_ACTION_DYNAMIC_APPLY_HERE_BASE,
+            MF_BYCOMMAND)&MF_GRAYED));
+        CHECK(GetMenuState(custom,CHAT_ACTION_DYNAMIC_APPLY_HERE_BASE+2,
+            MF_BYCOMMAND)&MF_GRAYED);
+        CHECK(GetMenuState(custom,CHAT_ACTION_DYNAMIC_DELETE_BASE+7,
+            MF_BYCOMMAND)&MF_GRAYED);
+        CHECK(chat_profile_remove(chat,0) && chat_profile_remove(chat,0));
+        CHECK(chat->profile_count==0);
+        HMENU empty=chat_actions_menu(chat);
+        CHECK(empty);
+        CHECK(GetMenuItemInfoW(empty,GetMenuItemCount(empty)-1,TRUE,&top));
+        HMENU empty_custom=top.hSubMenu;
+        chat_action_context_init(&ctx,chat);
+        chat_actions_sync(empty_custom,&ctx);
+        CHECK(GetMenuState(empty_custom,ACTION_PROFILE_APPLY,MF_BYCOMMAND)&MF_GRAYED);
+        CHECK(GetMenuState(empty_custom,ACTION_PROFILE_DELETE,MF_BYCOMMAND)&MF_GRAYED);
+        CHECK(!(GetMenuState(empty_custom,ACTION_PROFILE_SAVE,MF_BYCOMMAND)&MF_GRAYED));
+        DestroyMenu(empty);
+        DestroyMenu(bar);
     }
     begin_fixture(h); CHECK(h->request_message==1);
     CompletionEvent *e=fixture(h,COMPLETION_DELTA,L"Partial answer");
@@ -3811,17 +4214,33 @@ static int backend_suite(void) {
     CHECK(!h->backend_switch_pending);
     /* Complete the catalogue fetch the cancelled switch started. */
     catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_ollama_json,NULL));
+    /* A conversation that already carries an Ollama override must not
+       swallow the model the user picks for the first switch: the switch
+       seeds the global slot (storage rejects an Ollama-active snapshot with
+       an empty one) and aligns the existing override, so after the commit
+       the effective model is exactly the selection. */
+    CHECK(chat_conversation_set_model(chat,chat->active,CHAT_BACKEND_OLLAMA,
+        L"stale/local"));
     h->backend_target=CHAT_BACKEND_OLLAMA; h->backend_switch_pending=true;
     begin_model_palette(h);
     CHECK(h->open_palette);
-    CHECK(!wcscmp(current_model(chat,CHAT_BACKEND_OLLAMA),L""));
+    CHECK(!wcscmp(global_model_for(chat,CHAT_BACKEND_OLLAMA),L""));
     palette_popup_set_selected_model(h->open_palette,L"llama3.2:latest");
     palette_popup_accept(h->open_palette);
     end_palette(h);
     CHECK(chat->backend==CHAT_BACKEND_OLLAMA);
+    CHECK(!h->backend_switch_pending);
     CHECK(!wcscmp(chat->ollama_model,L"llama3.2:latest"));
+    CHECK(!wcscmp(chat->conversations[chat->active].ollama_model,
+        L"llama3.2:latest"));
+    CHECK(!wcscmp(chat_effective_model(chat,chat_active(chat)),
+        L"llama3.2:latest"));
     { wchar_t shown[CHAT_MODEL_TEXT]; rich_text_get_text(&h->field,shown,CHAT_MODEL_TEXT);
       CHECK(!wcscmp(shown,L"llama3.2:latest")); }
+    /* The aligned override is conversation state; drop it so the following
+       remember-model checks resolve through the global slots. */
+    CHECK(chat_conversation_set_model(chat,chat->active,CHAT_BACKEND_OLLAMA,
+        L""));
     /* Complete the accept's fetch so the client is not left busy. */
     catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_ollama_json,NULL));
 

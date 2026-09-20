@@ -129,6 +129,14 @@ void chat_actions_sync(HMENU menu, const ChatActionContext *context) {
             ? MF_ENABLED : MF_GRAYED;
         EnableMenuItem(menu, (UINT)table[i].id, MF_BYCOMMAND | enable);
     }
+    /* Dynamic profile items carry base + index ids, so the same command-id
+        sync covers them wherever the submenu carrying them opens. */
+    for (int id = CHAT_ACTION_DYNAMIC_APPLY_GLOBAL_BASE;
+        id < CHAT_ACTION_DYNAMIC_END; id++) {
+        UINT enable = chat_action_available(id, context)
+            ? MF_ENABLED : MF_GRAYED;
+        EnableMenuItem(menu, (UINT)id, MF_BYCOMMAND | enable);
+    }
 }
 static void append_action(HMENU menu, int id) {
     const ChatActionInfo *info = chat_action_info(id);
@@ -144,19 +152,100 @@ static void append_action(HMENU menu, int id) {
     text[CHAT_ACTION_LABEL_TEXT - 1] = 0;
     AppendMenuW(menu, MF_STRING, (UINT_PTR)id, text);
 }
+
+/* Copies a profile name as a menu label with every '&' doubled: names are
+    user-controlled and Win32 menu text treats a bare '&' as a mnemonic
+    marker, so "R&D" would otherwise display as "RD". Doubling renders the
+    literal ampersand; dynamic items carry no mnemonic, which is correct
+    for arbitrary user text. */
+static void append_escaped_name(HMENU menu, int id, const wchar_t *name) {
+    wchar_t text[2 * CHAT_PROFILE_NAME_TEXT];
+    size_t used = 0;
+    for (const wchar_t *p = name; *p && used + 1 < sizeof text/sizeof *text; p++) {
+        if (*p == L'&' && used + 2 < (int)(sizeof text/sizeof *text))
+            text[used++] = L'&';
+        text[used++] = *p;
+    }
+    text[used] = 0;
+    AppendMenuW(menu, MF_STRING, (UINT_PTR)id, text);
+}
+
+/* One dynamic leaf item per live profile, carrying base + profile index.
+    The submenu is rebuilt on every menu open, so no stale item can
+    outlive the profile it was built from; dispatch still validates the
+    index against the live count. */
+static void append_profile_items(HMENU menu, const Chat *chat, int base) {
+    for (int i = 0; i < chat->profile_count; i++) {
+        const ChatPromptProfile *p = chat_profile(chat, i);
+        if (!p) break;
+        append_escaped_name(menu, base + i, p->name);
+    }
+}
+
+/* Appends a submenu-only registry entry. MF_POPUP items carry their child
+    HMENU where a command id would go, so the registry id is set on the item
+    afterwards (MIIM_ID); that is what lets the availability sync enable and
+    gray the header by command id like every leaf item. */
+static void append_submenu(HMENU menu, int id, HMENU child,
+    bool separator_before) {
+    if (separator_before)
+        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)child, chat_action_menu_label(id));
+    MENUITEMINFO info;
+    memset(&info, 0, sizeof info);
+    info.cbSize = sizeof info;
+    info.fMask = MIIM_ID;
+    info.wID = (UINT)id;
+    SetMenuItemInfo(menu, GetMenuItemCount(menu) - 1, TRUE, &info);
+}
+
+/* Populates the dynamic profile submenus of one Customization entry. */
+static void populate_profile_submenu(HMENU parent, const Chat *chat, int id) {
+    if (id == ACTION_PROFILE_APPLY) {
+        /* One submenu, two targets: the global slot and the active
+            conversation's override, both reachable in two clicks. */
+        HMENU global = CreatePopupMenu();
+        HMENU here = CreatePopupMenu();
+        if (!global || !here) {
+            if (global) DestroyMenu(global);
+            if (here) DestroyMenu(here);
+            return;
+        }
+        append_profile_items(global, chat,
+            CHAT_ACTION_DYNAMIC_APPLY_GLOBAL_BASE);
+        append_profile_items(here, chat, CHAT_ACTION_DYNAMIC_APPLY_HERE_BASE);
+        AppendMenuW(parent, MF_POPUP, (UINT_PTR)global, L"Global &prompt");
+        AppendMenuW(parent, MF_POPUP, (UINT_PTR)here, L"This &conversation");
+    } else if (id == ACTION_PROFILE_EDIT) {
+        append_profile_items(parent, chat, CHAT_ACTION_DYNAMIC_EDIT_BASE);
+    } else if (id == ACTION_PROFILE_DELETE) {
+        append_profile_items(parent, chat, CHAT_ACTION_DYNAMIC_DELETE_BASE);
+    }
+}
+
 HMENU chat_actions_menu(const Chat *chat) {
     /* A popup root, not a menu bar: the only consumer tracks it directly
-       with TrackPopupMenu, which does not render a CreateMenu() bar (it
-       displays as an empty box). Items, their order and their separators come
-       from the registry; only the submenu hierarchy is structural. */
+        with TrackPopupMenu, which does not render a CreateMenu() bar (it
+        displays as an empty box). Items, their order and their separators come
+        from the registry; only the submenu hierarchy is structural. */
     HMENU group[CHAT_ACTION_GROUP_COUNT];
     for (int g = 0; g < CHAT_ACTION_GROUP_COUNT; g++)
         group[g] = CreatePopupMenu();
     size_t count;
     const ChatActionInfo *table = chat_action_table(&count);
-    for (size_t i = 0; i < count; i++)
-        if ((unsigned)table[i].group < (unsigned)CHAT_ACTION_GROUP_COUNT)
+    for (size_t i = 0; i < count; i++) {
+        if ((unsigned)table[i].group >= (unsigned)CHAT_ACTION_GROUP_COUNT)
+            continue;
+        if (table[i].flags & CHAT_ACTION_FLAG_SUBMENU_ONLY) {
+            HMENU child = CreatePopupMenu();
+            if (!child) continue;
+            populate_profile_submenu(child, chat, table[i].id);
+            append_submenu(group[table[i].group], table[i].id, child,
+                (table[i].flags & CHAT_ACTION_FLAG_SEPARATOR_BEFORE) != 0);
+        } else {
             append_action(group[table[i].group], table[i].id);
+        }
+    }
     chat_actions_sync_routing(group[CHAT_ACTION_GROUP_BACKEND], chat);
     chat_actions_sync_routing(group[CHAT_ACTION_GROUP_ROUTING], chat);
     AppendMenuW(group[CHAT_ACTION_GROUP_SETTINGS], MF_POPUP,
@@ -170,5 +259,7 @@ HMENU chat_actions_menu(const Chat *chat) {
         (UINT_PTR)group[CHAT_ACTION_GROUP_RESPONSE], L"&Response");
     AppendMenuW(bar, MF_POPUP,
         (UINT_PTR)group[CHAT_ACTION_GROUP_SETTINGS], L"&Settings");
+    AppendMenuW(bar, MF_POPUP,
+        (UINT_PTR)group[CHAT_ACTION_GROUP_CUSTOMIZATION], L"&Customization");
     return bar;
 }

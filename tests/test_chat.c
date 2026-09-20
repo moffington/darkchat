@@ -1264,6 +1264,44 @@ int main(void) {
         check(chat_conversation_set_system_prompt(ov, 0, L"") &&
             ov->conversations[0].system_prompt.data == NULL,
             "an empty prompt override clears to unset");
+        check(chat_conversation_apply_system_prompt(ov, 0, L"") &&
+            ov->conversations[0].system_prompt.data == NULL &&
+            ov->conversations[0].system_prompt_present,
+            "an applied empty prompt is a real override, not inherit");
+        check(chat_conversation_apply_system_prompt(ov, 0, L"explicit") &&
+            !wcscmp(chat_text_value(&ov->conversations[0].system_prompt),
+                L"explicit") &&
+            !ov->conversations[0].system_prompt_present,
+            "applying a non-empty prompt behaves like the setter");
+        check(chat_conversation_set_system_prompt(ov, 0, L"") &&
+            ov->conversations[0].system_prompt.data == NULL &&
+            !ov->conversations[0].system_prompt_present,
+            "the setter's empty clears the text and the empty-override flag");
+        check(!chat_conversation_apply_system_prompt(ov, 5, L"x") &&
+            !chat_conversation_apply_system_prompt(NULL, 0, L"x"),
+            "out-of-range and null-chat applies are rejected");
+        /* A failed non-empty set/apply must not silently convert the
+            deliberate empty override into inheritance: the flag survives
+            the failed allocation. */
+        check(chat_conversation_apply_system_prompt(ov, 0, L""),
+            "fixture: the empty override is applied");
+        fail_next_mallocs = 1;
+        check(!chat_conversation_set_system_prompt(ov, 0, L"alloc fails"),
+            "a set that fails to allocate reports failure");
+        check(ov->conversations[0].system_prompt_present &&
+            ov->conversations[0].system_prompt.data == NULL,
+            "the failed set keeps the explicit-empty override");
+        fail_next_mallocs = 1;
+        check(!chat_conversation_apply_system_prompt(ov, 0, L"alloc fails"),
+            "an apply that fails to allocate reports failure");
+        check(ov->conversations[0].system_prompt_present &&
+            ov->conversations[0].system_prompt.data == NULL,
+            "the failed apply keeps the explicit-empty override");
+        fail_next_mallocs = 0;
+        check(chat_conversation_set_system_prompt(ov, 0, L"recover") &&
+            !wcscmp(chat_text_value(&ov->conversations[0].system_prompt),
+                L"recover"),
+            "the set succeeds once allocation is allowed");
         check(chat_append(ov, CHAT_ROLE_USER, L"probe") == 1,
             "override conversation has a message");
         check(chat_conversation_set_system_prompt(ov, 0, L"survives clear"),
@@ -1274,6 +1312,72 @@ int main(void) {
             "the prompt override survives Clear, like the title");
         check_invariants(ov);
         chat_dispose(ov); free(ov);
+
+        /* Effective resolution: per-backend overrides, empty = inherit, the
+            deliberately-empty prompt override, and the request bookkeeping
+            that records the effective model. */
+        Chat *eff = (Chat *)calloc(1, sizeof *eff);
+        if (!eff) return 2;
+        chat_init(eff);
+        check(chat_conversation_set_model(eff, 0, CHAT_BACKEND_OPENROUTER,
+                L"conv-or") &&
+            chat_conversation_set_model(eff, 0, CHAT_BACKEND_OLLAMA,
+                L"conv-ollama"),
+            "fixture model overrides are set");
+        check(!wcscmp(chat_effective_model(eff, chat_active(eff)), L"conv-or"),
+            "the override for the active backend wins");
+        check(!wcscmp(chat_effective_model_for_backend(eff,
+                chat_active(eff), CHAT_BACKEND_OLLAMA), L"conv-ollama"),
+            "the explicit-backend resolver is backend-specific");
+        check(chat_conversation_set_model(eff, 0, CHAT_BACKEND_OPENROUTER,
+                L"") &&
+            !wcscmp(chat_effective_model(eff, chat_active(eff)), eff->model),
+            "an empty override inherits the global slot");
+        check(!wcscmp(chat_effective_model(eff, NULL), eff->model),
+            "a NULL conversation inherits the global slot");
+        eff->backend = CHAT_BACKEND_OLLAMA;
+        check(!wcscmp(chat_effective_model(eff, chat_active(eff)),
+                L"conv-ollama"),
+            "the active-backend resolver follows the backend");
+        eff->backend = CHAT_BACKEND_OPENROUTER;
+        wcscpy(eff->system_prompt, L"global prompt");
+        check(!wcscmp(chat_effective_system_prompt(eff, chat_active(eff)),
+                L"global prompt"),
+            "no prompt override inherits the global prompt");
+        check(chat_conversation_apply_system_prompt(eff, 0, L"") &&
+            chat_effective_system_prompt(eff, chat_active(eff))[0] == 0,
+            "the deliberately-empty override suppresses the global prompt");
+        check(chat_conversation_apply_system_prompt(eff, 0, L"here") &&
+            !wcscmp(chat_effective_system_prompt(eff, chat_active(eff)),
+                L"here"),
+            "a text override wins over the global prompt");
+        check(chat_conversation_set_system_prompt(eff, 0, L"") &&
+            !wcscmp(chat_effective_system_prompt(eff, chat_active(eff)),
+                L"global prompt"),
+            "clearing the override inherits the global prompt again");
+        check(chat_conversation_set_model(eff, 0, CHAT_BACKEND_OPENROUTER,
+                L"req-model"),
+            "the request fixture override is set");
+        check(chat_append(eff, CHAT_ROLE_USER, L"question") == 1,
+            "the request fixture has a user turn");
+        int resp = chat_begin_response(eff, CHAT_SEND, L"question");
+        check(resp >= 0, "the effective-model response begins");
+        if (resp >= 0) {
+            const ChatGeneration *g =
+                &chat_active(eff)->messages[resp].generation;
+            check(!wcscmp(g->requested_model, L"req-model"),
+                "requested_model records the effective model");
+            bool remembered = false;
+            for (int i = 0; i < eff->model_history_count; i++)
+                if (eff->model_history_backend[i] ==
+                        CHAT_BACKEND_OPENROUTER &&
+                    !wcscmp(eff->model_history[i], L"req-model"))
+                    remembered = true;
+            check(remembered,
+                "the effective model is remembered for its backend");
+        }
+        check_invariants(eff);
+        chat_dispose(eff); free(eff);
 
         /* Snapshot ownership: customization is detached then cloned, the
             snapshot never aliases the source, and failing any allocation in

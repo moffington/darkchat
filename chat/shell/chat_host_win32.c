@@ -651,29 +651,80 @@ static void mark_dirty(ChatHost *host) {
 static wchar_t *model_slot(Chat *chat, ChatBackend backend) {
     return backend == CHAT_BACKEND_OLLAMA ? chat->ollama_model : chat->model;
 }
-static const wchar_t *current_model(const Chat *chat, ChatBackend backend) {
+static const wchar_t *global_model_for(const Chat *chat, ChatBackend backend) {
     return backend == CHAT_BACKEND_OLLAMA ? chat->ollama_model : chat->model;
 }
+/* The write target for one backend's model: the active conversation's
+   override when one is set for that backend, otherwise the global slot.
+   While an override is active, the model field and the palette both display
+   and edit the conversation's own model; "Clear conversation model" hands
+   editing back to the global slot. */
+static wchar_t *model_target(ChatHost *host, ChatBackend backend) {
+    Chat *chat = host->config.chat;
+    if (chat->active < 0 || chat->active >= chat->conversation_count)
+        return model_slot(chat, backend);
+    ChatConversation *c = &chat->conversations[chat->active];
+    wchar_t *override = backend == CHAT_BACKEND_OLLAMA
+        ? c->ollama_model : c->model;
+    return override[0] ? override : model_slot(chat, backend);
+}
 
-/* Writes the selected id into the target backend's slot and the visible field
-   atomically. Rejects empty and over-capacity ids. The model is added to
-   history only when a request actually begins (chat_begin_response), never
-   here, and manual entry through the field remains a fully supported
+/* Mirrors the active conversation's effective model into the field. Every
+   conversation switch and override change goes through this, so the field
+   never shows a stale value that a later sync_model would write into the
+   wrong target (an inherited conversation's global slot, or the override
+   of a conversation that was left moments ago). */
+static void sync_model_field(ChatHost *host) {
+    rich_text_set_text(&host->field,
+        chat_effective_model(host->config.chat,
+            chat_active(host->config.chat)));
+}
+
+/* Writes the selected id into the target backend's slot — the active
+   conversation's override when one is active, else the global slot — and the
+   visible field atomically. Rejects empty and over-capacity ids. The model is
+   added to history only when a request actually begins (chat_begin_response),
+   never here, and manual entry through the field remains a fully supported
    secondary path. During a pending backend switch the field is not updated
    until the switch commits. */
 static bool apply_model(ChatHost *host, const wchar_t *id) {
     if (!id || !id[0] || wcslen(id) >= CHAT_MODEL_TEXT) return false;
     Chat *chat = host->config.chat;
-    wchar_t *slot = model_slot(chat, host->backend_target);
+    /* During a pending backend switch the selection seeds the new backend's
+       global slot, never only a conversation override: the switch commits
+       only after a selection, and storage rejects an Ollama-active snapshot
+       with an empty global Ollama slot — an override while that slot is
+       empty would commit exactly that rejected state. */
+    wchar_t *slot = host->backend_switch_pending
+        ? model_slot(chat, host->backend_target)
+        : model_target(host, host->backend_target);
     bool changed = wcscmp(slot, id) != 0;
     if (changed) {
         wcsncpy(slot, id, CHAT_MODEL_TEXT - 1);
         slot[CHAT_MODEL_TEXT - 1] = 0;
-        mark_dirty(host);
     }
-    /* The visible field always mirrors the active backend, changed or not. */
+    /* During a pending switch an existing conversation override for the
+       target backend is aligned with the selection too: the switch must
+       commit with the model the user just picked, and effective resolution
+       must choose it over a stale override the moment the backend changes.
+       No override is created when none exists — the selection is meant to
+       seed the global slot, and effective resolution already follows it. */
+    if (host->backend_switch_pending && chat->active >= 0 &&
+        chat->active < chat->conversation_count) {
+        ChatConversation *active = &chat->conversations[chat->active];
+        wchar_t *override = host->backend_target == CHAT_BACKEND_OLLAMA
+            ? active->ollama_model : active->model;
+        if (override[0] && wcscmp(override, id) != 0) {
+            wcscpy(override, id);   /* id length validated above */
+            changed = true;
+        }
+    }
+    if (changed) mark_dirty(host);
+    /* The visible field always mirrors the active backend's effective
+       model — override or global — changed or not. */
     if (!host->backend_switch_pending)
-        rich_text_set_text(&host->field, chat_active_model(chat));
+        rich_text_set_text(&host->field,
+            chat_effective_model(chat, chat_active(chat)));
     return changed;
 }
 
@@ -790,7 +841,6 @@ static void maybe_start_catalog_fetch(ChatHost *host, ChatBackend backend) {
    pump. */
 static void begin_model_palette(ChatHost *host) {
     if (host->open_palette) return;
-    Chat *chat = host->config.chat;
     ChatBackend backend = host->backend_target;
     bool has_key = host->config.api_key_utf8 && host->config.api_key_utf8[0];
     if (backend == CHAT_BACKEND_OPENROUTER && !has_key) {
@@ -807,9 +857,11 @@ static void begin_model_palette(ChatHost *host) {
     int history_count = build_backend_history(host, backend, history);
     wchar_t status[CHAT_STATUS_TEXT];
     picker_status(host, backend, status, CHAT_STATUS_TEXT);
+    const wchar_t *highlight = chat_effective_model_for_backend(
+        host->config.chat, chat_active(host->config.chat), backend);
     host->open_palette = palette_popup_create_models(host->window,
-        &host->catalog[(int)backend], current_model(chat, backend), history,
-        history_count, status, current_model(chat, backend));
+        &host->catalog[(int)backend], highlight, history,
+        history_count, status, highlight);
     if (!host->open_palette)
         set_status(host, L"Could not open the model palette.");
 }
@@ -824,7 +876,7 @@ static void end_model_palette(ChatHost *host, bool accepted, const wchar_t *id) 
         changed = apply_model(host, id);
         if (host->backend_switch_pending) {
             chat->backend = host->backend_target;
-            rich_text_set_text(&host->field, chat_active_model(chat));
+            sync_model_field(host);
             changed = true;
         }
     }
@@ -936,7 +988,7 @@ static void select_backend(ChatHost *host, ChatBackend backend) {
     chat->backend = backend;
     host->backend_target = backend;
     mark_dirty(host);
-    rich_text_set_text(&host->field, chat_active_model(chat));
+    sync_model_field(host);
     save(host);
     chat_ui_sync(&host->chat_ui);
     set_status(host, backend == CHAT_BACKEND_OLLAMA ?
@@ -997,7 +1049,8 @@ static void catalog_event(ChatHost *host, ModelCatalogEvent *event) {
         picker_status(host, target, status, CHAT_STATUS_TEXT);
         if (!palette_popup_set_models(host->open_palette,
                 &host->catalog[(int)target],
-                current_model(host->config.chat, target), history,
+                chat_effective_model_for_backend(host->config.chat,
+                    chat_active(host->config.chat), target), history,
                 history_count, status))
             set_status(host, L"Could not refresh the model list.");
     }
@@ -1175,14 +1228,16 @@ static void sync_model(ChatHost *host) {
     while (length && (model[length - 1] == L' ' || model[length - 1] == L'\t'))
         model[--length] = 0;
     if (length) {
-        wchar_t *slot = model_slot(chat, chat->backend);
+        /* While the active conversation overrides the model, the field edits
+            the override; otherwise it edits the global slot. */
+        wchar_t *slot = model_target(host, chat->backend);
         wcsncpy(slot, model, CHAT_MODEL_TEXT - 1);
         slot[CHAT_MODEL_TEXT - 1] = 0;
     }
-    /* Never let the visible field and the stored model disagree: an empty field
-       falls back to the active backend's last valid model, which is written
-       back into the field. */
-    rich_text_set_text(&host->field, chat_active_model(chat));
+    /* Never let the visible field and the effective model disagree: an empty
+        field falls back to the effective model (override or global slot),
+        which is written back into the field. */
+    rich_text_set_text(&host->field, chat_effective_model(chat, chat_active(chat)));
     mark_dirty(host);
 }
 
@@ -1266,7 +1321,9 @@ static void capture_settings(ChatHost *host) {
     }
     wchar_t model[CHAT_MODEL_TEXT];
     rich_text_get_text(&host->field,model,CHAT_MODEL_TEXT);
-    wchar_t *slot=model_slot(chat,chat->backend);
+    /* While the active conversation overrides the model, the field edits the
+       override; otherwise it edits the global slot. */
+    wchar_t *slot=model_target(host,chat->backend);
     if (model[0] && wcscmp(model,slot)) { wcscpy(slot,model); mark_dirty(host); }
     WINDOWPLACEMENT placement={0}; placement.length=sizeof placement;
     if (GetWindowPlacement(host->window,&placement)) {
@@ -1330,10 +1387,13 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
         CHAT_CONTEXT_BUDGET_BYTES,&context);
     host->context_dropped=built==CHAT_CONTEXT_OK ? context.dropped_messages : 0;
     /* OpenRouter keeps its credentials and provider routing; Ollama needs
-       neither, so a missing OPENROUTER_API_KEY never blocks it. */
+        neither, so a missing OPENROUTER_API_KEY never blocks it. The model
+        sent is the one chat_begin_response recorded in requested_model: the
+        conversation's effective model (override or global slot) — the same
+        authoritative resolution the audit metadata carries. */
     host->request_generation=saved && built==CHAT_CONTEXT_OK ?
         completion_request(&host->client,chat->backend,
-            host->config.api_key_utf8,chat_active_model(chat),
+            host->config.api_key_utf8,m->generation.requested_model,
             context.messages,context.count,
             chat->backend==CHAT_BACKEND_OPENROUTER ?
                 &chat->provider_routing : NULL) : 0;
@@ -1610,6 +1670,9 @@ static void command(void *user, ChatCommand code, int index) {
             sync_transcript_container(host);
             render_transcript(host);
             rich_text_set_text(&host->composer, L"");
+            /* The fresh conversation inherits the model: show its effective
+                model, not the previous conversation's. */
+            sync_model_field(host);
             chat_ui_sync(&host->chat_ui);
             /* The new row sits below the window until it is revealed. */
             chat_ui_request_reveal(&host->chat_ui,
@@ -1622,6 +1685,10 @@ static void command(void *user, ChatCommand code, int index) {
             sync_transcript_container(host);
             render_transcript(host);
             rich_text_set_text(&host->composer,chat->conversations[chat->active].draft);
+            /* The selected conversation may override the model: the field
+                shows its effective model so a later sync edits the right
+                target. */
+            sync_model_field(host);
             chat_ui_sync(&host->chat_ui);
             /* Identity-based selection may target a row outside the window
                (search navigation, UIA SetFocus on a list summary). */
@@ -1861,6 +1928,96 @@ static void action(ChatHost *host, int code) {
         select_backend(host,code==ACTION_BACKEND_OLLAMA ?
             CHAT_BACKEND_OLLAMA : CHAT_BACKEND_OPENROUTER);
         return;
+    } else if (code==ACTION_PROFILE_APPLY || code==ACTION_PROFILE_EDIT ||
+        code==ACTION_PROFILE_DELETE) {
+        /* Submenu headers are structural, never commands; a stray dispatch
+            (they carry no shortcut and the palette skips them) is a no-op. */
+        return;
+    } else if (code==ACTION_MODEL_USE_HERE) {
+        const wchar_t *global=global_model_for(chat,chat->backend);
+        if (!global[0]) { set_status(host,L"No global model to copy; set the model field first."); return; }
+        if (chat_conversation_set_model(chat,chat->active,chat->backend,global)) {
+            sync_model_field(host);
+            set_status(host,L"Using this conversation's own model.");
+        }
+    } else if (code==ACTION_MODEL_CLEAR_HERE) {
+        chat_conversation_set_model(chat,chat->active,chat->backend,L"");
+        sync_model_field(host);
+        set_status(host,L"Conversation model cleared; using the global model.");
+    } else if (code==ACTION_SYSTEM_HERE) {
+        /* The dialog edits this conversation's own override: absent means
+            inherit (prefills empty), and an explicitly applied empty text
+            means "no system prompt in this conversation". Cancel discards. */
+        wchar_t prompt[CHAT_COMPOSER_TEXT];
+        wcscpy(prompt,chat_text_value(&c->system_prompt));
+        if (!chat_edit_dialog(host->window,
+            L"System prompt for this conversation (overrides the global prompt)",
+            prompt,CHAT_COMPOSER_TEXT,true)) return;
+        if (!chat_conversation_apply_system_prompt(chat,chat->active,prompt)) {
+            set_status(host,L"The prompt is too long for a conversation override.");
+            return;
+        }
+        set_status(host,prompt[0] ?
+            L"Using this conversation's own system prompt." :
+            L"This conversation now uses no system prompt.");
+    } else if (code==ACTION_SYSTEM_CLEAR_HERE) {
+        chat_conversation_set_system_prompt(chat,chat->active,L"");
+        set_status(host,L"Using the global system prompt.");
+    } else if (code==ACTION_PROFILE_SAVE) {
+        wchar_t name[CHAT_PROFILE_NAME_TEXT]; name[0]=0;
+        if (!chat_edit_dialog(host->window,L"Profile name",name,
+            CHAT_PROFILE_NAME_TEXT,false)) return;
+        if (chat_profile_add(chat,name,chat_effective_system_prompt(chat,c))<0) {
+            set_status(host,L"Could not save the profile: the name is empty or taken, or the profile limit is reached.");
+            return;
+        }
+        set_status(host,L"Prompt profile saved.");
+    } else if (code>=CHAT_ACTION_DYNAMIC_APPLY_GLOBAL_BASE &&
+        code<CHAT_ACTION_DYNAMIC_END) {
+        int index=chat_action_dynamic_profile_index(code);
+        const ChatPromptProfile *p=chat_profile(chat,index);
+        if (index<0 || !p) { set_status(host,L"That profile no longer exists."); return; }
+        if (code<CHAT_ACTION_DYNAMIC_APPLY_HERE_BASE) {
+            /* Apply to the global slot verbatim; a profile prompt is bounded
+                by CHAT_COMPOSER_TEXT like the global buffer. */
+            wcscpy(chat->system_prompt,chat_text_value(&p->prompt));
+            set_status(host,L"Profile applied to the global prompt.");
+        } else if (code<CHAT_ACTION_DYNAMIC_EDIT_BASE) {
+            /* Apply to this conversation. An empty profile prompt is a real
+                override: this conversation then uses no system prompt. */
+            if (!chat_conversation_apply_system_prompt(chat,chat->active,
+                    chat_text_value(&p->prompt))) {
+                set_status(host,L"The prompt is too long for a conversation override.");
+                return;
+            }
+            set_status(host,p->prompt.data ?
+                L"Profile applied to this conversation." :
+                L"Profile applied: this conversation now uses no system prompt.");
+        } else if (code<CHAT_ACTION_DYNAMIC_DELETE_BASE) {
+            wchar_t name[CHAT_PROFILE_NAME_TEXT]; wcscpy(name,p->name);
+            if (!chat_edit_dialog(host->window,L"Profile name",name,
+                CHAT_PROFILE_NAME_TEXT,false)) return;
+            wchar_t text[CHAT_COMPOSER_TEXT];
+            wcscpy(text,chat_text_value(&p->prompt));
+            if (!chat_edit_dialog(host->window,L"Profile prompt",text,
+                CHAT_COMPOSER_TEXT,true)) return;
+            if (!chat_profile_set(chat,index,name,text)) {
+                set_status(host,L"Could not update the profile: the name is empty, taken, or too long.");
+                return;
+            }
+            set_status(host,L"Prompt profile updated.");
+        } else {
+            wchar_t message[CHAT_PROFILE_NAME_TEXT+40];
+            swprintf(message,sizeof message/sizeof *message,
+                L"Delete profile \u201c%ls\u201d?",p->name);
+            if (MessageBoxW(host->window,message,L"DarkChat",
+                MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES) return;
+            if (!chat_profile_remove(chat,index)) {
+                set_status(host,L"That profile no longer exists.");
+                return;
+            }
+            set_status(host,L"Prompt profile deleted.");
+        }
     } else if (code>=ACTION_ROUTING_SORT_DEFAULT && code<=ACTION_ROUTING_ZDR) {
         /* OpenRouter provider routing has no meaning for a local Ollama
            request. The menu items are grayed while Ollama is active; a stale

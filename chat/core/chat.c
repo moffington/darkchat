@@ -218,6 +218,7 @@ bool chat_reserve_messages(ChatConversation *c, size_t count) {
    the profile library survives). */
 static void dispose_conversation(ChatConversation *c) {
     chat_text_dispose(&c->system_prompt);
+    c->system_prompt_present = false;
     for (size_t j=0;j<c->message_count;j++)
         chat_message_dispose(&c->messages[j]);
     free(c->messages);
@@ -558,8 +559,42 @@ const wchar_t *chat_active_model(const Chat *chat) {
     return chat->backend == CHAT_BACKEND_OLLAMA ? chat->ollama_model : chat->model;
 }
 
+/* The global remembered slot of one backend. */
+static const wchar_t *global_model_slot(const Chat *chat, ChatBackend backend) {
+    return backend == CHAT_BACKEND_OLLAMA ? chat->ollama_model : chat->model;
+}
+
+const wchar_t *chat_effective_model_for_backend(const Chat *chat,
+    const ChatConversation *c, ChatBackend backend) {
+    if (!chat) return L"";
+    const wchar_t *global = global_model_slot(chat, backend);
+    if (!c) return global;
+    const wchar_t *override = backend == CHAT_BACKEND_OLLAMA
+        ? c->ollama_model : c->model;
+    return override[0] ? override : global;
+}
+
+const wchar_t *chat_effective_model(const Chat *chat,
+    const ChatConversation *c) {
+    return chat ? chat_effective_model_for_backend(chat, c, chat->backend)
+                : L"";
+}
+
+const wchar_t *chat_effective_system_prompt(const Chat *chat,
+    const ChatConversation *c) {
+    if (!chat) return L"";
+    if (c) {
+        if (c->system_prompt.data) return c->system_prompt.data;
+        if (c->system_prompt_present) return L"";
+    }
+    return chat->system_prompt;
+}
+
 void chat_remember_model(Chat *chat) {
-    const wchar_t *model = chat_active_model(chat);
+    /* The remembered history records the model a request actually uses,
+        which is the active conversation's effective model (an override or
+        the global slot), tagged with the backend that sent it. */
+    const wchar_t *model = chat_effective_model(chat, chat_active(chat));
     ChatBackend backend = chat->backend;
     int found = chat->model_history_count;
     for (int i = 0; i < chat->model_history_count; i++)
@@ -656,8 +691,37 @@ bool chat_conversation_set_system_prompt(Chat *chat, int conversation,
         conversation >= chat->conversation_count) return false;
     if (!text) text = L"";
     if (wcslen(text) >= CHAT_COMPOSER_TEXT) return false;
-    return chat_text_set(&chat->conversations[conversation].system_prompt,
-        text);
+    ChatConversation *c = &chat->conversations[conversation];
+    /* The flag is dropped only after the text set succeeds: a fallible
+        non-empty set must never turn a deliberate empty override into
+        inheritance by clearing the flag before its allocation failed. The
+        empty path disposes (infallible) and clears the flag together. */
+    if (!chat_text_set(&c->system_prompt, text)) return false;
+    c->system_prompt_present = false;
+    return true;
+}
+
+bool chat_conversation_apply_system_prompt(Chat *chat, int conversation,
+    const wchar_t *text) {
+    if (!chat || conversation < 0 ||
+        conversation >= chat->conversation_count) return false;
+    if (!text) text = L"";
+    if (wcslen(text) >= CHAT_COMPOSER_TEXT) return false;
+    ChatConversation *c = &chat->conversations[conversation];
+    if (!text[0]) {
+        /* An explicitly applied empty prompt is a real override, not
+            inherit: dispose the text and mark the override present-empty.
+            Dispose cannot fail, so this is transactional. */
+        chat_text_dispose(&c->system_prompt);
+        c->system_prompt_present = true;
+        return true;
+    }
+    /* Same ordering as the setter: the flag survives a failed allocation,
+        so the explicit-empty override is never silently widened into
+        inheritance. */
+    if (!chat_text_set(&c->system_prompt, text)) return false;
+    c->system_prompt_present = false;
+    return true;
 }
 
 bool chat_conversation_set_model(Chat *chat, int conversation,
@@ -803,7 +867,13 @@ int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt) {
     g->state = CHAT_GENERATION_RUNNING;
     g->backend = chat->backend;
     g->started_at = chat_now();
-    wcsncpy(g->requested_model, chat_active_model(chat), CHAT_MODEL_TEXT - 1);
+    /* The audit metadata records the model this request actually resolves
+        to: the conversation's override for the active backend, or the
+        global slot. The host sends this same recorded value, so request
+        body and metadata can never disagree. */
+    wcsncpy(g->requested_model,
+        chat_effective_model_for_backend(chat, c, chat->backend),
+        CHAT_MODEL_TEXT - 1);
     g->requested_model[CHAT_MODEL_TEXT - 1] = 0;
     chat_remember_model(chat);
     return index;

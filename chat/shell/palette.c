@@ -197,6 +197,9 @@ bool palette_set_commands(Palette *palette, const ChatActionContext *context) {
     size_t built = 0;
     for (size_t i = 0; i < count; i++) {
         const ChatActionInfo *info = &table[i];
+        /* Submenu headers have no single effect to invoke; their dynamic
+            per-profile contents cannot become palette rows. */
+        if (info->flags & CHAT_ACTION_FLAG_SUBMENU_ONLY) continue;
         if (!chat_action_available(info->id, context)) continue;
         PaletteRow *row = &scratch[built++];
         memset(row, 0, sizeof *row);
@@ -326,7 +329,8 @@ size_t palette_section_start(const Palette *palette, size_t section) {
 
 const wchar_t *palette_section_label(const Palette *palette, size_t section) {
     static const wchar_t *command_labels[CHAT_ACTION_GROUP_COUNT] = {
-        L"Conversation", L"Response", L"Settings", L"Backend", L"Routing"
+        L"Conversation", L"Response", L"Settings", L"Backend", L"Routing",
+        L"Customization"
     };
     static const wchar_t *model_labels[] = {
         L"Current", L"Recent", L"All"
