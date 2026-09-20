@@ -249,6 +249,10 @@ typedef struct {
         bool down);
     bool (*row_click)(void *user, RichTextControl *control, int line,
         bool down);
+    /* Read-only surface hover relay (surface client coordinates; `leave`
+        once when the pointer exits). The host drives the code-copy pill. */
+    void (*hover)(void *user, RichTextControl *control, int x, int y,
+        bool leave);
     void (*focus_release)(void *user);
     void *user;
 } TranscriptCallbacks;

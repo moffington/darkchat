@@ -512,6 +512,7 @@ static RichTextControl *ensure_surface(Transcript *t,
         update_created_peak(t);
         control->on_key = t->callbacks.surface_key;
         control->on_line_click = t->callbacks.row_click;
+        control->on_hover = t->callbacks.hover;
         control->user = t->callbacks.user;
     }
     return control;

@@ -110,6 +110,15 @@ typedef struct {
        `close_pending` and is reposted once the pump has unwound. */
     PalettePopup *open_palette;
     bool palette_pumping;
+    /* Code-block Copy pill: one reusable borderless child of the transcript
+       container, shown while the pointer rests on a rendered code block.
+       `copy_control`/`copy_block` anchor the hovered block; `copy_hovering`
+       tracks the pointer being over the pill itself. */
+    HWND copy_pill;
+    RichTextControl *copy_control;
+    int copy_block;
+    bool copy_hovering;
+    HFONT copy_font;
 
 } ChatHost;
 
@@ -131,6 +140,9 @@ static void flush_reasoning_paint(ChatHost *host);
 static ChatMessage *pending(ChatHost *host);
 static bool turn_row_click(void *user, RichTextControl *control, int line,
     bool down);
+static void transcript_hover(void *user, RichTextControl *control, int x,
+    int y, bool leave);
+static void copy_pill_hide(ChatHost *host);
 static bool search_submit(void *user);
 static bool search_refresh(ChatHost *host, bool reverse);
 static bool search_step(ChatHost *host, bool reverse);
@@ -166,6 +178,7 @@ static TranscriptFeed transcript_feed(ChatHost *host) {
     return feed;
 }
 static void render_transcript(ChatHost *host) {
+    copy_pill_hide(host);
     TranscriptFeed feed = transcript_feed(host);
     transcript_render(&host->transcript, &feed);
 }
@@ -180,14 +193,17 @@ static void sync_transcript_container(ChatHost *host) {
     place_container(host);
 }
 static void refresh_turn(ChatHost *host, int index) {
+    copy_pill_hide(host);
     TranscriptFeed feed = transcript_feed(host);
     transcript_refresh_turn(&host->transcript, &feed, index);
 }
 static bool stream_body_markdown(ChatHost *host, int index) {
+    copy_pill_hide(host);
     TranscriptFeed feed = transcript_feed(host);
     return transcript_stream_body(&host->transcript, &feed, index);
 }
 static void position_turns(ChatHost *host, bool follow) {
+    copy_pill_hide(host);
     TranscriptFeed feed = transcript_feed(host);
     transcript_position(&host->transcript, &feed, follow);
 }
@@ -305,6 +321,228 @@ static void set_status(ChatHost *host, const wchar_t *text) {
     host->config.chat->status[CHAT_STATUS_TEXT - 1] = 0;
     chat_ui_sync(&host->chat_ui);
     flush(host);
+}
+
+/* ---- Code-block Copy pill ----------------------------------------------- */
+
+/* One reusable borderless child of the transcript container: shown while the
+   pointer rests on a rendered code block, anchored at that block's first-line
+   right edge. Decorative to UIA (not focusable, never announced); Ctrl+Shift+C
+   is the keyboard path. Hidden on hover leave, scroll, rebuild and focus
+   loss. */
+#define COPY_PILL_CLASS L"DarkChat.CopyPill"
+#define COPY_PILL_ID 9000
+#define COPY_PILL_WIDTH_DIPS 46
+#define COPY_PILL_HEIGHT_DIPS 18
+#define COPY_PILL_INSET_DIPS 6
+
+static void copy_pill_hide(ChatHost *host) {
+    host->copy_control = NULL;
+    host->copy_block = -1;
+    if (host->copy_pill && IsWindow(host->copy_pill))
+        ShowWindow(host->copy_pill, SW_HIDE);
+}
+
+/* Reads the hovered block back and copies it through the shared clipboard
+   helper, reporting the outcome in the status line. */
+static void copy_pill_copy(ChatHost *host) {
+    RichTextControl *control = host->copy_control;
+    int block = host->copy_block;
+    if (!control || !control->window || block < 0) return;
+    size_t start, length;
+    if (!rich_text_code_block_range(control, block, &start, &length) ||
+        length > 0x2000000) {
+        copy_pill_hide(host);
+        return;
+    }
+    size_t capacity = length * 2 + 3;   /* CRLF-normalized worst case + NUL */
+    wchar_t *text = (wchar_t *)malloc(capacity * sizeof(wchar_t));
+    if (!text) { set_status(host, L"Copy failed"); return; }
+    if (rich_text_code_block_text(control, block, text, capacity))
+        set_status(host, chat_copy_text(host->window, text) ? L"Code copied"
+                                                            : L"Copy failed");
+    else set_status(host, L"Copy failed");
+    free(text);
+}
+
+static LRESULT CALLBACK copy_pill_proc(HWND window, UINT message, WPARAM w,
+    LPARAM l) {
+    ChatHost *host = (ChatHost *)GetWindowLongPtrW(window, GWLP_USERDATA);
+    if (message == WM_NCCREATE) {
+        host = ((CREATESTRUCTW *)l)->lpCreateParams;
+        SetWindowLongPtrW(window, GWLP_USERDATA, (LONG_PTR)host);
+    }
+    if (!host) return DefWindowProcW(window, message, w, l);
+    switch (message) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT paint;
+        if (!BeginPaint(window, &paint)) return 0;
+        RECT bounds;
+        GetClientRect(window, &bounds);
+        HBRUSH brush = CreateSolidBrush(host->rich_theme.code_background);
+        if (brush) { FillRect(paint.hdc, &bounds, brush); DeleteObject(brush); }
+        SetBkMode(paint.hdc, TRANSPARENT);
+        SetTextColor(paint.hdc, host->rich_theme.code_text);
+        HGDIOBJ previous = host->copy_font
+            ? SelectObject(paint.hdc, host->copy_font) : NULL;
+        DrawTextW(paint.hdc, L"Copy", -1, &bounds,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (previous) SelectObject(paint.hdc, previous);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (!host->copy_hovering) {
+            TRACKMOUSEEVENT tracking = { sizeof tracking, TME_LEAVE, window,
+                0 };
+            host->copy_hovering = TrackMouseEvent(&tracking) != FALSE;
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE: {
+        host->copy_hovering = false;
+        /* Leaving the pill back onto the transcript keeps it: the surface's
+           next hover event repositions or hides it. */
+        HWND under = NULL;
+        POINT point;
+        if (GetCursorPos(&point)) under = WindowFromPoint(point);
+        if (under != (host->copy_control ? host->copy_control->window : NULL))
+            copy_pill_hide(host);
+        return 0;
+    }
+    case WM_LBUTTONUP:
+        copy_pill_copy(host);
+        return 0;
+    case WM_NCDESTROY:
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        break;
+    }
+    return DefWindowProcW(window, message, w, l);
+}
+
+static bool register_copy_pill_class(void) {
+    WNDCLASSW cls = { 0 };
+    cls.lpfnWndProc = copy_pill_proc;
+    cls.hInstance = GetModuleHandleW(NULL);
+    cls.hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512));
+    cls.lpszClassName = COPY_PILL_CLASS;
+    if (RegisterClassW(&cls)) return true;
+    return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+static void copy_pill_ensure_font(ChatHost *host) {
+    if (host->copy_font) return;
+    int size = MulDiv((int)(host->rich_theme.small_size + 0.5f),
+        (int)(host->dpi + 0.5f), 96);
+    host->copy_font = CreateFontW(-size, 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+        FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+        host->rich_theme.ui_family);
+}
+
+static void copy_pill_show(ChatHost *host, RichTextControl *control,
+    int block) {
+    size_t start = 0;
+    if (!control || !control->window || block < 0 ||
+        !rich_text_code_block_range(control, block, &start, NULL)) {
+        copy_pill_hide(host);
+        return;
+    }
+    POINTL first;
+    SendMessageW(control->window, EM_POSFROMCHAR, (WPARAM)&first,
+        (LPARAM)start);
+    RECT client;
+    GetClientRect(control->window, &client);
+    /* A first line scrolled above the surface (negative coordinates) or below
+       the client is not on screen: nothing to anchor to. */
+    if (first.x < 0 || first.y < 0 || first.y >= client.bottom) {
+        copy_pill_hide(host);
+        return;
+    }
+    int width = px(host, COPY_PILL_WIDTH_DIPS);
+    int height = px(host, COPY_PILL_HEIGHT_DIPS);
+    if (width < 1 || height < 1) return;
+    if (!host->copy_pill || !IsWindow(host->copy_pill)) {
+        if (!register_copy_pill_class()) return;
+        host->copy_pill = CreateWindowExW(0, COPY_PILL_CLASS, L"",
+            WS_CHILD | WS_CLIPSIBLINGS, 0, 0, width, height, host->view,
+            (HMENU)(INT_PTR)COPY_PILL_ID, GetModuleHandleW(NULL), host);
+        if (!host->copy_pill) return;
+    }
+    copy_pill_ensure_font(host);
+    host->copy_control = control;
+    host->copy_block = block;
+    /* Overlap the block's first line, flush with the surface's right edge. */
+    POINT anchor = { client.right - px(host, COPY_PILL_INSET_DIPS) - width,
+        first.y + px(host, 8) - height / 2 };
+    MapWindowPoints(control->window, host->view, &anchor, 1);
+    SetWindowPos(host->copy_pill, HWND_TOP, anchor.x, anchor.y, width, height,
+        SWP_NOACTIVATE);
+    if (!IsWindowVisible(host->copy_pill))
+        ShowWindow(host->copy_pill, SW_SHOWNOACTIVATE);
+}
+
+/* Transcript hover relay: shows the pill over a rendered code block, hides it
+   everywhere else and on leave. While the pointer rests on the pill itself the
+   surface's leave is ignored (the pill owns tracking and its own hide). */
+static void transcript_hover(void *user, RichTextControl *control, int x,
+    int y, bool leave) {
+    ChatHost *host = (ChatHost *)user;
+    if (leave) {
+        if (host->copy_hovering) return;
+        copy_pill_hide(host);
+        return;
+    }
+    if (!control || !control->window) return;
+    if (GetKeyState(VK_LBUTTON) & 0x8000) return;   /* selection drag */
+    POINTL point = { x, y };
+    LONG character = (LONG)SendMessageW(control->window, EM_CHARFROMPOS, 0,
+        (LPARAM)&point);
+    int block = character < 0
+        ? -1 : rich_text_code_block_at_char(control, (size_t)character);
+    if (block < 0) { copy_pill_hide(host); return; }
+    if (control == host->copy_control && block == host->copy_block &&
+        host->copy_pill && IsWindowVisible(host->copy_pill))
+        return;
+    copy_pill_show(host, control, block);
+}
+
+/* Ctrl+Shift+C: an existing transcript selection wins; otherwise the code
+   block under the reader's caret in the last focused transcript surface;
+   otherwise a friendly hint. */
+static void copy_selection_or_code(ChatHost *host) {
+    RichTextControl *selected = transcript_selected_surface(host);
+    if (selected) {
+        SendMessageW(selected->window, WM_COPY, 0, 0);
+        set_status(host, L"Selection copied");
+        return;
+    }
+    HWND focus = host->transcript.focus_window;
+    RichTextControl *control = focus
+        ? (RichTextControl *)GetWindowLongPtrW(focus, GWLP_USERDATA) : NULL;
+    if (control && control->window) {
+        CHARRANGE caret;
+        SendMessageW(control->window, EM_EXGETSEL, 0, (LPARAM)&caret);
+        int block = caret.cpMin >= 0
+            ? rich_text_code_block_at_char(control, (size_t)caret.cpMin) : -1;
+        size_t start, length;
+        if (block >= 0 &&
+            rich_text_code_block_range(control, block, &start, &length) &&
+            length <= 0x2000000) {
+            size_t capacity = length * 2 + 3;
+            wchar_t *text = (wchar_t *)malloc(capacity * sizeof(wchar_t));
+            if (!text) { set_status(host, L"Copy failed"); return; }
+            if (rich_text_code_block_text(control, block, text, capacity))
+                set_status(host, chat_copy_text(host->window, text)
+                    ? L"Code copied" : L"Copy failed");
+            else set_status(host, L"Copy failed");
+            free(text);
+            return;
+        }
+    }
+    set_status(host,
+        L"Select text, or rest the caret in a code block, to copy.");
 }
 
 static ChatMessage *pending(ChatHost *host) {
@@ -656,6 +894,7 @@ static void end_palette(ChatHost *host) {
 /* Opens the command palette (Ctrl+K) and runs its modal pump. */
 static void open_palette(ChatHost *host) {
     if (host->open_palette) return;
+    copy_pill_hide(host);
     ChatActionContext context;
     palette_context(host, &context);
     host->open_palette = palette_popup_create(host->window, &context);
@@ -1522,6 +1761,7 @@ static RichTextControl *transcript_selected_surface(ChatHost *host) {
    TrackPopupMenu's WM_INITMENUPOPUP runs the live availability and
    routing/backend sync. */
 static void open_actions_menu(ChatHost *host) {
+    copy_pill_hide(host);
     UiRect r = chat_ui_rect(&host->chat_ui, host->chat_ui.overflow);
     /* The arranged rectangle is in 96-DPI DIPs; ClientToScreen expects
        physical pixels, so both coordinates scale before the conversion. */
@@ -1964,6 +2204,11 @@ static bool host_shortcut(ChatHost *host, WPARAM key, bool shift,
         open_palette(host);
         return true;
     }
+    /* Ctrl+Shift+C: transcript selection, else the code block at the caret. */
+    if (control && shift && (key == L'C' || key == L'c')) {
+        copy_selection_or_code(host);
+        return true;
+    }
     /* Ctrl+B toggles the sidebar; F10 / the context-menu key open the
        retained command menu, the replacement route to every command that the
        removed menu bar used to carry. */
@@ -2276,6 +2521,7 @@ static LRESULT CALLBACK view_proc(HWND window, UINT message, WPARAM w,
             transcript_selection_changed(&host->transcript, &feed, control);
             return 0;
         }
+        if (header->code == EN_VSCROLL) copy_pill_hide(host);
         if (control && rich_text_handle_notify(control, l)) return 0;
         break;
     }
@@ -2296,6 +2542,7 @@ static LRESULT CALLBACK view_proc(HWND window, UINT message, WPARAM w,
             transcript_focus_notify(&host->transcript, control, true);
             return 0;
         case EN_KILLFOCUS:
+            copy_pill_hide(host);
             transcript_focus_notify(&host->transcript, control, false);
             return 0;
         default:
@@ -2345,6 +2592,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             host->config.bounded_transcript);
         host->transcript.callbacks.surface_key = surface_key;
         host->transcript.callbacks.row_click = turn_row_click;
+        host->transcript.callbacks.hover = transcript_hover;
         host->transcript.callbacks.focus_release = transcript_focus_to_composer;
         host->transcript.callbacks.user = host;
         host->composer.on_submit = composer_submit;
@@ -2525,6 +2773,11 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
     case WM_DPICHANGED: {
         host->dpi = (float)HIWORD(w);
         RECT *r = (RECT *)l;
+        if (host->copy_font) {
+            DeleteObject(host->copy_font);
+            host->copy_font = NULL;
+        }
+        copy_pill_hide(host);
         rich_text_set_dpi(&host->field, host->dpi);
         rich_text_set_dpi(&host->search, host->dpi);
         rich_text_set_dpi(&host->composer, host->dpi);
@@ -2691,6 +2944,13 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         KillTimer(window, 1);
         KillTimer(window, 2);
         KillTimer(window, CHAT_TIMER_BODY_FLUSH);
+        if (host->copy_font) {
+            DeleteObject(host->copy_font);
+            host->copy_font = NULL;
+        }
+        host->copy_pill = NULL;
+        host->copy_control = NULL;
+        host->copy_block = -1;
         /* Never free the palette underneath its active nested pump: cancel it
             so the pump unwinds, and let its completion path destroy it. Only a
             palette with no live pump is safe to destroy here. The end_palette

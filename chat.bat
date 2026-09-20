@@ -6,11 +6,19 @@ rem (the toolkit showcase) untouched; `chat.bat test` additionally runs the
 rem toolkit suite, which rebuilds the showcase, so close it first.
 rem MinGW-w64 / w64devkit; no third-party dependencies.
 if not exist build mkdir build
-windres app.rc -O coff -o build\chat_app.res
-if errorlevel 1 exit /b 1
-gcc -std=c17 -I. -municode -mwindows -Wall -Wextra -Wpedantic -Werror -O2 chat_main.c chat\core\chat.c chat\generation\context.c chat\generation\provider_routing.c chat\core\search.c chat\shell\chat_ui.c chat\transcript\transcript_policy.c chat\transcript\transcript_win32.c chat\shell\chat_host_win32.c chat\persistence\storage.c chat\persistence\saver.c chat\shell\actions_win32.c chat\core\commands.c chat\shell\palette.c chat\shell\palette_win32.c chat\transcript\rich_text_win32.c chat\transcript\markdown.c chat\transcript\table_layout.c chat\json.c chat\generation\sse.c chat\generation\completion_request.c chat\generation\completion_winhttp.c chat\models\model_catalog.c chat\models\model_catalog_winhttp.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c build\chat_app.res -o build\darkchat.exe -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp -ladvapi32
-if errorlevel 1 exit /b 1
-echo Built build\darkchat.exe
+set "progress_log=build\chat.log"
+set "progress_stop=%CD%\build\.chat-progress-%RANDOM%-%RANDOM%.done"
+set "DARKUI_PROGRESS_STOP=%progress_stop%"
+break > "%progress_log%"
+<nul set /p "=  Building DarkChat  "
+start "" /b powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$f='.oOo';$i=1;$s=$env:DARKUI_PROGRESS_STOP;if(-not(Test-Path -LiteralPath $s)){[Console]::Write('.');while(-not(Test-Path -LiteralPath $s)){Start-Sleep -Milliseconds 160;[Console]::Write(([char]8).ToString()+$f[$i%%4]);$i++};[Console]::Write(([char]8).ToString()+' ')};Remove-Item -LiteralPath $s -Force"
+
+windres app.rc -O coff -o build\chat_app.res >> "%progress_log%" 2>&1
+if errorlevel 1 goto failed
+gcc -std=c17 -I. -municode -mwindows -Wall -Wextra -Wpedantic -Werror -O2 chat_main.c chat\core\chat.c chat\generation\context.c chat\generation\provider_routing.c chat\core\search.c chat\shell\chat_ui.c chat\transcript\transcript_policy.c chat\transcript\transcript_win32.c chat\shell\chat_host_win32.c chat\persistence\storage.c chat\persistence\saver.c chat\shell\actions_win32.c chat\core\commands.c chat\shell\palette.c chat\shell\palette_win32.c chat\transcript\rich_text_win32.c chat\transcript\markdown.c chat\transcript\table_layout.c chat\json.c chat\generation\sse.c chat\generation\completion_request.c chat\generation\completion_winhttp.c chat\models\model_catalog.c chat\models\model_catalog_winhttp.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c build\chat_app.res -o build\darkchat.exe -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp -ladvapi32 >> "%progress_log%" 2>&1
+if errorlevel 1 goto failed
+call :stop_progress
+echo done - chat build passed
 if /i "%~1"=="run" start "" "build\darkchat.exe"
 if /i "%~1"=="test" (
     gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_sse.c chat\generation\sse.c -o build\test_sse.exe
@@ -89,7 +97,7 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_model_catalog_worker.exe
     if errorlevel 1 exit /b 1
-    gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat_host.c chat\generation\context.c chat\generation\provider_routing.c chat\core\search.c chat\core\chat.c chat\shell\chat_ui.c chat\transcript\transcript_policy.c chat\transcript\transcript_win32.c chat\persistence\storage.c chat\persistence\saver.c chat\shell\actions_win32.c chat\transcript\rich_text_win32.c chat\transcript\markdown.c chat\transcript\table_layout.c chat\json.c chat\generation\sse.c chat\generation\completion_request.c chat\generation\completion_winhttp.c chat\models\model_catalog.c chat\models\model_catalog_winhttp.c chat\shell\palette.c chat\shell\palette_win32.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c chat\core\commands.c -o build\test_chat_host.exe -Wl,--wrap=completion_request -Wl,--wrap=model_catalog_request -Wl,--wrap=palette_popup_pump -Wl,--wrap=storage_save -Wl,--wrap=malloc -Wl,--wrap=realloc -Wl,--wrap=rich_text_create_block -Wl,--wrap=rich_text_create_viewport -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp
+    gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_chat_host.c chat\generation\context.c chat\generation\provider_routing.c chat\core\search.c chat\core\chat.c chat\shell\chat_ui.c chat\transcript\transcript_policy.c chat\transcript\transcript_win32.c chat\persistence\storage.c chat\persistence\saver.c chat\shell\actions_win32.c chat\transcript\rich_text_win32.c chat\transcript\markdown.c chat\transcript\table_layout.c chat\json.c chat\generation\sse.c chat\generation\completion_request.c chat\generation\completion_winhttp.c chat\models\model_catalog.c chat\models\model_catalog_winhttp.c chat\shell\palette.c chat\shell\palette_win32.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c chat\core\commands.c -o build\test_chat_host.exe -Wl,--wrap=completion_request -Wl,--wrap=model_catalog_request -Wl,--wrap=palette_popup_pump -Wl,--wrap=storage_save -Wl,--wrap=malloc -Wl,--wrap=realloc -Wl,--wrap=rich_text_create_block -Wl,--wrap=rich_text_create_viewport -Wl,--wrap=chat_copy_text -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp
     if errorlevel 1 exit /b 1
     build\test_chat_host.exe
     if errorlevel 1 exit /b 1
@@ -100,4 +108,16 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     echo Chat and toolkit suites passed
 )
+exit /b 0
+
+:failed
+set "progress_error=%errorlevel%"
+call :stop_progress
+echo failed
+type "%progress_log%"
+exit /b %progress_error%
+
+:stop_progress
+break > "%progress_stop%"
+powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$s=$env:DARKUI_PROGRESS_STOP;$limit=(Get-Date).AddSeconds(3);while((Test-Path -LiteralPath $s)-and(Get-Date)-lt$limit){Start-Sleep -Milliseconds 20};Remove-Item -LiteralPath $s -Force -ErrorAction SilentlyContinue" >nul 2>&1
 exit /b 0

@@ -105,6 +105,19 @@ void __wrap_palette_popup_pump(PalettePopup *popup) {
     (void)popup;
     ++palette_pump_calls;
 }
+/* Code-copy seam (linked with -Wl,--wrap=chat_copy_text): records the text the
+   host hands to the clipboard helper without touching the real clipboard. */
+static wchar_t copied_text[8192];
+static int copy_calls;
+static bool copy_result = true;
+bool __real_chat_copy_text(HWND owner, const wchar_t *text);
+bool __wrap_chat_copy_text(HWND owner, const wchar_t *text) {
+    (void)owner;
+    ++copy_calls;
+    wcsncpy(copied_text, text, 8191);
+    copied_text[8191] = 0;
+    return copy_result;
+}
 /* Identity helpers over the popup's visible rows: the controller labels are
    display text, so id assertions resolve the stable row key instead. */
 static const wchar_t *palette_row_id(PalettePopup *popup, size_t index) {
@@ -323,7 +336,7 @@ static int child_controls(HWND parent,bool visible_only) {
     return count;
 }
 /* Every record that strictly intersects the viewport is bound and shows its
-    own body — the qualified I-GAP probe used across the bounded suite. */
+    own body â€” the qualified I-GAP probe used across the bounded suite. */
 static bool visible_realized(ChatHost *h) {
     Transcript *tr=&h->transcript;
     int count=tr->record_count;
@@ -1715,7 +1728,7 @@ static int default_suite(void) {
         /* Result ordering, per attempt: an older attempt's success never
            marks newer mutations durable, a stale result never re-interprets,
            and a failure older than the newest submitted attempt is
-           superseded — it must not latch failure, because that newer attempt
+           superseded â€” it must not latch failure, because that newer attempt
            is guaranteed to complete and report authoritatively. The
            synthetic attempt ids stay above the real ones while the sequence
            plays out and both real counters are restored afterwards. */
@@ -2368,7 +2381,7 @@ static int bounded_suite(void) {
         CHECK(wcsstr(shown,L"A answer")==NULL);      /* never foreign */
     }
     /* Pure replacement: B's window rebinds onto A's departed slots with
-       matching shapes — zero pristine consumptions, zero new HWNDs. */
+       matching shapes â€” zero pristine consumptions, zero new HWNDs. */
     CHECK(transcript_created_windows(&h->transcript)==created_before_r1);
     CHECK(transcript_created_windows(&h->transcript)<=4*h->transcript.slot_limit+1);
     /* A returns intact: switching back re-renders A's own content on the
@@ -4550,6 +4563,183 @@ static int navigation_suite(void) {
     return 0;
 }
 
+/* ---- Code-block copy suite (separate clean fixture) ------------------------ */
+
+/* The suite's top-level window is never shown, so a child's visibility must
+   be read from its own style bit, not IsWindowVisible (which walks ancestors). */
+static bool copy_pill_shown(ChatHost *h) {
+    return h->copy_pill &&
+        (GetWindowLongW(h->copy_pill, GWL_STYLE) & WS_VISIBLE) != 0;
+}
+
+/* Intercepts WM_COPY so the selection path can be asserted without touching
+   the real clipboard. */
+static WNDPROC copy_probe_previous;
+static int copy_probe_wm_copy;
+static LRESULT CALLBACK copy_probe_proc(HWND window, UINT message,
+    WPARAM w, LPARAM l) {
+    if (message == WM_COPY) { ++copy_probe_wm_copy; return 0; }
+    return CallWindowProcW(copy_probe_previous, window, message, w, l);
+}
+
+static int code_copy_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Copy host",1100,720,720,480,NULL,
+        false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-copy-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Code copy integration",
+        WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+
+    /* One completed assistant turn whose Markdown body renders exactly one
+       code block, preceded and followed by prose. */
+    int index=add_turn(chat,L"copy question",
+        L"Before the block.\n\n```basic\nline one\nline two\n```\n\n"
+        L"After the block.",NULL,-1);
+    render_transcript(h);
+    flush(h);
+    RichTextControl *body=transcript_surface(&h->transcript,index,
+        TRANSCRIPT_BODY);
+    CHECK(body && body->window);
+    CHECK(rich_text_code_block_count(body)==1);
+    size_t start=0,length=0;
+    CHECK(rich_text_code_block_range(body,0,&start,&length));
+
+    /* The pill appears over the block, anchored at its first-line right
+       edge. */
+    POINTL first;
+    SendMessageW(body->window,EM_POSFROMCHAR,(WPARAM)&first,(LPARAM)start);
+    CHECK(first.x>=0 && first.y>=0);
+    SendMessageW(body->window,WM_MOUSEMOVE,0,
+        MAKELPARAM(first.x+2,first.y+2));
+    CHECK(h->copy_pill && copy_pill_shown(h));
+    CHECK(h->copy_control==body && h->copy_block==0);
+    {
+        int width=px(h,COPY_PILL_WIDTH_DIPS);
+        int height=px(h,COPY_PILL_HEIGHT_DIPS);
+        RECT client; GetClientRect(body->window,&client);
+        POINT anchor={ client.right-px(h,COPY_PILL_INSET_DIPS)-width,
+            first.y+px(h,8)-height/2 };
+        MapWindowPoints(body->window,h->view,&anchor,1);
+        POINT origin={0,0}; MapWindowPoints(h->view,NULL,&origin,1);
+        RECT pill; CHECK(GetWindowRect(h->copy_pill,&pill));
+        CHECK(pill.left==origin.x+anchor.x && pill.top==origin.y+anchor.y);
+        CHECK(pill.right-pill.left==width && pill.bottom-pill.top==height);
+    }
+
+    /* Prose hides it again. */
+    {
+        POINTL prose;
+        SendMessageW(body->window,EM_POSFROMCHAR,(WPARAM)&prose,(LPARAM)0);
+        SendMessageW(body->window,WM_MOUSEMOVE,0,
+            MAKELPARAM(prose.x+2,prose.y+2));
+        CHECK(!copy_pill_shown(h));
+    }
+
+    /* Moving onto the pill arms its own tracking: the surface's leave keeps
+       the pill, and the pill's own leave hides it. */
+    SendMessageW(body->window,WM_MOUSEMOVE,0,
+        MAKELPARAM(first.x+2,first.y+2));
+    CHECK(copy_pill_shown(h));
+    SendMessageW(h->copy_pill,WM_MOUSEMOVE,0,MAKELPARAM(2,2));
+    CHECK(h->copy_hovering);
+    SendMessageW(body->window,WM_MOUSELEAVE,0,0);
+    CHECK(copy_pill_shown(h));
+    SendMessageW(h->copy_pill,WM_MOUSELEAVE,0,0);
+    CHECK(!copy_pill_shown(h) && !h->copy_hovering);
+
+    /* A pill click copies exactly the block's rendered text (fence markers
+       excluded, LF normalized to CRLF) with status feedback. */
+    SendMessageW(body->window,WM_MOUSEMOVE,0,
+        MAKELPARAM(first.x+2,first.y+2));
+    CHECK(copy_pill_shown(h));
+    copied_text[0]=0; copy_calls=0;
+    SendMessageW(h->copy_pill,WM_LBUTTONUP,0,0);
+    CHECK(copy_calls==1 && !wcscmp(copied_text,L"line one\r\nline two"));
+    CHECK(!wcscmp(chat->status,L"Code copied"));
+
+    /* Container scroll hides the pill; the hover point stays valid because
+       the block's position inside its own surface never moved. */
+    SendMessageW(h->view,WM_VSCROLL,MAKEWPARAM(SB_PAGEDOWN,0),0);
+    CHECK(!copy_pill_shown(h));
+    SendMessageW(body->window,WM_MOUSEMOVE,0,
+        MAKELPARAM(first.x+2,first.y+2));
+    CHECK(copy_pill_shown(h));
+
+    /* A rebuild (whole re-render) hides the pill. */
+    render_transcript(h);
+    CHECK(!copy_pill_shown(h));
+
+    /* Verbatim bodies (the user turn) expose no pill. */
+    {
+        RichTextControl *user_body=transcript_surface(&h->transcript,index-1,
+            TRANSCRIPT_BODY);
+        CHECK(user_body && user_body->window);
+        SendMessageW(user_body->window,WM_MOUSEMOVE,0,MAKELPARAM(4,4));
+        CHECK(!copy_pill_shown(h));
+    }
+
+    /* Ctrl+Shift+C: no selection and no transcript focus -> the hint, and
+       the clipboard helper is never called. */
+    copy_calls=0;
+    CHECK(host_shortcut(h,L'C',true,true,false));
+    CHECK(copy_calls==0);
+    CHECK(!wcscmp(chat->status,
+        L"Select text, or rest the caret in a code block, to copy."));
+
+    /* A transcript selection wins over the block at the caret: WM_COPY runs
+       through the interceptor, never the real clipboard. */
+    copy_probe_wm_copy=0;
+    copy_probe_previous=(WNDPROC)SetWindowLongPtrW(body->window,GWLP_WNDPROC,
+        (LONG_PTR)copy_probe_proc);
+    CHARRANGE selection={(LONG)start,(LONG)(start+4)};
+    SendMessageW(body->window,EM_EXSETSEL,0,(LPARAM)&selection);
+    CHECK(host_shortcut(h,L'C',true,true,false));
+    CHECK(copy_probe_wm_copy==1 && copy_calls==0);
+    CHECK(!wcscmp(chat->status,L"Selection copied"));
+    SetWindowLongPtrW(body->window,GWLP_WNDPROC,
+        (LONG_PTR)copy_probe_previous);
+    CHARRANGE none={0,0};
+    SendMessageW(body->window,EM_EXSETSEL,0,(LPARAM)&none);
+
+    /* The caret inside the block copies the block. */
+    h->transcript.focus_window=body->window;
+    CHARRANGE caret={(LONG)(start+2),(LONG)(start+2)};
+    SendMessageW(body->window,EM_EXSETSEL,0,(LPARAM)&caret);
+    CHECK(host_shortcut(h,L'C',true,true,false));
+    CHECK(copy_calls==1 && !wcscmp(copied_text,L"line one\r\nline two"));
+    CHECK(!wcscmp(chat->status,L"Code copied"));
+
+    /* The caret outside any block gets the hint again. */
+    SendMessageW(body->window,EM_EXSETSEL,0,(LPARAM)&none);
+    CHECK(host_shortcut(h,L'C',true,true,false));
+    CHECK(copy_calls==1);
+    CHECK(!wcscmp(chat->status,
+        L"Select text, or rest the caret in a code block, to copy."));
+
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(!IsWindow(window));
+    saver_shutdown(&h->saver); storage_close(&h->storage);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer); DeleteObject(h->background);
+    transcript_dispose(&h->transcript);
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
 /* Returns the first scroll-fragment child whose UIA Name equals `name`; the
    caller owns the returned reference. NULL when absent. */
 static IRawElementProviderFragment *palette_named_child(PalettePopup *popup,
@@ -5034,6 +5224,8 @@ int main(void) {
     if (failed) return failed;
     failed=navigation_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation fixtures) passed");
+    failed=code_copy_suite();
+    if (failed) return failed;
+    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy fixtures) passed");
     return failed;
 }

@@ -69,6 +69,14 @@ struct RichTextControl {
        click; the host uses this for a turn's reasoning row. */
     bool (*on_line_click)(void *user, RichTextControl *control, int line,
         bool down);
+    /* Hover relay over a read-only surface: client coordinates while the
+       pointer rests on the control, `leave` once when it exits. Pure
+       notification -- consuming moves would break selection dragging; the
+       host drives the code-copy pill from it. */
+    void (*on_hover)(void *user, RichTextControl *control, int x, int y,
+        bool leave);
+    /* Set while a hover-leave request is outstanding for this surface. */
+    bool hover_tracking;
     /* Called when the surface loses keyboard focus (e.g. to validate a field). */
     void (*on_blur)(void *user);
     void *user;
@@ -157,6 +165,12 @@ bool rich_text_code_block_range(const RichTextControl *control, int index,
    half-open, so neither the separator newline between adjacent fences nor the
    character after a block belongs to it. */
 int rich_text_code_block_at_char(const RichTextControl *control, size_t cp);
+/* Reads the rendered text of code block `index` back from the control into
+   `out` with Windows CRLF line endings (NUL terminated; `capacity` includes
+   the terminator). False when the control or index is invalid, on allocation
+   failure, or when the CRLF-normalized text does not fit. */
+bool rich_text_code_block_text(const RichTextControl *control, int index,
+    wchar_t *out, size_t capacity);
 /* Handles EN_LINK (opens the target) and EN_VSCROLL. Returns true if consumed.
    lparam is the WM_NOTIFY lParam; the caller checks the source handle. */
 bool rich_text_handle_notify(RichTextControl *control, LPARAM lparam);

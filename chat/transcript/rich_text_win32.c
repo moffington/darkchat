@@ -322,6 +322,23 @@ static LRESULT CALLBACK rich_proc(HWND window, UINT message, WPARAM w,
         if (control->on_line_click(control->user, control, line,
                 message == WM_LBUTTONDOWN)) return 0;
     }
+    /* Read-only transcript surfaces relay hover to the host (the code-copy
+        pill). Pure notification: the native proc still sees the move, so
+        selection dragging is untouched. */
+    if (control->readonly && control->on_hover) {
+        if (message == WM_MOUSEMOVE) {
+            if (!control->hover_tracking) {
+                TRACKMOUSEEVENT tracking = { sizeof tracking, TME_LEAVE,
+                    window, 0 };
+                control->hover_tracking = TrackMouseEvent(&tracking) != FALSE;
+            }
+            control->on_hover(control->user, control, (short)LOWORD(l),
+                (short)HIWORD(l), false);
+        } else if (message == WM_MOUSELEAVE) {
+            control->hover_tracking = false;
+            control->on_hover(control->user, control, 0, 0, true);
+        }
+    }
     if (message == WM_KILLFOCUS && control->on_blur) control->on_blur(control->user);
     return CallWindowProcW(control->previous, window, message, w, l);
 }
@@ -531,6 +548,44 @@ int rich_text_code_block_at_char(const RichTextControl *control, size_t cp) {
         if (cp >= block->offset && cp - block->offset < block->length) return i;
     }
     return -1;
+}
+
+bool rich_text_code_block_text(const RichTextControl *control, int index,
+    wchar_t *out, size_t capacity) {
+    size_t start, length;
+    if (!out || capacity < 1) return false;
+    out[0] = 0;
+    if (!control || !control->window) return false;
+    if (!rich_text_code_block_range(control, index, &start, &length)) return false;
+    if (length == 0) return true;
+    if (length > 0x2000000) return false;
+    wchar_t *buffer = (wchar_t *)malloc((length + 1) * sizeof(wchar_t));
+    if (!buffer) return false;
+    TEXTRANGEW text_range;
+    text_range.chrg.cpMin = (LONG)start;
+    text_range.chrg.cpMax = (LONG)(start + length);
+    text_range.lpstrText = buffer;
+    SendMessageW(control->window, EM_GETTEXTRANGE, 0, (LPARAM)&text_range);
+    buffer[length] = 0;
+    /* The clipboard gets Windows CRLF line endings whatever the control
+       stores (a lone CR paragraph mark, or CR+LF): every line break folds
+       into one CRLF, and pairs never double. */
+    size_t write = 0;
+    for (size_t i = 0; i < length; i++) {
+        wchar_t ch = buffer[i];
+        if (ch == L'\r' && i + 1 < length && buffer[i + 1] == L'\n') continue;
+        if (ch == L'\r' || ch == L'\n') {
+            if (write + 3 > capacity) { free(buffer); return false; }
+            out[write++] = L'\r';
+            out[write++] = L'\n';
+        } else {
+            if (write + 2 > capacity) { free(buffer); return false; }
+            out[write++] = ch;
+        }
+    }
+    out[write] = 0;
+    free(buffer);
+    return true;
 }
 
 void rich_text_scroll_to_end(RichTextControl *control) {
