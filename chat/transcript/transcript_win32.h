@@ -122,6 +122,22 @@ typedef struct {
     uint64_t conversation, message, revision, body_revision;
     ChatRole role;
     ChatGenerationState state;
+    /* Streaming body bookkeeping: body_marked_len is the number of leading
+       answer-text characters the bound body holds from its last full
+       Markdown render; body_stream_dirty marks plain appends beyond that
+       render. While the turn streams, appends keep body_current true so
+       renders never rebuild the accumulated document; once the turn is no
+       longer running the dirty flag makes the body stale, so the terminal
+       render re-renders the complete Markdown exactly once. Cleared and
+       stamped together with body_revision on every landed body write. */
+    size_t body_marked_len;
+    bool body_stream_dirty;
+    /* Reasoning streaming bookkeeping: the number of leading reasoning
+       characters the bound viewport holds (stamped by write_reasoning on
+       every full reload, advanced by the host's batched streaming
+       appends), so a flush appends only the tail beyond the pane's
+       content and a wholesale reload rebases it automatically. */
+    size_t reason_painted;
     /* Assistant Markdown body layout currency: the width/DPI/theme epoch the
        bound body's flattened text was produced at. Stamped only after a
        successful assistant body write into the bound surface, never by the

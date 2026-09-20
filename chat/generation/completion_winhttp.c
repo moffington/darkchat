@@ -48,6 +48,22 @@ typedef struct {
 } CompletionWork;
 
 typedef struct { char *data; size_t length, capacity; } Response;
+
+/* Pending stream fragments awaiting delivery. Tiny reasoning and content
+   deltas arrive as separate SSE events (often one word each); concatenating
+   them and enqueueing one event per flush keeps the delivered text and its
+   order identical to the original per-fragment stream. */
+typedef struct { wchar_t *data; size_t length, capacity; } PendingFragments;
+
+/* Delivery threshold: a single fragment flush never grows past this, so a
+   fast burst inside one network chunk still reaches the UI promptly. */
+#define STREAM_COALESCE_CHARS 1024u
+
+/* Delivery cadence, in milliseconds: fragments never sit in the buffers
+   longer than this regardless of read boundaries, so one SSE event per
+   network read still coalesces into at most one enqueue per interval. */
+#define STREAM_FLUSH_MS 100u
+
 typedef struct {
     HANDLE event;
     volatile LONG status;
@@ -58,6 +74,8 @@ typedef struct {
     CompletionWork *work;
     bool done, failed;
     wchar_t *error;
+    PendingFragments delta, reason;   /* coalescing buffers, NUL-terminated */
+    ULONGLONG flush_tick;             /* last real delivery, any type */
 } Stream;
 typedef enum { REQUEST_DONE, REQUEST_ERROR, REQUEST_CANCELLED, REQUEST_INTERRUPTED } RequestOutcome;
 
@@ -69,24 +87,16 @@ static wchar_t *copy_wide(const wchar_t *text) {
     return copy;
 }
 
-void completion_init(CompletionClient *client, HWND notify, UINT message) {
-    if (!client) return;
-    memset(client, 0, sizeof *client);
-    client->notify = notify;
-    client->message = message;
-}
-
-void completion_event_free(CompletionEvent *event) {
-    if (!event) return;
-    free(event->text);
-    free(event);
-}
-
 static bool cancelled(const CompletionWork *work) {
     return InterlockedCompareExchange(&work->client->cancelled_generation,
         0, 0) == work->generation;
 }
 
+/* Enqueues one event for UI delivery. The worker appends under the client
+   lock and posts exactly one outstanding wake message: a wake is sent only
+   when none is pending (`wake_pending` cleared by the UI thread inside
+   completion_take), so the number of posted messages is bounded by the
+   number of takes, never by the number of fragments. */
 static bool post_event(CompletionWork *work, CompletionEventType type,
     wchar_t *owned_text) {
     if (type == COMPLETION_DELTA && cancelled(work)) {
@@ -99,12 +109,154 @@ static bool post_event(CompletionWork *work, CompletionEventType type,
     event->type = type;
     event->text = owned_text;
     event->metadata = work->metadata;
-    if (!PostMessageW(work->notify, work->message, (WPARAM)work->generation,
-        (LPARAM)event)) {
+    CompletionClient *client = work->client;
+    bool alive = false, wake = false;
+    EnterCriticalSection(&client->lock);
+    alive = client->alive;
+    if (alive) {
+        if (client->tail) client->tail->next = event;
+        else client->head = event;
+        client->tail = event;
+        wake = !InterlockedExchange(&client->wake_pending, 1);
+    }
+    LeaveCriticalSection(&client->lock);
+    if (!alive) {
+        /* Defensive: the worker is joined before shutdown closes the
+           queue, so this never fires in production; a late post frees its
+           event and reports failure. */
         completion_event_free(event);
         return false;
     }
+    if (wake && !PostMessageW(client->notify, client->message,
+        (WPARAM)work->generation, 0)) {
+        /* The event stays queued; clearing the flag makes the next event
+           (the terminal one, at the latest) retry the wake, and the host's
+           1 Hz sweep drains the batch as a backstop once the worker exits. */
+        InterlockedExchange(&client->wake_pending, 0);
+        return false;
+    }
     return true;
+}
+
+static bool fragments_append(PendingFragments *buffer, const wchar_t *text) {
+    size_t added = wcslen(text);
+    if (buffer->length + added + 1 > buffer->capacity) {
+        size_t capacity = buffer->capacity ? buffer->capacity : 256;
+        while (capacity < buffer->length + added + 1) capacity *= 2;
+        wchar_t *grown = (wchar_t *)realloc(buffer->data,
+            capacity * sizeof *grown);
+        if (!grown) return false;
+        buffer->data = grown;
+        buffer->capacity = capacity;
+    }
+    wmemcpy(buffer->data + buffer->length, text, added + 1);
+    buffer->length += added;
+    return true;
+}
+
+static wchar_t *fragments_release(PendingFragments *buffer) {
+    wchar_t *data = buffer->data;
+    buffer->data = NULL;
+    buffer->length = buffer->capacity = 0;
+    return data;
+}
+
+static void fragments_free(PendingFragments *buffer) {
+    free(buffer->data);
+    buffer->data = NULL;
+    buffer->length = buffer->capacity = 0;
+}
+
+/* Posts the pending fragments as one event per type, reasoning before
+   content (the order the stream emits them). Delivery failure keeps the
+   current failure semantics of the direct-post path; cancellation frees
+   the text inside post_event. */
+static bool stream_flush(Stream *stream) {
+    bool ok = true;
+    if (stream->reason.length) {
+        wchar_t *text = fragments_release(&stream->reason);
+        if (!post_event(stream->work, COMPLETION_REASONING, text)) {
+            if (!cancelled(stream->work)) {
+                stream->error =
+                    copy_wide(L"Could not deliver streamed reasoning.");
+                stream->failed = true;
+            }
+            ok = false;
+        }
+    }
+    if (stream->delta.length) {
+        wchar_t *text = fragments_release(&stream->delta);
+        if (!post_event(stream->work, COMPLETION_DELTA, text)) {
+            if (!cancelled(stream->work)) {
+                stream->error = copy_wide(L"Could not deliver streamed text.");
+                stream->failed = true;
+            }
+            ok = false;
+        }
+    }
+    if (ok) stream->flush_tick = GetTickCount64();
+    return ok;
+}
+
+/* Adds one decoded fragment to a coalescing buffer (taking ownership).
+   Delivery is independent of read boundaries: buffers drain only when the
+   cadence interval has elapsed or the size threshold is crossed, so
+   packetization (one SSE event per read) cannot force one enqueue per
+   token. */
+static bool stream_push(Stream *stream, PendingFragments *buffer,
+    wchar_t *owned) {
+    if (!owned) return false;
+    if (!fragments_append(buffer, owned)) {
+        free(owned);
+        stream->error = copy_wide(L"Out of memory decoding the stream.");
+        stream->failed = true;
+        return false;
+    }
+    free(owned);
+    if (stream->failed || cancelled(stream->work)) return !stream->failed;
+    if (buffer->length >= STREAM_COALESCE_CHARS) return stream_flush(stream);
+    if (GetTickCount64() - stream->flush_tick >= STREAM_FLUSH_MS)
+        return stream_flush(stream);
+    return true;
+}
+
+void completion_init(CompletionClient *client, HWND notify, UINT message) {
+    if (!client) return;
+    memset(client, 0, sizeof *client);
+    client->notify = notify;
+    client->message = message;
+    client->alive = true;
+    InitializeCriticalSection(&client->lock);
+}
+
+CompletionEvent *completion_take(CompletionClient *client) {
+    /* `alive` gates before the lock: after shutdown the critical section is
+       deleted, and this runs on the UI thread that also wrote the flag. */
+    if (!client || !client->alive) return NULL;
+    CompletionEvent *batch = NULL;
+    EnterCriticalSection(&client->lock);
+    batch = client->head;
+    client->head = client->tail = NULL;
+    InterlockedExchange(&client->wake_pending, 0);
+    LeaveCriticalSection(&client->lock);
+    return batch;
+}
+
+/* Single-event ownership: the event's `next` link, if any, is NOT followed
+   (a batch must be detached node-by-node before each free, or use
+   completion_events_free). */
+void completion_event_free(CompletionEvent *event) {
+    if (!event) return;
+    free(event->text);
+    free(event);
+}
+
+void completion_events_free(CompletionEvent *batch) {
+    while (batch) {
+        CompletionEvent *next = batch->next;
+        completion_event_free(batch);
+        batch = next;
+    }
 }
 
 /* Real encoder: adapts the work arrays into the shared borrowed view. Kept as
@@ -187,7 +339,7 @@ static void CALLBACK winhttp_callback(HINTERNET handle, DWORD_PTR context,
 }
 
 static bool wait_status(CompletionWork *work, AsyncState *state,
-    DWORD expected) {
+    DWORD expected, Stream *stream) {
     for (;;) {
         DWORD waited = WaitForSingleObject(state->event, 100);
         if (waited == WAIT_OBJECT_0) {
@@ -199,6 +351,14 @@ static bool wait_status(CompletionWork *work, AsyncState *state,
             state->error = GetLastError();
             return false;
         }
+        /* Between waits the network is quiet: the 100 ms delivery cadence
+           is enforced here, not only when the next fragment arrives, so a
+           paused stream never holds decoded text past the latency bound. */
+        if (stream && !stream->failed && !cancelled(work) &&
+            (stream->delta.length || stream->reason.length) &&
+            GetTickCount64() - stream->flush_tick >= STREAM_FLUSH_MS &&
+            !stream_flush(stream))
+            return false;
         if (cancelled(work)) return false;
     }
 }
@@ -310,10 +470,10 @@ static bool stream_event(void *user, const char *data, size_t length) {
         if (has_fragment) {
             has_reasoning = true;
             wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
-            if (!wide || !post_event(stream->work, COMPLETION_REASONING, wide)) {
-                if (!cancelled(stream->work))
-                    stream->error = copy_wide(
-                        L"Could not deliver streamed reasoning.");
+            if (!stream_push(stream, &stream->reason, wide) &&
+                !stream->failed && !cancelled(stream->work)) {
+                stream->error = copy_wide(
+                    L"Could not deliver streamed reasoning.");
                 stream->failed = true;
             }
         }
@@ -331,9 +491,9 @@ static bool stream_event(void *user, const char *data, size_t length) {
             decoded[0];
     if (has_plain_reasoning && !stream->failed) {
         wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
-        if (!wide || !post_event(stream->work, COMPLETION_REASONING, wide)) {
-            if (!cancelled(stream->work))
-                stream->error = copy_wide(L"Could not deliver streamed reasoning.");
+        if (!stream_push(stream, &stream->reason, wide) &&
+            !stream->failed && !cancelled(stream->work)) {
+            stream->error = copy_wide(L"Could not deliver streamed reasoning.");
             stream->failed = true;
         }
     }
@@ -345,9 +505,9 @@ static bool stream_event(void *user, const char *data, size_t length) {
             g->ttft_ms = (double)(GetTickCount64() - stream->work->started_tick);
         }
         wchar_t *wide = json_utf8_to_utf16(decoded, strlen(decoded));
-        if (!wide || !post_event(stream->work, COMPLETION_DELTA, wide)) {
-            if (!cancelled(stream->work))
-                stream->error = copy_wide(L"Could not deliver streamed text.");
+        if (!stream_push(stream, &stream->delta, wide) &&
+            !stream->failed && !cancelled(stream->work)) {
+            stream->error = copy_wide(L"Could not deliver streamed text.");
             stream->failed = true;
         }
     }
@@ -368,7 +528,7 @@ static RequestOutcome perform(CompletionWork *work, wchar_t **error) {
     bool request_context_set = false;
     Response response = {0};
     SseParser parser;
-    Stream stream = {work, false, false, NULL};
+    Stream stream = {work, false, false, NULL, {0}, {0}, GetTickCount64()};
     DWORD winhttp_error = ERROR_SUCCESS, status = 0;
     RequestOutcome outcome = REQUEST_ERROR;
     sse_init(&parser);
@@ -417,12 +577,13 @@ static RequestOutcome perform(CompletionWork *work, wchar_t **error) {
     if (!async_started(WinHttpSendRequest(request, headers, (DWORD)-1,
         (LPVOID)body.data, (DWORD)body.length, (DWORD)body.length, context),
         &async) || !wait_status(work, &async,
-            WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE)) {
+            WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE, NULL)) {
         winhttp_error = async.error; goto network_or_cancel;
     }
     begin_async(&async);
     if (!async_started(WinHttpReceiveResponse(request, NULL), &async) ||
-        !wait_status(work, &async, WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE)) {
+        !wait_status(work, &async, WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE,
+            NULL)) {
         winhttp_error = async.error; goto network_or_cancel;
     }
     DWORD status_size = sizeof status;
@@ -436,7 +597,8 @@ static RequestOutcome perform(CompletionWork *work, wchar_t **error) {
         begin_async(&async);
         if (!async_started(WinHttpQueryDataAvailable(request, NULL), &async) ||
             !wait_status(work, &async,
-                WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE)) {
+                WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE, &stream)) {
+            if (stream.failed) goto stream_failed;
             winhttp_error = async.error; goto network_or_cancel;
         }
         DWORD available = async.bytes;
@@ -454,12 +616,17 @@ static RequestOutcome perform(CompletionWork *work, wchar_t **error) {
         begin_async(&async);
         if (!async_started(WinHttpReadData(request,
             response.data + response.length, available, NULL), &async) ||
-            !wait_status(work, &async, WINHTTP_CALLBACK_STATUS_READ_COMPLETE)) {
+            !wait_status(work, &async, WINHTTP_CALLBACK_STATUS_READ_COMPLETE,
+                &stream)) {
+            if (stream.failed) goto stream_failed;
             winhttp_error = async.error; goto network_or_cancel;
         }
         DWORD read = async.bytes;
         if (!read) break;
         if (status == 200 || status == 201) {
+            /* Fragments are buffered independently of read boundaries (the
+                cadence/threshold logic in stream_push); nothing is flushed
+                per read. */
             if (!sse_feed(&parser, response.data + response.length, read,
                 stream_event, &stream)) {
                 if (cancelled(work)) goto was_cancelled;
@@ -477,7 +644,8 @@ static RequestOutcome perform(CompletionWork *work, wchar_t **error) {
             response.data ? response.data : "");
         goto cleanup;
     }
-    if (!sse_finish(&parser, stream_event, &stream) || stream.failed) {
+    if (!sse_finish(&parser, stream_event, &stream) || stream.failed ||
+        !stream_flush(&stream)) {
         if (cancelled(work)) goto was_cancelled;
         *error = stream.error ? stream.error :
             copy_wide(L"The streaming response was malformed.");
@@ -496,6 +664,12 @@ static RequestOutcome perform(CompletionWork *work, wchar_t **error) {
 network_or_cancel:
     if (cancelled(work)) goto was_cancelled;
     goto network_error;
+stream_failed:
+    if (cancelled(work)) goto was_cancelled;
+    *error = stream.error ? stream.error :
+        copy_wide(L"Could not deliver streamed text.");
+    stream.error = NULL;
+    goto cleanup;
 network_error:
     if (cancelled(work)) goto was_cancelled;
     if (work->metadata.first_token_at) outcome = REQUEST_INTERRUPTED;
@@ -512,6 +686,12 @@ network_error:
 was_cancelled:
     outcome = REQUEST_CANCELLED;
 cleanup:
+    /* Deliver decoded-but-undelivered fragments (success, malformed tail
+       and network failure all flush before erroring so no text is lost);
+       cancellation drops them instead. */
+    if (outcome != REQUEST_CANCELLED) stream_flush(&stream);
+    fragments_free(&stream.reason);
+    fragments_free(&stream.delta);
     free(stream.error);
     sse_dispose(&parser);
     free(response.data);
@@ -623,10 +803,26 @@ void completion_complete(CompletionClient *client, int generation) {
 }
 
 void completion_shutdown(CompletionClient *client) {
-    if (!client || !client->thread) return;
-    int generation = (int)client->generation;
-    completion_cancel(client, generation);
-    WaitForSingleObject(client->thread, INFINITE);
-    CloseHandle(client->thread);
-    client->thread = NULL;
+    if (!client || !client->alive) return;
+    /* `alive` is the once-guard: the first shutdown joins the (optional)
+       worker, closes and drains the queue, and destroys the critical
+       section exactly once; later calls return here. */
+    if (client->thread) {
+        int generation = (int)client->generation;
+        completion_cancel(client, generation);
+        WaitForSingleObject(client->thread, INFINITE);
+        CloseHandle(client->thread);
+        client->thread = NULL;
+    }
+    /* Close the queue and free anything the worker left: a wake message
+       still pending in the pump finds the queue closed (completion_take
+       answers NULL) and delivers nothing. */
+    EnterCriticalSection(&client->lock);
+    client->alive = false;
+    CompletionEvent *queued = client->head;
+    client->head = client->tail = NULL;
+    LeaveCriticalSection(&client->lock);
+    InterlockedExchange(&client->wake_pending, 0);
+    completion_events_free(queued);
+    DeleteCriticalSection(&client->lock);
 }

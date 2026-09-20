@@ -5,27 +5,49 @@
 #include "chat/generation/context.h"
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
-static int deltas, reasons, terminal;
+static int deltas, reasons, terminal, wakes;
 static wchar_t reasoning_text[256];
+static wchar_t delta_text[4096];
+static CompletionEventType order[16];
+static int order_count;
 static CompletionEventType outcome;
 static ChatGeneration metadata;
 static int generation;
+/* File scope: the wake handler drains this client's queue. */
+static CompletionClient client;
 static LRESULT CALLBACK test_proc(HWND window,UINT msg,WPARAM w,LPARAM l) {
     if (msg==CHAT_WM_COMPLETION_EVENT) {
-        CompletionEvent *e=(CompletionEvent *)l;
-        if (e->generation==generation) {
-            if (e->type==COMPLETION_DELTA) { if (e->text && e->text[0]) ++deltas; }
-            else if (e->type==COMPLETION_REASONING) {
-                if (e->text && e->text[0]) {
-                    ++reasons;
-                    wcsncat(reasoning_text,e->text,
-                        255-wcslen(reasoning_text));
+        /* The wake carries no payload: take the whole queued batch. */
+        ++wakes;
+        CompletionEvent *batch=completion_take(&client);
+        while (batch) {
+            CompletionEvent *e=batch;
+            batch=batch->next;
+            e->next=NULL;
+            if (e->generation==generation) {
+                if (order_count<16) order[order_count++]=e->type;
+                if (e->type==COMPLETION_DELTA) {
+                    if (e->text && e->text[0]) {
+                        ++deltas;
+                        wcsncat(delta_text,e->text,
+                            (sizeof delta_text/sizeof *delta_text)-1
+                                -wcslen(delta_text));
+                    }
                 }
+                else if (e->type==COMPLETION_REASONING) {
+                    if (e->text && e->text[0]) {
+                        ++reasons;
+                        wcsncat(reasoning_text,e->text,
+                            (sizeof reasoning_text/sizeof *reasoning_text)-1
+                                -wcslen(reasoning_text));
+                    }
+                }
+                else { ++terminal; outcome=e->type; }
+                metadata=e->metadata;
             }
-            else { ++terminal; outcome=e->type; }
-            metadata=e->metadata;
+            completion_event_free(e);
         }
-        completion_event_free(e); return 0;
+        return 0;
     }
     return DefWindowProcW(window,msg,w,l);
 }
@@ -40,6 +62,24 @@ static bool await_terminal(DWORD timeout) {
     }
     return terminal==1;
 }
+/* Flushes a stream's coalescing buffers and pumps the wake through. Every
+   decode assertion runs after this; buffering means stream_event alone no
+   longer delivers. */
+#define DELIVER(s) do { CHECK(stream_flush(s)); pump(); } while (0)
+/* Drops undelivered fragments after a forced failure reset, so pending
+   text from the failing event cannot leak into later counts. */
+static void drop_pending(Stream *s) {
+    fragments_free(&s->delta);
+    fragments_free(&s->reason);
+}
+typedef struct { AsyncState *state; DWORD status, delay; } DelayedSignal;
+static unsigned __stdcall signal_after(void *parameter) {
+    DelayedSignal *signal=(DelayedSignal *)parameter;
+    Sleep(signal->delay);
+    InterlockedExchange(&signal->state->status,(LONG)signal->status);
+    SetEvent(signal->state->event);
+    return 0;
+}
 /* Builds a request body through the real work adapter. */
 static bool encode(CompletionWork *work, JsonBuf *body) {
     return build_request(work, body);
@@ -48,15 +88,20 @@ int main(int argc,char **argv) {
     WNDCLASSW cls={0}; cls.lpfnWndProc=test_proc; cls.lpszClassName=L"DarkChat.NetworkTest";
     CHECK(RegisterClassW(&cls));
     HWND window=CreateWindowW(cls.lpszClassName,L"",0,0,0,0,0,HWND_MESSAGE,NULL,NULL,NULL); CHECK(window);
-    CompletionClient client; completion_init(&client,window,CHAT_WM_COMPLETION_EVENT);
+    completion_init(&client,window,CHAT_WM_COMPLETION_EVENT);
     CompletionWork work={0}; work.notify=window; work.message=CHAT_WM_COMPLETION_EVENT;
     work.client=&client; work.generation=7; generation=7;
     work.backend=CHAT_BACKEND_OPENROUTER;
     work.started_tick=GetTickCount64(); chat_generation_init(&work.metadata);
     work.metadata.backend=CHAT_BACKEND_OPENROUTER;
-    Stream stream={&work,false,false,NULL};
+    Stream stream={0}; stream.work=&work; stream.flush_tick=GetTickCount64();
     const char *chunk="{\"model\":\"actual/model\",\"choices\":[{\"delta\":{\"content\":\"Hi\\uD83D\\uDE80\"}}]}";
-    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(deltas==1);
+    CHECK(stream_event(&stream,chunk,strlen(chunk)));
+    /* Below the burst threshold and cadence, the fragment stays buffered
+       ("Hi" plus the U+1F680 surrogate pair: 4 UTF-16 units). */
+    CHECK(stream.delta.length==4 && deltas==0 && terminal==0);
+    DELIVER(&stream); CHECK(deltas==1 &&
+        !wcscmp(delta_text,L"Hi" L"\xD83D" L"\xDE80"));
     CHECK(work.metadata.ttft_ms>=0 && work.metadata.first_token_at>0);
     chunk="{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5,\"cost\":0.00002}}";
     CHECK(stream_event(&stream,chunk,strlen(chunk)));
@@ -65,41 +110,43 @@ int main(int argc,char **argv) {
     CHECK(stream_event(&stream,"[DONE]",6) && stream.done);
     chunk="{\"choices\":[{\"delta\":{\"content\":\"partial\"}}],\"error\":{\"message\":\"provider failed\"}}";
     CHECK(!stream_event(&stream,chunk,strlen(chunk)) && stream.failed && stream.error);
-    free(stream.error); stream.error=NULL; stream.failed=false;
-    CHECK(!stream_event(&stream,"{bad}",5)); free(stream.error); pump();
+    free(stream.error); stream.error=NULL; stream.failed=false; drop_pending(&stream);
+    CHECK(!stream_event(&stream,"{bad}",5)); free(stream.error); drop_pending(&stream); pump();
     /* Reasoning is parsed from structured details and compatibility fallbacks;
        an entry with no displayable text never fabricates one. */
     stream.error=NULL; stream.failed=false; reasons=0; deltas=0;
     reasoning_text[0]=0;
+    stream.flush_tick=GetTickCount64();
     chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"step one \"}]}}]}";
-    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==1);
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); DELIVER(&stream); CHECK(reasons==1);
     chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.summary\",\"summary\":\"summary\"}]}}]}";
-    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==2);
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); DELIVER(&stream); CHECK(reasons==2);
     chunk="{\"choices\":[{\"delta\":{\"reasoning\":\"plain text\"}}]}";
-    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==3);
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); DELIVER(&stream); CHECK(reasons==3);
     chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"data\":\"opaque\"}]}}]}";
-    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==3);
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); DELIVER(&stream); CHECK(reasons==3);
     chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"multi one \"},{\"type\":\"reasoning.encrypted\",\"data\":\"opaque\"},{\"type\":\"reasoning.summary\",\"summary\":\"multi two\"}]}}]}";
-    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump();
-    CHECK(reasons==5 && wcsstr(reasoning_text,L"multi one multi two"));
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); DELIVER(&stream);
+    CHECK(reasons==4 && wcsstr(reasoning_text,L"multi one multi two"));
     chunk="{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"data\":\"opaque\"}],\"reasoning_content\":\"alias text\"}}]}";
-    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump();
-    CHECK(reasons==6 && wcsstr(reasoning_text,L"alias text"));
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); DELIVER(&stream);
+    CHECK(reasons==5 && wcsstr(reasoning_text,L"alias text"));
     chunk="{\"choices\":[{\"delta\":{\"content\":\"answer only\"}}]}";
-    CHECK(stream_event(&stream,chunk,strlen(chunk))); pump(); CHECK(reasons==6 && deltas==1);
+    CHECK(stream_event(&stream,chunk,strlen(chunk))); DELIVER(&stream); CHECK(reasons==5 && deltas==1);
     /* Ollama's OpenAI-compatible reasoning output arrives through the same
        parser fallbacks (reasoning, then reasoning_content). */
     stream.error=NULL; stream.failed=false; reasons=0; deltas=0; reasoning_text[0]=0;
     CompletionWork ollama=work; ollama.backend=CHAT_BACKEND_OLLAMA;
     ollama.metadata.backend=CHAT_BACKEND_OLLAMA;
-    Stream ollama_stream={&ollama,false,false,NULL};
+    Stream ollama_stream={0}; ollama_stream.work=&ollama;
+    ollama_stream.flush_tick=GetTickCount64();
     chunk="{\"choices\":[{\"delta\":{\"reasoning\":\"local step \"}}]}";
-    CHECK(stream_event(&ollama_stream,chunk,strlen(chunk))); pump(); CHECK(reasons==1);
+    CHECK(stream_event(&ollama_stream,chunk,strlen(chunk))); DELIVER(&ollama_stream); CHECK(reasons==1);
     chunk="{\"choices\":[{\"delta\":{\"reasoning_content\":\"more\"}}]}";
-    CHECK(stream_event(&ollama_stream,chunk,strlen(chunk))); pump();
+    CHECK(stream_event(&ollama_stream,chunk,strlen(chunk))); DELIVER(&ollama_stream);
     CHECK(reasons==2 && wcsstr(reasoning_text,L"local step more"));
     chunk="{\"model\":\"llama3\",\"choices\":[{\"delta\":{\"content\":\"local answer\"}}]}";
-    CHECK(stream_event(&ollama_stream,chunk,strlen(chunk))); pump(); CHECK(deltas==1);
+    CHECK(stream_event(&ollama_stream,chunk,strlen(chunk))); DELIVER(&ollama_stream); CHECK(deltas==1);
     chunk="{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":4,\"total_tokens\":11}}";
     CHECK(stream_event(&ollama_stream,chunk,strlen(chunk)));
     CHECK(ollama.metadata.prompt_tokens==7 && ollama.metadata.completion_tokens==4 &&
@@ -107,10 +154,92 @@ int main(int argc,char **argv) {
     CHECK(!wcscmp(ollama.metadata.actual_model,L"llama3"));
     CHECK(!stream_event(&ollama_stream,"{oops",5) && ollama_stream.failed);
     free(ollama_stream.error); ollama_stream.error=NULL; ollama_stream.failed=false;
+    drop_pending(&ollama_stream);
     CHECK(stream_event(&ollama_stream,"[DONE]",6) && ollama_stream.done);
     /* Backend identity travels with the generation metadata. */
     CHECK(ollama.metadata.backend==CHAT_BACKEND_OLLAMA &&
         work.metadata.backend==CHAT_BACKEND_OPENROUTER);
+
+    /* Coalescing: fragments concatenate per type in arrival order, one
+       flush enqueues reasoning before content, and a single outstanding
+       wake delivers the whole batch. Nothing is delivered by pushes alone
+       (no read boundary exists in this harness, and the cadence is reset). */
+    stream.error=NULL; stream.failed=false; stream.done=false;
+    drop_pending(&stream);
+    reasons=0; deltas=0; wakes=0; order_count=0;
+    reasoning_text[0]=0; delta_text[0]=0;
+    stream.flush_tick=GetTickCount64();
+    chunk="{\"choices\":[{\"delta\":{\"reasoning\":\"one \"}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk)));
+    chunk="{\"choices\":[{\"delta\":{\"reasoning\":\"two\"}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk)));
+    chunk="{\"choices\":[{\"delta\":{\"content\":\"alpha \"}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk)));
+    chunk="{\"choices\":[{\"delta\":{\"content\":\"beta\"}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk)));
+    CHECK(stream.reason.length==7 && stream.delta.length==10);
+    CHECK(wakes==0 && reasons==0 && deltas==0);
+    CHECK(stream_flush(&stream)); pump();
+    CHECK(wakes==1 && reasons==1 && deltas==1);
+    CHECK(!wcscmp(reasoning_text,L"one two") && !wcscmp(delta_text,L"alpha beta"));
+    CHECK(order_count==2 && order[0]==COMPLETION_REASONING &&
+        order[1]==COMPLETION_DELTA);
+    /* A burst past the coalesce threshold delivers mid-stream without an
+       explicit flush, still as one concatenated event per type. */
+    reasons=0; deltas=0; wakes=0; reasoning_text[0]=0; delta_text[0]=0;
+    stream.flush_tick=GetTickCount64();
+    {
+        static wchar_t big[1200];
+        static char burst[16000];
+        for (int i=0;i<1199;i++) big[i]=L'x';
+        big[1199]=0;
+        snprintf(burst,sizeof burst,
+            "{\"choices\":[{\"delta\":{\"content\":\"%ls\"}}]}",big);
+        CHECK(stream_event(&stream,burst,strlen(burst)));
+        CHECK(stream.delta.length==0 && stream.reason.length==0);
+        pump();
+        CHECK(deltas==1 && (int)wcslen(delta_text)==1199 && wakes==1);
+        CHECK(stream_event(&stream,burst,strlen(burst)));
+        CHECK(stream.delta.length==0 && stream.reason.length==0);
+        pump();
+        CHECK(deltas==2 && (int)wcslen(delta_text)==2398 && wakes==2);
+    }
+    /* A quiet network wait enforces the cadence even when no later fragment
+       arrives to call stream_push. The delayed expected callback keeps
+       wait_status blocked long enough for its timeout path to flush. */
+    deltas=0; wakes=0; delta_text[0]=0;
+    drop_pending(&stream);
+    stream.flush_tick=GetTickCount64();
+    chunk="{\"choices\":[{\"delta\":{\"content\":\"quiet\"}}]}";
+    CHECK(stream_event(&stream,chunk,strlen(chunk)) && stream.delta.length==5);
+    {
+        AsyncState state={0};
+        state.event=CreateEventW(NULL,TRUE,FALSE,NULL);
+        CHECK(state.event);
+        DelayedSignal signal={&state,
+            WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE,STREAM_FLUSH_MS*2+50};
+        HANDLE thread=(HANDLE)_beginthreadex(NULL,0,signal_after,&signal,0,NULL);
+        CHECK(thread);
+        CHECK(wait_status(&work,&state,
+            WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE,&stream));
+        WaitForSingleObject(thread,INFINITE);
+        CloseHandle(thread); CloseHandle(state.event);
+    }
+    pump();
+    CHECK(stream.delta.length==0 && deltas==1 && wakes==1 &&
+        !wcscmp(delta_text,L"quiet"));
+    /* A cancelled generation drops content at delivery, keeps the queue
+       empty, and leaves the stream's failure state clean. */
+    deltas=0; wakes=0; delta_text[0]=0; stream.done=false;
+    drop_pending(&stream);
+    chunk="{\"choices\":[{\"delta\":{\"content\":\"gone\"}}]}";
+    stream.flush_tick=GetTickCount64();
+    CHECK(stream_event(&stream,chunk,strlen(chunk)));
+    CHECK(stream.delta.length==4);
+    InterlockedExchange(&client.cancelled_generation,7);
+    CHECK(!stream_flush(&stream) && !stream.failed && !stream.error);
+    CHECK(deltas==0 && wakes==0 && stream.delta.length==0);
+    InterlockedExchange(&client.cancelled_generation,0);
 
     work.model=L"test/model";
     ChatRole roles[]={CHAT_ROLE_SYSTEM,CHAT_ROLE_USER,CHAT_ROLE_ERROR};

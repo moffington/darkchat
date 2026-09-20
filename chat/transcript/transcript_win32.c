@@ -207,6 +207,10 @@ static bool turn_state(Transcript *t, const TranscriptFeed *feed, int index,
         (s->has_row ? !wcscmp(rec->row, s->row) : !rec->row[0]);
     s->body_current = same && rec->body_revision == m->body_revision &&
         rec->role == m->role &&
+        /* Plain streaming appends keep the currency only while the turn is
+            still running; once it stops, the dirty flag makes the body
+            stale so the terminal render re-renders the full Markdown. */
+        !(rec->body_stream_dirty && !s->running) &&
         (m->role != CHAT_ROLE_ASSISTANT ||
          (rec->body_layout_width == t->view_width &&
           rec->body_layout_dpi == t->dpi &&
@@ -1419,6 +1423,9 @@ static bool write_body(Transcript *t, TranscriptRecord *rec, int index,
         return false;
     }
     rec->body_pending = false;
+    /* The control now holds the full Markdown render of exactly this text. */
+    rec->body_marked_len = wcslen(text);
+    rec->body_stream_dirty = false;
     rec->measured_valid = false;
     rec->measured_estimated = false;
     if (role == CHAT_ROLE_ASSISTANT) {
@@ -1472,6 +1479,9 @@ static bool write_reasoning(Transcript *t, TranscriptRecord *rec, int index,
     rich_text_set_reasoning(control, text);
     t->applying = false;
     rec->reason_pending = false;
+    /* The viewport now holds exactly this text; batched streaming appends
+        resume from the full length. */
+    rec->reason_painted = wcslen(text ? text : L"");
     rec->measured_valid = false;
     rec->measured_estimated = false;
     if (t->render_active) ++t->round_transitions;
@@ -1598,9 +1608,11 @@ static void prepare_turn(Transcript *t, const TranscriptFeed *feed,
         m->revision, m->role, m->generation.state, running,
         feed->content_started, m->reasoning_open, has_row, row);
     /* The answer body is keyed on its text alone, so a terminal metadata
-       update refreshes the footer without rebuilding the body. */
+        update refreshes the footer without rebuilding the body. Plain
+        streaming appends end the currency the moment the turn stops. */
     bool body_fresh = certified && body_current(t, rec, c->id, m->id,
-        m->body_revision, m->role);
+        m->body_revision, m->role) &&
+        !(rec->body_stream_dirty && !running);
     /* Does the surface still represent this exact message instance? The
        instance-level comparison goes through the pure policy seam. Captured
        before the invalidations below overwrite it. */
@@ -2606,30 +2618,68 @@ bool transcript_stream_body(Transcript *t, const TranscriptFeed *feed,
     }
     if (rich_text_has_selection(body)) {
         /* The reader holds a selection in the live answer: the destructive
-           Markdown rebuild is deferred until the selection clears. */
+            Markdown rebuild is deferred until the selection clears. */
         rec->body_pending = true;
         rec->blocked_debt = true;
         return true;
     }
+    const wchar_t *text = chat_message_text(m);
+    size_t length = wcslen(text);
     bool pinned = transcript_following(t);
+    /* Live answer appends extend the last full Markdown render with plain
+        text instead of reparsing and rewriting the accumulated document;
+        the terminal render re-renders the complete Markdown exactly once.
+        Eligible only while the stream runs, for the certified same-message
+        body whose bookkeeping proves the control holds a prefix of the
+        current text. A shrinking or uncertified text falls through to the
+        full rebuild. */
+    if (feed->generating && m->role == CHAT_ROLE_ASSISTANT &&
+        rec->rendered_valid && record_certified(t, rec) &&
+        transcript_policy_same_message(rec->conversation, rec->message,
+            c->id, m->id) && length >= rec->body_marked_len) {
+        if (length > rec->body_marked_len) {
+            t->applying = true;
+            rich_text_append_body(body, text + rec->body_marked_len);
+            t->applying = false;
+            rec->body_marked_len = length;
+            rec->body_stream_dirty = true;
+            /* The revision stamp keeps the realize loop from treating the
+                streaming body as destructive; the dirty flag (not the
+                revision) restores the terminal render. */
+            rec->body_revision = m->body_revision;
+            rec->measured_valid = false;
+            rec->measured_estimated = false;
+        }
+        if (t->bounded) {
+            RealizeResult r;
+            realize_loop(t, feed, pinned, -1, true, &r);
+            place_and_scroll(t, feed, pinned);
+        } else {
+            transcript_layout_from(t, index, pinned);
+        }
+        return true;
+    }
     t->applying = true;
     bool ok = true;
     if (m->role == CHAT_ROLE_ASSISTANT)
-        ok = rich_text_set_markdown_width(body, m->role, chat_message_text(m),
+        ok = rich_text_set_markdown_width(body, m->role, text,
             t->view_width);
     else
-        rich_text_set_block(body, m->role, chat_message_text(m));
+        rich_text_set_block(body, m->role, text);
     t->applying = false;
     if (!ok) {
         /* The rebuild did not land: keep the debt and certify nothing so the
-           caller's armed flush (or the next render) retries. */
+            caller's armed flush (or the next render) retries. */
         rec->body_pending = true;
         return false;
     }
     rec->body_pending = false;
     /* This path bypasses prepare_turn(); keep the recorded revision and the
-       assistant layout currency in step. */
+        assistant layout currency in step. The Markdown render now covers
+        exactly this text, so the streaming append bookkeeping restarts. */
     rec->body_revision = m->body_revision;
+    rec->body_marked_len = length;
+    rec->body_stream_dirty = false;
     if (m->role == CHAT_ROLE_ASSISTANT) {
         rec->body_layout_width = t->view_width;
         rec->body_layout_dpi = t->dpi;
@@ -2660,6 +2710,10 @@ static void reset_slot(Transcript *t, int index) {
     rec->rendered_valid = false;
     rec->head_pending = rec->body_pending = false;
     rec->meta_pending = rec->reason_pending = false;
+    /* Streaming append bookkeeping belongs to the departed content. */
+    rec->body_marked_len = 0;
+    rec->body_stream_dirty = false;
+    rec->reason_painted = 0;
     /* Replacement class: the captured reader state belongs to the departed
         message instance and must never leak into the replacement. */
     for (int s = 0; s < TRANSCRIPT_SURFACE_COUNT; s++)

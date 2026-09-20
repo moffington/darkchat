@@ -5,9 +5,12 @@
    request bytes come from the shared pure builder (chat/generation/completion_request.h);
    this module only selects a hard-coded endpoint descriptor, opens the
    matching WinHTTP session and reuses one SSE lifecycle for OpenRouter and
-   Ollama. Each posted event is heap-owned by the UI thread. Generation IDs let
-   the host ignore stale queued deltas. Answer content and model reasoning
-   arrive as separate event types. */
+   Ollama. Events are queued under the client lock and delivered to the UI
+   thread through one outstanding wake message: the wake handler takes the
+   whole queued batch and then returns to the normal pump, so stream
+   delivery can never starve input or outgrow one bounded batch per wake.
+   Generation IDs let the host ignore stale queued deltas. Answer content
+   and model reasoning arrive as separate event types. */
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -24,11 +27,14 @@ typedef enum {
     COMPLETION_CANCELLED, COMPLETION_INTERRUPTED
 } CompletionEventType;
 
-typedef struct {
+typedef struct CompletionEvent {
     int generation;
     CompletionEventType type;
     wchar_t *text;
     ChatGeneration metadata;
+    /* Delivery-queue link: events are queued under the client lock and
+       handed to the UI thread as one FIFO batch per wake. */
+    struct CompletionEvent *next;
 } CompletionEvent;
 
 typedef struct CompletionClient {
@@ -37,9 +43,24 @@ typedef struct CompletionClient {
     HANDLE thread;
     volatile LONG generation;
     volatile LONG cancelled_generation;
+    /* Single-outstanding-wake delivery: the worker appends events under
+       `lock` and posts `message` to `notify` only when no wake is
+       outstanding (`wake_pending`). completion_take clears that flag under
+       the same lock while removing the batch, so an event is never
+       stranded without a wake and never posted twice. `alive` gates drains
+       after shutdown (the wake message may outlive the queue). */
+    CRITICAL_SECTION lock;
+    CompletionEvent *head, *tail;
+    volatile LONG wake_pending;
+    bool alive;
 } CompletionClient;
 
 void completion_init(CompletionClient *client, HWND notify, UINT message);
+/* Takes every queued completion event as one FIFO batch (ownership
+   transfers to the caller); NULL when nothing is queued. Call from the
+   wake-message handler on the UI thread; each wake delivers exactly the
+   events queued since the previous take. */
+CompletionEvent *completion_take(CompletionClient *client);
 /* Starts one streamed request against `backend`. An API key is required only
    for OpenRouter: Ollama needs none, so a missing OPENROUTER_API_KEY never
    blocks it. `routing` applies to OpenRouter only. Returns the generation
@@ -50,6 +71,8 @@ int completion_request(CompletionClient *client, ChatBackend backend,
     const ChatProviderRouting *routing);
 bool completion_cancel(CompletionClient *client, int generation);
 void completion_event_free(CompletionEvent *event);
+/* Frees a linked batch returned by completion_take (single events too). */
+void completion_events_free(CompletionEvent *batch);
 void completion_complete(CompletionClient *client, int generation);
 void completion_shutdown(CompletionClient *client);
 

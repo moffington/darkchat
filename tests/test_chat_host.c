@@ -594,6 +594,9 @@ static int default_suite(void) {
     handle_event(h,fixture(h,COMPLETION_REASONING,L"stream rea"));
     handle_event(h,fixture(h,COMPLETION_REASONING,L"soning"));
     reasoning_text(h,second,text,128);
+    CHECK(text[0]==0); /* paint waits for the shared stream-flush timer */
+    flush_stream_body(h);
+    reasoning_text(h,second,text,128);
     CHECK(!wcscmp(text,L"stream reasoning"));
     handle_event(h,fixture(h,COMPLETION_DELTA,L"Streamed answer"));
     CHECK(h->transcript.records[second].reason_live &&
@@ -767,11 +770,11 @@ static int default_suite(void) {
       CHECK(info.nPos<=before+4 && info.nPos<maximum);
       free(big); DestroyWindow(probe.window); }
     /* ---- Progressive Markdown streaming: the first delta renders
-       immediately, rapid deltas stay within the throttle window (no per-token
-       reparse), an elapsed window renders the accumulated text so markers
-       fragmented across deltas reassemble, incomplete syntax stays literal,
-       and the terminal event flushes the final render. Stored message text
-       keeps the raw markers throughout. */
+       immediately, rapid deltas stay within the throttle window, and later
+       flushes append only the raw tail instead of reparsing accumulated
+       Markdown. The terminal event performs one full render, reassembling
+       markers fragmented across deltas. Stored message text keeps the raw
+       markers throughout. */
     command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
     add_turn(chat,L"seed",L"seed answer",NULL,-1);
     begin_regenerate(h);
@@ -790,47 +793,21 @@ static int default_suite(void) {
     Sleep(CHAT_BODY_RENDER_MS+20);
     handle_event(h,fixture(h,COMPLETION_DELTA,L"d\nnext **ope"));
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
-      CHECK(!wcscmp(body,L"Title bold and code and\r\nnext **ope"));
-      CHARFORMAT2W f;
-      memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* "bold" */
-      SendMessageW(body_window(h,stream_turn),EM_SETSEL,6,7);
-      SendMessageW(body_window(h,stream_turn),EM_GETCHARFORMAT,
-          SCF_SELECTION,(LPARAM)&f);
-      CHECK((f.dwEffects & CFE_BOLD) && !(f.dwEffects & CFE_ITALIC));
-      memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* "code" */
-      SendMessageW(body_window(h,stream_turn),EM_SETSEL,15,16);
-      SendMessageW(body_window(h,stream_turn),EM_GETCHARFORMAT,
-          SCF_SELECTION,(LPARAM)&f);
-      CHECK(!wcscmp(f.szFaceName,L"Consolas") &&
-          (f.dwMask & CFM_BACKCOLOR));
-      memset(&f,0,sizeof f); f.cbSize=sizeof f;             /* plain tail */
-      SendMessageW(body_window(h,stream_turn),EM_SETSEL,26,27);
-      SendMessageW(body_window(h,stream_turn),EM_GETCHARFORMAT,
-          SCF_SELECTION,(LPARAM)&f);
-      CHECK(!(f.dwEffects & CFE_BOLD) && !wcscmp(f.szFaceName,L"Segoe UI")); }
+      CHECK(!wcscmp(body,L"Title **bold** and `code` and\r\nnext **ope")); }
     CHECK(!wcscmp(pending(h)->text,
         L"# Title **bold** and `code` and\nnext **ope"));
     SendMessageW(body_window(h,stream_turn),EM_SETSEL,(WPARAM)-1,(LPARAM)-1);
     h->transcript.body_render_tick=0;
     handle_event(h,fixture(h,COMPLETION_DELTA,L"n** ~~old and ``variable"));
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
-      CHECK(!wcscmp(body,L"Title bold and code and\r\nnext open ~~old and ``variable")); }
+      CHECK(!wcscmp(body,L"Title **bold** and `code` and\r\nnext **open** ~~old and ``variable")); }
     CHECK(!wcscmp(pending(h)->text,
         L"# Title **bold** and `code` and\nnext **open** ~~old and ``variable"));
     h->transcript.body_render_tick=0;
     handle_event(h,fixture(h,COMPLETION_DELTA,
         L"``~~\n~~~~\n~~fenced~~\n- [x] task\n~~~"));
     { wchar_t body[256]; body_text(h,stream_turn,body,256);
-      CHECK(!wcscmp(body,L"Title bold and code and\r\nnext open old and variable\r\n~~fenced~~\r\n- [x] task\r\n~~~"));
-      CHARFORMAT2W f;
-      memset(&f,0,sizeof f); f.cbSize=sizeof f;
-      SendMessageW(body_window(h,stream_turn),EM_SETSEL,
-          (WPARAM)wcslen(L"Title bold and code and\r\nnext open old and variable\r\n"),
-          (LPARAM)(wcslen(L"Title bold and code and\r\nnext open old and variable\r\n")+1));
-      SendMessageW(body_window(h,stream_turn),EM_GETCHARFORMAT,
-          SCF_SELECTION,(LPARAM)&f);
-      CHECK(!(f.dwEffects&CFE_STRIKEOUT) && !wcscmp(f.szFaceName,L"Consolas") &&
-          (f.dwMask&CFM_BACKCOLOR)); }
+      CHECK(!wcscmp(body,L"Title **bold** and `code` and\r\nnext **open** ~~old and ``variable``~~\r\n~~~~\r\n~~fenced~~\r\n- [x] task\r\n~~~")); }
     CHECK(!wcscmp(pending(h)->text,
         L"# Title **bold** and `code` and\nnext **open** ~~old and ``variable``~~\n~~~~\n~~fenced~~\n- [x] task\n~~~"));
     SendMessageW(body_window(h,stream_turn),EM_SETSEL,(WPARAM)-1,(LPARAM)-1);
@@ -857,8 +834,8 @@ static int default_suite(void) {
       CHECK(!(f.dwEffects&(CFE_BOLD|CFE_ITALIC|CFE_STRIKEOUT)) &&
           !wcscmp(f.szFaceName,L"Segoe UI")); }
     /* ---- Nested Markdown streams the same way: an incomplete prefix stays
-       literal, the accumulated message is reparsed at the throttle interval,
-       and the terminal render carries the paragraph layout. ---- */
+       literal, later fragments append plainly, and the terminal render
+       carries the completed paragraph layout. ---- */
     add_turn(chat,L"seed",L"seed answer",NULL,-1);
     begin_regenerate(h);
     int nested_turn=h->request_message;
@@ -869,11 +846,11 @@ static int default_suite(void) {
     h->transcript.body_render_tick=0;
     handle_event(h,fixture(h,COMPLETION_DELTA,L" item"));
     { wchar_t body[256]; body_text(h,nested_turn,body,256);
-      CHECK(!wcscmp(body,L"\u258C \u2022 item")); }
+      CHECK(!wcscmp(body,L"\u258C - item")); }
     h->transcript.body_render_tick=0;
     handle_event(h,fixture(h,COMPLETION_DELTA,L"\n>   - nested"));
     { wchar_t body[256]; body_text(h,nested_turn,body,256);
-      CHECK(!wcscmp(body,L"\u258C \u2022 item\r\n\u258C \u2022 nested")); }
+      CHECK(!wcscmp(body,L"\u258C - item\r\n>   - nested")); }
     handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     { wchar_t body[256]; body_text(h,nested_turn,body,256);
       CHECK(!wcscmp(body,L"\u258C \u2022 item\r\n\u258C \u2022 nested"));
@@ -909,10 +886,9 @@ static int default_suite(void) {
       SendMessageW(body->window,EM_SETSEL,0,1);
       SendMessageW(body->window,EM_GETCHARFORMAT,SCF_SELECTION,(LPARAM)&f);
       CHECK(f.dwEffects & CFE_LINK); }
-    /* ---- Table markdown streams through the same throttle: the header alone
-       stays literal until its delimiter row arrives, then the table flattens
-       to tab-separated physical lines, and the terminal render completes it
-       with the paragraph's tab stops. ---- */
+    /* ---- Table markdown streams through the same throttle: the header and
+       subsequent rows remain literal while streaming, and the terminal
+       render flattens the completed table and installs its tab stops. ---- */
     add_turn(chat,L"seed",L"seed answer",NULL,-1);
     begin_regenerate(h);
     int table_stream_turn=h->request_message;
@@ -923,11 +899,11 @@ static int default_suite(void) {
     h->transcript.body_render_tick=0;
     handle_event(h,fixture(h,COMPLETION_DELTA,L"| --- | --- |\n"));
     { wchar_t body[256]; body_text(h,table_stream_turn,body,256);
-      CHECK(wcsstr(body,L"|")==NULL && wcsstr(body,L"\t")!=NULL); }
+      CHECK(wcsstr(body,L"| --- | --- |")!=NULL && wcsstr(body,L"\t")==NULL); }
     h->transcript.body_render_tick=0;
     handle_event(h,fixture(h,COMPLETION_DELTA,L"| c | d |"));
     { wchar_t body[256]; body_text(h,table_stream_turn,body,256);
-      CHECK(!wcscmp(body,L"a\tb\r\nc\td")); }
+      CHECK(wcsstr(body,L"| c | d |")!=NULL && wcsstr(body,L"\t")==NULL); }
     handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
     { wchar_t body[256]; body_text(h,table_stream_turn,body,256);
@@ -1096,10 +1072,12 @@ static int default_suite(void) {
     click_row(h,second);
     CHECK(h->transcript.records[second].reason_live);
     handle_event(h,fixture(h,COMPLETION_REASONING,L"alpha beta"));
+    flush_stream_body(h);
     { HWND vp=transcript_surface(&h->transcript,second,TRANSCRIPT_REASON)->window;
       CHECK(vp);
       SendMessageW(vp,EM_SETSEL,2,5);
       handle_event(h,fixture(h,COMPLETION_REASONING,L" gamma"));
+      flush_stream_body(h);
       CHARRANGE sel; memset(&sel,0,sizeof sel);
       SendMessageW(vp,EM_EXGETSEL,0,(LPARAM)&sel);
       CHECK(sel.cpMin==2 && sel.cpMax==5);
@@ -1178,8 +1156,9 @@ static int default_suite(void) {
           chat->conversations[cv].messages[second].body_revision); }
     handle_event(h,fixture(h,COMPLETION_DONE,NULL));
     /* A scheduled flush writes the body outside prepare_turn(), so the
-       recorded revision must advance with it. Completion then refreshes only
-       the footer, leaving a selection in the live body untouched. */
+       recorded revision must advance with it. Completion still owes the one
+       terminal Markdown render; an active selection defers that render
+       without disturbing the selection. */
     begin_regenerate(h);
     handle_event(h,fixture(h,COMPLETION_DELTA,L"first token"));
     { TranscriptRecord *turn=&h->transcript.records[second];
@@ -1195,11 +1174,12 @@ static int default_suite(void) {
       SendMessageW(body,EM_SETSEL,1,4);
       handle_event(h,fixture(h,COMPLETION_DONE,NULL));
       CHECK(pending(h)->generation.state==CHAT_GENERATION_COMPLETE);
-      CHECK(!turn->body_pending);                  /* footer only */
+      CHECK(turn->body_pending);
       CHARRANGE sel; memset(&sel,0,sizeof sel);
       SendMessageW(body,EM_EXGETSEL,0,(LPARAM)&sel);
       CHECK(sel.cpMin==1 && sel.cpMax==4);
-      SendMessageW(body,EM_SETSEL,0,0); }
+      SendMessageW(body,EM_SETSEL,0,0);
+      CHECK(!turn->body_pending); }
     /* Live reasoning survives collapse and reopen mid-stream: the collapsed
        viewport stops appending, reopening loads the accumulation, and the
        stream then resumes appending into that turn's own viewport. */
@@ -1208,6 +1188,7 @@ static int default_suite(void) {
     CHECK(h->transcript.records[second].reason_live);
     handle_event(h,fixture(h,COMPLETION_REASONING,L"first"));
     handle_event(h,fixture(h,COMPLETION_REASONING,L" second"));
+    flush_stream_body(h);
     { wchar_t shown[128]; reasoning_text(h,second,shown,128);
       CHECK(!wcscmp(shown,L"first second")); }
     click_row(h,second);                     /* collapse mid-stream */
@@ -1218,6 +1199,7 @@ static int default_suite(void) {
     { wchar_t shown[128]; reasoning_text(h,second,shown,128);
       CHECK(!wcscmp(shown,L"first second hidden")); }
     handle_event(h,fixture(h,COMPLETION_REASONING,L" live"));
+    flush_stream_body(h);
     { wchar_t shown[128]; reasoning_text(h,second,shown,128);
       CHECK(!wcscmp(shown,L"first second hidden live")); }
     handle_event(h,fixture(h,COMPLETION_DELTA,L"answer after reasoning"));
@@ -1654,6 +1636,7 @@ static int default_suite(void) {
     { wchar_t shown[128]; reasoning_text(h,1,shown,128);
       CHECK(!wcscmp(shown,L"A live more")); }
     handle_event(h,fixture(h,COMPLETION_REASONING,L" end"));
+    flush_stream_body(h);
     { wchar_t shown[128]; reasoning_text(h,1,shown,128);
       CHECK(!wcscmp(shown,L"A live more end")); }
     handle_event(h,fixture(h,COMPLETION_DONE,NULL));
@@ -5054,5 +5037,3 @@ int main(void) {
     puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation fixtures) passed");
     return failed;
 }
-
-

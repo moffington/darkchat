@@ -55,8 +55,18 @@ typedef struct {
     bool generating, stopping, accepting, dirty, editing, content_started;
     bool reasoning_streaming;
     /* Appended text not yet written to the live body; a scheduled flush
-       guarantees it renders even when the stream pauses. */
+        guarantees it renders even when the stream pauses. */
     bool body_flush_pending;
+    /* Reasoning pane appends batched the same way: fragments accumulate in
+        the message and the pane repaints on the flush timer, never once per
+        fragment (each repaint is a synchronous Rich Edit update). The
+        painted-tail mark lives on the transcript record, stamped by every
+        full pane reload, so a mid-stream re-render cannot desync it.
+        reasoning_paint_tick is the reasoning flush's own throttle deadline:
+        it advances after every reasoning flush, so a reasoning-only stream
+        schedules real-interval timers instead of 1 ms ones. */
+    bool reason_paint_pending;
+    ULONGLONG reasoning_paint_tick;
     ULONGLONG reasoning_started_tick;
     ChatStorage storage;
     /* Background snapshot writer. Mutations is the counter every save handoff
@@ -117,6 +127,8 @@ static void position_turns(ChatHost *host, bool follow);
 static void schedule_body_flush(ChatHost *host);
 static void cancel_body_flush(ChatHost *host);
 static void flush_stream_body(ChatHost *host);
+static void flush_reasoning_paint(ChatHost *host);
+static ChatMessage *pending(ChatHost *host);
 static bool turn_row_click(void *user, RichTextControl *control, int line,
     bool down);
 static bool search_submit(void *user);
@@ -189,7 +201,14 @@ static void schedule_body_flush(ChatHost *host) {
         host->body_flush_pending = false;
         return;
     }
-    ULONGLONG elapsed = GetTickCount64() - host->transcript.body_render_tick;
+    /* The pending family owns the deadline: a reasoning-only burst must not
+        ride the body's tick (which only advances when the body flushes), or
+        its elapsed time stays huge and every fragment schedules the 1 ms
+        fallback -- nearly one synchronous repaint per fragment. */
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG tick = host->body_flush_pending
+        ? host->transcript.body_render_tick : host->reasoning_paint_tick;
+    ULONGLONG elapsed = now - tick;
     UINT delay = elapsed >= CHAT_BODY_RENDER_MS ? 1
         : (UINT)(CHAT_BODY_RENDER_MS - elapsed);
     if (SetTimer(host->window, CHAT_TIMER_BODY_FLUSH, delay, NULL)) return;
@@ -199,10 +218,37 @@ static void schedule_body_flush(ChatHost *host) {
     flush_stream_body(host);
 }
 /* Drops any scheduled or pending body flush; used when content is rendered
-   whole (first token, terminal render) or the target turn is no longer live. */
+    whole (first token, terminal render) or the target turn is no longer live. */
 static void cancel_body_flush(ChatHost *host) {
     host->body_flush_pending = false;
+    host->reason_paint_pending = false;
     if (host->window) KillTimer(host->window, CHAT_TIMER_BODY_FLUSH);
+}
+/* Paints the reasoning accumulated since the last flush into the live pane.
+    One append per flush, never one per fragment: each append is a
+    synchronous Rich Edit update with a forced repaint. The painted-tail
+    mark lives on the transcript record (stamped by every full pane
+    reload), so a wholesale rewrite rebases it automatically; a closed or
+    missing pane leaves the mark untouched until such a reload. */
+static void flush_reasoning_paint(ChatHost *host) {
+    if (!host->reason_paint_pending) return;
+    host->reason_paint_pending = false;
+    /* Advance the reasoning deadline whether or not a pane existed: the
+        throttle measures the flush cadence, not the paint's success. */
+    host->reasoning_paint_tick = GetTickCount64();
+    if (!host->generating) return;
+    if (host->request_conversation != host->config.chat->active) return;
+    ChatMessage *m = pending(host);
+    const wchar_t *text = chat_message_reasoning(m);
+    size_t length = wcslen(text);
+    TranscriptRecord *rec = &host->transcript.records[host->request_message];
+    RichTextControl *reason = transcript_surface(&host->transcript,
+        host->request_message, TRANSCRIPT_REASON);
+    if (m->reasoning_open && rec->reason_live && reason) {
+        if (length > rec->reason_painted)
+            rich_text_append_reasoning(reason, text + rec->reason_painted);
+        rec->reason_painted = length;
+    }
 }
 /* Applies the scheduled rebuild. A body holding a selection is not rewritten:
    transcript_stream_body records the debt as a pending write and returns, so
@@ -214,11 +260,15 @@ static void cancel_body_flush(ChatHost *host) {
    SetTimer and never schedule_body_flush, whose SetTimer-failure fallback
    calls this function -- re-entering the scheduler would recurse. A failed
    re-arm simply falls back to the external retry paths (next incoming
-   delta, the 1 Hz sweep, the next render). */
+   delta, the 1 Hz sweep, the next render). Batched reasoning appends share
+   this timer. */
 static void flush_stream_body(ChatHost *host) {
     if (host->window) KillTimer(host->window, CHAT_TIMER_BODY_FLUSH);
-    if (!host->body_flush_pending || !host->generating) return;
+    if ((!host->body_flush_pending && !host->reason_paint_pending) ||
+        !host->generating) return;
     if (host->request_conversation != host->config.chat->active) return;
+    flush_reasoning_paint(host);
+    if (!host->body_flush_pending) return;
     host->body_flush_pending = false;
     host->transcript.body_render_tick = GetTickCount64();
     if (stream_body_markdown(host, host->request_message)) return;
@@ -1017,6 +1067,7 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     /* The running turn shows a temporary pending row; it is removed once answer
        text begins if the provider never supplies reasoning. */
     host->reasoning_streaming=false; host->content_started=false;
+    host->reason_paint_pending=false; host->reasoning_paint_tick=0;
     host->transcript.body_render_tick=0;
     cancel_body_flush(host);
     ChatMessage *m=pending(host);
@@ -1128,6 +1179,9 @@ static void append_stream_delta(ChatHost *host, CompletionEvent *event) {
     bool first=!host->content_started;
     if (first) {
         host->content_started=true;
+        /* Paint any reasoning tail still pending before the streaming
+            window ends and the flush timer is cancelled. */
+        flush_reasoning_paint(host);
         end_reasoning(host);
     }
     size_t incoming=wcslen(event->text);
@@ -1197,10 +1251,21 @@ static void append_reasoning_delta(ChatHost *host, CompletionEvent *event) {
             TranscriptRecord *rec=&host->transcript.records[host->request_message];
             RichTextControl *reason=transcript_surface(&host->transcript,
                 host->request_message,TRANSCRIPT_REASON);
-            if (m->reasoning_open && !rec->reason_live)
+            if (m->reasoning_open && !rec->reason_live) {
+                /* Creating or reopening the pane reloads the accumulated
+                    reasoning whole (the record's painted mark is stamped
+                    by that reload). */
                 refresh_turn(host,host->request_message);
-            else if (m->reasoning_open && rec->reason_live && reason)
-                rich_text_append_reasoning(reason,event->text);
+                host->reason_paint_pending=false;
+            } else if (m->reasoning_open && rec->reason_live && reason) {
+                /* Fragments accumulate in the message; the pane repaints
+                    at most once per flush interval. One repaint is a
+                    synchronous Rich Edit update with a forced repaint, so
+                    per-fragment appends would freeze the UI under a
+                    word-sized reasoning stream. */
+                host->reason_paint_pending=true;
+                if (!host->body_flush_pending) schedule_body_flush(host);
+            }
         }
     }
     m->modified_at=chat_now();
@@ -1255,6 +1320,22 @@ static void handle_event(ChatHost *host, CompletionEvent *event) {
         else finish_request(host,event);
     }
     completion_event_free(event);
+}
+
+/* Processes the batch one wake delivered. The per-wake work is naturally
+   bounded (fragments are coalesced by the worker and the heavy body and
+   reasoning flushes stay on the flush timer), so the handler returns to
+   the normal pump immediately instead of re-entering a filtered loop that
+   would starve queued input messages. Events for an older generation are
+   freed unprocessed. */
+static void handle_events(ChatHost *host) {
+    CompletionEvent *batch=completion_take(&host->client);
+    while (batch) {
+        CompletionEvent *next=batch->next;
+        batch->next=NULL;
+        handle_event(host,batch);
+        batch=next;
+    }
 }
 
 static void command(void *user, ChatCommand code, int index) {
@@ -2366,14 +2447,13 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             return 0;
         }
         if (w == 2) {
-            /* If allocation/PostMessage failed for the terminal event, the
-               worker can finish without notifying us. Drain queued events
-               before declaring this failure so a queued DONE always wins. */
+            /* If allocation/queueing failed for the terminal event, the
+                worker can finish without notifying us. Take the queued
+                batch before declaring this failure so a queued DONE always
+                wins. */
             if (host->generating && host->client.thread &&
                 WaitForSingleObject(host->client.thread,0)==WAIT_OBJECT_0) {
-                MSG queued;
-                while (PeekMessageW(&queued,window,CHAT_WM_COMPLETION_EVENT,CHAT_WM_COMPLETION_EVENT,PM_REMOVE))
-                    handle_event(host,(CompletionEvent *)queued.lParam);
+                handle_events(host);
                 if (host->generating) {
                     CompletionEvent lost={0}; lost.generation=host->request_generation;
                     lost.type=COMPLETION_ERROR; lost.metadata=pending(host)->generation;
@@ -2386,9 +2466,11 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             capture_settings(host);
             { TranscriptFeed feed = transcript_feed(host);
               transcript_apply_pending(&host->transcript, &feed); }
-            /* Bounded 1 Hz retry for an armed, still-missing streaming body:
-               timer context, one attempt, no re-arming loop. */
-            if (host->transcript.bounded && host->body_flush_pending &&
+            /* Bounded 1 Hz retry for an armed, still-missing streaming body
+                or an unpainted reasoning pane: timer context, one attempt,
+                no re-arming loop. */
+            if (host->transcript.bounded &&
+                (host->body_flush_pending || host->reason_paint_pending) &&
                 host->generating)
                 flush_stream_body(host);
             /* One-second autosave: hand a snapshot to the background writer.
@@ -2527,7 +2609,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         }
         return 0;
     case CHAT_WM_COMPLETION_EVENT:
-        handle_event(host, (CompletionEvent *)l);
+        handle_events(host);
         return 0;
     case CHAT_WM_CATALOG_EVENT:
         catalog_event(host, (ModelCatalogEvent *)l);
@@ -2563,13 +2645,19 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             chat_message_touch(pending(host));
             mark_dirty(host);
             save_sync(host);
-            completion_shutdown(&host->client);
+            /* Stop this request without finalizing the reusable client. The
+               save-failure prompt below can keep the window open; destroying
+               the client's critical section here would leave that live
+               window unable to start another request. Final shutdown belongs
+               to chat_host_run's cleanup after the window really closes. */
+            completion_cancel(&host->client,host->request_generation);
+            completion_complete(&host->client,host->request_generation);
             host->generating = false;
             host->context_dropped = 0;
-            MSG queued;
-            while (PeekMessageW(&queued, window, CHAT_WM_COMPLETION_EVENT,
-                CHAT_WM_COMPLETION_EVENT, PM_REMOVE))
-                completion_event_free((CompletionEvent *)queued.lParam);
+            /* Discard anything the joined worker queued. generating is false,
+               so handle_event frees every node without applying it. A stale
+               wake message can safely find the still-live queue empty. */
+            handle_events(host);
         }
         /* Join and drain the catalog worker while the main window still
            exists, so a late completion is freed here instead of leaking into a
@@ -2769,7 +2857,6 @@ cleanup:
         L"DarkChat", MB_OK | MB_ICONERROR);
     return result;
 }
-
 
 
 
