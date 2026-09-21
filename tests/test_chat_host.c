@@ -982,12 +982,13 @@ static int default_suite(void) {
             CHECK((info.hSubMenu!=NULL)==expected[i].submenu);
         }
         /* The Data submenu is the last top-level group: Markdown, JSON,
-            separator, Export all, separator, Import. Availability leaves them
-            enabled at idle and grays them while generating. */
+            separator, Export all, separator, Import JSON, Import Markdown.
+            Availability leaves them enabled at idle and grays them while
+            generating. */
         {
             CHECK(GetMenuItemInfoW(bar,4,TRUE,&top));
             HMENU data=top.hSubMenu;
-            CHECK(data && GetMenuItemCount(data)==6);
+            CHECK(data && GetMenuItemCount(data)==7);
             static const struct { int id; bool separator; } data_expected[] = {
                 { ACTION_EXPORT_MARKDOWN, false },
                 { ACTION_EXPORT_JSON, false },
@@ -995,6 +996,7 @@ static int default_suite(void) {
                 { ACTION_EXPORT_ALL, false },
                 { 0, true },
                 { ACTION_IMPORT_JSON, false },
+                { ACTION_IMPORT_MARKDOWN, false },
             };
             for (UINT i=0;i<(UINT)GetMenuItemCount(data) &&
                 i<sizeof data_expected/sizeof data_expected[0];i++) {
@@ -1013,12 +1015,14 @@ static int default_suite(void) {
             CHECK(!(GetMenuState(data,ACTION_EXPORT_JSON,MF_BYCOMMAND)&MF_GRAYED));
             CHECK(!(GetMenuState(data,ACTION_EXPORT_ALL,MF_BYCOMMAND)&MF_GRAYED));
             CHECK(!(GetMenuState(data,ACTION_IMPORT_JSON,MF_BYCOMMAND)&MF_GRAYED));
+            CHECK(!(GetMenuState(data,ACTION_IMPORT_MARKDOWN,MF_BYCOMMAND)&MF_GRAYED));
             data_ctx.generating=true;
             chat_actions_sync(data,&data_ctx);
             CHECK(GetMenuState(data,ACTION_EXPORT_MARKDOWN,MF_BYCOMMAND)&MF_GRAYED);
             CHECK(GetMenuState(data,ACTION_EXPORT_JSON,MF_BYCOMMAND)&MF_GRAYED);
             CHECK(GetMenuState(data,ACTION_EXPORT_ALL,MF_BYCOMMAND)&MF_GRAYED);
             CHECK(GetMenuState(data,ACTION_IMPORT_JSON,MF_BYCOMMAND)&MF_GRAYED);
+            CHECK(GetMenuState(data,ACTION_IMPORT_MARKDOWN,MF_BYCOMMAND)&MF_GRAYED);
         }
         /* The Apply submenu carries two nested popups, each with one item
             per live profile; names are mnemonic-escaped. */
@@ -6140,6 +6144,7 @@ static int import_suite(void) {
     source->conversations[0].messages[mi].modified_at=1600;
     source->conversations[0].messages[mi].generation.state=CHAT_GENERATION_COMPLETE;
     JsonBuf out; CHECK(chat_export_json(source,0,true,7,&out));
+    JsonBuf markdown; CHECK(chat_export_markdown(source,0,true,7,&markdown));
     chat_dispose(source); free(source);
 
     /* ---- Cancel is a silent no-op: no read, no capture, no status ---- */
@@ -6183,6 +6188,89 @@ static int import_suite(void) {
         CHECK(!wcscmp(chat_message_text(&imp->messages[0]),L"hello"));
         CHECK(imp->messages[1].generation.state==CHAT_GENERATION_COMPLETE);
         CHECK(imp->messages[1].generation.cost==-1);
+    }
+
+    /* ---- Markdown cancel is a silent no-op ---- */
+    {
+        int count=chat->conversation_count;
+        open_queue_clear(); read_set(NULL,0,CHAT_FILE_READ_OK);
+        open_queue_push(L"ignored.md",CHAT_FILE_DIALOG_CANCELLED);
+        action(h,ACTION_IMPORT_MARKDOWN);
+        CHECK(chat->conversation_count==count);
+        CHECK(open_dialog_calls==1 && read_calls==0);
+    }
+
+    /* ---- Markdown payload round trip ---- */
+    {
+        int count=chat->conversation_count;
+        int active=chat->active;
+        open_queue_clear(); open_queue_push(L"import.md",CHAT_FILE_DIALOG_ACCEPTED);
+        read_set(markdown.data,markdown.length,CHAT_FILE_READ_OK);
+        action(h,ACTION_IMPORT_MARKDOWN);
+        CHECK(open_dialog_calls==1 && read_calls==1);
+        CHECK(chat->conversation_count==count+1);
+        CHECK(chat->active==active);
+        CHECK(!wcscmp(chat->status,L"Imported 1 conversation."));
+        const ChatConversation *imp=&chat->conversations[count];
+        CHECK(!wcscmp(imp->title,L"Imported one"));
+        CHECK(imp->message_count==2);
+        CHECK(!wcscmp(chat_message_text(&imp->messages[0]),L"hello"));
+        CHECK(!wcscmp(chat_message_text(&imp->messages[1]),L"world"));
+        CHECK(imp->messages[1].generation.state==CHAT_GENERATION_COMPLETE);
+        CHECK(imp->messages[1].generation.cost==-1);
+    }
+
+    /* ---- Payload-less Markdown: one verbatim message, heading title ---- */
+    {
+        int count=chat->conversation_count;
+        open_queue_clear(); open_queue_push(L"notes.md",CHAT_FILE_DIALOG_ACCEPTED);
+        const char *plain="# Heading\n\n## User\n\nbody text\n";
+        read_set(plain,(size_t)strlen(plain),CHAT_FILE_READ_OK);
+        action(h,ACTION_IMPORT_MARKDOWN);
+        CHECK(chat->conversation_count==count+1);
+        const ChatConversation *imp=&chat->conversations[count];
+        CHECK(!wcscmp(imp->title,L"Heading"));
+        CHECK(imp->message_count==1);
+        CHECK(imp->messages[0].role==CHAT_ROLE_USER);
+        CHECK(!wcscmp(chat_message_text(&imp->messages[0]),
+            L"# Heading\n\n## User\n\nbody text\n"));
+    }
+
+    /* ---- Filename fallback title, surrogate-safe at the buffer boundary ---- */
+    {
+        int count=chat->conversation_count;
+        wchar_t path[128];
+        size_t ep=0;
+        for (int i=0;i<62;i++) path[ep++]=L'a';
+        path[ep++]=(wchar_t)0xd83d;
+        path[ep++]=(wchar_t)0xde00;
+        path[ep++]=L'.'; path[ep++]=L'm'; path[ep++]=L'd'; path[ep]=0;
+        open_queue_clear(); open_queue_push(path,CHAT_FILE_DIALOG_ACCEPTED);
+        const char *plain="plain body\n";
+        read_set(plain,(size_t)strlen(plain),CHAT_FILE_READ_OK);
+        action(h,ACTION_IMPORT_MARKDOWN);
+        CHECK(chat->conversation_count==count+1);
+        const ChatConversation *imp=&chat->conversations[count];
+        CHECK(wcslen(imp->title)==62);
+        CHECK(imp->title[61]==L'a');
+
+        /* An extension-only basename falls through to the default title. */
+        open_queue_clear(); open_queue_push(L".md",CHAT_FILE_DIALOG_ACCEPTED);
+        read_set(plain,(size_t)strlen(plain),CHAT_FILE_READ_OK);
+        action(h,ACTION_IMPORT_MARKDOWN);
+        CHECK(!wcscmp(chat->conversations[chat->conversation_count-1].title,
+            L"Imported conversation"));
+    }
+
+    /* ---- Invalid Markdown reports its own error text ---- */
+    {
+        int count=chat->conversation_count;
+        open_queue_clear(); open_queue_push(L"x.md",CHAT_FILE_DIALOG_ACCEPTED);
+        const char invalid[]={ '#',(char)0xff,'x' };
+        read_set(invalid,sizeof invalid,CHAT_FILE_READ_OK);
+        action(h,ACTION_IMPORT_MARKDOWN);
+        CHECK(chat->conversation_count==count);
+        CHECK(wcsstr(chat->status,L"not valid UTF-8 Markdown")!=NULL);
     }
 
     /* ---- Read failures and malformed payloads never mutate ---- */
@@ -6239,6 +6327,7 @@ static int import_suite(void) {
 
     open_queue_clear(); read_set(NULL,0,CHAT_FILE_READ_OK);
     json_buf_free(&out);
+    json_buf_free(&markdown);
     saver_shutdown(&h->saver); storage_close(&h->storage);
     DeleteFileW(bom_path); DeleteFileW(empty_path);
     DeleteFileW(exact_path); DeleteFileW(over_path);

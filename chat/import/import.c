@@ -390,6 +390,42 @@ static void transfer_conversations(Chat *chat, Chat *staging) {
     chat->next_id = staging->next_id;
 }
 
+/* Allocates the detached staging Chat shared by every import format. Its id
+   counter starts where the destination's does so ids are fresh but the
+   destination is not touched until the transfer commits. */
+static Chat *import_staging_new(const Chat *chat) {
+    Chat *staging = (Chat *)malloc(sizeof *staging);
+    if (!staging) return NULL;
+    memset(staging, 0, sizeof *staging);
+    staging->next_id = chat->next_id;
+    return staging;
+}
+
+static void import_staging_abort(Chat *staging) {
+    chat_dispose(staging);
+    free(staging);
+}
+
+/* Infallible commit: capacity was preflighted by the format parser, the
+   conversations move into the destination tail and `stats` reports the work.
+   Ownership transfer zeroes the staging slots so disposing the staging Chat
+   cannot free the moved allocations twice. */
+static ChatImportStatus import_staging_finish(Chat *chat, Chat *staging,
+    int messages_added, ChatImportStats *stats) {
+    if (chat->conversation_count >
+        CHAT_MAX_CONVERSATIONS - staging->conversation_count) {
+        import_staging_abort(staging);
+        return CHAT_IMPORT_CAPACITY;
+    }
+    transfer_conversations(chat, staging);
+    if (stats) {
+        stats->conversations_added = staging->conversation_count;
+        stats->messages_added = messages_added;
+    }
+    import_staging_abort(staging);
+    return CHAT_IMPORT_OK;
+}
+
 ChatImportStatus chat_import_json(Chat *chat, const char *json, size_t length,
     ChatImportStats *stats) {
     if (stats) *stats = (ChatImportStats){0};
@@ -410,32 +446,151 @@ ChatImportStatus chat_import_json(Chat *chat, const char *json, size_t length,
     char *scratch = (char *)malloc(length + 1);
     if (!scratch) { free(copy); return CHAT_IMPORT_OOM; }
 
-    Chat *staging = (Chat *)malloc(sizeof *staging);
+    Chat *staging = import_staging_new(chat);
     if (!staging) { free(scratch); free(copy); return CHAT_IMPORT_OOM; }
-    memset(staging, 0, sizeof *staging);
-    staging->next_id = chat->next_id;
 
     ImportCtx ctx = { scratch, length + 1, chat->conversation_count, 0 };
     ChatImportStatus status = parse_document(&ctx, copy, staging);
     free(scratch);
     free(copy);
     if (status != CHAT_IMPORT_OK) {
-        chat_dispose(staging);
-        free(staging);
+        import_staging_abort(staging);
         return status;
     }
-    if (chat->conversation_count >
-        CHAT_MAX_CONVERSATIONS - staging->conversation_count) {
-        chat_dispose(staging);
-        free(staging);
+    return import_staging_finish(chat, staging, ctx.messages_added, stats);
+}
+
+/* --- Markdown import ----------------------------------------------------- */
+
+static bool title_space(wchar_t c) {
+    return c == L' ' || c == L'\t' || c == L'\r';
+}
+
+/* Copies at most capacity-1 units of source[0..length), dropping a trailing
+   high surrogate left by a truncation that fell inside a surrogate pair. */
+static void title_copy_span(wchar_t *out, size_t capacity, const wchar_t *src,
+    size_t length) {
+    if (!out || capacity == 0) return;
+    if (!src) length = 0;
+    size_t n = length;
+    if (n > capacity - 1) n = capacity - 1;
+    if (n > 0 && src[n - 1] >= 0xd800 && src[n - 1] <= 0xdbff) n--;
+    for (size_t i = 0; i < n; i++) out[i] = src[i];
+    out[n] = 0;
+}
+
+void chat_import_copy_title(wchar_t *out, size_t capacity,
+    const wchar_t *source, size_t length) {
+    title_copy_span(out, capacity, source, length);
+}
+
+/* First line beginning exactly "# ": its text is copied (trailing CR/space/tab
+   removed) into `out`, or `out` is left empty when no non-empty heading
+   exists. This is a deliberately simple, fence-unaware scan. */
+static void markdown_heading_title(const wchar_t *text, wchar_t *out,
+    size_t capacity) {
+    if (out && capacity) out[0] = 0;
+    if (!text || !out || capacity == 0) return;
+    const wchar_t *p = text;
+    while (*p) {
+        const wchar_t *line = p;
+        const wchar_t *eol = line;
+        while (*eol && *eol != L'\n') eol++;
+        if (line[0] == L'#' && line[1] == L' ') {
+            const wchar_t *start = line + 2;
+            const wchar_t *end = eol;
+            while (end > start && title_space(end[-1])) end--;
+            if (end > start) {
+                title_copy_span(out, capacity, start, (size_t)(end - start));
+                return;
+            }
+        }
+        p = *eol ? eol + 1 : eol;
+    }
+}
+
+/* The payload-less path: one conversation with one verbatim user message. */
+static ChatImportStatus import_markdown_fallback(Chat *chat,
+    const char *markdown, size_t length, const wchar_t *fallback_title,
+    ChatImportStats *stats) {
+    if (memchr(markdown, 0, length) != NULL ||
+        !json_utf8_valid(markdown, length))
+        return CHAT_IMPORT_MALFORMED;
+    /* Capacity is decided before any allocation or staging mutation: the
+       fallback consumes one conversation id and one message id, so with both
+       reserved a later append failure can only be an allocation failure. */
+    if (chat->conversation_count >= CHAT_MAX_CONVERSATIONS)
         return CHAT_IMPORT_CAPACITY;
+    if (chat->next_id > CHAT_MAX_ID - 2)
+        return CHAT_IMPORT_CAPACITY;
+    wchar_t *text = json_utf8_to_utf16(markdown, length);
+    if (!text) return CHAT_IMPORT_OOM;
+
+    Chat *staging = import_staging_new(chat);
+    if (!staging) { free(text); return CHAT_IMPORT_OOM; }
+    int index = chat_new_conversation(staging);
+    if (index < 0) {   /* unreachable after the capacity preflight */
+        import_staging_abort(staging);
+        free(text);
+        return CHAT_IMPORT_OOM;
     }
-    transfer_conversations(chat, staging);
-    if (stats) {
-        stats->conversations_added = staging->conversation_count;
-        stats->messages_added = ctx.messages_added;
+    ChatConversation *conversation = &staging->conversations[index];
+    /* Imported titles are authoritative: deriving from the first user message
+       must never overwrite one. */
+    conversation->renamed = true;
+    wchar_t title[CHAT_TITLE_TEXT];
+    markdown_heading_title(text, title, CHAT_TITLE_TEXT);
+    if (!title[0]) {
+        chat_import_copy_title(title, CHAT_TITLE_TEXT,
+            fallback_title, fallback_title ? wcslen(fallback_title) : 0);
+        if (!title[0]) wcscpy(title, L"Imported conversation");
     }
-    chat_dispose(staging);
-    free(staging);
-    return CHAT_IMPORT_OK;
+    wcscpy(conversation->title, title);
+    if (chat_append_at(staging, index, CHAT_ROLE_USER, text) < 0) {
+        import_staging_abort(staging);
+        free(text);
+        return CHAT_IMPORT_OOM;
+    }
+    free(text);
+    return import_staging_finish(chat, staging, 1, stats);
+}
+
+ChatImportStatus chat_import_markdown(Chat *chat, const char *markdown,
+    size_t length, const wchar_t *fallback_title, ChatImportStats *stats) {
+    if (stats) *stats = (ChatImportStats){0};
+    if (!chat || !markdown || length == 0) return CHAT_IMPORT_MALFORMED;
+    if (length > CHAT_IMPORT_LIMIT) return CHAT_IMPORT_TOO_LARGE;
+    static const unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+    if (length >= sizeof bom && (unsigned char)markdown[0] == bom[0] &&
+        (unsigned char)markdown[1] == bom[1] &&
+        (unsigned char)markdown[2] == bom[2]) {
+        markdown += sizeof bom;
+        length -= sizeof bom;
+    }
+    if (length == 0) return CHAT_IMPORT_MALFORMED;   /* BOM-only file */
+    static const char opener[] = "<!-- darkchat.export:";
+    const size_t opener_length = sizeof opener - 1;
+    if (length >= opener_length &&
+        memcmp(markdown, opener, opener_length) == 0) {
+        const char *begin = markdown + opener_length;
+        const char *end = markdown + length;
+        const char *close = NULL;
+        for (const char *p = begin; p + 3 <= end; p++)
+            if (p[0] == '-' && p[1] == '-' && p[2] == '>') {
+                close = p;
+                break;
+            }
+        if (!close) return CHAT_IMPORT_MALFORMED;
+        /* Trim only ASCII JSON whitespace around the payload. */
+        while (begin < close && (*begin == ' ' || *begin == '\t' ||
+                *begin == '\r' || *begin == '\n')) begin++;
+        const char *json_end = close;
+        while (json_end > begin && (json_end[-1] == ' ' ||
+                json_end[-1] == '\t' || json_end[-1] == '\r' ||
+                json_end[-1] == '\n')) json_end--;
+        if (json_end == begin) return CHAT_IMPORT_MALFORMED;
+        return chat_import_json(chat, begin, (size_t)(json_end - begin), stats);
+    }
+    return import_markdown_fallback(chat, markdown, length, fallback_title,
+        stats);
 }

@@ -97,8 +97,8 @@ static int commands_basic(void) {
     CHECK(palette);
     ChatActionContext context = idle_context();
     CHECK(palette_set_commands(palette, &context));
-    /* The idle memset context enables 24 registry actions. */
-    CHECK(palette_row_count(palette) == 24);
+    /* The idle memset context enables 25 registry actions. */
+    CHECK(palette_row_count(palette) == 25);
     /* Registry order and grouping. The idle context has no conversation, so
         the Response section is absent: the six present sections are
         Conversation, Settings, Backend, Routing, Customization, Data. */
@@ -132,7 +132,7 @@ static int commands_basic(void) {
     CHECK(palette_section_label(palette, 6) == NULL);
     /* NULL context is rejected, and the previous source survives. */
     CHECK(!palette_set_commands(palette, NULL));
-    CHECK(palette_row_count(palette) == 24);
+    CHECK(palette_row_count(palette) == 25);
     palette_dispose(palette);
     return 0;
 }
@@ -143,7 +143,7 @@ static int commands_filtering(void) {
     ChatActionContext context = idle_context();
     CHECK(palette_set_commands(palette, &context));
     size_t full = palette_row_count(palette);
-    CHECK(full == 24);
+    CHECK(full == 25);
 
     CHECK(palette_set_query(palette, L"model"));
     CHECK(palette_row_count(palette) == 1);
@@ -191,7 +191,7 @@ static int commands_disabled(void) {
     ChatActionContext ollama = idle_context();
     ollama.backend_openrouter = false;
     CHECK(palette_set_commands(palette, &ollama));
-    CHECK(palette_row_count(palette) == 24 - 7);
+    CHECK(palette_row_count(palette) == 25 - 7);
     CHECK(palette_section_count(palette) == 5);
     CHECK(!wcscmp(palette_section_label(palette, 2), L"Backend"));
     CHECK(!wcscmp(palette_section_label(palette, 4), L"Data"));
@@ -546,7 +546,7 @@ static int transactional_oom(void) {
     ChatActionContext context = idle_context();
     CHECK(palette_set_commands(palette, &context));
     size_t full = palette_row_count(palette);
-    CHECK(full == 24);
+    CHECK(full == 25);
     PaletteRowKey before;
     CHECK(palette_selected_key(palette, &before));
 

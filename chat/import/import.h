@@ -66,4 +66,39 @@ typedef struct {
 ChatImportStatus chat_import_json(Chat *chat, const char *json, size_t length,
     ChatImportStats *stats);
 
+/* Imports `length` bytes of Markdown into `chat`, reusing the same
+   transactional guarantees and fresh-id policy as chat_import_json.
+
+   If the bytes at offset zero carry the export's authoritative payload opener
+   (`<!-- darkchat.export:`) exactly, the JSON between it and the first `-->`
+   is parsed by chat_import_json: the presentation body is ignored, so a
+   DarkChat Markdown export round-trips exactly (including model/system-prompt
+   overrides, reasoning, roles and timestamps). A payload opener with a
+   missing, empty or invalid payload is rejected; it never falls back to the
+   body, because the opener claims authority over the file.
+
+   Otherwise the whole file is imported as one new conversation holding a
+   single CHAT_ROLE_USER message: the entire content, copied verbatim, so role
+   headings like `## User` inside a body are never re-parsed into history. The
+   conversation title is the first line beginning exactly `# ` (a deliberately
+   simple, fence-unaware scan) with trailing CR/space/tab removed; when that is
+   absent or empty, `fallback_title` (when non-empty); otherwise
+   "Imported conversation".
+
+   A single leading UTF-8 BOM is removed before parsing; the fallback message
+   preserves everything after the BOM (its first unit is never U+FEFF), and a
+   BOM-only file is empty and therefore malformed. `markdown` may be any
+   pointer with at least `length` readable bytes and need not be terminated;
+   the importer never retains it. `stats` may be NULL. */
+ChatImportStatus chat_import_markdown(Chat *chat, const char *markdown,
+    size_t length, const wchar_t *fallback_title, ChatImportStats *stats);
+
+/* Copies at most `capacity - 1` code units of `source[0..length)` into `out`,
+   always terminating it. When truncation falls between a surrogate pair the
+   dangling high surrogate is dropped, so a caller never stores half of an
+   astral character in a fixed title buffer. Writes nothing when `capacity` is
+   zero; a NULL `source` is treated as empty. */
+void chat_import_copy_title(wchar_t *out, size_t capacity,
+    const wchar_t *source, size_t length);
+
 #endif

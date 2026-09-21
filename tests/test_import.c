@@ -477,6 +477,337 @@ static int test_reject_when_full(void) {
     return 0;
 }
 
+/* --- Markdown ------------------------------------------------------------ */
+
+static ChatImportStatus import_markdown(Chat *chat, const char *text,
+    const wchar_t *fallback, ChatImportStats *stats) {
+    return chat_import_markdown(chat, text, strlen(text), fallback, stats);
+}
+
+static int test_markdown_round_trip(void) {
+    Chat *source = new_chat();
+    Chat *dest = new_chat();
+    CHECK(source && dest);
+    Snapshot before;
+    snapshot(dest, &before);
+
+    ChatConversation *c0 = &source->conversations[0];
+    CHECK(add(source, 0, CHAT_ROLE_USER, L"Hello <world> & stuff", 1500) != NULL);
+    ChatMessage *a = add(source, 0, CHAT_ROLE_ASSISTANT, L"Hi there", 1600);
+    CHECK(a != NULL);
+    full_generation(a);
+    CHECK(chat_message_set_reasoning(a, L"Thinking\nHard"));
+    wcscpy(c0->model, L"openai/gpt-4o-mini");
+    wcscpy(c0->ollama_model, L"llama3.2");
+    c0->modified_at = 2000;
+
+    int second = chat_new_conversation(source);
+    CHECK(second == 1);
+    ChatConversation *c1 = &source->conversations[1];
+    c1->renamed = true;
+    wcscpy(c1->title, L"Emoji chat");
+    CHECK(add(source, 1, CHAT_ROLE_USER,
+        L"caf\xc3\xa9 \xf0\x9f\x98\x80", 3500) != NULL);
+    c1->created_at = 3000;
+    c1->modified_at = 4000;
+    CHECK(chat_conversation_apply_system_prompt(source, 1, L""));
+
+    JsonBuf md;
+    CHECK(chat_export_markdown(source, 0, true, 42, &md));
+    ChatImportStats stats;
+    CHECK(chat_import_markdown(dest, md.data, md.length, NULL, &stats) ==
+        CHAT_IMPORT_OK);
+    CHECK(stats.conversations_added == 2 && stats.messages_added == 3);
+
+    CHECK(dest->conversation_count == 3);
+    CHECK(dest->active == before.active);
+    CHECK(!wcscmp(dest->status, before.status));
+    CHECK(dest->conversations[0].id == before.id);
+    CHECK(dest->next_id > before.next_id);
+
+    ChatConversation *d0 = &dest->conversations[1];
+    CHECK(!wcscmp(d0->title, L"Test chat"));
+    CHECK(d0->created_at == 1000 && d0->modified_at == 2000);
+    CHECK(!wcscmp(d0->model, L"openai/gpt-4o-mini"));
+    CHECK(!wcscmp(d0->ollama_model, L"llama3.2"));
+    CHECK(d0->message_count == 2);
+    CHECK(!wcscmp(chat_message_text(&d0->messages[0]),
+        L"Hello <world> & stuff"));
+    CHECK(!wcscmp(chat_message_text(&d0->messages[1]), L"Hi there"));
+    CHECK(!wcscmp(chat_message_reasoning(&d0->messages[1]),
+        L"Thinking\nHard"));
+    const ChatGeneration *g = &d0->messages[1].generation;
+    CHECK(g->state == CHAT_GENERATION_COMPLETE);
+    CHECK(!g->requested_model[0] && g->cost == -1);
+
+    ChatConversation *d1 = &dest->conversations[2];
+    CHECK(!wcscmp(d1->title, L"Emoji chat"));
+    CHECK(d1->system_prompt_present && d1->system_prompt.data == NULL);
+    CHECK(!wcscmp(chat_message_text(&d1->messages[0]),
+        L"caf\xc3\xa9 \xf0\x9f\x98\x80"));
+
+    json_buf_free(&md);
+    chat_dispose(source); free(source);
+    chat_dispose(dest); free(dest);
+    return 0;
+}
+
+/* Only the offset-zero payload is authoritative: a marker later in a
+   payload-less file is ordinary body text. */
+static int test_markdown_offset_authority(void) {
+    Chat *dest = new_chat();
+    CHECK(dest);
+    const char *md = "# Notes\n\n<!-- darkchat.export:\n{}\n-->\n\nbody\n";
+    Snapshot before;
+    snapshot(dest, &before);
+    ChatImportStats stats;
+    CHECK(import_markdown(dest, md, NULL, &stats) == CHAT_IMPORT_OK);
+    CHECK(stats.conversations_added == 1 && stats.messages_added == 1);
+    ChatConversation *c = &dest->conversations[before.count];
+    CHECK(!wcscmp(c->title, L"Notes"));
+    CHECK(c->message_count == 1);
+    CHECK(c->messages[0].role == CHAT_ROLE_USER);
+    CHECK(!wcscmp(chat_message_text(&c->messages[0]),
+        L"# Notes\n\n<!-- darkchat.export:\n{}\n-->\n\nbody\n"));
+    chat_dispose(dest); free(dest);
+    return 0;
+}
+
+/* A payload-less file is one verbatim user message; role headings inside it
+   are never re-parsed into history. */
+static int test_markdown_fallback(void) {
+    Chat *dest = new_chat();
+    CHECK(dest);
+    const char *md =
+        "# My Notes\n\n## User\n\nhello\n\n## Assistant\n\nworld\n";
+    ChatImportStats stats;
+    CHECK(import_markdown(dest, md, NULL, &stats) == CHAT_IMPORT_OK);
+    CHECK(stats.conversations_added == 1 && stats.messages_added == 1);
+    ChatConversation *c = &dest->conversations[1];
+    CHECK(!wcscmp(c->title, L"My Notes"));
+    CHECK(c->message_count == 1);
+    CHECK(c->messages[0].role == CHAT_ROLE_USER);
+    CHECK(!wcscmp(chat_message_text(&c->messages[0]),
+        L"# My Notes\n\n## User\n\nhello\n\n## Assistant\n\nworld\n"));
+    chat_dispose(dest); free(dest);
+    return 0;
+}
+
+static int test_markdown_title_rules(void) {
+    Chat *dest = new_chat();
+    CHECK(dest);
+    /* No heading: the fallback title is used verbatim. */
+    CHECK(import_markdown(dest, "just body\n", L"notes.txt", NULL) ==
+        CHAT_IMPORT_OK);
+    CHECK(!wcscmp(dest->conversations[1].title, L"notes.txt"));
+    /* An empty or NULL fallback title falls through to the default. */
+    CHECK(import_markdown(dest, "just body\n", L"", NULL) == CHAT_IMPORT_OK);
+    CHECK(!wcscmp(dest->conversations[2].title, L"Imported conversation"));
+    CHECK(import_markdown(dest, "just body\n", NULL, NULL) == CHAT_IMPORT_OK);
+    CHECK(!wcscmp(dest->conversations[3].title, L"Imported conversation"));
+    /* A heading containing only spaces is absent. */
+    CHECK(import_markdown(dest, "#   \nbody\n", NULL, NULL) == CHAT_IMPORT_OK);
+    CHECK(!wcscmp(dest->conversations[4].title, L"Imported conversation"));
+    /* A heading wins over the fallback; trailing CR/space/tab is trimmed. */
+    CHECK(import_markdown(dest, "# Real title \t\r\nbody\n", L"ignored", NULL)
+        == CHAT_IMPORT_OK);
+    CHECK(!wcscmp(dest->conversations[5].title, L"Real title"));
+    chat_dispose(dest); free(dest);
+    return 0;
+}
+
+static int test_markdown_copy_title(void) {
+    wchar_t out[CHAT_TITLE_TEXT];
+    /* The high surrogate lands on the last copied index: it is dropped. */
+    wchar_t src1[70];
+    size_t n = 0;
+    for (int i = 0; i < 62; i++) src1[n++] = L'a';
+    src1[n++] = (wchar_t)0xd83d;
+    src1[n++] = (wchar_t)0xde00;
+    src1[n] = 0;
+    chat_import_copy_title(out, CHAT_TITLE_TEXT, src1, n);
+    CHECK(wcslen(out) == 62 && out[61] == L'a');
+
+    /* The boundary lands on the low surrogate: the pair survives intact. */
+    wchar_t src2[70];
+    n = 0;
+    for (int i = 0; i < 61; i++) src2[n++] = L'a';
+    src2[n++] = (wchar_t)0xd83d;
+    src2[n++] = (wchar_t)0xde00;
+    src2[n++] = L'b';
+    src2[n] = 0;
+    chat_import_copy_title(out, CHAT_TITLE_TEXT, src2, n);
+    CHECK(wcslen(out) == 63);
+    CHECK(out[61] == (wchar_t)0xd83d && out[62] == (wchar_t)0xde00);
+
+    /* Degenerate capacities and a NULL source are safe. */
+    chat_import_copy_title(out, 1, src1, n);
+    CHECK(out[0] == 0);
+    chat_import_copy_title(out, 0, src1, n);
+    chat_import_copy_title(out, CHAT_TITLE_TEXT, NULL, 5);
+    CHECK(out[0] == 0);
+
+    /* Heading-derived title through the importer, emoji at the boundary. */
+    Chat *dest = new_chat();
+    CHECK(dest);
+    char narrow[512];
+    size_t used = 0;
+    narrow[used++] = '#';
+    narrow[used++] = ' ';
+    for (int i = 0; i < 62; i++) narrow[used++] = 'a';
+    narrow[used++] = (char)0xf0;
+    narrow[used++] = (char)0x9f;
+    narrow[used++] = (char)0x98;
+    narrow[used++] = (char)0x80;
+    narrow[used++] = '\n';
+    narrow[used++] = 'b';
+    narrow[used] = 0;
+    CHECK(chat_import_markdown(dest, narrow, used, NULL, NULL) ==
+        CHAT_IMPORT_OK);
+    CHECK(wcslen(dest->conversations[1].title) == 62);
+    CHECK(dest->conversations[1].title[61] == L'a');
+    chat_dispose(dest); free(dest);
+    return 0;
+}
+
+static int test_markdown_bom(void) {
+    Chat *dest = new_chat();
+    CHECK(dest);
+    /* The BOM is stripped, the heading is found, and the message never starts
+       with U+FEFF. */
+    const char *body = "\xEF\xBB\xBF# BOM Title\nbody\n";
+    ChatImportStats stats;
+    CHECK(chat_import_markdown(dest, body, strlen(body), NULL, &stats) ==
+        CHAT_IMPORT_OK);
+    ChatConversation *c = &dest->conversations[1];
+    CHECK(!wcscmp(c->title, L"BOM Title"));
+    CHECK(chat_message_text(&c->messages[0])[0] == L'#');
+
+    /* A BOM-only file is empty. */
+    Snapshot before;
+    snapshot(dest, &before);
+    CHECK(chat_import_markdown(dest, "\xEF\xBB\xBF", 3, NULL, NULL) ==
+        CHAT_IMPORT_MALFORMED);
+    CHECK(unchanged(dest, &before));
+
+    /* A BOM before the authoritative payload still round-trips. */
+    Chat *source = new_chat();
+    CHECK(source);
+    CHECK(add(source, 0, CHAT_ROLE_USER, L"bom round", 5) != NULL);
+    JsonBuf md;
+    CHECK(chat_export_markdown(source, 0, false, 9, &md));
+    char *prefixed = (char *)malloc(md.length + 3);
+    CHECK(prefixed);
+    prefixed[0] = (char)0xEF;
+    prefixed[1] = (char)0xBB;
+    prefixed[2] = (char)0xBF;
+    memcpy(prefixed + 3, md.data, md.length);
+    int count = dest->conversation_count;
+    CHECK(chat_import_markdown(dest, prefixed, md.length + 3, NULL, &stats) ==
+        CHAT_IMPORT_OK);
+    CHECK(dest->conversation_count == count + 1);
+    free(prefixed);
+    json_buf_free(&md);
+    chat_dispose(source); free(source);
+    chat_dispose(dest); free(dest);
+    return 0;
+}
+
+static int test_markdown_invalid(void) {
+    Chat *dest = new_chat();
+    CHECK(dest);
+    Snapshot before;
+    snapshot(dest, &before);
+    const char *bad[] = {
+        "<!-- darkchat.export:\n{ not json }\n-->\n",
+        "<!-- darkchat.export:\n{\"format\":\"other\",\"version\":1,"
+            "\"conversations\":[]}\n-->\n",
+        "<!-- darkchat.export:\n-->\n",
+        "<!-- darkchat.export:\n{\"format\":\"darkchat.export\"",
+        "<!-- darkchat.export:\n{}\n-->\n",
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        CHECK(import_markdown(dest, bad[i], NULL, NULL) ==
+            CHAT_IMPORT_MALFORMED);
+        CHECK(unchanged(dest, &before));
+    }
+    CHECK(import_markdown(dest, "", NULL, NULL) == CHAT_IMPORT_MALFORMED);
+    static const char embedded_nul[] = { '#', 0, 'x' };
+    CHECK(chat_import_markdown(dest, embedded_nul, sizeof embedded_nul, NULL,
+        NULL) == CHAT_IMPORT_MALFORMED);
+    const char invalid[] = { '#', (char)0xff, 'x' };
+    CHECK(chat_import_markdown(dest, invalid, sizeof invalid, NULL, NULL) ==
+        CHAT_IMPORT_MALFORMED);
+    CHECK(unchanged(dest, &before));
+    chat_dispose(dest); free(dest);
+    return 0;
+}
+
+static int test_markdown_capacity(void) {
+    Chat *dest = new_chat();
+    CHECK(dest);
+    while (dest->conversation_count < CHAT_MAX_CONVERSATIONS)
+        CHECK(chat_new_conversation(dest) >= 0);
+    Snapshot before;
+    snapshot(dest, &before);
+    ChatImportStats stats;
+    CHECK(import_markdown(dest, "# T\nbody", NULL, &stats) ==
+        CHAT_IMPORT_CAPACITY);
+    CHECK(stats.conversations_added == 0 && stats.messages_added == 0);
+    CHECK(unchanged(dest, &before));
+    chat_dispose(dest); free(dest);
+    return 0;
+}
+
+/* The fallback consumes one conversation id and one message id; exhaustion is
+   capacity, not allocation failure. */
+static int test_markdown_id_exhaustion(void) {
+    Chat *dest = new_chat();
+    CHECK(dest);
+    dest->next_id = CHAT_MAX_ID - 1;
+    Snapshot before;
+    snapshot(dest, &before);
+    ChatImportStats stats;
+    CHECK(import_markdown(dest, "# T\nbody", NULL, &stats) ==
+        CHAT_IMPORT_CAPACITY);
+    CHECK(stats.conversations_added == 0 && stats.messages_added == 0);
+    CHECK(unchanged(dest, &before));
+    chat_dispose(dest); free(dest);
+    return 0;
+}
+
+static int test_markdown_allocation_failure(void) {
+    long baseline = live_allocs;
+    Chat *dest = new_chat();
+    CHECK(dest);
+    Snapshot before;
+    snapshot(dest, &before);
+    const char *md = "# Title\n\nsome body text\n";
+    bool succeeded = false;
+    for (long n = 0; n < 512; n++) {
+        long live_before = live_allocs;
+        pass_allocs = n;
+        fail_allocs = 1;
+        ChatImportStats stats;
+        ChatImportStatus status = chat_import_markdown(dest, md, strlen(md),
+            NULL, &stats);
+        if (status == CHAT_IMPORT_OK) {
+            CHECK(n > 0);
+            CHECK(!unchanged(dest, &before));
+            succeeded = true;
+            break;
+        }
+        CHECK(status == CHAT_IMPORT_OOM);
+        CHECK(unchanged(dest, &before));
+        CHECK(live_allocs == live_before);
+    }
+    CHECK(succeeded);
+    seam_reset();
+    chat_dispose(dest); free(dest);
+    CHECK(live_allocs == baseline);
+    return 0;
+}
+
 typedef struct { const char *name; int (*run)(void); } ImportTest;
 
 static const ImportTest import_tests[] = {
@@ -487,6 +818,16 @@ static const ImportTest import_tests[] = {
     { "id_exhaustion", test_id_exhaustion },
     { "reject_when_full", test_reject_when_full },
     { "allocation_failure", test_allocation_failure },
+    { "markdown_round_trip", test_markdown_round_trip },
+    { "markdown_offset_authority", test_markdown_offset_authority },
+    { "markdown_fallback", test_markdown_fallback },
+    { "markdown_title_rules", test_markdown_title_rules },
+    { "markdown_copy_title", test_markdown_copy_title },
+    { "markdown_bom", test_markdown_bom },
+    { "markdown_invalid", test_markdown_invalid },
+    { "markdown_capacity", test_markdown_capacity },
+    { "markdown_id_exhaustion", test_markdown_id_exhaustion },
+    { "markdown_allocation_failure", test_markdown_allocation_failure },
 };
 
 int main(void) {

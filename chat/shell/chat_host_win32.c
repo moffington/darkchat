@@ -1867,10 +1867,13 @@ static void export_conversation(ChatHost *host, bool json, bool all) {
                              : L"Could not write the export file.");
 }
 
-static const wchar_t *import_failure_text(ChatImportStatus status) {
+static const wchar_t *import_failure_text(ChatImportStatus status,
+    bool markdown) {
     switch (status) {
     case CHAT_IMPORT_MALFORMED:
-        return L"Import failed: the file is not a valid DarkChat JSON export.";
+        return markdown
+            ? L"Import failed: the file is not valid UTF-8 Markdown or contains invalid DarkChat export metadata."
+            : L"Import failed: the file is not a valid DarkChat JSON export.";
     case CHAT_IMPORT_TOO_LARGE:
         return L"Import failed: the export or one of its fields exceeds the allowed size.";
     case CHAT_IMPORT_CAPACITY:
@@ -1882,18 +1885,37 @@ static const wchar_t *import_failure_text(ChatImportStatus status) {
     }
 }
 
-/* Imports conversations from a native JSON file. Mutating, so the live
-   composer/model are captured before the durability flush; the active
+/* Title used when a Markdown file carries no usable level-1 heading: the
+   file's basename with its extension removed. An extension-only basename
+   (".md") yields an empty title and the importer's default. */
+static void import_fallback_title(const wchar_t *path, wchar_t *out,
+    size_t capacity) {
+    if (out && capacity) out[0] = 0;
+    if (!path) return;
+    const wchar_t *name = path;
+    for (const wchar_t *p = path; *p; p++)
+        if (*p == L'\\' || *p == L'/') name = p + 1;
+    size_t length = wcslen(name);
+    for (size_t i = length; i > 0; i--)
+        if (name[i - 1] == L'.') { length = i - 1; break; }
+    chat_import_copy_title(out, capacity, name, length);
+}
+
+/* Imports conversations from a native JSON or Markdown file. Mutating, so the
+   live composer/model are captured before the durability flush; the active
    conversation is never changed, so its transcript is deliberately not
    invalidated or re-rendered. The sidebar remap, the reveal of the first
    imported row and the paint all ride the normal flush. */
-static void import_conversations(ChatHost *host) {
+static void import_conversations(ChatHost *host, bool markdown) {
     Chat *chat = host->config.chat;
     wchar_t path[1024];
-    const wchar_t *filter = L"JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
+    const wchar_t *filter = markdown
+        ? L"Markdown (*.md;*.markdown)\0*.md;*.markdown\0All files (*.*)\0*.*\0\0"
+        : L"JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
     ChatFileDialogResult dialog = chat_open_dialog(host->window,
-        L"Import conversations from JSON", filter, path,
-        sizeof path / sizeof *path);
+        markdown ? L"Import conversations from Markdown"
+                 : L"Import conversations from JSON",
+        filter, path, sizeof path / sizeof *path);
     if (dialog == CHAT_FILE_DIALOG_CANCELLED) return;
     if (dialog == CHAT_FILE_DIALOG_ERROR) {
         set_status(host, L"Could not open the import dialog.");
@@ -1919,10 +1941,18 @@ static void import_conversations(ChatHost *host) {
     }
     int before = chat->conversation_count;
     ChatImportStats stats;
-    ChatImportStatus status = chat_import_json(chat, data, length, &stats);
+    ChatImportStatus status;
+    if (markdown) {
+        wchar_t fallback_title[CHAT_TITLE_TEXT];
+        import_fallback_title(path, fallback_title, CHAT_TITLE_TEXT);
+        status = chat_import_markdown(chat, data, length, fallback_title,
+            &stats);
+    } else {
+        status = chat_import_json(chat, data, length, &stats);
+    }
     free(data);
     if (status != CHAT_IMPORT_OK) {
-        set_status(host, import_failure_text(status));
+        set_status(host, import_failure_text(status, markdown));
         return;
     }
     capture_settings(host);
@@ -2006,10 +2036,10 @@ static void action(ChatHost *host, int code) {
             code==ACTION_EXPORT_ALL);
         return;
     }
-    if (code==ACTION_IMPORT_JSON) {
+    if (code==ACTION_IMPORT_JSON || code==ACTION_IMPORT_MARKDOWN) {
         /* Mutating: import_conversations() captures settings and flushes
-           itself, so it must not fall through to the shared tail. */
-        import_conversations(host);
+            itself, so it must not fall through to the shared tail. */
+        import_conversations(host,code==ACTION_IMPORT_MARKDOWN);
         return;
     }
     capture_settings(host);
