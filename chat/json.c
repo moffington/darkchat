@@ -229,17 +229,37 @@ static int hex4(const char *p) {
     return value;
 }
 
-const char *json_decode_string(const char *json, char *out, size_t capacity) {
-    if (!json || !out || capacity == 0 || *json != '"') return NULL;
+/* Shared decoder for json_decode_string (lenient) and
+   json_decode_string_strict. `out` may be NULL to measure only. `strict`
+   rejects unpaired surrogate escapes and a decoded NUL (U+0000) rather than
+   substituting U+FFFD or dropping the byte. Returns one past the closing
+   quote, NULL on malformed input or when the text does not fit capacity
+   (capacity is ignored when measuring). `length`, when non-NULL, receives the
+   decoded byte count. */
+static const char *decode_string_impl(const char *json, char *out,
+    size_t capacity, bool strict, size_t *length) {
+    if (!json || *json != '"') return NULL;
+    if (out && capacity == 0) return NULL;
     const char *p = json + 1;
     size_t used = 0;
     for (;;) {
         char c = *p;
         if (!c) return NULL;
-        if (c == '"') { out[used] = 0; return p + 1; }
+        if (c == '"') {
+            if (out) out[used] = 0;
+            if (length) *length = used;
+            return p + 1;
+        }
         if (c != '\\') {
-            if (used + 1 >= capacity) return NULL;
-            out[used++] = c;
+            /* Unescaped control characters are not valid JSON. The lenient
+               decoder tolerates them for callers that did not validate, but
+               the strict contract rejects them. */
+            if (strict && (unsigned char)c < 0x20) return NULL;
+            if (out) {
+                if (used + 1 >= capacity) return NULL;
+                out[used] = c;
+            }
+            used++;
             ++p;
             continue;
         }
@@ -265,20 +285,40 @@ const char *json_decode_string(const char *json, char *out, size_t capacity) {
                         cp = 0x10000 + ((cp - 0xd800) << 10) +
                             (uint32_t)(low - 0xdc00);
                         p += 6;
-                    } else cp = 0xfffd;  /* unpaired low escape */
-                } else cp = 0xfffd;      /* unpaired high surrogate */
-            } else if (cp >= 0xdc00 && cp <= 0xdfff) cp = 0xfffd;
-            if (!cp) continue;  /* keep NUL bytes out of the C string */
+                    } else if (strict) return NULL;  /* unpaired low escape */
+                    else cp = 0xfffd;
+                } else if (strict) return NULL;      /* unpaired high surrogate */
+                else cp = 0xfffd;
+            } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+                if (strict) return NULL;
+                cp = 0xfffd;
+            }
+            if (!cp) {
+                if (strict) return NULL;
+                continue;  /* keep NUL bytes out of the C string */
+            }
             break;
         }
         default: return NULL;
         }
         char scratch[4];
         size_t n = encode_utf8(scratch, cp);
-        if (used + n >= capacity) return NULL;
-        memcpy(out + used, scratch, n);
+        if (out) {
+            if (used + n >= capacity) return NULL;
+            memcpy(out + used, scratch, n);
+        }
         used += n;
     }
+}
+
+const char *json_decode_string(const char *json, char *out, size_t capacity) {
+    if (!out) return NULL;
+    return decode_string_impl(json, out, capacity, false, NULL);
+}
+
+const char *json_decode_string_strict(const char *json, char *out,
+    size_t capacity, size_t *length) {
+    return decode_string_impl(json, out, capacity, true, length);
 }
 
 /* --- Structure skipping -------------------------------------------------- */
@@ -553,4 +593,165 @@ bool json_query_field(const char *json, const char *path, JsonFieldKind *kind,
     *kind = JSON_FIELD_NUMBER;
     if (value) *value = number;
     return true;
+}
+
+/* --- Value spans, strict decoding and container cursors ------------------- */
+
+bool json_utf8_valid(const char *utf8, size_t length) {
+    if (!utf8 && length) return false;
+    size_t i = 0;
+    while (i < length) {
+        unsigned char b = (unsigned char)utf8[i];
+        if (b < 0x80) { ++i; continue; }
+        unsigned need;
+        uint32_t cp;
+        if ((b & 0xe0) == 0xc0) { need = 1; cp = b & 0x1fu; }
+        else if ((b & 0xf0) == 0xe0) { need = 2; cp = b & 0x0fu; }
+        else if ((b & 0xf8) == 0xf0) { need = 3; cp = b & 0x07u; }
+        else return false;
+        if (i + need >= length) return false;
+        for (unsigned k = 1; k <= need; k++) {
+            unsigned char c = (unsigned char)utf8[i + k];
+            if ((c & 0xc0) != 0x80) return false;
+            cp = (cp << 6) | (c & 0x3fu);
+        }
+        if ((need == 1 && cp < 0x80) || (need == 2 && cp < 0x800) ||
+            (need == 3 && cp < 0x10000) || cp > 0x10ffff ||
+            (cp >= 0xd800 && cp <= 0xdfff)) return false;
+        i += (size_t)need + 1;
+    }
+    return true;
+}
+
+/* True when `end` (one past a value) is followed only by whitespace and then
+   either end-of-input or a structural delimiter. Whitespace is skipped so
+   trailing junk after a space is still rejected. */
+static bool value_terminated(const char *end) {
+    if (!end) return false;
+    const char *p = skip_ws(end);
+    return *p == 0 || *p == ',' || *p == '}' || *p == ']';
+}
+
+JsonValueKind json_value_kind(const char *value) {
+    if (!value) return JSON_VALUE_INVALID;
+    const char *p = skip_ws(value);
+    switch (*p) {
+    case '"':
+        return value_terminated(skip_value(p, 0))
+            ? JSON_VALUE_STRING : JSON_VALUE_INVALID;
+    case '{':
+        return value_terminated(skip_value(p, 0))
+            ? JSON_VALUE_OBJECT : JSON_VALUE_INVALID;
+    case '[':
+        return value_terminated(skip_value(p, 0))
+            ? JSON_VALUE_ARRAY : JSON_VALUE_INVALID;
+    case 't':
+        return strncmp(p, "true", 4) == 0 && value_terminated(p + 4)
+            ? JSON_VALUE_BOOL : JSON_VALUE_INVALID;
+    case 'f':
+        return strncmp(p, "false", 5) == 0 && value_terminated(p + 5)
+            ? JSON_VALUE_BOOL : JSON_VALUE_INVALID;
+    case 'n':
+        return strncmp(p, "null", 4) == 0 && value_terminated(p + 4)
+            ? JSON_VALUE_NULL : JSON_VALUE_INVALID;
+    default:
+        return value_terminated(skip_number(p))
+            ? JSON_VALUE_NUMBER : JSON_VALUE_INVALID;
+    }
+}
+
+const char *json_value_end(const char *value) {
+    return value ? skip_value(value, 0) : NULL;
+}
+
+bool json_value_number(const char *value, double *out) {
+    if (!value || !out) return false;
+    const char *p = skip_ws(value);
+    const char *end = skip_number(p);
+    if (!value_terminated(end)) return false;
+    char *parsed;
+    errno = 0;
+    double number = strtod(p, &parsed);
+    if (errno || parsed != end || !isfinite(number)) return false;
+    *out = number;
+    return true;
+}
+
+bool json_value_bool(const char *value, bool *out) {
+    if (!value || !out) return false;
+    const char *p = skip_ws(value);
+    if (strncmp(p, "true", 4) == 0 && value_terminated(p + 4)) {
+        *out = true;
+        return true;
+    }
+    if (strncmp(p, "false", 5) == 0 && value_terminated(p + 5)) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+bool json_cursor_object(JsonCursor *cursor, const char *value) {
+    if (!cursor || !value) return false;
+    const char *p = skip_ws(value);
+    if (*p != '{') return false;
+    cursor->cursor = p + 1;
+    cursor->close = '}';
+    cursor->first = true;
+    cursor->key = NULL;
+    cursor->value = NULL;
+    return true;
+}
+
+bool json_cursor_array(JsonCursor *cursor, const char *value) {
+    if (!cursor || !value) return false;
+    const char *p = skip_ws(value);
+    if (*p != '[') return false;
+    cursor->cursor = p + 1;
+    cursor->close = ']';
+    cursor->first = true;
+    cursor->key = NULL;
+    cursor->value = NULL;
+    return true;
+}
+
+bool json_cursor_next(JsonCursor *cursor) {
+    if (!cursor) return false;
+    bool object = cursor->close == '}';
+    const char *p = skip_ws(cursor->cursor);
+    if (cursor->first) {
+        if (*p == cursor->close) { cursor->cursor = p; return false; }
+        cursor->first = false;
+    } else if (*p == ',') {
+        p = skip_ws(p + 1);
+    } else if (*p == cursor->close) {
+        cursor->cursor = p;
+        return false;
+    } else {
+        return false;
+    }
+    if (object) {
+        if (*p != '"') return false;
+        const char *after = skip_string(p);
+        if (!after) return false;
+        cursor->key = p;
+        p = skip_ws(after);
+        if (*p != ':') return false;
+        p = skip_ws(p + 1);
+    } else {
+        cursor->key = NULL;
+    }
+    cursor->value = p;
+    const char *end = skip_value(p, 0);
+    if (!end) return false;
+    cursor->cursor = end;
+    return true;
+}
+
+const char *json_cursor_key(const JsonCursor *cursor) {
+    return cursor ? cursor->key : NULL;
+}
+
+const char *json_cursor_value(const JsonCursor *cursor) {
+    return cursor ? cursor->value : NULL;
 }

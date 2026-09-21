@@ -275,6 +275,142 @@ static void test_field_kind(void) {
         kind == JSON_FIELD_ABSENT, "missing key under valid path is absent");
 }
 
+static void test_spans_and_cursors(void) {
+    /* Strict UTF-8 validation. */
+    check(json_utf8_valid("plain", 5), "ascii is valid utf-8");
+    check(json_utf8_valid("\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80", 9),
+        "2/3/4-byte sequences are valid");
+    check(!json_utf8_valid("\xc0\x80", 2), "overlong encoding rejected");
+    check(!json_utf8_valid("\xed\xa0\x80", 3), "surrogate encoding rejected");
+    check(!json_utf8_valid("\xf4\x90\x80\x80", 4), "above U+10FFFF rejected");
+    check(!json_utf8_valid("\xe2\x82", 2), "truncated sequence rejected");
+    check(!json_utf8_valid("\x80", 1), "lone continuation byte rejected");
+    check(!json_utf8_valid("\xff", 1), "0xFF start byte rejected");
+    check(json_utf8_valid(NULL, 0) && !json_utf8_valid(NULL, 1),
+        "null range is only valid when empty");
+
+    /* Value classification and spans. */
+    check(json_value_kind("\"s\"") == JSON_VALUE_STRING, "string classified");
+    check(json_value_kind("  -1.5e2 ") == JSON_VALUE_NUMBER,
+        "number classified with leading space");
+    check(json_value_kind("true") == JSON_VALUE_BOOL &&
+        json_value_kind("false") == JSON_VALUE_BOOL, "booleans classified");
+    check(json_value_kind("null") == JSON_VALUE_NULL, "null classified");
+    check(json_value_kind("{\"a\":1}") == JSON_VALUE_OBJECT, "object classified");
+    check(json_value_kind("[1,2]") == JSON_VALUE_ARRAY, "array classified");
+    check(json_value_kind("truex") == JSON_VALUE_INVALID &&
+        json_value_kind("nul") == JSON_VALUE_INVALID &&
+        json_value_kind("01") == JSON_VALUE_INVALID, "malformed values rejected");
+    /* The whole value is validated, so trailing junk is never a match. */
+    check(json_value_kind("{\"a\":1}junk") == JSON_VALUE_INVALID &&
+        json_value_kind("\"x\"junk") == JSON_VALUE_INVALID &&
+        json_value_kind("[1]junk") == JSON_VALUE_INVALID,
+        "trailing junk after a value is rejected");
+    check(json_value_kind("\"x\" junk") == JSON_VALUE_INVALID &&
+        json_value_kind("{\"a\":1} junk") == JSON_VALUE_INVALID &&
+        json_value_kind("[1] junk") == JSON_VALUE_INVALID &&
+        json_value_kind("true junk") == JSON_VALUE_INVALID,
+        "whitespace does not hide trailing junk");
+    check(json_value_kind("{\"a\":1},{\"b\":2}") == JSON_VALUE_OBJECT &&
+        json_value_kind("\"x\",") == JSON_VALUE_STRING,
+        "a delimiter after a value is accepted");
+    {
+        const char *doc = "{\"a\":1}tail";
+        const char *end = json_value_end(doc);
+        check(end == doc + 7, "value end stops at the value");
+    }
+    {
+        double number = 0;
+        check(json_value_number(" -1.25e+2 ,", &number) && number == -125,
+            "span number parses");
+        check(!json_value_number("01", &number) &&
+            !json_value_number("\"1\"", &number) &&
+            !json_value_number("1 junk", &number),
+            "bad span numbers rejected");
+    }
+    {
+        bool flag = false;
+        check(json_value_bool(" true ", &flag) && flag,
+            "span bool parses true");
+        check(json_value_bool("false}", &flag) && !flag,
+            "span bool parses false");
+        check(!json_value_bool("1", &flag) && !json_value_bool("truex", &flag) &&
+            !json_value_bool("true junk", &flag),
+            "non-bool spans rejected");
+    }
+
+    /* Strict string decoding: reject lossy escapes. */
+    {
+        char out[32];
+        size_t length = 0;
+        check(json_decode_string_strict("\"ok\"", out, sizeof out, &length) &&
+            !strcmp(out, "ok") && length == 2, "strict decode of plain text");
+        check(json_decode_string_strict("\"\\uD83D\\uDE80\"", out, sizeof out,
+            &length) && length == 4, "strict decode of a surrogate pair");
+        check(json_decode_string_strict("\"\\uD800\"", NULL, 0, &length) == NULL,
+            "unpaired high surrogate escape rejected");
+        check(json_decode_string_strict("\"\\uDC00\"", NULL, 0, &length) == NULL,
+            "lone low surrogate escape rejected");
+        check(json_decode_string_strict("\"a\\u0000b\"", NULL, 0,
+            &length) == NULL, "escaped NUL rejected");
+        check(json_decode_string_strict("\"a\nb\"", NULL, 0,
+            &length) == NULL, "literal newline rejected");
+        check(json_decode_string_strict("\"a\tb\"", NULL, 0,
+            &length) == NULL, "literal tab rejected");
+        check(json_decode_string_strict("\"smol\"", out, sizeof out, &length) &&
+            length == 4, "literal space is not a control character");
+        check(json_decode_string_strict("\"toolong\"", out, 4, &length) == NULL,
+            "strict decode rejects a too-small buffer");
+        check(json_decode_string_strict("\"measure\"", NULL, 0,
+            &length) && length == 7, "measure-only decode reports length");
+    }
+
+    /* Container cursors walk without root re-scanning. */
+    {
+        const char *doc = "{ \"format\": \"x\", \"version\": 1, "
+            "\"conversations\": [ {\"a\":true}, {} ] }";
+        JsonCursor root;
+        check(json_cursor_object(&root, doc), "root cursor opens");
+        char key[32];
+        int seen = 0;
+        while (json_cursor_next(&root)) {
+            const char *raw = json_cursor_key(&root);
+            check(raw != NULL && json_decode_string_strict(raw, key,
+                sizeof key, NULL) != NULL, "cursor key decodes");
+            if (!strcmp(key, "format"))
+                check(json_value_kind(json_cursor_value(&root)) ==
+                    JSON_VALUE_STRING, "format value is a string");
+            if (!strcmp(key, "version"))
+                check(json_value_kind(json_cursor_value(&root)) ==
+                    JSON_VALUE_NUMBER, "version value is a number");
+            if (!strcmp(key, "conversations")) {
+                JsonCursor array;
+                check(json_cursor_array(&array, json_cursor_value(&root)),
+                    "conversations cursor opens");
+                int elements = 0;
+                while (json_cursor_next(&array)) {
+                    check(json_value_kind(json_cursor_value(&array)) ==
+                        JSON_VALUE_OBJECT, "element is an object");
+                    ++elements;
+                }
+                check(elements == 2, "array cursor visits every element");
+            }
+            ++seen;
+        }
+        check(seen == 3, "root cursor visits every member");
+    }
+    /* Empty containers yield no iterations. */
+    {
+        JsonCursor cursor;
+        check(json_cursor_object(&cursor, "{}") && !json_cursor_next(&cursor),
+            "empty object visits nothing");
+        check(json_cursor_array(&cursor, "[]") && !json_cursor_next(&cursor),
+            "empty array visits nothing");
+        check(!json_cursor_object(&cursor, "[]") &&
+            !json_cursor_array(&cursor, "{}"), "wrong container type rejected");
+    }
+}
+
 int main(void) {
     double value;
     check(json_validate("{\"n\":-1.25e+2,\"s\":\"\\uD83D\\uDE80\"}"), "strict document validates");
@@ -292,6 +428,7 @@ int main(void) {
     test_buffers();
     test_utf16_conversion();
     test_field_kind();
+    test_spans_and_cursors();
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("\nall json checks passed\n");
     return 0;

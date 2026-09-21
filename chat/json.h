@@ -66,4 +66,64 @@ typedef enum {
 bool json_query_field(const char *json, const char *path, JsonFieldKind *kind,
     double *value);
 
+/* --- Value spans, strict decoding and container cursors ------------------- */
+
+/* Strict variant of json_decode_string: in addition to the syntax rules it
+    rejects unpaired surrogate escapes and a decoded NUL (U+0000) instead of
+    substituting U+FFFD or dropping the byte, so a caller can never silently
+    lose or corrupt an imported string. `out` may be NULL to validate and
+    measure only (capacity is then ignored); otherwise the decoded text must
+    fit, including the terminator. `length`, when non-NULL, receives the
+    decoded UTF-8 byte count (excluding the terminator). Returns one past the
+    closing quote, or NULL on malformed input or when it does not fit. */
+const char *json_decode_string_strict(const char *json, char *out,
+    size_t capacity, size_t *length);
+
+/* Strict validation of a raw UTF-8 byte range: rejects overlong encodings,
+    surrogate code points, values above U+10FFFF, and truncated sequences. */
+bool json_utf8_valid(const char *utf8, size_t length);
+
+/* Classification of the value a span pointer names. The whole value is
+    validated, including its closing delimiter, so trailing junk or an
+    unterminated container/string is JSON_VALUE_INVALID. */
+typedef enum {
+    JSON_VALUE_INVALID,
+    JSON_VALUE_STRING,
+    JSON_VALUE_NUMBER,
+    JSON_VALUE_BOOL,
+    JSON_VALUE_NULL,
+    JSON_VALUE_OBJECT,
+    JSON_VALUE_ARRAY
+} JsonValueKind;
+JsonValueKind json_value_kind(const char *value);
+
+/* One past the end of the value at `value`, or NULL when malformed. */
+const char *json_value_end(const char *value);
+
+/* Parses a finite number occupying the value span, and a real true/false
+    literal occupying the value span. False for any other type. */
+bool json_value_number(const char *value, double *out);
+bool json_value_bool(const char *value, bool *out);
+
+/* Linear container iteration: initializing over a validated object or array
+    and walking to the end visits every member/element once, without
+    re-scanning from the document root. `value` must point at the '{' or '['.
+    After a true json_cursor_next, json_cursor_key returns the raw key span
+    (points at its opening quote; NULL for arrays) and json_cursor_value
+    returns the value span. The document must already be well-formed
+    (json_validate); the cursor is defensive but reports malformed structure by
+    returning false early. */
+typedef struct {
+    const char *cursor;
+    char close;
+    bool first;
+    const char *key;
+    const char *value;
+} JsonCursor;
+bool json_cursor_object(JsonCursor *cursor, const char *value);
+bool json_cursor_array(JsonCursor *cursor, const char *value);
+bool json_cursor_next(JsonCursor *cursor);
+const char *json_cursor_key(const JsonCursor *cursor);
+const char *json_cursor_value(const JsonCursor *cursor);
+
 #endif
