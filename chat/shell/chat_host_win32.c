@@ -8,6 +8,7 @@
 #include "chat/core/search.h"
 #include "chat/persistence/storage.h"
 #include "chat/persistence/saver.h"
+#include "chat/export/export.h"
 #include "chat/shell/actions_win32.h"
 #include "chat/models/model_catalog.h"
 #include "chat/models/model_catalog_winhttp.h"
@@ -1822,6 +1823,49 @@ static RichTextControl *transcript_selected_surface(ChatHost *host) {
     return NULL;
 }
 
+/* Exports the active conversation, or every conversation, through the native
+   save dialog. Read-only with respect to the session: the caller dispatches
+   this before capture_settings(), so a cancelled or failed export never
+   captures a draft, dirties or saves state. */
+static void export_conversation(ChatHost *host, bool json, bool all) {
+    Chat *chat = host->config.chat;
+    JsonBuf out = {0};
+    bool serialized = json
+        ? chat_export_json(chat, chat->active, all, chat_export_timestamp(), &out)
+        : chat_export_markdown(chat, chat->active, all, chat_export_timestamp(), &out);
+    if (!serialized) {
+        json_buf_free(&out);
+        set_status(host, L"Export failed: the conversation could not be serialized.");
+        return;
+    }
+    wchar_t default_name[CHAT_TITLE_TEXT + 8];
+    if (all)
+        wcscpy(default_name, json ? L"darkchat-export.json"
+                                  : L"darkchat-export.md");
+    else
+        chat_export_default_name(chat->conversations[chat->active].title,
+            json ? L".json" : L".md", default_name,
+            sizeof default_name / sizeof *default_name);
+    const wchar_t *filter = json
+        ? L"JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0"
+        : L"Markdown (*.md)\0*.md\0All files (*.*)\0*.*\0\0";
+    wchar_t path[1024];
+    ChatFileDialogResult result = chat_save_dialog(host->window,
+        all ? L"Export all conversations" : L"Export conversation", filter,
+        json ? L"json" : L"md", default_name, path,
+        sizeof path / sizeof *path);
+    if (result == CHAT_FILE_DIALOG_CANCELLED) { json_buf_free(&out); return; }
+    if (result == CHAT_FILE_DIALOG_ERROR) {
+        json_buf_free(&out);
+        set_status(host, L"Could not open the save dialog.");
+        return;
+    }
+    bool written = chat_write_file_utf8(path, out.data, out.length);
+    json_buf_free(&out);
+    set_status(host, written ? L"Export complete."
+                             : L"Could not write the export file.");
+}
+
 /* Anchors the complete retained command menu under the overflow button. The
    default presentation has no menu bar, but every Conversation, Response and
    Settings command stays reachable here (and through its keyboard shortcut).
@@ -1877,6 +1921,15 @@ static void action(ChatHost *host, int code) {
     }
     if (code==ACTION_NEW) { command(host,CHAT_COMMAND_NEW_CONVERSATION,-1); return; }
     if (host->generating) { set_status(host,L"Stop generation before changing history or settings."); return; }
+    if (code==ACTION_EXPORT_MARKDOWN || code==ACTION_EXPORT_JSON ||
+        code==ACTION_EXPORT_ALL) {
+        /* Dispatched before capture_settings(): an export is a read-only
+           snapshot and must not capture a draft, mark the session dirty, or
+           trigger a save. */
+        export_conversation(host,code!=ACTION_EXPORT_MARKDOWN,
+            code==ACTION_EXPORT_ALL);
+        return;
+    }
     capture_settings(host);
     if (code==ACTION_CANCEL_EDIT) {
         host->editing=false; rich_text_set_text(&host->composer,c->draft); set_status(host,L"Edit cancelled");

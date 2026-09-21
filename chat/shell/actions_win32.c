@@ -1,4 +1,5 @@
 #include "chat/shell/actions_win32.h"
+#include <commdlg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +83,171 @@ bool chat_copy_text(HWND owner,const wchar_t *text) {
     if (!ok) GlobalFree(memory);
     return ok;
 }
+ChatFileDialogResult chat_save_dialog(HWND owner, const wchar_t *title,
+    const wchar_t *filter, const wchar_t *default_ext,
+    const wchar_t *default_name, wchar_t *path, size_t capacity) {
+    if (!path || capacity == 0) return CHAT_FILE_DIALOG_ERROR;
+    path[0] = 0;
+    if (default_name && default_name[0]) {
+        wcsncpy(path, default_name, capacity - 1);
+        path[capacity - 1] = 0;
+    }
+    OPENFILENAMEW ofn;
+    memset(&ofn, 0, sizeof ofn);
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = (DWORD)capacity;
+    ofn.lpstrTitle = title;
+    ofn.lpstrDefExt = default_ext;
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER |
+        OFN_NOCHANGEDIR;
+    if (GetSaveFileNameW(&ofn)) return CHAT_FILE_DIALOG_ACCEPTED;
+    /* CommDlgExtendedError is zero for a plain cancel and nonzero for a real
+       dialog failure (invalid flags, out of memory, ...). */
+    return CommDlgExtendedError() == 0 ? CHAT_FILE_DIALOG_CANCELLED
+                                       : CHAT_FILE_DIALOG_ERROR;
+}
+
+bool chat_write_file_utf8(const wchar_t *path, const char *data, size_t length) {
+    if (!path || !path[0] || (!data && length)) return false;
+    /* WriteFile takes a DWORD byte count; a larger size_t would be truncated
+       and could report a short write as success. The exporter is bounded well
+       below this, but the declared contract is not. */
+    if (length > (size_t)MAXDWORD) return false;
+    /* The temporary is a short fixed-shape name inside the destination
+       directory, never derived from the destination basename: appending to a
+       name already near the component-length limit could fail, and a fixed
+       sibling such as "report.json.tmp" could collide with an unrelated
+       file. CREATE_NEW guarantees we only ever delete a path we created. */
+    const wchar_t *slash = wcsrchr(path, L'\\');
+    const wchar_t *fwd = wcsrchr(path, L'/');
+    if (fwd && (!slash || fwd > slash)) slash = fwd;
+    size_t dir_length = slash ? (size_t)(slash - path) : 0;
+    wchar_t temp[1024];
+    /* Reserve the widest possible suffix (".darkchat-" plus two decimal
+       fields up to 10 digits each plus ".tmp") up front, so the directory
+       prefix can never leave the generated name truncated. */
+    const size_t suffix_reserve = 64;
+    size_t temp_capacity = sizeof temp / sizeof *temp;
+    if (dir_length + suffix_reserve > temp_capacity) return false;
+    if (dir_length) memcpy(temp, path, dir_length * sizeof(wchar_t));
+    const wchar_t *separator = L"";
+    if (dir_length && path[dir_length - 1] != L'\\' &&
+        path[dir_length - 1] != L'/')
+        separator = L"\\";
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        wchar_t suffix[64];
+        int suffix_length = swprintf(suffix, suffix_reserve,
+            L"%ls.darkchat-%lu-%u.tmp", separator,
+            (unsigned long)GetCurrentProcessId(), attempt);
+        if (suffix_length < 0 ||
+            (size_t)suffix_length + 1 > suffix_reserve ||
+            dir_length + (size_t)suffix_length + 1 > temp_capacity)
+            return false;
+        memcpy(temp + dir_length, suffix,
+            ((size_t)suffix_length + 1) * sizeof(wchar_t));
+        file = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file != INVALID_HANDLE_VALUE) break;
+        if (GetLastError() != ERROR_FILE_EXISTS) return false;
+    }
+    if (file == INVALID_HANDLE_VALUE) return false;
+    bool ok = true;
+    if (length) {
+        DWORD written = 0;
+        /* A single synchronous WriteFile must write the whole bounded
+           payload; a short write is a failure, not a partial-file success. */
+        ok = WriteFile(file, data, (DWORD)length, &written, NULL) != 0 &&
+            written == (DWORD)length;
+    }
+    if (ok) ok = FlushFileBuffers(file) != 0;
+    CloseHandle(file);
+    if (ok) ok = MoveFileExW(temp, path,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (!ok) DeleteFileW(temp);
+    return ok;
+}
+
+int64_t chat_export_timestamp(void) {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER ticks;
+    ticks.LowPart = ft.dwLowDateTime;
+    ticks.HighPart = ft.dwHighDateTime;
+    /* FILETIME counts 100 ns intervals from 1601-01-01; subtract the Unix
+       epoch offset and scale to milliseconds. */
+    const uint64_t epoch_delta = 116444736000000000ULL;
+    return (int64_t)((ticks.QuadPart - epoch_delta) / 10000ULL);
+}
+
+/* True when `name` (already trimmed of trailing dots/spaces) begins with a
+   reserved Win32 DOS device basename. Windows refuses such a name however it
+   is extended, so the caller must prefix it. The check is case-insensitive
+   and stops at the first dot: "CON", "CON.txt" and "con.anything" are all
+   reserved, while "CONSOLE" and "COM10" are not. */
+static bool reserved_device_basename(const wchar_t *name, size_t length) {
+    static const wchar_t *const devices[] = {
+        L"CON", L"PRN", L"AUX", L"NUL",
+        L"COM1", L"COM2", L"COM3", L"COM4", L"COM5",
+        L"COM6", L"COM7", L"COM8", L"COM9",
+        L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5",
+        L"LPT6", L"LPT7", L"LPT8", L"LPT9"
+    };
+    size_t stem = length;
+    for (size_t i = 0; i < length; i++)
+        if (name[i] == L'.') { stem = i; break; }
+    for (size_t i = 0; i < sizeof devices / sizeof devices[0]; i++) {
+        const wchar_t *device = devices[i];
+        size_t j = 0;
+        for (; j < stem && device[j]; j++) {
+            wchar_t a = name[j];
+            wchar_t b = device[j];
+            if (a >= L'A' && a <= L'Z') a = (wchar_t)(a - L'A' + L'a');
+            if (b >= L'A' && b <= L'Z') b = (wchar_t)(b - L'A' + L'a');
+            if (a != b) break;
+        }
+        if (j == stem && device[j] == 0) return true;
+    }
+    return false;
+}
+
+void chat_export_default_name(const wchar_t *title, const wchar_t *ext,
+    wchar_t *out, size_t capacity) {
+    if (!out || capacity == 0) return;
+    const wchar_t *name = (title && title[0]) ? title : L"conversation";
+    size_t used = 0;
+    for (const wchar_t *p = name; *p && used + 1 < capacity; p++) {
+        wchar_t ch = *p;
+        if (ch == L'\\' || ch == L'/' || ch == L':' || ch == L'*' ||
+            ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' ||
+            ch == L'|' || ch < 32)
+            ch = L'_';
+        out[used++] = ch;
+    }
+    while (used && (out[used - 1] == L' ' || out[used - 1] == L'.')) used--;
+    if (used == 0) {
+        const wchar_t *fallback = L"conversation";
+        for (const wchar_t *p = fallback; *p && used + 1 < capacity; p++)
+            out[used++] = *p;
+    }
+    /* A device basename is refused however it is extended, so prefix it with
+       an underscore. Drop one character first when the prefix would not fit,
+       keeping the result terminated. */
+    if (reserved_device_basename(out, used)) {
+        if (used + 1 >= capacity) used--;
+        memmove(out + 1, out, used * sizeof(wchar_t));
+        out[0] = L'_';
+        used++;
+    }
+    if (ext)
+        for (const wchar_t *p = ext; *p && used + 1 < capacity; p++)
+            out[used++] = *p;
+    out[used] = 0;
+}
+
 static int routing_sort_action(ChatProviderSort sort) {
     switch (sort) {
     case CHAT_PROVIDER_SORT_PRICE: return ACTION_ROUTING_SORT_PRICE;
@@ -261,5 +427,7 @@ HMENU chat_actions_menu(const Chat *chat) {
         (UINT_PTR)group[CHAT_ACTION_GROUP_SETTINGS], L"&Settings");
     AppendMenuW(bar, MF_POPUP,
         (UINT_PTR)group[CHAT_ACTION_GROUP_CUSTOMIZATION], L"&Customization");
+    AppendMenuW(bar, MF_POPUP,
+        (UINT_PTR)group[CHAT_ACTION_GROUP_DATA], L"&Data");
     return bar;
 }

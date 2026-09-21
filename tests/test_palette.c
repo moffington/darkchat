@@ -97,18 +97,19 @@ static int commands_basic(void) {
     CHECK(palette);
     ChatActionContext context = idle_context();
     CHECK(palette_set_commands(palette, &context));
-    /* The idle memset context enables 20 of the 27 registry actions. */
-    CHECK(palette_row_count(palette) == 20);
+    /* The idle memset context enables 23 registry actions. */
+    CHECK(palette_row_count(palette) == 23);
     /* Registry order and grouping. The idle context has no conversation, so
-        the Response section is absent: the five present sections are
-        Conversation, Settings, Backend, Routing, Customization. */
-    CHECK(palette_section_count(palette) == 5);
+        the Response section is absent: the six present sections are
+        Conversation, Settings, Backend, Routing, Customization, Data. */
+    CHECK(palette_section_count(palette) == 6);
     CHECK(palette_section_start(palette, 0) == 0);
     CHECK(!wcscmp(palette_section_label(palette, 0), L"Conversation"));
     CHECK(!wcscmp(palette_section_label(palette, 1), L"Settings"));
     CHECK(!wcscmp(palette_section_label(palette, 2), L"Backend"));
     CHECK(!wcscmp(palette_section_label(palette, 3), L"Routing"));
     CHECK(!wcscmp(palette_section_label(palette, 4), L"Customization"));
+    CHECK(!wcscmp(palette_section_label(palette, 5), L"Data"));
     const PaletteRow *row = palette_row(palette, 0);
     CHECK(row->key.kind == PALETTE_ROW_COMMAND);
     CHECK(row->key.action_id == ACTION_NEW);
@@ -127,11 +128,11 @@ static int commands_basic(void) {
     for (size_t i = 0; i < palette_row_count(palette); i++)
         CHECK(wcschr(palette_row(palette, i)->label, L'&') == NULL);
     /* Out-of-range section lookups are safe. */
-    CHECK(palette_section_start(palette, 5) == (size_t)-1);
-    CHECK(palette_section_label(palette, 5) == NULL);
+    CHECK(palette_section_start(palette, 6) == (size_t)-1);
+    CHECK(palette_section_label(palette, 6) == NULL);
     /* NULL context is rejected, and the previous source survives. */
     CHECK(!palette_set_commands(palette, NULL));
-    CHECK(palette_row_count(palette) == 20);
+    CHECK(palette_row_count(palette) == 23);
     palette_dispose(palette);
     return 0;
 }
@@ -142,7 +143,7 @@ static int commands_filtering(void) {
     ChatActionContext context = idle_context();
     CHECK(palette_set_commands(palette, &context));
     size_t full = palette_row_count(palette);
-    CHECK(full == 20);
+    CHECK(full == 23);
 
     CHECK(palette_set_query(palette, L"model"));
     CHECK(palette_row_count(palette) == 1);
@@ -190,9 +191,10 @@ static int commands_disabled(void) {
     ChatActionContext ollama = idle_context();
     ollama.backend_openrouter = false;
     CHECK(palette_set_commands(palette, &ollama));
-    CHECK(palette_row_count(palette) == 20 - 7);
-    CHECK(palette_section_count(palette) == 4);
+    CHECK(palette_row_count(palette) == 23 - 7);
+    CHECK(palette_section_count(palette) == 5);
     CHECK(!wcscmp(palette_section_label(palette, 2), L"Backend"));
+    CHECK(!wcscmp(palette_section_label(palette, 4), L"Data"));
     /* Unavailable commands never become rows, so accept can never fire one:
        under generating, activating whatever is highlighted is safe. */
     CHECK(palette_set_commands(palette, &generating));
@@ -544,7 +546,7 @@ static int transactional_oom(void) {
     ChatActionContext context = idle_context();
     CHECK(palette_set_commands(palette, &context));
     size_t full = palette_row_count(palette);
-    CHECK(full == 20);
+    CHECK(full == 23);
     PaletteRowKey before;
     CHECK(palette_selected_key(palette, &before));
 
@@ -593,7 +595,7 @@ static int transactional_oom(void) {
         /* Either the new source is complete or the old one is fully intact;
             a partial mix is never observable. */
         size_t rows = palette_row_count(palette);
-        CHECK(rows == 20 || rows == 2);
+        CHECK(rows == 23 || rows == 2);
     }
 
     /* A source larger than the current visible capacity forces a visible

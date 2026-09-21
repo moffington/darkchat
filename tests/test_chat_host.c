@@ -167,6 +167,68 @@ static void edit_queue_push(const wchar_t *text) {
     if (edit_dialog_answer_count < 8)
         wcscpy(edit_dialog_answers[edit_dialog_answer_count++], text);
 }
+/* Save-dialog seam (linked with -Wl,--wrap=chat_save_dialog): each call
+    consumes the next queued path/result. With the queue exhausted the dialog
+    is declined, which is the cancel path. */
+static wchar_t save_dialog_paths[8][512];
+static ChatFileDialogResult save_dialog_results[8];
+static int save_dialog_count, save_dialog_head, save_dialog_calls;
+static wchar_t save_dialog_last_default[512];
+ChatFileDialogResult __real_chat_save_dialog(HWND owner, const wchar_t *title,
+    const wchar_t *filter, const wchar_t *default_ext,
+    const wchar_t *default_name, wchar_t *path, size_t capacity);
+ChatFileDialogResult __wrap_chat_save_dialog(HWND owner, const wchar_t *title,
+    const wchar_t *filter, const wchar_t *default_ext,
+    const wchar_t *default_name, wchar_t *path, size_t capacity) {
+    (void)owner; (void)title; (void)filter; (void)default_ext;
+    ++save_dialog_calls;
+    wcsncpy(save_dialog_last_default, default_name ? default_name : L"", 511);
+    save_dialog_last_default[511] = 0;
+    if (save_dialog_head >= save_dialog_count) return CHAT_FILE_DIALOG_CANCELLED;
+    ChatFileDialogResult result = save_dialog_results[save_dialog_head];
+    const wchar_t *queued = save_dialog_paths[save_dialog_head++];
+    if (result == CHAT_FILE_DIALOG_ACCEPTED) {
+        wcsncpy(path, queued, capacity - 1);
+        path[capacity - 1] = 0;
+    }
+    return result;
+}
+static void save_queue_clear(void) {
+    save_dialog_count = save_dialog_head = save_dialog_calls = 0;
+}
+static void save_queue_push(const wchar_t *path, ChatFileDialogResult result) {
+    if (save_dialog_count >= 8) return;
+    wcsncpy(save_dialog_paths[save_dialog_count], path, 511);
+    save_dialog_paths[save_dialog_count][511] = 0;
+    save_dialog_results[save_dialog_count++] = result;
+}
+/* Export-writer seam (linked with -Wl,--wrap=chat_write_file_utf8): records
+    the host's payload and, when armed, fails without touching the disk. The
+    writer's own atomic guarantees are tested directly against
+    __real_chat_write_file_utf8 in export_suite(). */
+static int write_file_calls;
+static bool write_file_fail;
+static wchar_t write_file_last_path[512];
+static size_t write_file_last_length;
+static char write_file_capture[8192];
+bool __real_chat_write_file_utf8(const wchar_t *path, const char *data,
+    size_t length);
+bool __wrap_chat_write_file_utf8(const wchar_t *path, const char *data,
+    size_t length) {
+    ++write_file_calls;
+    wcsncpy(write_file_last_path, path, 511); write_file_last_path[511] = 0;
+    write_file_last_length = length;
+    size_t copy = data ? (length < 8191 ? length : 8191) : 0;
+    if (copy) memcpy(write_file_capture, data, copy);
+    write_file_capture[copy] = 0;
+    if (write_file_fail) return false;
+    return __real_chat_write_file_utf8(path, data, length);
+}
+/* Export-timestamp seam (linked with -Wl,--wrap=chat_export_timestamp): a
+    fixed value keeps host export tests byte-deterministic. */
+static int64_t export_timestamp_value = 1700000000000LL;
+int64_t __real_chat_export_timestamp(void);
+int64_t __wrap_chat_export_timestamp(void) { return export_timestamp_value; }
 /* Confirmation seam lives above the host include (MessageBoxW macro
     redirection must precede the host's call sites). */
 /* Identity helpers over the popup's visible rows: the controller labels are
@@ -821,10 +883,11 @@ static int default_suite(void) {
         CHECK(chat_profile_add(chat,L"Plain",L"")==1);
         HMENU bar=chat_actions_menu(chat);
         CHECK(bar);
-        CHECK(GetMenuItemCount(bar)==4);
+        /* Conversation, Response, Settings, Customization, Data. */
+        CHECK(GetMenuItemCount(bar)==5);
         MENUITEMINFOW top; memset(&top,0,sizeof top);
         top.cbSize=sizeof top; top.fMask=MIIM_SUBMENU;
-        CHECK(GetMenuItemInfoW(bar,GetMenuItemCount(bar)-1,TRUE,&top));
+        CHECK(GetMenuItemInfoW(bar,3,TRUE,&top));
         HMENU custom=top.hSubMenu;
         CHECK(custom);
         /* Eight registry entries plus three flagged separators. */
@@ -855,6 +918,41 @@ static int default_suite(void) {
             if (expected[i].separator) { CHECK(info.wID==0); continue; }
             CHECK(info.wID==(UINT)expected[i].id);
             CHECK((info.hSubMenu!=NULL)==expected[i].submenu);
+        }
+        /* The Data submenu is the last top-level group: Markdown, JSON,
+            separator, Export all. Availability leaves them enabled at idle
+            and grays them while generating. */
+        {
+            CHECK(GetMenuItemInfoW(bar,4,TRUE,&top));
+            HMENU data=top.hSubMenu;
+            CHECK(data && GetMenuItemCount(data)==4);
+            static const struct { int id; bool separator; } data_expected[] = {
+                { ACTION_EXPORT_MARKDOWN, false },
+                { ACTION_EXPORT_JSON, false },
+                { 0, true },
+                { ACTION_EXPORT_ALL, false },
+            };
+            for (UINT i=0;i<(UINT)GetMenuItemCount(data) &&
+                i<sizeof data_expected/sizeof data_expected[0];i++) {
+                MENUITEMINFOW info; memset(&info,0,sizeof info);
+                info.cbSize=sizeof info; info.fMask=MIIM_ID|MIIM_FTYPE;
+                CHECK(GetMenuItemInfoW(data,i,TRUE,&info));
+                CHECK(((info.fType & MFT_SEPARATOR)!=0)==
+                    (int)data_expected[i].separator);
+                if (data_expected[i].separator) { CHECK(info.wID==0); continue; }
+                CHECK(info.wID==(UINT)data_expected[i].id);
+            }
+            ChatActionContext data_ctx;
+            chat_action_context_init(&data_ctx,chat);
+            chat_actions_sync(data,&data_ctx);
+            CHECK(!(GetMenuState(data,ACTION_EXPORT_MARKDOWN,MF_BYCOMMAND)&MF_GRAYED));
+            CHECK(!(GetMenuState(data,ACTION_EXPORT_JSON,MF_BYCOMMAND)&MF_GRAYED));
+            CHECK(!(GetMenuState(data,ACTION_EXPORT_ALL,MF_BYCOMMAND)&MF_GRAYED));
+            data_ctx.generating=true;
+            chat_actions_sync(data,&data_ctx);
+            CHECK(GetMenuState(data,ACTION_EXPORT_MARKDOWN,MF_BYCOMMAND)&MF_GRAYED);
+            CHECK(GetMenuState(data,ACTION_EXPORT_JSON,MF_BYCOMMAND)&MF_GRAYED);
+            CHECK(GetMenuState(data,ACTION_EXPORT_ALL,MF_BYCOMMAND)&MF_GRAYED);
         }
         /* The Apply submenu carries two nested popups, each with one item
             per live profile; names are mnemonic-escaped. */
@@ -929,7 +1027,7 @@ static int default_suite(void) {
         CHECK(chat->profile_count==0);
         HMENU empty=chat_actions_menu(chat);
         CHECK(empty);
-        CHECK(GetMenuItemInfoW(empty,GetMenuItemCount(empty)-1,TRUE,&top));
+        CHECK(GetMenuItemInfoW(empty,3,TRUE,&top));
         HMENU empty_custom=top.hSubMenu;
         chat_action_context_init(&ctx,chat);
         chat_actions_sync(empty_custom,&ctx);
@@ -5322,6 +5420,274 @@ static bool has_lone_surrogate(const wchar_t *text, size_t n) {
     return false;
 }
 
+/* ---- Export + native file dialog suite ---------------------------------- */
+
+static bool export_file_exists(const wchar_t *path) {
+    return GetFileAttributesW(path)!=INVALID_FILE_ATTRIBUTES;
+}
+static size_t export_read(const wchar_t *path,char *out,size_t capacity) {
+    out[0]=0;
+    HANDLE file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,
+        NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+    if (file==INVALID_HANDLE_VALUE) return 0;
+    DWORD got=0;
+    bool ok=ReadFile(file,out,(DWORD)(capacity-1),&got,NULL)!=0;
+    CloseHandle(file);
+    if (!ok) return 0;
+    out[got]=0;
+    return got;
+}
+static bool export_contains(const char *haystack,const char *needle) {
+    return strstr(haystack,needle)!=NULL;
+}
+
+static int export_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Export host",1100,720,720,480,NULL,false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-export-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Export integration",
+        WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+
+    wchar_t md_path[512],json_path[512],all_path[512],direct_path[512];
+    wchar_t empty_path[512],big_path[512],unrelated_tmp[512],unrelated_target[512];
+    wchar_t subdir[512];
+    swprintf(md_path,512,L"%ls\\chat.md",dir);
+    swprintf(json_path,512,L"%ls\\chat.json",dir);
+    swprintf(all_path,512,L"%ls\\all.json",dir);
+    swprintf(direct_path,512,L"%ls\\direct.json",dir);
+    swprintf(empty_path,512,L"%ls\\empty.json",dir);
+    swprintf(big_path,512,L"%ls\\big.json",dir);
+    swprintf(unrelated_tmp,512,L"%ls\\report.json.tmp",dir);
+    swprintf(unrelated_target,512,L"%ls\\report.json",dir);
+    swprintf(subdir,512,L"%ls\\adir",dir);
+
+    /* ---- Direct real-writer guarantees (no host, no wrapper) ---- */
+    {
+        const char *first="first";
+        CHECK(__real_chat_write_file_utf8(direct_path,first,strlen(first)));
+        char read[512];
+        CHECK(export_read(direct_path,read,sizeof read)==strlen(first));
+        CHECK(!strcmp(read,first));
+        /* An existing destination is replaced atomically. */
+        const char *second="a longer replacement payload";
+        CHECK(__real_chat_write_file_utf8(direct_path,second,strlen(second)));
+        CHECK(export_read(direct_path,read,sizeof read)==strlen(second));
+        CHECK(!strcmp(read,second));
+    }
+    /* Zero-length output is a valid empty file. */
+    CHECK(__real_chat_write_file_utf8(empty_path,"",0));
+    CHECK(export_file_exists(empty_path));
+    { char read[8]; CHECK(export_read(empty_path,read,sizeof read)==0); CHECK(read[0]==0); }
+    /* A length above the DWORD WriteFile limit is rejected, not truncated. */
+    if (sizeof(size_t) > sizeof(DWORD))
+        CHECK(!__real_chat_write_file_utf8(direct_path,"x",(size_t)MAXDWORD+1));
+    /* An unrelated temp-like sibling survives untouched. */
+    {
+        const char *keep="do not touch";
+        CHECK(__real_chat_write_file_utf8(unrelated_tmp,keep,strlen(keep)));
+        const char *payload="exported payload";
+        CHECK(__real_chat_write_file_utf8(unrelated_target,payload,
+            strlen(payload)));
+        char read[64];
+        CHECK(export_read(unrelated_tmp,read,sizeof read)==strlen(keep));
+        CHECK(!strcmp(read,keep));
+    }
+    /* Failure after the temporary exists: moving onto an existing directory
+       fails, and only our owned temporary is removed. */
+    CHECK(CreateDirectoryW(subdir,NULL)!=0);
+    {
+        const char *payload="cannot land here";
+        CHECK(!__real_chat_write_file_utf8(subdir,payload,strlen(payload)));
+        wchar_t pattern[512]; swprintf(pattern,512,L"%ls\\.darkchat-*",dir);
+        WIN32_FIND_DATAW found; HANDLE find=FindFirstFileW(pattern,&found);
+        CHECK(find==INVALID_HANDLE_VALUE);
+        if (find!=INVALID_HANDLE_VALUE) FindClose(find);
+    }
+    RemoveDirectoryW(subdir);
+    /* A large payload round-trips byte-exact. */
+    {
+        size_t length=200000;
+        char *big=malloc(length); CHECK(big);
+        for (size_t i=0;i<length;i++) big[i]=(char)(' '+(i%95));
+        CHECK(__real_chat_write_file_utf8(big_path,big,length));
+        char *back=malloc(length+1); CHECK(back);
+        CHECK(export_read(big_path,back,length+1)==length);
+        CHECK(memcmp(big,back,length)==0);
+        free(big); free(back);
+    }
+
+    /* Default-name sanitizer: reserved characters, trailing trim, reserved
+       DOS device basenames (prefixed), and the empty-title fallback. */
+    {
+        wchar_t name[64];
+        chat_export_default_name(L"a/b:c*d?e\"f<g>h|i",L".md",name,64);
+        CHECK(!wcscmp(name,L"a_b_c_d_e_f_g_h_i.md"));
+        chat_export_default_name(L"trailing... ",L".json",name,64);
+        CHECK(!wcscmp(name,L"trailing.json"));
+        chat_export_default_name(L"CON",L".json",name,64);
+        CHECK(!wcscmp(name,L"_CON.json"));
+        chat_export_default_name(L"nul",L".md",name,64);
+        CHECK(!wcscmp(name,L"_nul.md"));
+        chat_export_default_name(L"com1",L".txt",name,64);
+        CHECK(!wcscmp(name,L"_com1.txt"));
+        chat_export_default_name(L"lpt9",L".txt",name,64);
+        CHECK(!wcscmp(name,L"_lpt9.txt"));
+        /* A device stem is reserved even with an internal extension. */
+        chat_export_default_name(L"CON.txt",L".json",name,64);
+        CHECK(!wcscmp(name,L"_CON.txt.json"));
+        chat_export_default_name(L"lpt1.log",L".md",name,64);
+        CHECK(!wcscmp(name,L"_lpt1.log.md"));
+        /* Only the stem before the first dot is compared. */
+        chat_export_default_name(L"CONSOLE",L".md",name,64);
+        CHECK(!wcscmp(name,L"CONSOLE.md"));
+        /* COM10 is not a reserved device name. */
+        chat_export_default_name(L"com10",L".txt",name,64);
+        CHECK(!wcscmp(name,L"com10.txt"));
+        chat_export_default_name(L"",L".md",name,64);
+        CHECK(!wcscmp(name,L"conversation.md"));
+        chat_export_default_name(L"   ",L".md",name,64);
+        CHECK(!wcscmp(name,L"conversation.md"));
+    }
+
+    /* ---- Host actions through the dialog seam ---- */
+    add_turn(chat,L"export question",L"exported answer body",NULL,-1);
+    render_transcript(h); flush(h);
+    CHECK(chat_rename(chat,L"Chat/Export: \"Test\"?"));
+
+    /* Markdown export, with the session deliberately staged to look dirty:
+       the export must not capture the draft/model/geometry or save. */
+    rich_text_set_text(&h->composer,L"staged unsaved draft");
+    rich_text_set_text(&h->field,L"staged/model");
+    h->dirty=false;
+    wchar_t draft_before[CHAT_COMPOSER_TEXT];
+    wcscpy(draft_before,chat->conversations[chat->active].draft);
+    wchar_t model_before[CHAT_MODEL_TEXT], override_before[CHAT_MODEL_TEXT];
+    wcscpy(model_before,chat->model);
+    wcscpy(override_before,chat->conversations[chat->active].model);
+    int64_t modified_before=chat->conversations[chat->active].modified_at;
+    int wx=chat->window_x,wy=chat->window_y,ww=chat->window_width,wh=chat->window_height;
+    int maximized=chat->maximized;
+    LONG saves_before=storage_save_calls;
+    save_queue_clear(); write_file_calls=0; write_file_fail=false;
+    save_queue_push(md_path,CHAT_FILE_DIALOG_ACCEPTED);
+    action(h,ACTION_EXPORT_MARKDOWN);
+    CHECK(save_dialog_calls==1 && write_file_calls==1);
+    CHECK(!wcscmp(write_file_last_path,md_path));
+    /* The proposed name is sanitized and typed. */
+    {
+        size_t n=wcslen(save_dialog_last_default);
+        CHECK(n>3 && !wcscmp(save_dialog_last_default+n-3,L".md"));
+        CHECK(!wcschr(save_dialog_last_default,L'/'));
+        CHECK(!wcschr(save_dialog_last_default,L':'));
+        CHECK(!wcschr(save_dialog_last_default,L'"'));
+    }
+    CHECK(export_file_exists(md_path));
+    {
+        char read[8192];
+        CHECK(export_read(md_path,read,sizeof read)>0);
+        CHECK(export_contains(read,"# "));
+        CHECK(export_contains(read,"exported answer body"));
+        CHECK(export_contains(read,"<!-- darkchat.export:"));
+    }
+    CHECK(h->dirty==false);
+    CHECK(!wcscmp(chat->conversations[chat->active].draft,draft_before));
+    CHECK(!wcscmp(chat->model,model_before));
+    CHECK(!wcscmp(chat->conversations[chat->active].model,override_before));
+    CHECK(chat->conversations[chat->active].modified_at==modified_before);
+    CHECK(chat->window_x==wx && chat->window_y==wy &&
+        chat->window_width==ww && chat->window_height==wh &&
+        chat->maximized==maximized);
+    CHECK(storage_save_calls==saves_before);
+
+    /* JSON export of the active conversation. */
+    save_queue_clear(); write_file_calls=0;
+    save_queue_push(json_path,CHAT_FILE_DIALOG_ACCEPTED);
+    action(h,ACTION_EXPORT_JSON);
+    CHECK(write_file_calls==1 && export_file_exists(json_path));
+    {
+        char read[8192];
+        CHECK(export_read(json_path,read,sizeof read)>0);
+        CHECK(json_validate(read));
+        CHECK(export_contains(read,"darkchat.export"));
+        CHECK(export_contains(read,"exported answer body"));
+    }
+
+    /* Export all: a second conversation is included in one JSON file. */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    add_turn(chat,L"second question",L"second answer body",NULL,-1);
+    render_transcript(h); flush(h);
+    save_queue_clear(); write_file_calls=0;
+    save_queue_push(all_path,CHAT_FILE_DIALOG_ACCEPTED);
+    action(h,ACTION_EXPORT_ALL);
+    CHECK(write_file_calls==1 && export_file_exists(all_path));
+    {
+        char read[16384];
+        CHECK(export_read(all_path,read,sizeof read)>0);
+        CHECK(json_validate(read));
+        CHECK(export_contains(read,"exported answer body"));
+        CHECK(export_contains(read,"second answer body"));
+    }
+
+    /* Cancel is silent and writes nothing. */
+    save_queue_clear(); write_file_calls=0;
+    action(h,ACTION_EXPORT_JSON);
+    CHECK(save_dialog_calls==1 && write_file_calls==0);
+
+    /* A dialog error is reported, not mistaken for a cancel. */
+    save_queue_clear(); write_file_calls=0;
+    save_queue_push(L"",CHAT_FILE_DIALOG_ERROR);
+    action(h,ACTION_EXPORT_MARKDOWN);
+    CHECK(save_dialog_calls==1 && write_file_calls==0);
+    CHECK(!wcscmp(chat->status,L"Could not open the save dialog."));
+
+    /* A writer failure is surfaced and leaves no target. */
+    DeleteFileW(json_path);
+    save_queue_clear(); write_file_calls=0; write_file_fail=true;
+    save_queue_push(json_path,CHAT_FILE_DIALOG_ACCEPTED);
+    action(h,ACTION_EXPORT_JSON);
+    write_file_fail=false;
+    CHECK(write_file_calls==1 && !export_file_exists(json_path));
+    CHECK(!wcscmp(chat->status,L"Could not write the export file."));
+
+    /* While generating the existing guard runs first: no dialog, no write. */
+    save_queue_clear(); write_file_calls=0;
+    h->generating=true;
+    action(h,ACTION_EXPORT_JSON);
+    h->generating=false;
+    CHECK(save_dialog_calls==0 && write_file_calls==0);
+    CHECK(!wcscmp(chat->status,
+        L"Stop generation before changing history or settings."));
+
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(!IsWindow(window));
+    saver_shutdown(&h->saver); storage_close(&h->storage);
+    DeleteFileW(md_path); DeleteFileW(json_path); DeleteFileW(all_path);
+    DeleteFileW(direct_path); DeleteFileW(empty_path); DeleteFileW(big_path);
+    DeleteFileW(unrelated_tmp); DeleteFileW(unrelated_target);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup);
+    DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir);
+    DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer);
+    DeleteObject(h->background);
+    transcript_dispose(&h->transcript);
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
 /* ---- Model palette / virtualized rows suite ------------------------------ */
 
 static int model_palette_suite(void) {
@@ -5645,6 +6011,8 @@ int main(void) {
     if (failed) return failed;
     failed=code_copy_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy fixtures) passed");
+    failed=export_suite();
+    if (failed) return failed;
+    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy + export fixtures) passed");
     return failed;
 }

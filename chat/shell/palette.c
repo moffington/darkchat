@@ -330,7 +330,7 @@ size_t palette_section_start(const Palette *palette, size_t section) {
 const wchar_t *palette_section_label(const Palette *palette, size_t section) {
     static const wchar_t *command_labels[CHAT_ACTION_GROUP_COUNT] = {
         L"Conversation", L"Response", L"Settings", L"Backend", L"Routing",
-        L"Customization"
+        L"Customization", L"Data"
     };
     static const wchar_t *model_labels[] = {
         L"Current", L"Recent", L"All"
