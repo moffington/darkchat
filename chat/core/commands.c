@@ -77,6 +77,8 @@ static const ChatActionInfo table[] = {
         CHAT_ACTION_GROUP_DATA, CHAT_ACTION_FLAG_NONE },
     { ACTION_EXPORT_ALL, L"Export &all conversations as JSON...", NULL,
         CHAT_ACTION_GROUP_DATA, CHAT_ACTION_FLAG_SEPARATOR_BEFORE },
+    { ACTION_IMPORT_JSON, L"&Import conversations from JSON...", NULL,
+        CHAT_ACTION_GROUP_DATA, CHAT_ACTION_FLAG_SEPARATOR_BEFORE },
 };
 
 int chat_action_dynamic_profile_index(int id) {
@@ -231,6 +233,7 @@ bool chat_action_available(int id, const ChatActionContext *context) {
     case ACTION_EXPORT_MARKDOWN:
     case ACTION_EXPORT_JSON:
     case ACTION_EXPORT_ALL:
+    case ACTION_IMPORT_JSON:
         return !context->generating;
     default:
         return false;

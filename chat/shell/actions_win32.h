@@ -33,6 +33,33 @@ ChatFileDialogResult chat_save_dialog(HWND owner, const wchar_t *title,
     const wchar_t *filter, const wchar_t *default_ext,
     const wchar_t *default_name, wchar_t *path, size_t capacity);
 
+/* Open-file dialog. Same result contract as chat_save_dialog: a real dialog
+    failure is distinct from a user cancellation. On ACCEPTED `path` holds the
+    chosen existing file. */
+ChatFileDialogResult chat_open_dialog(HWND owner, const wchar_t *title,
+    const wchar_t *filter, wchar_t *path, size_t capacity);
+
+/* Native UTF-8 file read. A too-large file is kept distinct from an
+    unreadable one and from an allocation failure, so a caller can report the
+    right reason (and so the importer's own size classification stays
+    reachable through the UI). */
+typedef enum {
+    CHAT_FILE_READ_OK,
+    CHAT_FILE_READ_TOO_LARGE,
+    CHAT_FILE_READ_OOM,
+    CHAT_FILE_READ_IO_ERROR
+} ChatFileReadResult;
+
+/* Reads `path` as raw UTF-8 with an upper bound of `limit` bytes. On OK, `*data`
+    owns a NUL-terminated buffer (release with free) and `*length` is its byte
+    count; a leading UTF-8 BOM is stripped. On every failure `*data` is NULL and
+    `*length` is 0. The bytes are not validated as UTF-8 here: the importer owns
+    that check. */
+ChatFileReadResult chat_read_file_utf8_limited(const wchar_t *path,
+    size_t limit, char **data, size_t *length);
+ChatFileReadResult chat_read_file_utf8(const wchar_t *path, char **data,
+    size_t *length);
+
 /* Writes `length` UTF-8 bytes to `path` atomically. A uniquely named
    same-directory temporary is created with CREATE_NEW, flushed with
    FlushFileBuffers, then moved over `path` with MOVEFILE_REPLACE_EXISTING |

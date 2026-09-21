@@ -224,6 +224,68 @@ bool __wrap_chat_write_file_utf8(const wchar_t *path, const char *data,
     if (write_file_fail) return false;
     return __real_chat_write_file_utf8(path, data, length);
 }
+/* Open-dialog seam (linked with -Wl,--wrap=chat_open_dialog): each call
+   consumes the next queued path/result; an exhausted queue is a cancel. */
+static wchar_t open_dialog_paths[8][512];
+static ChatFileDialogResult open_dialog_results[8];
+static int open_dialog_count, open_dialog_head, open_dialog_calls;
+ChatFileDialogResult __real_chat_open_dialog(HWND owner, const wchar_t *title,
+    const wchar_t *filter, wchar_t *path, size_t capacity);
+ChatFileDialogResult __wrap_chat_open_dialog(HWND owner, const wchar_t *title,
+    const wchar_t *filter, wchar_t *path, size_t capacity) {
+    (void)owner; (void)title; (void)filter;
+    ++open_dialog_calls;
+    if (open_dialog_head >= open_dialog_count)
+        return CHAT_FILE_DIALOG_CANCELLED;
+    ChatFileDialogResult result = open_dialog_results[open_dialog_head];
+    const wchar_t *queued = open_dialog_paths[open_dialog_head++];
+    if (result == CHAT_FILE_DIALOG_ACCEPTED) {
+        wcsncpy(path, queued, capacity - 1);
+        path[capacity - 1] = 0;
+    }
+    return result;
+}
+static void open_queue_clear(void) {
+    open_dialog_count = open_dialog_head = open_dialog_calls = 0;
+}
+static void open_queue_push(const wchar_t *path, ChatFileDialogResult result) {
+    if (open_dialog_count >= 8) return;
+    wcsncpy(open_dialog_paths[open_dialog_count], path, 511);
+    open_dialog_paths[open_dialog_count][511] = 0;
+    open_dialog_results[open_dialog_count++] = result;
+}
+/* File-reader seam (linked with -Wl,--wrap=chat_read_file_utf8): serves a
+   fixed in-memory payload or a queued failure. The reader's own boundary
+   behavior is tested directly against __real_chat_read_file_utf8_limited. */
+static char read_payload[65536];
+static size_t read_payload_length;
+static ChatFileReadResult read_result = CHAT_FILE_READ_OK;
+static int read_calls;
+ChatFileReadResult __real_chat_read_file_utf8(const wchar_t *path, char **data,
+    size_t *length);
+ChatFileReadResult __wrap_chat_read_file_utf8(const wchar_t *path, char **data,
+    size_t *length) {
+    (void)path;
+    ++read_calls;
+    *data = NULL;
+    *length = 0;
+    if (read_result != CHAT_FILE_READ_OK) return read_result;
+    char *copy = (char *)malloc(read_payload_length + 1);
+    if (!copy) return CHAT_FILE_READ_OOM;
+    memcpy(copy, read_payload, read_payload_length);
+    copy[read_payload_length] = 0;
+    *data = copy;
+    *length = read_payload_length;
+    return CHAT_FILE_READ_OK;
+}
+static void read_set(const char *bytes, size_t length,
+    ChatFileReadResult result) {
+    if (length > sizeof read_payload) length = sizeof read_payload;
+    if (bytes) memcpy(read_payload, bytes, length);
+    read_payload_length = length;
+    read_result = result;
+    read_calls = 0;
+}
 /* Export-timestamp seam (linked with -Wl,--wrap=chat_export_timestamp): a
     fixed value keeps host export tests byte-deterministic. */
 static int64_t export_timestamp_value = 1700000000000LL;
@@ -920,17 +982,19 @@ static int default_suite(void) {
             CHECK((info.hSubMenu!=NULL)==expected[i].submenu);
         }
         /* The Data submenu is the last top-level group: Markdown, JSON,
-            separator, Export all. Availability leaves them enabled at idle
-            and grays them while generating. */
+            separator, Export all, separator, Import. Availability leaves them
+            enabled at idle and grays them while generating. */
         {
             CHECK(GetMenuItemInfoW(bar,4,TRUE,&top));
             HMENU data=top.hSubMenu;
-            CHECK(data && GetMenuItemCount(data)==4);
+            CHECK(data && GetMenuItemCount(data)==6);
             static const struct { int id; bool separator; } data_expected[] = {
                 { ACTION_EXPORT_MARKDOWN, false },
                 { ACTION_EXPORT_JSON, false },
                 { 0, true },
                 { ACTION_EXPORT_ALL, false },
+                { 0, true },
+                { ACTION_IMPORT_JSON, false },
             };
             for (UINT i=0;i<(UINT)GetMenuItemCount(data) &&
                 i<sizeof data_expected/sizeof data_expected[0];i++) {
@@ -948,11 +1012,13 @@ static int default_suite(void) {
             CHECK(!(GetMenuState(data,ACTION_EXPORT_MARKDOWN,MF_BYCOMMAND)&MF_GRAYED));
             CHECK(!(GetMenuState(data,ACTION_EXPORT_JSON,MF_BYCOMMAND)&MF_GRAYED));
             CHECK(!(GetMenuState(data,ACTION_EXPORT_ALL,MF_BYCOMMAND)&MF_GRAYED));
+            CHECK(!(GetMenuState(data,ACTION_IMPORT_JSON,MF_BYCOMMAND)&MF_GRAYED));
             data_ctx.generating=true;
             chat_actions_sync(data,&data_ctx);
             CHECK(GetMenuState(data,ACTION_EXPORT_MARKDOWN,MF_BYCOMMAND)&MF_GRAYED);
             CHECK(GetMenuState(data,ACTION_EXPORT_JSON,MF_BYCOMMAND)&MF_GRAYED);
             CHECK(GetMenuState(data,ACTION_EXPORT_ALL,MF_BYCOMMAND)&MF_GRAYED);
+            CHECK(GetMenuState(data,ACTION_IMPORT_JSON,MF_BYCOMMAND)&MF_GRAYED);
         }
         /* The Apply submenu carries two nested popups, each with one item
             per live profile; names are mnemonic-escaped. */
@@ -5988,6 +6054,205 @@ static int model_palette_suite(void) {
     return 0;
 }
 
+/* ---- Import + native open/read suite ------------------------------------ */
+
+static int import_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Import host",1100,720,720,480,NULL,false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-import-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Import integration",
+        WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+
+    wchar_t bom_path[512],empty_path[512],exact_path[512],over_path[512];
+    swprintf(bom_path,512,L"%ls\\bom.json",dir);
+    swprintf(empty_path,512,L"%ls\\empty.json",dir);
+    swprintf(exact_path,512,L"%ls\\exact.json",dir);
+    swprintf(over_path,512,L"%ls\\over.json",dir);
+
+    /* ---- Direct real-reader boundary guarantees ---- */
+    {
+        const char *bom="\xEF\xBB\xBF{}";
+        CHECK(__real_chat_write_file_utf8(bom_path,bom,strlen(bom)));
+        char *data=(char *)0x1; size_t length=123;
+        CHECK(chat_read_file_utf8_limited(bom_path,64,&data,&length)==
+            CHAT_FILE_READ_OK);
+        CHECK(data && length==2 && !strcmp(data,"{}"));
+        free(data);
+
+        CHECK(__real_chat_write_file_utf8(empty_path,"",0));
+        data=(char *)0x1; length=123;
+        CHECK(chat_read_file_utf8_limited(empty_path,64,&data,&length)==
+            CHAT_FILE_READ_OK);
+        CHECK(data && length==0 && data[0]==0);
+        free(data);
+
+        /* Exact limit succeeds; one byte past it is classified, not read. */
+        CHECK(__real_chat_write_file_utf8(exact_path,"abcd",4));
+        data=(char *)0x1; length=123;
+        CHECK(chat_read_file_utf8_limited(exact_path,4,&data,&length)==
+            CHAT_FILE_READ_OK);
+        CHECK(data && length==4 && !strcmp(data,"abcd"));
+        free(data);
+
+        CHECK(__real_chat_write_file_utf8(over_path,"abcde",5));
+        data=(char *)0x1; length=123;
+        CHECK(chat_read_file_utf8_limited(over_path,4,&data,&length)==
+            CHAT_FILE_READ_TOO_LARGE);
+        CHECK(data==NULL && length==0);
+
+        data=(char *)0x1; length=123;
+        CHECK(chat_read_file_utf8_limited(L"Z:\\darkchat\\missing.json",4,
+            &data,&length)==CHAT_FILE_READ_IO_ERROR);
+        CHECK(data==NULL && length==0);
+        /* Rejected arguments clear the outputs too. */
+        data=(char *)0x1; length=123;
+        CHECK(chat_read_file_utf8_limited(NULL,4,&data,&length)==
+            CHAT_FILE_READ_IO_ERROR);
+        CHECK(data==NULL && length==0);
+    }
+
+    /* ---- A source chat whose export is the import payload ---- */
+    Chat *source=calloc(1,sizeof *source); CHECK(source);
+    chat_init(source); chat_clear(source);
+    ChatConversation *sc=&source->conversations[0];
+    sc->id=7; sc->created_at=1000; sc->modified_at=2000; sc->renamed=true;
+    wcscpy(sc->title,L"Imported one");
+    int mi=chat_append_at(source,0,CHAT_ROLE_USER,L"hello");
+    CHECK(mi>=0);
+    source->conversations[0].messages[mi].created_at=1500;
+    source->conversations[0].messages[mi].modified_at=1500;
+    mi=chat_append_at(source,0,CHAT_ROLE_ASSISTANT,L"world");
+    CHECK(mi>=0);
+    source->conversations[0].messages[mi].created_at=1600;
+    source->conversations[0].messages[mi].modified_at=1600;
+    source->conversations[0].messages[mi].generation.state=CHAT_GENERATION_COMPLETE;
+    JsonBuf out; CHECK(chat_export_json(source,0,true,7,&out));
+    chat_dispose(source); free(source);
+
+    /* ---- Cancel is a silent no-op: no read, no capture, no status ---- */
+    {
+        int count=chat->conversation_count;
+        open_queue_clear(); read_set(NULL,0,CHAT_FILE_READ_OK);
+        open_queue_push(L"ignored.json",CHAT_FILE_DIALOG_CANCELLED);
+        action(h,ACTION_IMPORT_JSON);
+        CHECK(chat->conversation_count==count);
+        CHECK(open_dialog_calls==1 && read_calls==0);
+    }
+
+    /* ---- Success appends and persists; active selection is untouched ---- */
+    {
+        int count=chat->conversation_count;
+        int active=chat->active;
+        open_queue_clear(); open_queue_push(L"import.json",CHAT_FILE_DIALOG_ACCEPTED);
+        read_set(out.data,out.length,CHAT_FILE_READ_OK);
+        /* Unsaved composer text proves capture_settings() runs on the import
+           path: it must land in the untouched active conversation and in the
+           durable snapshot. */
+        rich_text_set_text(&h->composer,L"unsaved draft before import");
+        uint64_t mutations=h->mutations;
+        action(h,ACTION_IMPORT_JSON);
+        CHECK(open_dialog_calls==1 && read_calls==1);
+        CHECK(chat->conversation_count==count+1);
+        CHECK(chat->active==active);
+        CHECK(h->mutations>mutations);
+        CHECK(!wcscmp(chat->status,L"Imported 1 conversation."));
+        CHECK(!wcscmp(chat->conversations[active].draft,
+            L"unsaved draft before import"));
+        {
+            char saved[65536];
+            size_t saved_length=export_read(h->storage.path,saved,sizeof saved);
+            CHECK(saved_length>0);
+            CHECK(strstr(saved,"unsaved draft before import")!=NULL);
+        }
+        const ChatConversation *imp=&chat->conversations[count];
+        CHECK(!wcscmp(imp->title,L"Imported one"));
+        CHECK(imp->message_count==2);
+        CHECK(!wcscmp(chat_message_text(&imp->messages[0]),L"hello"));
+        CHECK(imp->messages[1].generation.state==CHAT_GENERATION_COMPLETE);
+        CHECK(imp->messages[1].generation.cost==-1);
+    }
+
+    /* ---- Read failures and malformed payloads never mutate ---- */
+    {
+        int count=chat->conversation_count;
+        open_queue_clear(); open_queue_push(L"x.json",CHAT_FILE_DIALOG_ACCEPTED);
+        read_set(NULL,0,CHAT_FILE_READ_TOO_LARGE);
+        action(h,ACTION_IMPORT_JSON);
+        CHECK(chat->conversation_count==count);
+        CHECK(wcsstr(chat->status,L"larger than")!=NULL);
+
+        open_queue_clear(); open_queue_push(L"x.json",CHAT_FILE_DIALOG_ACCEPTED);
+        read_set(NULL,0,CHAT_FILE_READ_IO_ERROR);
+        action(h,ACTION_IMPORT_JSON);
+        CHECK(chat->conversation_count==count);
+        CHECK(wcsstr(chat->status,L"could not be read")!=NULL);
+
+        open_queue_clear(); open_queue_push(L"x.json",CHAT_FILE_DIALOG_ACCEPTED);
+        read_set(NULL,0,CHAT_FILE_READ_OOM);
+        action(h,ACTION_IMPORT_JSON);
+        CHECK(chat->conversation_count==count);
+        CHECK(wcsstr(chat->status,L"memory")!=NULL);
+
+        open_queue_clear(); open_queue_push(L"x.json",CHAT_FILE_DIALOG_ACCEPTED);
+        read_set("not a darkchat export",21,CHAT_FILE_READ_OK);
+        action(h,ACTION_IMPORT_JSON);
+        CHECK(chat->conversation_count==count);
+        CHECK(wcsstr(chat->status,L"not a valid")!=NULL);
+    }
+
+    /* ---- Generating disables the action before any dialog opens ---- */
+    {
+        int count=chat->conversation_count;
+        int calls=open_dialog_calls;
+        h->generating=true;
+        action(h,ACTION_IMPORT_JSON);
+        h->generating=false;
+        CHECK(open_dialog_calls==calls);
+        CHECK(chat->conversation_count==count);
+    }
+
+    /* ---- A failed durability flush is not overwritten by success ---- */
+    {
+        int count=chat->conversation_count;
+        open_queue_clear(); open_queue_push(L"x.json",CHAT_FILE_DIALOG_ACCEPTED);
+        read_set(out.data,out.length,CHAT_FILE_READ_OK);
+        bool writable=h->storage.writable;
+        h->storage.writable=false;
+        action(h,ACTION_IMPORT_JSON);
+        h->storage.writable=writable;
+        CHECK(chat->conversation_count==count+1);
+        CHECK(!wcscmp(chat->status,CHAT_SAVE_FAILED));
+    }
+
+    open_queue_clear(); read_set(NULL,0,CHAT_FILE_READ_OK);
+    json_buf_free(&out);
+    saver_shutdown(&h->saver); storage_close(&h->storage);
+    DeleteFileW(bom_path); DeleteFileW(empty_path);
+    DeleteFileW(exact_path); DeleteFileW(over_path);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup);
+    DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir);
+    DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer);
+    DeleteObject(h->background);
+    transcript_dispose(&h->transcript);
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
 int main(void) {
     /* The fixtures share one process and never unload Msftedit: repeated
         unload/reload cycles across fixtures can fail its DllMain with
@@ -6013,6 +6278,8 @@ int main(void) {
     if (failed) return failed;
     failed=export_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy + export fixtures) passed");
+    failed=import_suite();
+    if (failed) return failed;
+    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy + export + import fixtures) passed");
     return failed;
 }

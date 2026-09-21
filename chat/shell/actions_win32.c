@@ -1,4 +1,5 @@
 #include "chat/shell/actions_win32.h"
+#include "chat/import/import.h"
 #include <commdlg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,6 +109,82 @@ ChatFileDialogResult chat_save_dialog(HWND owner, const wchar_t *title,
        dialog failure (invalid flags, out of memory, ...). */
     return CommDlgExtendedError() == 0 ? CHAT_FILE_DIALOG_CANCELLED
                                        : CHAT_FILE_DIALOG_ERROR;
+}
+
+ChatFileDialogResult chat_open_dialog(HWND owner, const wchar_t *title,
+    const wchar_t *filter, wchar_t *path, size_t capacity) {
+    if (!path || capacity == 0) return CHAT_FILE_DIALOG_ERROR;
+    path[0] = 0;
+    OPENFILENAMEW ofn;
+    memset(&ofn, 0, sizeof ofn);
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = (DWORD)capacity;
+    ofn.lpstrTitle = title;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER |
+        OFN_NOCHANGEDIR;
+    if (GetOpenFileNameW(&ofn)) return CHAT_FILE_DIALOG_ACCEPTED;
+    return CommDlgExtendedError() == 0 ? CHAT_FILE_DIALOG_CANCELLED
+                                       : CHAT_FILE_DIALOG_ERROR;
+}
+
+ChatFileReadResult chat_read_file_utf8_limited(const wchar_t *path,
+    size_t limit, char **data, size_t *length) {
+    if (data) *data = NULL;
+    if (length) *length = 0;
+    if (!path || !path[0] || !data || !length) return CHAT_FILE_READ_IO_ERROR;
+    HANDLE file = CreateFileW(path, GENERIC_READ,
+        FILE_SHARE_READ, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return CHAT_FILE_READ_IO_ERROR;
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0) {
+        CloseHandle(file);
+        return CHAT_FILE_READ_IO_ERROR;
+    }
+    /* Reject an oversized file before allocating, so a huge file cannot cause
+       a huge allocation just to be discarded. */
+    if ((uint64_t)size.QuadPart > (uint64_t)limit) {
+        CloseHandle(file);
+        return CHAT_FILE_READ_TOO_LARGE;
+    }
+    size_t bytes = (size_t)size.QuadPart;
+    char *buffer = (char *)malloc(bytes + 1);
+    if (!buffer) {
+        CloseHandle(file);
+        return CHAT_FILE_READ_OOM;
+    }
+    size_t got = 0;
+    while (got < bytes) {
+        DWORD chunk = 0;
+        size_t remaining = bytes - got;
+        DWORD request = remaining > (size_t)MAXDWORD
+            ? MAXDWORD : (DWORD)remaining;
+        if (!ReadFile(file, buffer + got, request, &chunk, NULL) || chunk == 0) {
+            CloseHandle(file);
+            free(buffer);
+            return CHAT_FILE_READ_IO_ERROR;
+        }
+        got += chunk;
+    }
+    CloseHandle(file);
+    /* A leading UTF-8 BOM is not part of the JSON document. */
+    if (bytes >= 3 && (unsigned char)buffer[0] == 0xEF &&
+        (unsigned char)buffer[1] == 0xBB && (unsigned char)buffer[2] == 0xBF) {
+        memmove(buffer, buffer + 3, bytes - 3);
+        bytes -= 3;
+    }
+    buffer[bytes] = 0;
+    *data = buffer;
+    *length = bytes;
+    return CHAT_FILE_READ_OK;
+}
+
+ChatFileReadResult chat_read_file_utf8(const wchar_t *path, char **data,
+    size_t *length) {
+    return chat_read_file_utf8_limited(path, CHAT_IMPORT_LIMIT, data, length);
 }
 
 bool chat_write_file_utf8(const wchar_t *path, const char *data, size_t length) {

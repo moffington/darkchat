@@ -9,6 +9,7 @@
 #include "chat/persistence/storage.h"
 #include "chat/persistence/saver.h"
 #include "chat/export/export.h"
+#include "chat/import/import.h"
 #include "chat/shell/actions_win32.h"
 #include "chat/models/model_catalog.h"
 #include "chat/models/model_catalog_winhttp.h"
@@ -1866,6 +1867,81 @@ static void export_conversation(ChatHost *host, bool json, bool all) {
                              : L"Could not write the export file.");
 }
 
+static const wchar_t *import_failure_text(ChatImportStatus status) {
+    switch (status) {
+    case CHAT_IMPORT_MALFORMED:
+        return L"Import failed: the file is not a valid DarkChat JSON export.";
+    case CHAT_IMPORT_TOO_LARGE:
+        return L"Import failed: the export or one of its fields exceeds the allowed size.";
+    case CHAT_IMPORT_CAPACITY:
+        return L"Import failed: not enough conversation or message capacity.";
+    case CHAT_IMPORT_OOM:
+        return L"Import failed: not enough memory.";
+    default:
+        return L"Import failed.";
+    }
+}
+
+/* Imports conversations from a native JSON file. Mutating, so the live
+   composer/model are captured before the durability flush; the active
+   conversation is never changed, so its transcript is deliberately not
+   invalidated or re-rendered. The sidebar remap, the reveal of the first
+   imported row and the paint all ride the normal flush. */
+static void import_conversations(ChatHost *host) {
+    Chat *chat = host->config.chat;
+    wchar_t path[1024];
+    const wchar_t *filter = L"JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
+    ChatFileDialogResult dialog = chat_open_dialog(host->window,
+        L"Import conversations from JSON", filter, path,
+        sizeof path / sizeof *path);
+    if (dialog == CHAT_FILE_DIALOG_CANCELLED) return;
+    if (dialog == CHAT_FILE_DIALOG_ERROR) {
+        set_status(host, L"Could not open the import dialog.");
+        return;
+    }
+    char *data = NULL;
+    size_t length = 0;
+    ChatFileReadResult read = chat_read_file_utf8(path, &data, &length);
+    if (read == CHAT_FILE_READ_TOO_LARGE) {
+        set_status(host,
+            L"Import failed: the file is larger than the 128 MB limit.");
+        return;
+    }
+    if (read == CHAT_FILE_READ_OOM) {
+        free(data);
+        set_status(host, L"Import failed: not enough memory to read the file.");
+        return;
+    }
+    if (read != CHAT_FILE_READ_OK) {
+        free(data);
+        set_status(host, L"Import failed: the file could not be read.");
+        return;
+    }
+    int before = chat->conversation_count;
+    ChatImportStats stats;
+    ChatImportStatus status = chat_import_json(chat, data, length, &stats);
+    free(data);
+    if (status != CHAT_IMPORT_OK) {
+        set_status(host, import_failure_text(status));
+        return;
+    }
+    capture_settings(host);
+    mark_dirty(host);
+    if (stats.conversations_added > 0 && before < chat->conversation_count)
+        chat_ui_request_reveal(&host->chat_ui, chat->conversations[before].id);
+    /* save_sync raises the save-failure status itself; never overwrite it
+       with a success message. */
+    if (save_sync(host)) {
+        wchar_t message[CHAT_STATUS_TEXT];
+        swprintf(message, CHAT_STATUS_TEXT, L"Imported %d conversation%s.",
+            stats.conversations_added,
+            stats.conversations_added == 1 ? L"" : L"s");
+        message[CHAT_STATUS_TEXT - 1] = 0;
+        set_status(host, message);
+    }
+    flush(host);
+}
+
 /* Anchors the complete retained command menu under the overflow button. The
    default presentation has no menu bar, but every Conversation, Response and
    Settings command stays reachable here (and through its keyboard shortcut).
@@ -1928,6 +2004,12 @@ static void action(ChatHost *host, int code) {
            trigger a save. */
         export_conversation(host,code!=ACTION_EXPORT_MARKDOWN,
             code==ACTION_EXPORT_ALL);
+        return;
+    }
+    if (code==ACTION_IMPORT_JSON) {
+        /* Mutating: import_conversations() captures settings and flushes
+           itself, so it must not fall through to the shared tail. */
+        import_conversations(host);
         return;
     }
     capture_settings(host);
