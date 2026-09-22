@@ -279,6 +279,11 @@ typedef struct {
        snapshot field), 1 = collapsed. The temporary narrow-width drawer is
        session state and is never persisted. Additive at snapshot format 3. */
     int sidebar_collapsed;
+    /* Completion-notification preference: 0 = enabled (the historical default
+       and the meaning of an absent snapshot field), 1 = the user turned tray
+       notifications off. Additive at snapshot format 3, so an enabled store
+       keeps its exact byte shape. */
+    int notify_disabled;
 } Chat;
 
 int64_t chat_now(void);

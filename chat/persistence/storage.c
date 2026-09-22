@@ -245,6 +245,11 @@ static bool encode(const Chat *chat, JsonBuf *b) {
         number(b, "backend", (double)chat->backend);
     if (chat->ollama_model[0])
         string(b, "ollama_model", chat->ollama_model);
+    /* Additive completion-notification preference: emitted only when the user
+       disabled notifications, so an enabled store keeps the older byte shape
+       and an older build ignores the field (a missing value means enabled). */
+    if (chat->notify_disabled)
+        number(b, "notify_disabled", 1);
     /* Format 4 only: the profile-library count, appended last so a v3-shaped
        uncustomized settings record keeps its exact byte shape. */
     if (version >= 4)
@@ -417,6 +422,14 @@ static bool decode(char *data, Chat *chat) {
     chat->backend=(ChatBackend)backend_value;
     if (!optional_string(line,"ollama_model",chat->ollama_model,CHAT_MODEL_TEXT))
         goto bad;
+    /* Additive completion-notification preference: absent in older snapshots
+       and defaulted to enabled. A present but malformed value is corruption. */
+    {
+        int notify_disabled;
+        if (!optional_int(line,"notify_disabled",0,1,0,&notify_disabled))
+            goto bad;
+        chat->notify_disabled=notify_disabled;
+    }
     /* An Ollama-active snapshot must remember the local model it will send:
         an empty slot would make the next request unusable and is corruption. */
     if (chat->backend == CHAT_BACKEND_OLLAMA && !chat->ollama_model[0])

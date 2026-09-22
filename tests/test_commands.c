@@ -187,7 +187,8 @@ static void test_availability_matrix(Chat *chat) {
     const int generating[] = { ACTION_RENAME, ACTION_DELETE, ACTION_DELETE_ALL,
         ACTION_CLEAR, ACTION_RETRY, ACTION_REGENERATE, ACTION_EDIT,
         ACTION_CANCEL_EDIT, ACTION_SELECTION, ACTION_SYSTEM, ACTION_SIDEBAR,
-        ACTION_MODELS, ACTION_BACKEND_OPENROUTER, ACTION_BACKEND_OLLAMA,
+        ACTION_MODELS, ACTION_NOTIFY_FINISH,
+        ACTION_BACKEND_OPENROUTER, ACTION_BACKEND_OLLAMA,
         ACTION_MODEL_USE_HERE, ACTION_MODEL_CLEAR_HERE, ACTION_SYSTEM_HERE,
         ACTION_SYSTEM_CLEAR_HERE,         ACTION_PROFILE_APPLY, ACTION_PROFILE_SAVE,
         ACTION_PROFILE_EDIT, ACTION_PROFILE_DELETE,
@@ -247,6 +248,14 @@ static void test_availability_matrix(Chat *chat) {
     chat_action_context_init(&context, chat);
     context.generating = true;
     expect_disabled(&context, "Ollama generating", generating, ARRAY_LEN(generating));
+
+    /* The notification check mark reads the same pure context. */
+    reset(chat);
+    chat_action_context_init(&context, chat);
+    check(context.notify_enabled, "notifications enabled by default");
+    chat->notify_disabled = 1;
+    chat_action_context_init(&context, chat);
+    check(!context.notify_enabled, "notifications disabled reflected in context");
 }
 
 /* The dynamic profile submenu ids are deliberately outside the static

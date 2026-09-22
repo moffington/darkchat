@@ -34,6 +34,13 @@
    inside the click handler lets the popup's own input loop see the held
    capture and dismiss it immediately. */
 #define CHAT_WM_ACTIONS_MENU (WM_APP + 0x52)
+/* Tray callback message. With NOTIFYICON_VERSION_4 the notification event is
+   in LOWORD(lParam) and the cursor position in wParam. */
+#define CHAT_WM_TRAY (WM_APP + 0x53)
+/* A generation shorter than this is not worth a balloon. */
+#define CHAT_NOTIFY_MIN_MS 5000
+/* Resource id of the application icon in app.rc. */
+#define CHAT_APP_ICON_ID 1
 
 typedef struct {
     ChatHostConfig config;
@@ -122,6 +129,15 @@ typedef struct {
     int copy_block;
     bool copy_hovering;
     HFONT copy_font;
+    /* App identity and notifications: `icon` is the shared small icon (loaded
+       once at startup, never destroyed); `taskbar_created_message` is the
+       Explorer-restart broadcast to re-add the tray; `notified_conversation_id`
+       is the conversation a displayed balloon belongs to, snapshotted at show
+       time and preserved until another balloon replaces it. */
+    HICON icon;
+    bool tray_visible;
+    UINT taskbar_created_message;
+    uint64_t notified_conversation_id;
 
 } ChatHost;
 
@@ -129,6 +145,7 @@ static void flush(ChatHost *host);
 static void render_transcript(ChatHost *host);
 static void perform_send(ChatHost *host);
 static void action(ChatHost *host, int code);
+static void command(void *user, ChatCommand code, int index);
 static bool save(ChatHost *host);
 static void capture_settings(ChatHost *host);
 static bool surface_key(void *user, WPARAM key, bool shift, bool control,
@@ -1579,6 +1596,103 @@ static void append_reasoning_delta(ChatHost *host, CompletionEvent *event) {
     }
 }
 
+/* ---- Tray icon and completion notifications ------------------------------ */
+
+/* The tray helpers live here (not with the low-level seam in actions_win32.c)
+   so their calls to chat_shell_notify are cross-translation-unit references
+   that -Wl,--wrap intercepts in the tests; a same-unit call would not be
+   reliably replaced. */
+
+bool chat_tray_show(HWND window, HICON icon, UINT callback_message,
+    const wchar_t *tip) {
+    NOTIFYICONDATAW data;
+    memset(&data, 0, sizeof data);
+    data.cbSize = sizeof data;
+    data.hWnd = window;
+    data.uID = CHAT_TRAY_ICON_ID;
+    /* NIF_SHOWTIP is required to keep the standard tooltip: with
+       NOTIFYICON_VERSION_4 the shell otherwise suppresses it in favor of an
+       application-drawn popup that we do not provide. */
+    data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+    data.uCallbackMessage = callback_message;
+    data.hIcon = icon;
+    if (tip)
+        wcsncpy(data.szTip, tip, sizeof data.szTip / sizeof *data.szTip - 1);
+    if (!chat_shell_notify(&data, NIM_ADD)) return false;
+    /* The shell requires the version call after every add (including after an
+       Explorer restart re-add). A failed version call would leave an
+       untracked icon, so it is rolled back immediately. */
+    data.uVersion = NOTIFYICON_VERSION_4;
+    data.uFlags = NIF_SHOWTIP;
+    if (!chat_shell_notify(&data, NIM_SETVERSION)) {
+        chat_shell_notify(&data, NIM_DELETE);
+        return false;
+    }
+    return true;
+}
+
+bool chat_tray_hide(HWND window) {
+    NOTIFYICONDATAW data;
+    memset(&data, 0, sizeof data);
+    data.cbSize = sizeof data;
+    data.hWnd = window;
+    data.uID = CHAT_TRAY_ICON_ID;
+    return chat_shell_notify(&data, NIM_DELETE);
+}
+
+bool chat_tray_balloon(HWND window, const wchar_t *title, const wchar_t *text) {
+    NOTIFYICONDATAW data;
+    memset(&data, 0, sizeof data);
+    data.cbSize = sizeof data;
+    data.hWnd = window;
+    data.uID = CHAT_TRAY_ICON_ID;
+    data.uFlags = NIF_INFO;
+    if (title)
+        wcsncpy(data.szInfoTitle, title,
+            sizeof data.szInfoTitle / sizeof *data.szInfoTitle - 1);
+    if (text)
+        wcsncpy(data.szInfo, text, sizeof data.szInfo / sizeof *data.szInfo - 1);
+    data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+    return chat_shell_notify(&data, NIM_MODIFY);
+}
+
+/* Restores the window and selects the conversation a displayed balloon
+   belongs to. The id is snapshotted when the balloon is shown, never read
+   from the live request, so a newer generation cannot redirect an older
+   balloon's click. */
+static void activate_notified_conversation(ChatHost *host) {
+    if (IsIconic(host->window)) ShowWindow(host->window, SW_RESTORE);
+    chat_set_foreground(host->window);
+    if (host->notified_conversation_id) {
+        int index = chat_index_of_id(host->config.chat,
+            host->notified_conversation_id);
+        if (index >= 0 && index != host->config.chat->active)
+            command(host, CHAT_COMMAND_SELECT, index);
+    }
+    if (host->composer.window) SetFocus(host->composer.window);
+}
+
+/* Notifies that a long generation finished while the app was not foreground.
+   Only the terminal states a user would want to hear about qualify; a user
+   cancellation does not. */
+static void notify_finished_request(ChatHost *host, ChatGenerationState state) {
+    if (host->config.chat->notify_disabled || !host->tray_visible) return;
+    if (state != CHAT_GENERATION_COMPLETE && state != CHAT_GENERATION_FAILED &&
+        state != CHAT_GENERATION_INTERRUPTED) return;
+    if (GetTickCount64() - host->started_tick < CHAT_NOTIFY_MIN_MS) return;
+    if (chat_foreground_window() == host->window) return;
+    if (host->request_conversation < 0 ||
+        host->request_conversation >= host->config.chat->conversation_count)
+        return;
+    const ChatConversation *c =
+        &host->config.chat->conversations[host->request_conversation];
+    wchar_t text[CHAT_STATUS_TEXT];
+    swprintf(text, sizeof text / sizeof *text, L"%ls \u2014 %ls",
+        chat_generation_name(state), c->title);
+    if (chat_tray_balloon(host->window, L"DarkChat", text))
+        host->notified_conversation_id = c->id;
+}
+
 static void finish_request(ChatHost *host, CompletionEvent *event) {
     end_reasoning(host);
     double reasoning_ms=pending(host)->generation.reasoning_ms;
@@ -1606,6 +1720,9 @@ static void finish_request(ChatHost *host, CompletionEvent *event) {
     host->context_dropped=0;   /* the omission count belongs to the live request */
     chat_ui_set_generation(&host->chat_ui,false,false); EnableWindow(host->field.window,TRUE);
     set_status(host,chat_generation_name(g->state));
+    /* A long generation that finished while the app was not foreground raises
+       one balloon; the conversation id is snapshotted for a later click. */
+    notify_finished_request(host, g->state);
     /* The full transcript render flushes any body rebuild the streaming
        throttle had deferred, so the terminal Markdown is always visible. */
     cancel_body_flush(host);
@@ -1973,18 +2090,12 @@ static void import_conversations(ChatHost *host, bool markdown) {
     flush(host);
 }
 
-/* Anchors the complete retained command menu under the overflow button. The
-   default presentation has no menu bar, but every Conversation, Response and
-   Settings command stays reachable here (and through its keyboard shortcut).
-   TrackPopupMenu's WM_INITMENUPOPUP runs the live availability and
-   routing/backend sync. */
-static void open_actions_menu(ChatHost *host) {
+/* TrackPopupMenu at an explicit screen point. The header overflow button and
+   the tray callback share this; the tray anchor must not be the header button,
+   which can be off-screen while the window is minimized. TrackPopupMenu's
+   WM_INITMENUPOPUP runs the live availability and routing/backend sync. */
+static void open_actions_menu_at(ChatHost *host, POINT point) {
     copy_pill_hide(host);
-    UiRect r = chat_ui_rect(&host->chat_ui, host->chat_ui.overflow);
-    /* The arranged rectangle is in 96-DPI DIPs; ClientToScreen expects
-       physical pixels, so both coordinates scale before the conversion. */
-    POINT point = { px(host, r.x + r.w), px(host, r.y + r.h + 4) };
-    ClientToScreen(host->window, &point);
     HMENU menu = chat_actions_menu(host->config.chat);
     if (!menu) return;
     SetForegroundWindow(host->window);
@@ -1994,6 +2105,18 @@ static void open_actions_menu(ChatHost *host) {
     if (command_id) action(host, command_id);
     /* MSDN: a queued null message lets the menu dismiss cleanly. */
     PostMessageW(host->window, WM_NULL, 0, 0);
+}
+
+/* Anchors the complete retained command menu under the overflow button. The
+   default presentation has no menu bar, but every Conversation, Response and
+   Settings command stays reachable here (and through its keyboard shortcut). */
+static void open_actions_menu(ChatHost *host) {
+    UiRect r = chat_ui_rect(&host->chat_ui, host->chat_ui.overflow);
+    /* The arranged rectangle is in 96-DPI DIPs; ClientToScreen expects
+       physical pixels, so both coordinates scale before the conversion. */
+    POINT point = { px(host, r.x + r.w), px(host, r.y + r.h + 4) };
+    ClientToScreen(host->window, &point);
+    open_actions_menu_at(host, point);
 }
 
 static void action(ChatHost *host, int code) {
@@ -2184,6 +2307,11 @@ static void action(ChatHost *host, int code) {
             }
             set_status(host,L"Prompt profile deleted.");
         }
+    } else if (code==ACTION_NOTIFY_FINISH) {
+        chat->notify_disabled = !chat->notify_disabled;
+        set_status(host,chat->notify_disabled ?
+            L"Completion notifications off." :
+            L"Completion notifications on for long responses.");
     } else if (code>=ACTION_ROUTING_SORT_DEFAULT && code<=ACTION_ROUTING_ZDR) {
         /* OpenRouter provider routing has no meaning for a local Ollama
            request. The menu items are grayed while Ollama is active; a stale
@@ -2888,6 +3016,16 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         SetWindowLongPtrW(window, GWLP_USERDATA, (LONG_PTR)host);
     }
     if (!host) return DefWindowProcW(window, message, w, l);
+    /* Explorer can restart and discard every tray icon; the shell's broadcast
+       uses a runtime-registered message id, so it must be tested before the
+       switch (a runtime value cannot be a case label). */
+    if (host->taskbar_created_message && message == host->taskbar_created_message) {
+        host->tray_visible = false;
+        if (host->icon)
+            host->tray_visible = chat_tray_show(window, host->icon,
+                CHAT_WM_TRAY, L"DarkChat");
+        return 0;
+    }
     Ui *u = host->config.ui;
     switch (message) {
     case WM_CREATE: {
@@ -2938,6 +3076,12 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             ui_set_accessible_name(u, u->root, host->config.title);
         host->accessibility = ui_accessibility_create(window, u);
         if (!host->accessibility) return -1;
+        /* App identity: add the tray icon and remember the Explorer-restart
+           broadcast. A zero/unknown message id simply disables re-adding. */
+        host->taskbar_created_message = RegisterWindowMessageW(L"TaskbarCreated");
+        if (host->icon)
+            host->tray_visible = chat_tray_show(window, host->icon,
+                CHAT_WM_TRAY, L"DarkChat");
         /* No menu bar: the header's overflow button (and the retained
            keyboard shortcuts) carries every command. */
         SetTimer(window,2,1000,NULL);
@@ -3259,11 +3403,29 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         SetFocus(window);
         DestroyWindow(window);
         return 0;
+    case CHAT_WM_TRAY: {
+        /* NOTIFYICON_VERSION_4: LOWORD(lParam) is the event; wParam carries
+           the cursor position (0,0 for a keyboard activation). */
+        WORD event = LOWORD(l);
+        if (event == WM_CONTEXTMENU) {
+            POINT point = { GET_X_LPARAM(w), GET_Y_LPARAM(w) };
+            if (!point.x && !point.y) GetCursorPos(&point);
+            open_actions_menu_at(host, point);
+        } else if (event == WM_LBUTTONUP || event == NIN_SELECT ||
+            event == NIN_KEYSELECT || event == NIN_BALLOONUSERCLICK) {
+            activate_notified_conversation(host);
+        }
+        return 0;
+    }
     case WM_ACTIVATE:
         ui_set_active(u, LOWORD(w) != WA_INACTIVE);
         flush(host);
         return 0;
     case WM_DESTROY:
+        if (host->tray_visible) {
+            chat_tray_hide(window);
+            host->tray_visible = false;
+        }
         KillTimer(window, 1);
         KillTimer(window, 2);
         KillTimer(window, CHAT_TIMER_BODY_FLUSH);
@@ -3346,11 +3508,24 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
     config->ui->measure_user = &host->renderer;
     host->background = CreateSolidBrush(rgb(config->ui->theme.colors[UI_BG]));
     if (!host->background) goto cleanup;
+    /* Load the application identity before the class is registered: the class
+       must already carry hIcon/hIconSm. Both handles are LR_SHARED (owned by
+       the module, never destroyed); the small one is retained for the tray. */
+    HICON app_icon = (HICON)LoadImageW(instance,
+        MAKEINTRESOURCEW(CHAT_APP_ICON_ID), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+    HICON app_icon_small = (HICON)LoadImageW(instance,
+        MAKEINTRESOURCEW(CHAT_APP_ICON_ID), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+        LR_SHARED);
+    host->icon = app_icon_small;
     WNDCLASSEXW cls = { 0 };
     cls.cbSize = sizeof cls;
     cls.lpfnWndProc = window_proc;
     cls.hInstance = instance;
     cls.hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512));
+    cls.hIcon = app_icon;
+    cls.hIconSm = app_icon_small;
     cls.lpszClassName = L"DarkChat.Window";
     if (!RegisterClassExW(&cls)) goto cleanup;
     WNDCLASSEXW view_cls = { 0 };

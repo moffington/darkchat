@@ -137,6 +137,63 @@ bool __wrap_chat_copy_text(HWND owner, const wchar_t *text) {
     copied_text[8191] = 0;
     return copy_result;
 }
+/* Tray/notification seams (linked with -Wl,--wrap=chat_shell_notify and
+   -Wl,--wrap=chat_foreground_window). The real tray helpers build the
+   NOTIFYICONDATAW, so the wrapper records the operation and the whole
+   structure: flags, id, callback message, icon and version are asserted, not
+   just the call count. The foreground query is injected so the trigger is
+   deterministic in a headless window. */
+#define NOTIFY_CALL_CAPACITY 64
+static struct {
+    DWORD operation;
+    NOTIFYICONDATAW data;
+} notify_calls[NOTIFY_CALL_CAPACITY];
+static int notify_count;
+static bool notify_result = true;
+static int notify_fail_index = -1;   /* 0-based call to fail; -1 never */
+bool __real_chat_shell_notify(NOTIFYICONDATAW *data, DWORD operation);
+bool __wrap_chat_shell_notify(NOTIFYICONDATAW *data, DWORD operation) {
+    int index = notify_count;
+    if (notify_count < NOTIFY_CALL_CAPACITY) {
+        notify_calls[notify_count].operation = operation;
+        notify_calls[notify_count].data = *data;
+    }
+    ++notify_count;
+    if (index == notify_fail_index) return false;
+    return notify_result;
+}
+static void notify_reset(void) {
+    notify_count = 0;
+    notify_result = true;
+    notify_fail_index = -1;
+}
+static int notify_op_count(DWORD operation) {
+    int count = 0;
+    for (int i = 0; i < notify_count && i < NOTIFY_CALL_CAPACITY; i++)
+        if (notify_calls[i].operation == operation) count++;
+    return count;
+}
+static NOTIFYICONDATAW *last_balloon(void) {
+    int top = notify_count < NOTIFY_CALL_CAPACITY ? notify_count
+                                                  : NOTIFY_CALL_CAPACITY;
+    for (int i = top - 1; i >= 0; i--)
+        if (notify_calls[i].operation == NIM_MODIFY) return &notify_calls[i].data;
+    return NULL;
+}
+static HWND foreground_window_override;
+static bool foreground_window_forced;
+HWND __real_chat_foreground_window(void);
+HWND __wrap_chat_foreground_window(void) {
+    return foreground_window_forced ? foreground_window_override
+                                    : __real_chat_foreground_window();
+}
+static int set_foreground_calls;
+bool __real_chat_set_foreground(HWND window);
+bool __wrap_chat_set_foreground(HWND window) {
+    (void)window;
+    ++set_foreground_calls;
+    return true;
+}
 /* Edit-dialog seam (linked with -Wl,--wrap=chat_edit_dialog): dialog-opening
     actions (per-conversation prompts, profile save/edit) are driven
     deterministically. Each call consumes the next queued answer; with the
@@ -6357,6 +6414,156 @@ static int import_suite(void) {
     return 0;
 }
 
+/* ---- Tray identity and completion notifications --------------------------- */
+
+static int notify_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Notify host",1100,720,720,480,NULL,false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-notify-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    /* The test executable links no app.rc, so supply a shared stock icon the
+       way chat_host_run's resource load would. */
+    h->icon=LoadIconW(NULL,(LPCWSTR)IDI_APPLICATION);
+    CHECK(h->icon);
+    notify_reset();
+    HWND window=CreateWindowW(cls.lpszClassName,L"Notify integration",WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+
+    /* WM_CREATE added the tray with a callback message, an icon and a tooltip,
+       then set the version the shell needs to deliver those events. */
+    CHECK(h->tray_visible);
+    CHECK(notify_count>=2);
+    CHECK(notify_calls[0].operation==NIM_ADD);
+    CHECK(notify_calls[0].data.hWnd==window);
+    CHECK(notify_calls[0].data.uID==CHAT_TRAY_ICON_ID);
+    CHECK(notify_calls[0].data.uCallbackMessage==CHAT_WM_TRAY);
+    CHECK(notify_calls[0].data.hIcon==h->icon);
+    CHECK((notify_calls[0].data.uFlags&(NIF_ICON|NIF_MESSAGE|NIF_TIP))==
+        (NIF_ICON|NIF_MESSAGE|NIF_TIP));
+    /* Version 4 suppresses the standard tooltip unless NIF_SHOWTIP is set. */
+    CHECK((notify_calls[0].data.uFlags&NIF_SHOWTIP)!=0);
+    CHECK(notify_calls[0].data.szTip[0]!=0);
+    CHECK(notify_calls[1].operation==NIM_SETVERSION);
+    CHECK(notify_calls[1].data.uVersion==NOTIFYICON_VERSION_4);
+    CHECK((notify_calls[1].data.uFlags&NIF_SHOWTIP)!=0);
+
+    /* A failed version call rolls the just-added icon back so no untracked
+       icon can outlive a false tray_visible. */
+    notify_reset();
+    notify_fail_index=1;
+    CHECK(!chat_tray_show(window,h->icon,CHAT_WM_TRAY,L"DarkChat"));
+    CHECK(notify_op_count(NIM_ADD)==1);
+    CHECK(notify_op_count(NIM_SETVERSION)==1);
+    CHECK(notify_op_count(NIM_DELETE)==1);
+
+    /* Explorer restart: the broadcast re-adds and re-sets the version. */
+    notify_reset();
+    UINT taskbar_msg=RegisterWindowMessageW(L"TaskbarCreated");
+    CHECK(taskbar_msg);
+    SendMessageW(window,taskbar_msg,0,0);
+    CHECK(notify_op_count(NIM_ADD)==1);
+    CHECK(notify_op_count(NIM_SETVERSION)==1);
+    CHECK(h->tray_visible);
+
+    /* Trigger matrix. An eligible long completion of an unfocused window
+       raises exactly one balloon naming the conversation and state. A real
+       keyless send first establishes the conversation and its user turn;
+       each iteration regenerates the latest response. */
+    rich_text_set_text(&h->composer,L"ask A");
+    perform_send(h);
+    CHECK(!h->generating &&
+        pending(h)->generation.state==CHAT_GENERATION_FAILED);
+    ChatConversation *conv_a=&chat->conversations[chat->active];
+    uint64_t id_a=conv_a->id;
+    wchar_t title_a[CHAT_TITLE_TEXT]; wcscpy(title_a,conv_a->title);
+    foreground_window_forced=true; foreground_window_override=(HWND)1;
+    notify_reset();
+    begin_regenerate(h);
+    h->started_tick=GetTickCount64()-6000;
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"long answer"));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+    CHECK(notify_op_count(NIM_MODIFY)==1);
+    CHECK(h->notified_conversation_id==id_a);
+    {
+        NOTIFYICONDATAW *balloon=last_balloon();
+        CHECK(balloon);
+        CHECK(!wcscmp(balloon->szInfoTitle,L"DarkChat"));
+        CHECK(wcsstr(balloon->szInfo,L"Complete")!=NULL);
+        CHECK(wcsstr(balloon->szInfo,title_a)!=NULL);
+    }
+    /* A short completion is silent. */
+    notify_reset();
+    begin_regenerate(h); h->started_tick=GetTickCount64();
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"quick"));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+    CHECK(notify_op_count(NIM_MODIFY)==0);
+    /* A foreground completion is silent. */
+    notify_reset();
+    foreground_window_override=window;
+    begin_regenerate(h); h->started_tick=GetTickCount64()-6000;
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"focused"));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+    CHECK(notify_op_count(NIM_MODIFY)==0);
+    /* The preference disables it. */
+    foreground_window_override=(HWND)1;
+    chat->notify_disabled=1;
+    notify_reset();
+    begin_regenerate(h); h->started_tick=GetTickCount64()-6000;
+    handle_event(h,fixture(h,COMPLETION_DELTA,L"ignored"));
+    handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+    CHECK(notify_op_count(NIM_MODIFY)==0);
+    chat->notify_disabled=0;
+    /* A user cancellation is not announced. */
+    notify_reset();
+    begin_regenerate(h); h->started_tick=GetTickCount64()-6000;
+    handle_event(h,fixture(h,COMPLETION_CANCELLED,NULL));
+    CHECK(notify_op_count(NIM_MODIFY)==0);
+    /* A failed long completion is announced. */
+    notify_reset();
+    begin_regenerate(h); h->started_tick=GetTickCount64()-6000;
+    handle_event(h,fixture(h,COMPLETION_ERROR,L"boom"));
+    CHECK(notify_op_count(NIM_MODIFY)==1);
+    CHECK(wcsstr(last_balloon()->szInfo,L"Failed")!=NULL);
+
+    /* Balloon lifetime: a newer request must not retarget an older balloon.
+       Show A, start B, click the tray, and A is selected. */
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    CHECK(chat_active(chat)->id!=id_a);
+    set_foreground_calls=0;
+    SendMessageW(window,CHAT_WM_TRAY,0,(LPARAM)WM_LBUTTONUP);
+    CHECK(chat_active(chat)->id==id_a);
+    CHECK(set_foreground_calls==1);
+
+    /* Destroying the window removes the tray exactly once. */
+    notify_reset();
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(!IsWindow(window));
+    CHECK(notify_op_count(NIM_DELETE)==1);
+
+    saver_shutdown(&h->saver); storage_close(&h->storage);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup);
+    DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir);
+    DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer);
+    DeleteObject(h->background);
+    transcript_dispose(&h->transcript);
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    foreground_window_forced=false;
+    return 0;
+}
+
 int main(void) {
     /* The fixtures share one process and never unload Msftedit: repeated
         unload/reload cycles across fixtures can fail its DllMain with
@@ -6384,6 +6591,8 @@ int main(void) {
     if (failed) return failed;
     failed=import_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy + export + import fixtures) passed");
+    failed=notify_suite();
+    if (failed) return failed;
+    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy + export + import + notifications fixtures) passed");
     return failed;
 }

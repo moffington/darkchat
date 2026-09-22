@@ -204,6 +204,15 @@ bool chat_edit_dialog(HWND owner, const wchar_t *title, wchar_t *text, size_t ca
     DeleteObject(d.edit_background);
     return d.accepted;
 }
+bool chat_shell_notify(NOTIFYICONDATAW *data, DWORD operation) {
+    return Shell_NotifyIconW(operation, data) != FALSE;
+}
+HWND chat_foreground_window(void) {
+    return GetForegroundWindow();
+}
+bool chat_set_foreground(HWND window) {
+    return SetForegroundWindow(window) != FALSE;
+}
 bool chat_copy_text(HWND owner,const wchar_t *text) {
     size_t bytes=(wcslen(text)+1)*sizeof(wchar_t);
     HGLOBAL memory=GlobalAlloc(GMEM_MOVEABLE,bytes);
@@ -515,6 +524,10 @@ void chat_actions_sync(HMENU menu, const ChatActionContext *context) {
             ? MF_ENABLED : MF_GRAYED;
         EnableMenuItem(menu, (UINT)id, MF_BYCOMMAND | enable);
     }
+    /* The notification toggle is a checkable preference, not routing state;
+       its mark is driven by the same pure context as its availability. */
+    CheckMenuItem(menu, ACTION_NOTIFY_FINISH, MF_BYCOMMAND |
+        (context->notify_enabled ? MF_CHECKED : MF_UNCHECKED));
 }
 static void append_action(HMENU menu, int id) {
     const ChatActionInfo *info = chat_action_info(id);

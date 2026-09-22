@@ -106,6 +106,7 @@ The Ollama endpoint is fixed at `localhost:11434`; there is no configurable endp
 - The Send button becomes Stop during generation.
 - Conversation actions provide New, Rename, Delete, and Clear messages.
 - Response actions provide Retry, Regenerate, Edit latest user message, Cancel edit, Copy response, and Copy transcript selection.
+- DarkChat keeps an icon in the notification area. A response that takes at least five seconds and finishes while the window is not in the foreground raises one balloon naming the conversation and the terminal state (complete, failed, or interrupted); clicking it, or left-clicking the tray icon, restores the window and selects that conversation. Right-clicking the tray icon opens the same command menu as the header's overflow button, anchored at the pointer. Explorer restarts re-add the icon automatically. **Settings > Notify when long responses finish** turns the balloons off (the tray icon stays).
 - The **Customization** group in the overflow menu carries the per-conversation model and prompt overrides and the prompt-profile library, described below. Its override commands and **Save current prompt as profile…** also appear in the `Ctrl+K` command palette under their own section; **Apply prompt profile**, **Edit profile…**, and **Delete profile…** stay in the overflow menu only, because they pick a profile from a submenu.
 
 Changing the system prompt affects future requests only. It does not rewrite existing history.
@@ -168,7 +169,10 @@ formats 1 through 5 and rewrites older valid snapshots in the current format
 on the next save; an unsupported newer format fails closed without
 overwriting it from a backup. The active backend, the per-backend models, and
 each generation's backend are additive optional fields: an older snapshot
-decodes as OpenRouter with no Ollama model. Customization (prompt profiles,
+decodes as OpenRouter with no Ollama model. The completion-notification
+preference (`notify_disabled`) is additive at the same version and is written
+only when notifications are turned off, so an enabled store keeps the older
+byte shape. Customization (prompt profiles,
 per-conversation overrides, and the explicitly-empty prompt override) is
 version-gated in both directions, so an older binary can never silently
 erase it.

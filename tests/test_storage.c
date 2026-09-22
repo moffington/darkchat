@@ -108,6 +108,7 @@ static bool same_chat(const Chat *a, const Chat *b) {
         a->window_height != b->window_height ||
         a->maximized != b->maximized || a->sidebar_width != b->sidebar_width ||
         a->sidebar_collapsed != b->sidebar_collapsed ||
+        a->notify_disabled != b->notify_disabled ||
         wcscmp(a->model, b->model) ||
         a->backend != b->backend ||
         wcscmp(a->ollama_model, b->ollama_model) ||
@@ -667,6 +668,40 @@ int main(void) {
         };
         for (size_t i=0;i<sizeof malformed/sizeof malformed[0];i++) {
             CHECK(load_backend_case(malformed[i],dest)==-1);
+            CHECK(load_backend_case(NULL,dest)==1);
+        }
+        chat_dispose(dest); free(dest);
+    }
+    /* The completion-notification preference is additive at format 3: emitted
+       only when disabled, absent means enabled, and a present malformed value
+       rejects the snapshot. */
+    {
+        char *notify=NULL; size_t notify_size=0;
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&notify,&notify_size));
+        CHECK(strstr(notify,"\"notify_disabled\"")==NULL);
+        free(notify);
+        chat->notify_disabled=1;
+        CHECK(storage_save(&store,chat));
+        CHECK(read_file_bytes(store.path,&notify,&notify_size));
+        CHECK(strstr(notify,"\"notify_disabled\":1")!=NULL);
+        free(notify);
+        CHECK(storage_load(&store,loaded)==1);
+        CHECK(loaded->notify_disabled==1);
+        chat->notify_disabled=0;
+        /* An absent field defaults to enabled; malformed values reject. */
+        Chat *dest=calloc(1,sizeof *dest); CHECK(dest);
+        CHECK(load_backend_case("\"notify_disabled\":1",dest)==1);
+        CHECK(dest->notify_disabled==1);
+        CHECK(load_backend_case(NULL,dest)==1);
+        CHECK(dest->notify_disabled==0);
+        static const char *const malformed_notify[]={
+            "\"notify_disabled\":2","\"notify_disabled\":-1",
+            "\"notify_disabled\":0.5","\"notify_disabled\":true",
+            "\"notify_disabled\":\"1\"","\"notify_disabled\":null"
+        };
+        for (size_t i=0;i<sizeof malformed_notify/sizeof malformed_notify[0];i++) {
+            CHECK(load_backend_case(malformed_notify[i],dest)==-1);
             CHECK(load_backend_case(NULL,dest)==1);
         }
         chat_dispose(dest); free(dest);

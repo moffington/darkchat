@@ -63,6 +63,20 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   surfaces through the ordinary Failed/Retry path. Provider routing is
   OpenRouter-only: while Ollama is active the controls are grayed and an
   activation is ignored with an explicit status.
+- Settings > **Notify when long responses finish** is a checkable preference
+  (checked by default) that gates the completion balloons described below; it
+  is persisted and survives a restart. The command also appears in the Ctrl+K
+  command palette.
+- DarkChat owns a notification-area icon for its lifetime. The icon carries the
+  application icon (`hIcon`/`hIconSm` on the window class), is re-added after an
+  Explorer restart (`TaskbarCreated`), and is removed on exit. Right-clicking it
+  opens the command menu at the pointer; left-clicking it, or clicking a
+  balloon, restores the window and selects the conversation the balloon
+  belongs to. Balloons are raised only for a generation that ran at least five
+  seconds and finished (complete, failed, or interrupted) while the window was
+  not the foreground window; a user cancellation is never announced. The
+  conversation id is captured when the balloon is shown, so a newer request
+  never retargets an older balloon's click.
 - Ctrl+Space opens the model palette (also available as Settings > Choose
   model...) for the active backend, and Ctrl+K opens the command palette. Both
   are the same retained dark popup, in models or commands mode respectively. The
@@ -588,7 +602,9 @@ drop on its next save, so that state is version-gated in both directions):
    conversation index, next ID counter, record counts, model/system prompt,
    geometry, the optional provider-routing fields (`provider_sort`,
    `provider_no_fallbacks`, `provider_data_collection`, `provider_zdr`), and
-   the optional backend fields (`backend`, `ollama_model`). At version 4 or
+   the optional backend fields (`backend`, `ollama_model`) and the optional
+   completion-notification preference (`notify_disabled`, emitted only when the
+   user turned notifications off). At version 4 or
    above the record additionally ends with a required `profile_count` field.
 2. Zero or more `type: "model"` history records, each carrying its backend tag
    (`"backend"`) when it is not OpenRouter; an untagged record loads as
@@ -629,7 +645,10 @@ fields emitted only when non-default
 when absent — to OpenRouter with no remembered Ollama model, and with every
 history entry tagged OpenRouter. A present field of the wrong JSON type is
 corruption, and an Ollama-active snapshot with an empty `ollama_model` is
-rejected. Provider-routing
+rejected. The completion-notification preference (`notify_disabled`) is the
+same kind of additive field: written only when notifications are disabled, so
+an enabled store and every older build keep the older byte shape (a missing
+value means enabled). Provider-routing
 settings are additive optional fields appended last, emitted only when
 non-default and defaulted when absent; like the optional
 reasoning fields they do not change the format version.

@@ -34,6 +34,8 @@ static const ChatActionInfo table[] = {
         CHAT_ACTION_GROUP_SETTINGS, CHAT_ACTION_FLAG_NONE },
     { ACTION_MODELS, L"&Choose model...", L"Ctrl+Space",
         CHAT_ACTION_GROUP_SETTINGS, CHAT_ACTION_FLAG_NONE },
+    { ACTION_NOTIFY_FINISH, L"&Notify when long responses finish", NULL,
+        CHAT_ACTION_GROUP_SETTINGS, CHAT_ACTION_FLAG_NONE },
     { ACTION_BACKEND_OPENROUTER, L"&OpenRouter", NULL,
         CHAT_ACTION_GROUP_BACKEND, CHAT_ACTION_FLAG_NONE },
     { ACTION_BACKEND_OLLAMA, L"&Ollama (local)", NULL,
@@ -199,6 +201,7 @@ void chat_action_context_init(ChatActionContext *context, const Chat *chat) {
     context->has_global_model =
         (context->backend_openrouter ? chat->model : chat->ollama_model)[0] != 0;
     context->profile_count = chat->profile_count;
+    context->notify_enabled = !chat->notify_disabled;
 }
 
 bool chat_action_available(int id, const ChatActionContext *context) {
@@ -234,6 +237,7 @@ bool chat_action_available(int id, const ChatActionContext *context) {
     case ACTION_SYSTEM:
     case ACTION_SIDEBAR:
     case ACTION_MODELS:
+    case ACTION_NOTIFY_FINISH:
     case ACTION_BACKEND_OPENROUTER:
     case ACTION_BACKEND_OLLAMA:
         return !context->generating;

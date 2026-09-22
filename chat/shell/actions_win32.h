@@ -4,6 +4,33 @@
 #include "chat/core/chat.h"
 #include "chat/core/commands.h"
 #include "chat/transcript/rich_text_win32.h"
+#include <shellapi.h>
+
+/* The tray icon's stable notification identifier. */
+#define CHAT_TRAY_ICON_ID 1
+
+/* Low-level seam around Shell_NotifyIconW. Kept in this translation unit so
+   the host's tray helpers (a different translation unit) call it through an
+   external reference that -Wl,--wrap can reliably intercept in the tests. */
+bool chat_shell_notify(NOTIFYICONDATAW *data, DWORD operation);
+
+/* Foreground-window query. Another dllimport seam wrapped behind a normal
+   function so the notification trigger is deterministically testable. */
+HWND chat_foreground_window(void);
+
+/* Requests the window be brought to the foreground. Seamed for the same
+   reason: a hidden test window must not drive the real foreground/IME path. */
+bool chat_set_foreground(HWND window);
+
+/* Tray lifecycle. Defined in the host translation unit (again, so calls to
+   chat_shell_notify are cross-unit and wrap-reliable). show performs NIM_ADD
+   and then NIM_SETVERSION(NOTIFYICON_VERSION_4), rolling back with NIM_DELETE
+   when the version call fails; balloon performs NIM_MODIFY with NIF_INFO. */
+bool chat_tray_show(HWND window, HICON icon, UINT callback_message,
+    const wchar_t *tip);
+bool chat_tray_hide(HWND window);
+bool chat_tray_balloon(HWND window, const wchar_t *title, const wchar_t *text);
+
 HMENU chat_actions_menu(const Chat *chat);
 /* Applies the availability predicate and the live routing/backend check state
    to every command the menu carries. Absent items are ignored, so it is safe

@@ -24,8 +24,9 @@ enum {
     ACTION_PROFILE_EDIT, ACTION_PROFILE_DELETE,
     ACTION_EXPORT_MARKDOWN, ACTION_EXPORT_JSON, ACTION_EXPORT_ALL,
     ACTION_IMPORT_JSON, ACTION_IMPORT_MARKDOWN,
+    ACTION_NOTIFY_FINISH,
     ACTION_FIRST = ACTION_NEW,
-    ACTION_LAST = ACTION_IMPORT_MARKDOWN
+    ACTION_LAST = ACTION_NOTIFY_FINISH
 };
 
 /* Dynamic profile submenu ids. Unlike the registry above these are not
@@ -117,6 +118,9 @@ typedef struct {
         this conversation" copies from. */
     bool has_model_override, has_prompt_override, has_global_model;
     int profile_count;
+    /* Completion-notification preference (the check mark the Settings toggle
+        reflects). Derived from the Chat, not the interaction. */
+    bool notify_enabled;
 } ChatActionContext;
 
 /* Fills every field derivable from `chat` (the active conversation's turn
