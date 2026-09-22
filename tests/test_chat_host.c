@@ -1024,6 +1024,21 @@ static int default_suite(void) {
             CHECK(GetMenuState(data,ACTION_IMPORT_JSON,MF_BYCOMMAND)&MF_GRAYED);
             CHECK(GetMenuState(data,ACTION_IMPORT_MARKDOWN,MF_BYCOMMAND)&MF_GRAYED);
         }
+        /* Registry-bound leaves compose native Label<Tab>Shortcut text so
+            the menu right-aligns the binding; unbound leaves carry no tab. */
+        {
+            wchar_t label[CHAT_ACTION_LABEL_TEXT];
+            MENUITEMINFOW info; memset(&info,0,sizeof info);
+            info.cbSize=sizeof info; info.fMask=MIIM_STRING;
+            info.dwTypeData=label; info.cch=CHAT_ACTION_LABEL_TEXT;
+            CHECK(GetMenuItemInfoW(bar,ACTION_RENAME,FALSE,&info));
+            wchar_t *tab=wcschr(label,L'\t');
+            CHECK(tab && !wcscmp(tab,L"\tF2"));
+            CHECK((size_t)(tab-label)==wcslen(L"&Rename..."));
+            info.cch=CHAT_ACTION_LABEL_TEXT;   /* the call overwrites cch */
+            CHECK(GetMenuItemInfoW(bar,ACTION_NEW,FALSE,&info));
+            CHECK(wcschr(label,L'\t')==NULL);
+        }
         /* The Apply submenu carries two nested popups, each with one item
             per live profile; names are mnemonic-escaped. */
         MENUITEMINFOW apply; memset(&apply,0,sizeof apply);

@@ -1,12 +1,67 @@
 #include "chat/shell/actions_win32.h"
 #include "chat/import/import.h"
+#include "platform/dark_mode_win32.h"
+#include "ui/ui.h"
 #include <commdlg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 
-typedef struct { HWND edit; wchar_t *text; size_t capacity; bool done, accepted, multiline; } EditDialog;
+typedef struct {
+    HWND edit, ok, cancel;
+    wchar_t *text;
+    size_t capacity;
+    bool done, accepted, multiline;
+    UINT dpi;
+    /* Per-instance resources: the window class is registered once and
+       reused, so nothing instance-owned may live in the class. */
+    HFONT font;
+    HBRUSH background, edit_background;
+} EditDialog;
+
+static COLORREF theme_color(unsigned role) {
+    const UiTheme theme = ui_theme_dark();
+    return RGB(theme.colors[role].r, theme.colors[role].g, theme.colors[role].b);
+}
+
+/* One Segoe UI face at the theme's body size, scaled to the dialog DPI, so
+   the shared dialog reuses the application theme instead of a second one. */
+static HFONT dialog_font(UINT dpi) {
+    const UiTheme theme = ui_theme_dark();
+    return CreateFontW(-MulDiv((int)theme.font_size[UI_BODY], (int)dpi, 96),
+        0, 0, 0, (int)theme.font_weight[UI_BODY], FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, theme.font_family);
+}
+
+/* Paint-time brush selection: the struct fields hold only independently
+   owned brushes (created per dialog, released in chat_edit_dialog), so a
+   NULL field means allocation failed and a stock brush is substituted
+   here instead of ever being stored or deleted. */
+static HBRUSH dialog_brush(const EditDialog *d) {
+    return d->background ? d->background : (HBRUSH)GetStockObject(BLACK_BRUSH);
+}
+
+static HBRUSH edit_brush(const EditDialog *d) {
+    return d->edit_background ? d->edit_background : dialog_brush(d);
+}
+
+/* Single geometry source for WM_CREATE and WM_DPICHANGED: the same unit
+   math that sized the controls originally, re-applied to the live
+   rectangle. */
+static void layout_children(EditDialog *d, HWND window) {
+    int unit = MulDiv(10, (int)d->dpi, 96);
+    RECT r;
+    GetClientRect(window, &r);
+    MoveWindow(d->edit, unit, unit, r.right - 2 * unit, r.bottom - 6 * unit,
+        TRUE);
+    MoveWindow(d->ok, r.right - 19 * unit, r.bottom - 4 * unit, 8 * unit,
+        3 * unit, TRUE);
+    MoveWindow(d->cancel, r.right - 10 * unit, r.bottom - 4 * unit, 9 * unit,
+        3 * unit, TRUE);
+}
+
 static LRESULT CALLBACK edit_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
     EditDialog *d=(EditDialog *)GetWindowLongPtrW(window,GWLP_USERDATA);
     if (message==WM_NCCREATE) {
@@ -16,19 +71,23 @@ static LRESULT CALLBACK edit_proc(HWND window, UINT message, WPARAM w, LPARAM l)
     if (!d) return DefWindowProcW(window,message,w,l);
     switch (message) {
     case WM_CREATE: {
-        UINT dpi=GetDpiForWindow(window);
-        int unit=MulDiv(10,(int)dpi,96);
-        RECT r; GetClientRect(window,&r);
+        d->dpi = GetDpiForWindow(window);
+        dark_mode_titlebar_apply(window);
         d->edit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",d->text,
             WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOVSCROLL|
             (d->multiline ? ES_MULTILINE|ES_WANTRETURN|WS_VSCROLL : ES_AUTOHSCROLL),
-            unit,unit,r.right-2*unit,r.bottom-6*unit,window,(HMENU)10,NULL,NULL);
+            0,0,0,0,window,(HMENU)10,NULL,NULL);
+        d->ok=CreateWindowExW(0,L"BUTTON",L"OK",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON,
+            0,0,0,0,window,(HMENU)IDOK,NULL,NULL);
+        d->cancel=CreateWindowExW(0,L"BUTTON",L"Cancel",WS_CHILD|WS_VISIBLE|WS_TABSTOP,
+            0,0,0,0,window,(HMENU)IDCANCEL,NULL,NULL);
         SendMessageW(d->edit,EM_SETLIMITTEXT,d->capacity-1,0);
-        SendMessageW(d->edit,WM_SETFONT,(WPARAM)GetStockObject(DEFAULT_GUI_FONT),TRUE);
-        CreateWindowExW(0,L"BUTTON",L"OK",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON,
-            r.right-19*unit,r.bottom-4*unit,8*unit,3*unit,window,(HMENU)IDOK,NULL,NULL);
-        CreateWindowExW(0,L"BUTTON",L"Cancel",WS_CHILD|WS_VISIBLE|WS_TABSTOP,
-            r.right-10*unit,r.bottom-4*unit,9*unit,3*unit,window,(HMENU)IDCANCEL,NULL,NULL);
+        HFONT font = d->font ? d->font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        SendMessageW(d->edit,WM_SETFONT,(WPARAM)font,TRUE);
+        SendMessageW(d->ok,WM_SETFONT,(WPARAM)font,TRUE);
+        SendMessageW(d->cancel,WM_SETFONT,(WPARAM)font,TRUE);
+        dark_mode_control_apply(d->edit);
+        layout_children(d,window);
         return 0;
     }
     case WM_COMMAND:
@@ -38,21 +97,92 @@ static LRESULT CALLBACK edit_proc(HWND window, UINT message, WPARAM w, LPARAM l)
         } else if (LOWORD(w)==IDCANCEL) d->done=true;
         return 0;
     case WM_CLOSE: d->done=true; return 0;
+    case WM_ERASEBKGND: {
+        /* Explicit client painting: this is an ordinary window class, not a
+           dialog-resource window, and the class carries no brush, so only
+           this path guarantees the dark background. */
+        RECT r;
+        GetClipBox((HDC)w,&r);
+        FillRect((HDC)w,&r,dialog_brush(d));
+        return 1;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc=BeginPaint(window,&ps);
+        if (dc) FillRect(dc,&ps.rcPaint,dialog_brush(d));
+        EndPaint(window,&ps);
+        return 0;
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc=(HDC)w;
+        SetTextColor(dc,theme_color(UI_TEXT));
+        SetBkColor(dc,theme_color(UI_TRACK));
+        return (LRESULT)edit_brush(d);
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc=(HDC)w;
+        SetTextColor(dc,theme_color(UI_TEXT));
+        SetBkColor(dc,theme_color(UI_PANEL));
+        return (LRESULT)dialog_brush(d);
+    }
+    case WM_DPICHANGED: {
+        UINT dpi=HIWORD(w);
+        RECT *suggested=(RECT *)l;
+        SetWindowPos(window,NULL,suggested->left,suggested->top,
+            suggested->right-suggested->left,suggested->bottom-suggested->top,
+            SWP_NOZORDER|SWP_NOACTIVATE);
+        /* The new DPI is adopted before any allocation attempt, so child
+           geometry always follows the new monitor even when font creation
+           below fails and the old font must be retained. */
+        d->dpi=dpi;
+        HFONT replacement=dialog_font(dpi);
+        if (!replacement) {
+            /* Allocation failed: every child keeps the existing font, and
+               that owned font stays installed and alive for the next
+               attempt instead of being deleted out from under them. */
+            layout_children(d,window);
+            return 0;
+        }
+        HFONT old=d->font;
+        d->font=replacement;
+        SendMessageW(d->edit,WM_SETFONT,(WPARAM)d->font,TRUE);
+        SendMessageW(d->ok,WM_SETFONT,(WPARAM)d->font,TRUE);
+        SendMessageW(d->cancel,WM_SETFONT,(WPARAM)d->font,TRUE);
+        /* The old font is released only after every child holds its
+           replacement, so no control can render with a dangling font. */
+        if (old) DeleteObject(old);
+        layout_children(d,window);
+        return 0;
+    }
     }
     return DefWindowProcW(window,message,w,l);
 }
 bool chat_edit_dialog(HWND owner, const wchar_t *title, wchar_t *text, size_t capacity, bool multiline) {
     WNDCLASSW cls={0}; cls.lpfnWndProc=edit_proc; cls.hInstance=GetModuleHandleW(NULL);
     cls.lpszClassName=L"DarkChat.Edit"; cls.hCursor=LoadCursorW(NULL,MAKEINTRESOURCEW(32512));
-    cls.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
-    RegisterClassW(&cls);
+    /* No permanent class brush: the class survives every opening of the
+       dialog, so instance resources live in EditDialog and the client area
+       is painted explicitly above. */
+    if (!RegisterClassW(&cls) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)
+        return false;
     EditDialog d={0}; d.text=text; d.capacity=capacity; d.multiline=multiline;
+    d.dpi=GetDpiForWindow(owner);
+    d.font=dialog_font(d.dpi);
+    /* The fields hold only independently owned handles; failed allocations
+       stay NULL and the paint helpers substitute stock brushes at use time,
+       so cleanup can never touch a stock object or the same brush twice. */
+    d.background=CreateSolidBrush(theme_color(UI_PANEL));
+    d.edit_background=CreateSolidBrush(theme_color(UI_TRACK));
     RECT r; GetWindowRect(owner,&r);
-    UINT dpi=GetDpiForWindow(owner);
     HWND window=CreateWindowExW(WS_EX_DLGMODALFRAME,cls.lpszClassName,title,
-        WS_CAPTION|WS_SYSMENU|WS_POPUP,r.left+40,r.top+60,MulDiv(560,dpi,96),
-        MulDiv(multiline ? 350 : 150,dpi,96),owner,NULL,cls.hInstance,&d);
-    if (!window) return false;
+        WS_CAPTION|WS_SYSMENU|WS_POPUP,r.left+40,r.top+60,MulDiv(560,d.dpi,96),
+        MulDiv(multiline ? 350 : 150,d.dpi,96),owner,NULL,cls.hInstance,&d);
+    if (!window) {
+        DeleteObject(d.font);
+        DeleteObject(d.background);
+        DeleteObject(d.edit_background);
+        return false;
+    }
     EnableWindow(owner,FALSE); ShowWindow(window,SW_SHOW); SetFocus(d.edit);
     SendMessageW(d.edit,EM_SETSEL,0,-1);
     MSG msg;
@@ -67,6 +197,11 @@ bool chat_edit_dialog(HWND owner, const wchar_t *title, wchar_t *text, size_t ca
         if (!IsDialogMessageW(window,&msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     }
     EnableWindow(owner,TRUE); DestroyWindow(window); SetActiveWindow(owner);
+    /* GDI releases happen only after DestroyWindow, when no WM_CTLCOLOR
+       delivery can still reference the brush or font. */
+    DeleteObject(d.font);
+    DeleteObject(d.background);
+    DeleteObject(d.edit_background);
     return d.accepted;
 }
 bool chat_copy_text(HWND owner,const wchar_t *text) {
@@ -387,12 +522,8 @@ static void append_action(HMENU menu, int id) {
     if (info->flags & CHAT_ACTION_FLAG_SEPARATOR_BEFORE)
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     wchar_t text[CHAT_ACTION_LABEL_TEXT];
-    if (info->shortcut && info->shortcut[0])
-        swprintf(text, CHAT_ACTION_LABEL_TEXT, L"%ls (%ls)",
-            info->menu_label, info->shortcut);
-    else
-        swprintf(text, CHAT_ACTION_LABEL_TEXT, L"%ls", info->menu_label);
-    text[CHAT_ACTION_LABEL_TEXT - 1] = 0;
+    if (!chat_action_compose_menu_label(id, text, CHAT_ACTION_LABEL_TEXT))
+        return;
     AppendMenuW(menu, MF_STRING, (UINT_PTR)id, text);
 }
 

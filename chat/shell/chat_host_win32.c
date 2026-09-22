@@ -16,6 +16,7 @@
 #include "chat/shell/palette_win32.h"
 #include "platform/renderer.h"
 #include "platform/accessibility.h"
+#include "platform/dark_mode_win32.h"
 #include <windowsx.h>
 #include <richedit.h>
 #include <dwmapi.h>
@@ -3306,6 +3307,10 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
     if (!SetProcessDpiAwarenessContext(
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) &&
         GetLastError() != ERROR_ACCESS_DENIED) return 1;
+    /* Best-effort dark native menus: the process-wide policy must exist
+       before the first window or menu. A silent no-op on pre-1809 builds
+       and whenever the undocumented surface cannot be resolved. */
+    dark_mode_process_init();
     HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(com)) return 1;
     ChatHost *host = (ChatHost *)calloc(1, sizeof *host);
@@ -3379,8 +3384,8 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
             DestroyWindow(window);
             result=1;
         } else {
-        BOOL dark = TRUE;
-        DwmSetWindowAttribute(window, 20, &dark, sizeof dark);
+        dark_mode_window_apply(window);
+        dark_mode_titlebar_apply(window);
         ShowWindow(window, config->chat->maximized ? SW_SHOWMAXIMIZED : show);
         UpdateWindow(window);
         if (host->composer.window) SetFocus(host->composer.window);

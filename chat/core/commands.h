@@ -135,6 +135,13 @@ const wchar_t *chat_action_shortcut(int id);
    when capacity > 0. */
 bool chat_action_plain_label(int id, wchar_t *out, size_t capacity);
 
+/* Composes the native menu text for an action: "Label\tShortcut" when the
+   registry carries a key binding (the native menu right-aligns the part
+   after the tab), else the bare mnemonic label. Returns false when the id is
+   unknown, `out` is null, capacity is zero, or the text exceeds capacity;
+   `out` is always terminated when capacity > 0. */
+bool chat_action_compose_menu_label(int id, wchar_t *out, size_t capacity);
+
 /* The static registry in presentation order: entries are grouped and ordered
    exactly as the menu lays them out. */
 const ChatActionInfo *chat_action_table(size_t *count);

@@ -93,6 +93,45 @@ static void test_labels(void) {
     check(!chat_action_plain_label(ACTION_NEW, none, 0), "zero capacity fails safely");
 }
 
+/* The native menu text the Win32 shell appends: "Label\tShortcut" for
+    registry-bound actions, the bare label otherwise, with the composer's
+    failure paths covered explicitly (a small buffer is the only way to
+    reach truncation, since every current label fits the standard one). */
+static void test_compose_menu_label(void) {
+    wchar_t text[CHAT_ACTION_LABEL_TEXT];
+    check(chat_action_compose_menu_label(ACTION_RENAME, text,
+            CHAT_ACTION_LABEL_TEXT), "composed label renders");
+    check(!wcscmp(text, L"&Rename...\tF2"),
+        "shortcut labels use the native Label<Tab>Shortcut form");
+    check(chat_action_compose_menu_label(ACTION_NEW, text,
+            CHAT_ACTION_LABEL_TEXT), "unbound label composes");
+    check(!wcscmp(text, L"&New conversation"),
+        "actions without a binding compose the bare label");
+    size_t count = 0;
+    const ChatActionInfo *table = chat_action_table(&count);
+    bool all_compose = true;
+    for (size_t i = 0; i < count; i++)
+        if (!chat_action_compose_menu_label(table[i].id, text,
+                CHAT_ACTION_LABEL_TEXT)) all_compose = false;
+    check(all_compose, "every registry entry fits the composed label buffer");
+    wchar_t none[8];
+    check(!chat_action_compose_menu_label(0, none, 8),
+        "unknown ids have no composed label");
+    check(none[0] == 0, "an unknown id still terminates the output buffer");
+    wcscpy(none, L"filled");
+    check(!chat_action_compose_menu_label(0, none, 8),
+        "unknown ids have no composed label (prefilled buffer)");
+    check(none[0] == 0, "the unknown-id path clears a prefilled buffer");
+    check(!chat_action_compose_menu_label(ACTION_NEW, NULL, 8),
+        "null output has no composed label");
+    check(!chat_action_compose_menu_label(ACTION_NEW, none, 0),
+        "zero capacity fails safely");
+    wchar_t tiny[6];
+    check(!chat_action_compose_menu_label(ACTION_RENAME, tiny, 6),
+        "truncated composed label reports failure");
+    check(tiny[5] == 0, "truncated composed label is terminated");
+}
+
 static void expect_disabled(const ChatActionContext *context, const char *state,
     const int *disabled, size_t count) {
     bool ok = true;
@@ -320,6 +359,7 @@ int main(void) {
     chat_init(chat);
     test_table();
     test_labels();
+    test_compose_menu_label();
     test_dynamic_ranges();
     test_availability_matrix(chat);
     test_customization_context(chat);

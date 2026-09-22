@@ -132,6 +132,38 @@ bool chat_action_plain_label(int id, wchar_t *out, size_t capacity) {
     return true;
 }
 
+bool chat_action_compose_menu_label(int id, wchar_t *out, size_t capacity) {
+    /* Buffer validation and termination come before the registry lookup, so
+       an unknown id still honours the "always terminated when capacity > 0"
+       contract instead of leaving the caller's buffer untouched. */
+    if (!out || capacity == 0) return false;
+    out[0] = 0;
+    const ChatActionInfo *info = chat_action_info(id);
+    if (!info) return false;
+    const wchar_t *shortcut =
+        (info->shortcut && info->shortcut[0]) ? info->shortcut : NULL;
+    size_t used = 0;
+    bool ok = true;
+    for (const wchar_t *p = info->menu_label; *p; p++) {
+        if (used + 1 >= capacity) { ok = false; break; }
+        out[used++] = *p;
+    }
+    if (ok && shortcut) {
+        if (used + 1 >= capacity) { ok = false; }
+        else {
+            out[used++] = L'\t';
+            for (const wchar_t *p = shortcut; *p; p++) {
+                if (used + 1 >= capacity) { ok = false; break; }
+                out[used++] = *p;
+            }
+        }
+    }
+    /* `used` never exceeds capacity - 1, so the terminator always fits,
+       including on the truncation failure paths. */
+    out[used] = 0;
+    return ok;
+}
+
 static bool response_is_replaceable(const ChatConversation *c, int user) {
     if (user < 0) return false;
     if ((size_t)user + 1 >= c->message_count) return true;
