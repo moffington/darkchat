@@ -53,6 +53,20 @@ static void draw_icon(const UiPainter *p, UiRect r, UiIcon icon, UiColor c) {
         p->line(p->user, cx - s * .6f, cy - s * .6f, cx + s * .6f, cy + s * .6f, c, 1.6f);
         p->line(p->user, cx - s * .6f, cy + s * .6f, cx + s * .6f, cy - s * .6f, c, 1.6f);
         break;
+    case UI_ICON_BRAIN: {
+        /* Two rounded hemispheres meeting at a seam, each with one crease
+           hint: a minimal brain mark from the standard primitives. */
+        float lobe_w = s * .68f, lobe_h = s * .88f;
+        p->stroke(p->user, (UiRect){cx - lobe_w, cy - lobe_h,
+            lobe_w, lobe_h * 2}, c, lobe_w * .72f, 1.5f);
+        p->stroke(p->user, (UiRect){cx, cy - lobe_h,
+            lobe_w, lobe_h * 2}, c, lobe_w * .72f, 1.5f);
+        p->line(p->user, cx - s * .34f, cy - s * .2f,
+            cx - s * .08f, cy - s * .2f, c, 1.2f);
+        p->line(p->user, cx + s * .08f, cy + s * .2f,
+            cx + s * .34f, cy + s * .2f, c, 1.2f);
+        break;
+    }
     default:
         break;
     }

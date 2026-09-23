@@ -44,7 +44,7 @@ typedef enum {
 typedef enum {
     UI_ICON_NONE = 0, UI_ICON_HAMBURGER, UI_ICON_SEND, UI_ICON_STOP,
     UI_ICON_OVERFLOW, UI_ICON_PLUS, UI_ICON_SEARCH, UI_ICON_CHEVRON_DOWN,
-    UI_ICON_CLOSE, UI_ICON_COUNT
+    UI_ICON_CLOSE, UI_ICON_BRAIN, UI_ICON_COUNT
 } UiIcon;
 typedef enum { UI_AUTO, UI_FIXED, UI_FLEX } UiSizeKind;
 typedef struct { UiSizeKind kind; float value; } UiSize;
