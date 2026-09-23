@@ -28,7 +28,7 @@ It provides streaming responses, per-turn reasoning views, progressive Markdown 
 - Stop an active request while retaining its partial response.
 - Copy responses, transcript selections, and composer text.
 - Configure the backend, the model, the global system prompt, sidebar width, and OpenRouter provider routing.
-- Browse and search the active backend's model catalog with `Ctrl+Space`; offline or without a key it falls back to the current model and that backend's 16 most recently used identifiers (history is tagged per backend, so the two model lists stay isolated).
+- Browse and search the active backend's model catalog with `Ctrl+Space`; offline or without a key it falls back to the current model and that backend's 16 most recently used identifiers (history is tagged per backend, so the two model lists stay isolated). When an IME owns the input locale, `Ctrl+Space` stays with the IME and the model palette is opened from Settings > Choose model… instead.
 - Apply global provider routing to future OpenRouter requests: sort by price, throughput, or latency; allow or disable fallback providers; allow or deny providers that may store data; and require Zero Data Retention. Every control defaults to OpenRouter's own default and is disabled while Ollama is active.
 - Show completion metadata including:
   - Time to first token
@@ -79,7 +79,7 @@ You can instead create `OPENROUTER_API_KEY` as a Windows User environment variab
 
 The key is never written to conversation state or included in persisted history, and temporary key buffers are cleared before release.
 
-Enter any valid OpenRouter model identifier in the model field, or press `Ctrl+Space` to search OpenRouter's model catalog. The catalog is fetched on demand with the same key, cached in memory for one hour, and never persisted; offline or without a key, the model palette falls back to the current model and recent history. Provider routing is configured under Settings > Provider routing.
+Enter any valid OpenRouter model identifier in the model field, or press `Ctrl+Space` to search OpenRouter's model catalog. The catalog is fetched on demand with the same key, cached in memory for one hour, and never persisted; offline or without a key, the model palette falls back to the current model and recent history. If an IME owns the input locale, `Ctrl+Space` is reserved for the IME's on/off toggle and the model palette opens from Settings > Choose model… instead. Provider routing is configured under Settings > Provider routing.
 
 ## Ollama setup
 
@@ -100,7 +100,7 @@ The Ollama endpoint is fixed at `localhost:11434`; there is no configurable endp
 
 - `Enter` sends a message.
 - `Shift+Enter` inserts a newline.
-- `Ctrl+Space` opens the searchable model palette for the active backend (current model, recent models, then the backend's catalog), and `Ctrl+K` opens the command palette. Both are the same retained dark popup: type to filter (by id or name for models), use Up/Down/PageUp/PageDown/Home/End, then Enter or a single click to select; Escape cancels.
+- `Ctrl+Space` opens the searchable model palette for the active backend (current model, recent models, then the backend's catalog), and `Ctrl+K` opens the command palette. Both are the same retained dark popup: type to filter (by id or name for models), use Up/Down/PageUp/PageDown/Home/End, then Enter or a single click to select; Escape cancels. When the active input locale is an IME, `Ctrl+Space` is left to the IME's on/off toggle and the model palette opens from Settings > Choose model… instead; `Ctrl+K` is unaffected. Composing IME text in the filter is not supported.
 - `Ctrl+F` focuses conversation search. Enter refreshes the search and jumps to
   its first result; `F3` / `Shift+F3` move through message and reasoning hits.
 - The Send button becomes Stop during generation.
@@ -294,7 +294,7 @@ An allocation failure while receiving a response retains the partial response an
 marks it Interrupted. The 128 MB snapshot limit is a serialized-file limit, not
 a total in-memory-content limit.
 
-Interactive clipboard and IME behavior, modal appearance, physical multi-monitor DPI transitions, and live provider behavior still require manual desktop verification. Hidden-window tests cover the underlying contracts but are not a replacement for visual review.
+Interactive clipboard and IME behavior, modal appearance, physical multi-monitor DPI transitions, and live provider behavior still require manual desktop verification. Hidden-window tests cover the underlying contracts but are not a replacement for visual review. See [`docs/NATIVE_VERIFICATION.md`](docs/NATIVE_VERIFICATION.md) for the repeatable manual matrix and the known limitations.
 
 For the detailed behavioral and persistence contract, see [`docs/CHAT.md`](docs/CHAT.md).
 

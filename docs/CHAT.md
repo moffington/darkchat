@@ -79,7 +79,11 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   never retargets an older balloon's click.
 - Ctrl+Space opens the model palette (also available as Settings > Choose
   model...) for the active backend, and Ctrl+K opens the command palette. Both
-  are the same retained dark popup, in models or commands mode respectively. The
+  are the same retained dark popup, in models or commands mode respectively.
+  When the thread's active input locale is an IME (Japanese, Chinese, and
+  similar), Ctrl+Space is the IME's on/off toggle and is left to the IME rather
+  than opening the model palette, which then opens from Settings > Choose
+  model...; Ctrl+K still opens the command palette. The
   model palette opens immediately with the backend's current model and that
   backend's recent-model history, then fills in from that backend's catalog when
   the fetch completes, refreshing in place without losing the filter text or the
@@ -103,8 +107,8 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   it as the list scrolls, so a catalog of thousands of models costs the same
   fixed node budget; each row shows `name — id` with the complete id always
   preserved. The palette is keyboard/mouse driven and filters on typed
-  characters; IME composition in the filter is not yet supported (tracked for
-  the accessibility/IME hardening pass).
+  characters. Composing IME text in the filter is not supported: the filter
+  sees only characters the IME has already committed.
 - Ctrl+F focuses the sidebar search field. Enter performs a fresh on-demand
   search over every live message body and reasoning field; F3 and Shift+F3 move
   between retained results. Matching is locale-independent ordinal Unicode
@@ -1105,6 +1109,8 @@ thresholds are not exposed, and the controls apply to OpenRouter only. Ollama is
 reached at the fixed OpenAI-compatible endpoint `localhost:11434/v1`; the
 endpoint is not configurable, and a local turn carries no billed cost. Response
 variants remain outside this pass.
-Interactive clipboard/IME behavior, modal-dialog appearance and physical
+Interactive clipboard and IME behavior, modal-dialog appearance and physical
 multi-monitor DPI transitions still need a manual desktop check; hidden-HWND
-tests do not substitute for that visual review.
+tests cover the underlying contracts but do not substitute for that visual
+review. See [`NATIVE_VERIFICATION.md`](NATIVE_VERIFICATION.md) for the
+repeatable matrix.

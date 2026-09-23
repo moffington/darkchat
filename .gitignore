@@ -2,4 +2,5 @@
 /build/
 /docs/*
 !/docs/CHAT.md
+!/docs/NATIVE_VERIFICATION.md
 /darkui.exe
