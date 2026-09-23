@@ -241,6 +241,13 @@ typedef struct {
     wchar_t ollama_model[CHAT_MODEL_TEXT];
     ChatText system_prompt;
     bool system_prompt_present;
+    /* Session-only reasoning preference for this conversation: 0 (the
+       historical default and the meaning of every fresh or freshly loaded
+       conversation) asks the provider for reasoning, 1 suppresses it. It is
+       deliberately never encoded, so it resets on the next load; the brain
+       button in the composer owns it. It affects OpenRouter only: Ollama
+       requests never carry a reasoning object regardless of the flag. */
+    bool reasoning_disabled;
 } ChatConversation;
 
 typedef struct {
@@ -357,6 +364,12 @@ bool chat_conversation_set_system_prompt(Chat *chat, int conversation,
     const wchar_t *text);
 bool chat_conversation_set_model(Chat *chat, int conversation,
     ChatBackend backend, const wchar_t *text);
+/* Session-only per-conversation reasoning preference. `enabled` requests
+    model reasoning for this conversation's next OpenRouter request; it is
+    never persisted and resets to enabled when the snapshot is reloaded.
+    The conversation index must be live. */
+bool chat_conversation_set_reasoning(Chat *chat, int conversation,
+    bool enabled);
 /* Explicit per-conversation prompt application. Unlike the setter above,
     an empty value is a meaningful override: it means "apply no system
     prompt in this conversation" (the presence flag with unset text), not
@@ -378,6 +391,11 @@ const wchar_t *chat_effective_model_for_backend(const Chat *chat,
 const wchar_t *chat_effective_model(const Chat *chat,
     const ChatConversation *conversation);
 const wchar_t *chat_effective_system_prompt(const Chat *chat,
+    const ChatConversation *conversation);
+/* Effective reasoning preference for a conversation: true unless the
+    session-only per-conversation flag is set. A NULL conversation reads as
+    the enabled default. Pure and total. */
+bool chat_effective_reasoning(const Chat *chat,
     const ChatConversation *conversation);
 
 void chat_init(Chat *chat);

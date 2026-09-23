@@ -9,11 +9,12 @@
 
    The two hard-coded envelopes are:
      OpenRouter: {"model":M,"messages":[...],"stream":true,
-                  "reasoning":{"enabled":true}[,"provider":{...}]}
+                  ["reasoning":{"enabled":true},]["provider":{...}]}
      Ollama:     {"model":M,"messages":[...],"stream":true,
                   "stream_options":{"include_usage":true}}
-   OpenRouter's bytes are unchanged from the historical encoder; Ollama never
-   carries OpenRouter's reasoning or provider-routing objects. */
+   OpenRouter's reasoning object is emitted only when `reasoning` is true; a
+   suppressed request omits it entirely. Ollama never carries reasoning or
+   provider-routing objects. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <wchar.h>
@@ -26,19 +27,22 @@
 
 /* The exact size of the framing around the messages: the opening object, the
    model string and the trailing options/closing brace, including the optional
-   OpenRouter provider object when configured. The context budget charges this
-   once. `routing` is ignored for Ollama. Pure and total. */
+   OpenRouter reasoning and provider objects when configured. The context
+   budget charges this once. `routing` and `reasoning` are ignored for Ollama.
+   Pure and total. */
 size_t chat_completion_envelope_bytes(ChatBackend backend, const wchar_t *model,
-    const ChatProviderRouting *routing);
+    const ChatProviderRouting *routing, bool reasoning);
 
 /* The exact bytes one message contributes, excluding the separator before it.
    Mirrors the encoder's framing and role names. */
 size_t chat_completion_message_bytes(ChatRole role, const wchar_t *text);
 
 /* Encodes the complete body into `buf` (initialized here). Error-role entries
-   are skipped exactly as before. Returns false only on allocation failure. */
+   are skipped exactly as before. `reasoning` gates OpenRouter's reasoning
+   object and is ignored for Ollama. Returns false only on allocation
+   failure. */
 bool chat_completion_request_build(JsonBuf *buf, ChatBackend backend,
     const wchar_t *model, const ChatRequestMessage *messages, int count,
-    const ChatProviderRouting *routing);
+    const ChatProviderRouting *routing, bool reasoning);
 
 #endif

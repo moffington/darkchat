@@ -1355,6 +1355,24 @@ int main(void) {
             !wcscmp(chat_effective_system_prompt(eff, chat_active(eff)),
                 L"global prompt"),
             "clearing the override inherits the global prompt again");
+        /* Session-only reasoning: defaults on, flips per conversation, is
+            bounds-checked, and reads enabled for a NULL conversation. */
+        check(chat_effective_reasoning(eff, chat_active(eff)),
+            "reasoning defaults on for a conversation");
+        check(chat_effective_reasoning(eff, NULL),
+            "a NULL conversation reads as reasoning on");
+        check(!chat_conversation_set_reasoning(eff, 99, false),
+            "an out-of-range reasoning set is rejected");
+        check(!chat_conversation_set_reasoning(NULL, 0, false),
+            "a NULL chat reasoning set is rejected");
+        check(chat_conversation_set_reasoning(eff, 0, false),
+            "the reasoning preference flips off");
+        check(!chat_effective_reasoning(eff, &eff->conversations[0]),
+            "the off preference is reflected");
+        check(chat_conversation_set_reasoning(eff, 0, true),
+            "the reasoning preference flips back on");
+        check(chat_effective_reasoning(eff, &eff->conversations[0]),
+            "the on preference is reflected");
         check(chat_conversation_set_model(eff, 0, CHAT_BACKEND_OPENROUTER,
                 L"req-model"),
             "the request fixture override is set");

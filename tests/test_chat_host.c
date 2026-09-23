@@ -37,18 +37,20 @@ static int completion_request_fake_generation;   /* 0: delegate to the real clie
 static ChatProviderRouting completion_request_last_routing;
 static ChatBackend completion_request_last_backend;
 static bool completion_request_last_had_routing;
+static bool completion_request_last_reasoning;
 static wchar_t completion_request_last_model[CHAT_MODEL_TEXT];
 int __real_completion_request(CompletionClient *client, ChatBackend backend,
     const char *api_key_utf8, const wchar_t *model,
     const CompletionMessage *messages, int count,
-    const ChatProviderRouting *routing);
+    const ChatProviderRouting *routing, bool reasoning);
 int __wrap_completion_request(CompletionClient *client, ChatBackend backend,
     const char *api_key_utf8, const wchar_t *model,
     const CompletionMessage *messages, int count,
-    const ChatProviderRouting *routing) {
+    const ChatProviderRouting *routing, bool reasoning) {
     ++completion_request_calls;
     completion_request_last_count=count;
     completion_request_last_backend=backend;
+    completion_request_last_reasoning=reasoning;
     if (model) {
         wcsncpy(completion_request_last_model, model, CHAT_MODEL_TEXT - 1);
         completion_request_last_model[CHAT_MODEL_TEXT - 1] = 0;
@@ -62,7 +64,7 @@ int __wrap_completion_request(CompletionClient *client, ChatBackend backend,
     else chat_provider_routing_init(&completion_request_last_routing);
     if (completion_request_fake_generation) return completion_request_fake_generation;
     return __real_completion_request(client,backend,api_key_utf8,model,messages,
-        count,routing);
+        count,routing,reasoning);
 }
 /* Catalog seams (linked with -Wl,--wrap=model_catalog_request and
    -Wl,--wrap=palette_popup_pump): the fetch is counted but never starts a
@@ -4424,6 +4426,33 @@ static int backend_suite(void) {
         CHECK((GetMenuState(menu,ACTION_BACKEND_OPENROUTER,MF_BYCOMMAND)&MF_CHECKED)!=0);
         CHECK((GetMenuState(menu,ACTION_ROUTING_ZDR,MF_BYCOMMAND)&MF_GRAYED)==0);
         DestroyMenu(menu);
+    }
+
+    /* Composer button tooltips: the text mirrors each button's current action
+       and hovering activates the tracking tooltip. */
+    CHECK(h->tooltip!=NULL);
+    CHECK(wcsstr(h->tooltip_text[0],L"Send the message")!=NULL);
+    CHECK(wcsstr(h->tooltip_text[1],L"Reasoning is on")!=NULL);
+    command(h,CHAT_COMMAND_TOGGLE_REASONING,-1);
+    CHECK(wcsstr(h->tooltip_text[1],L"Reasoning is off")!=NULL);
+    command(h,CHAT_COMMAND_TOGGLE_REASONING,-1);
+    {
+        UiRect r=chat_ui_rect(&h->chat_ui,h->chat_ui.reasoning);
+        LPARAM at=MAKELPARAM(px(h,r.x+r.w/2),px(h,r.y+r.h/2));
+        window_proc(h->window,WM_MOUSEMOVE,0,at);
+        CHECK(h->tooltip_shown==1);
+        CHECK(IsWindowVisible(h->tooltip));
+        window_proc(h->window,WM_MOUSELEAVE,0,0);
+        CHECK(h->tooltip_shown==-1);
+        CHECK(!IsWindowVisible(h->tooltip));
+        UiRect s=chat_ui_rect(&h->chat_ui,h->chat_ui.send);
+        at=MAKELPARAM(px(h,s.x+s.w/2),px(h,s.y+s.h/2));
+        window_proc(h->window,WM_MOUSEMOVE,0,at);
+        CHECK(h->tooltip_shown==0);
+        window_proc(h->window,WM_LBUTTONDOWN,0,at);
+        CHECK(h->tooltip_shown==-1);
+        /* Cancel the press so no send action fires and no capture is held. */
+        window_proc(h->window,WM_CANCELMODE,0,0);
     }
 
     /* chat_actions_sync is the single enabled-state authority. Routing sync

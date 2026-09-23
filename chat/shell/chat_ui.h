@@ -44,6 +44,9 @@ typedef enum {
     CHAT_COMMAND_OVERFLOW,
     /* Open the model catalog picker for the active backend. */
     CHAT_COMMAND_MODEL_PICKER,
+    /* Flip the active conversation's session-only reasoning preference. The
+       button's on/off surfaces reflect the resulting state. */
+    CHAT_COMMAND_TOGGLE_REASONING,
     /* Flip the sidebar: the explicit preference at wide widths, the
        temporary drawer at narrow widths. */
     CHAT_COMMAND_TOGGLE_SIDEBAR
@@ -77,8 +80,8 @@ typedef struct {
     Chat *chat;
     UiId root, heading, model, model_picker, overflow, hamburger, search,
         search_status, new_conversation, list, transcript, composer, send,
-        status, empty, empty_title, empty_hint, header, sidebar, main,
-        composer_area, composer_card, footer;
+        reasoning, status, empty, empty_title, empty_hint, header, sidebar,
+        main, composer_area, composer_card, footer;
     /* Windowed conversation list: two spacers sandwich the live rows so the
        laid-out extent always equals the full list (count*pitch - gap). */
     UiId top_spacer, bottom_spacer;
@@ -128,6 +131,10 @@ bool chat_ui_apply_reveal(ChatUi *chat_ui);
    state without rebuilding the retained tree. The icon changes too; the
    accessible name tracks the action. */
 void chat_ui_set_generation(ChatUi *chat_ui, bool generating, bool stopping);
+/* Reflects the active conversation's reasoning preference without rebuilding
+    the retained tree: the brain button reads as selected/accent when enabled
+    and greyed when disabled. Paint-only and a no-op when unchanged. */
+void chat_ui_set_reasoning(ChatUi *chat_ui, bool enabled);
 /* Toggles the sidebar through one command: at wide widths it flips and
    persists the explicit preference (written to Chat::sidebar_collapsed) and
    returns true so the host can mark storage dirty; at narrow widths it

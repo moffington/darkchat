@@ -18,6 +18,7 @@
 #include "platform/accessibility.h"
 #include "platform/dark_mode_win32.h"
 #include <windowsx.h>
+#include <commctrl.h>
 #include <richedit.h>
 #include <dwmapi.h>
 #include <math.h>
@@ -41,6 +42,10 @@
 #define CHAT_NOTIFY_MIN_MS 5000
 /* Resource id of the application icon in app.rc. */
 #define CHAT_APP_ICON_ID 1
+/* Tool ids for the two composer button tooltips. */
+#define CHAT_TOOLTIP_SEND 1
+#define CHAT_TOOLTIP_REASONING 2
+#define CHAT_TOOLTIP_COUNT 2
 
 typedef struct {
     ChatHostConfig config;
@@ -50,6 +55,14 @@ typedef struct {
     ChatUi chat_ui;
     RichTextControl composer, field, search;
     HWND view;                          /* transcript container child window */
+    /* Standard tooltip for the composer's Send and reasoning buttons.
+       Rect-based (TTF_SUBCLASS) tools track the retained nodes; the text
+       mirrors each node's help_text, so it follows Send/Stop and reasoning
+       on/off without a second source of truth. */
+    HWND tooltip;
+    wchar_t tooltip_text[CHAT_TOOLTIP_COUNT][UI_TEXT_CAPACITY];
+    /* Slot whose tracking tooltip is currently shown, or -1. */
+    int tooltip_shown;
     Transcript transcript;              /* per-turn update bookkeeping */
     RichTextTheme rich_theme;
     HBRUSH background;
@@ -1211,6 +1224,109 @@ static void sidebar_accessibility(ChatHost *host, const ChatUiRemapReport *repor
                                    : host->config.ui->root);
 }
 
+/* The two composer buttons as (tool id, text slot) pairs. */
+static const struct { UINT_PTR id; int slot; } host_tools[CHAT_TOOLTIP_COUNT] = {
+    { CHAT_TOOLTIP_SEND, 0 },
+    { CHAT_TOOLTIP_REASONING, 1 }
+};
+
+static UiId host_tool_node(const ChatHost *host, int slot) {
+    return slot == 0 ? host->chat_ui.send : host->chat_ui.reasoning;
+}
+
+/* Fills a tracking TOOLINFO for one composer button. */
+static void tooltip_info(ChatHost *host, TOOLINFOW *info, int slot) {
+    memset(info, 0, sizeof *info);
+    info->cbSize = sizeof *info;
+    info->hwnd = host->window;
+    info->uId = host_tools[slot].id;
+    info->uFlags = TTF_TRACK | TTF_ABSOLUTE;
+    info->lpszText = host->tooltip_text[slot];
+}
+
+static void tooltip_hide(ChatHost *host);
+
+/* Creates the shared tooltip and registers the Send and reasoning buttons as
+   tracking tools. Activation is driven explicitly (below) rather than by the
+   tooltip's own subclass tracking, which the retained paint loop does not feed
+   reliably. A failure only disables tooltips. */
+static void create_tooltips(ChatHost *host) {
+    host->tooltip_shown = -1;
+    INITCOMMONCONTROLSEX classes = { sizeof classes, ICC_WIN95_CLASSES };
+    InitCommonControlsEx(&classes);
+    host->tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        host->window, NULL, GetModuleHandleW(NULL), NULL);
+    if (!host->tooltip) return;
+    SetWindowPos(host->tooltip, HWND_TOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    for (int i = 0; i < CHAT_TOOLTIP_COUNT; i++) {
+        host->tooltip_text[i][0] = 0;
+        UiNode *item = ui_node(host->config.ui, host_tool_node(host, i));
+        if (item) {
+            wcsncpy(host->tooltip_text[i], item->help_text, UI_TEXT_CAPACITY - 1);
+            host->tooltip_text[i][UI_TEXT_CAPACITY - 1] = 0;
+        }
+        TOOLINFOW info;
+        tooltip_info(host, &info, i);
+        SendMessageW(host->tooltip, TTM_ADDTOOLW, 0, (LPARAM)&info);
+    }
+}
+
+/* Mirrors each button's help_text into its tool; a visible tool is refreshed
+   in place so Send/Stop and reasoning on/off stay current. */
+static void sync_tooltips(ChatHost *host) {
+    if (!host->tooltip) return;
+    for (int i = 0; i < CHAT_TOOLTIP_COUNT; i++) {
+        UiNode *item = ui_node(host->config.ui, host_tool_node(host, i));
+        if (!item) continue;
+        if (!wcscmp(host->tooltip_text[i], item->help_text)) continue;
+        wcsncpy(host->tooltip_text[i], item->help_text, UI_TEXT_CAPACITY - 1);
+        host->tooltip_text[i][UI_TEXT_CAPACITY - 1] = 0;
+        if (host->tooltip_shown == i) {
+            TOOLINFOW info;
+            tooltip_info(host, &info, i);
+            SendMessageW(host->tooltip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&info);
+        }
+    }
+}
+
+/* Shows the tracking tooltip for one composer button just above the cursor.
+   `slot` < 0 hides whichever tool is showing. */
+static void tooltip_show(ChatHost *host, int slot) {
+    if (host->tooltip_shown == slot) return;
+    if (!host->tooltip || slot < 0 || slot >= CHAT_TOOLTIP_COUNT) {
+        tooltip_hide(host);
+        return;
+    }
+    POINT cursor;
+    if (!GetCursorPos(&cursor)) return;
+    TOOLINFOW info;
+    tooltip_info(host, &info, slot);
+    SendMessageW(host->tooltip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&info);
+    SendMessageW(host->tooltip, TTM_TRACKPOSITION, 0,
+        MAKELPARAM(cursor.x + 16, cursor.y - 34));
+    SendMessageW(host->tooltip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&info);
+    host->tooltip_shown = slot;
+}
+
+static void tooltip_hide(ChatHost *host) {
+    if (!host->tooltip || host->tooltip_shown < 0) return;
+    TOOLINFOW info;
+    tooltip_info(host, &info, host->tooltip_shown);
+    SendMessageW(host->tooltip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&info);
+    host->tooltip_shown = -1;
+}
+
+/* Maps a cursor position (client DIPs) to a composer button slot, or -1. */
+static int tooltip_slot_at(ChatHost *host, float x, float y) {
+    UiId hit = ui_hit_test(host->config.ui, x, y);
+    if (hit == host->chat_ui.send) return 0;
+    if (hit == host->chat_ui.reasoning) return 1;
+    return -1;
+}
+
 static void flush(ChatHost *host) {
     layout(host);
     /* A reveal runs a second remap within this flush; the report
@@ -1235,6 +1351,7 @@ static void flush(ChatHost *host) {
     }
     if (GetCapture() == host->window && !host->config.ui->pressed &&
         !host->config.ui->drag_scroll) ReleaseCapture();
+    sync_tooltips(host);
     if (host->config.ui->paint_dirty) InvalidateRect(host->window, NULL, FALSE);
 }
 
@@ -1416,7 +1533,8 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
             host->config.api_key_utf8,m->generation.requested_model,
             context.messages,context.count,
             chat->backend==CHAT_BACKEND_OPENROUTER ?
-                &chat->provider_routing : NULL) : 0;
+                &chat->provider_routing : NULL,
+            chat_effective_reasoning(chat, c)) : 0;
     if (!host->request_generation) {
         m->generation.state=CHAT_GENERATION_FAILED;
         m->generation.finished_at=chat_now();
@@ -1777,6 +1895,18 @@ static void command(void *user, ChatCommand code, int index) {
         return;
     }
     if (code == CHAT_COMMAND_MODEL_PICKER) { open_model_palette(host); return; }
+    if (code == CHAT_COMMAND_TOGGLE_REASONING) {
+        /* Session-only per-conversation preference: never encoded, so the
+           store is not dirtied. The brain button and its tooltip follow
+           through chat_ui_sync and the flush's tooltip mirror. Toggling must
+           not cancel an in-progress edit, so this returns before the shared
+           capture/editing path. */
+        chat_conversation_set_reasoning(chat, chat->active,
+            !chat_effective_reasoning(chat, chat_active(chat)));
+        chat_ui_sync(&host->chat_ui);
+        flush(host);
+        return;
+    }
     if (code != CHAT_COMMAND_SEND) {
         capture_settings(host);
         host->editing=false;
@@ -3091,6 +3221,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         if (host->icon)
             host->tray_visible = chat_tray_show(window, host->icon,
                 CHAT_WM_TRAY, L"DarkChat");
+        create_tooltips(host);
         /* No menu bar: the header's overflow button (and the retained
            keyboard shortcuts) carries every command. */
         SetTimer(window,2,1000,NULL);
@@ -3276,19 +3407,26 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         info->ptMinTrackSize.y = r.bottom - r.top;
         return 0;
     }
-    case WM_MOUSEMOVE:
+    case WM_MOUSEMOVE: {
         if (!host->tracking) {
             TRACKMOUSEEVENT tracking = { sizeof tracking, TME_LEAVE, window, 0 };
             host->tracking = TrackMouseEvent(&tracking) != FALSE;
         }
-        ui_pointer_move(u, dip(host, GET_X_LPARAM(l)), dip(host, GET_Y_LPARAM(l)));
+        float x = dip(host, GET_X_LPARAM(l)), y = dip(host, GET_Y_LPARAM(l));
+        ui_pointer_move(u, x, y);
+        tooltip_show(host, tooltip_slot_at(host, x, y));
         flush(host);
         return 0;
+    }
     case WM_MOUSELEAVE:
-        host->tracking = false; ui_pointer_leave(u); flush(host); return 0;
+        host->tracking = false; ui_pointer_leave(u);
+        tooltip_hide(host);
+        flush(host);
+        return 0;
     case WM_LBUTTONDOWN:
         SetFocus(window);
         layout(host);
+        tooltip_hide(host);
         ui_pointer_down(u, dip(host, GET_X_LPARAM(l)), dip(host, GET_Y_LPARAM(l)));
         if (u->pressed) SetCapture(window);
         flush(host);
@@ -3311,7 +3449,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             end_scroll_drag(host, drag_position(host->view));
         flush(host);
         return 0;
-    case WM_MOUSEWHEEL: wheel(host, w, l); return 0;
+    case WM_MOUSEWHEEL: tooltip_hide(host); wheel(host, w, l); return 0;
     case WM_KEYDOWN:
     case WM_KEYUP: {
         bool down = message == WM_KEYDOWN;

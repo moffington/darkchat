@@ -590,6 +590,11 @@ const wchar_t *chat_effective_system_prompt(const Chat *chat,
     return chat->system_prompt;
 }
 
+bool chat_effective_reasoning(const Chat *chat, const ChatConversation *c) {
+    (void)chat;
+    return c ? !c->reasoning_disabled : true;
+}
+
 void chat_remember_model(Chat *chat) {
     /* The remembered history records the model a request actually uses,
         which is the active conversation's effective model (an override or
@@ -738,6 +743,14 @@ bool chat_conversation_set_model(Chat *chat, int conversation,
         ? chat->conversations[conversation].ollama_model
         : chat->conversations[conversation].model;
     wcscpy(slot, text);   /* empty clears back to inherit */
+    return true;
+}
+
+bool chat_conversation_set_reasoning(Chat *chat, int conversation,
+    bool enabled) {
+    if (!chat || conversation < 0 ||
+        conversation >= chat->conversation_count) return false;
+    chat->conversations[conversation].reasoning_disabled = !enabled;
     return true;
 }
 

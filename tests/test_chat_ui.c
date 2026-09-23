@@ -603,6 +603,43 @@ int main(void) {
         "an empty conversation reveals the empty state");
     check(!sidebar->hidden, "clearing messages does not disturb the sidebar");
 
+    /* Reasoning toggle: the brain button sits directly below Send at the same
+        size, starts on (selected), and mirrors the active conversation's
+        session-only preference. */
+    UiNode *reasoning = ui_node(ui, chat_ui->reasoning);
+    check(reasoning && reasoning->icon == UI_ICON_BRAIN,
+        "the composer exposes a brain reasoning button");
+    check(reasoning->rect.w == send->rect.w &&
+        reasoning->rect.h == send->rect.h,
+        "the reasoning button matches the send button size");
+    check(reasoning->rect.y >= send->rect.y + send->rect.h,
+        "the reasoning button sits below the send button");
+    check(reasoning->selected &&
+        !wcscmp(ui_accessible_name(ui, chat_ui->reasoning), L"Reasoning on"),
+        "reasoning is on and announced by default");
+
+    check(chat_conversation_set_reasoning(chat, chat->active, false),
+        "fixture: reasoning is turned off for the active conversation");
+    check(!chat_effective_reasoning(chat, chat_active(chat)),
+        "the effective resolver reflects the conversation flag");
+    chat_ui_sync(chat_ui);
+    check(!reasoning->selected && reasoning->style.foreground == UI_FAINT,
+        "a disabled conversation greys the reasoning button");
+    check(!wcscmp(ui_accessible_name(ui, chat_ui->reasoning), L"Reasoning off"),
+        "the reasoning button announces its off state");
+
+    /* Switching conversations shows that conversation's own state. */
+    int reason_home = chat->active;
+    check(chat_new_conversation(chat) >= 0, "fixture: a second conversation");
+    chat_ui_sync(chat_ui);
+    check(reasoning->selected,
+        "a fresh conversation defaults to reasoning on");
+    check(chat_select_conversation(chat, reason_home),
+        "fixture: back to the first");
+    chat_ui_sync(chat_ui);
+    check(!reasoning->selected,
+        "switching back restores the conversation's off state");
+
     free(chat_ui); chat_dispose(chat); free(chat); free(ui);
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("\nall chat UI checks passed\n");

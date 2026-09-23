@@ -43,6 +43,7 @@ typedef struct {
     wchar_t **texts;
     int count;
     ChatProviderRouting routing;
+    bool reasoning;
     ChatGeneration metadata;
     ULONGLONG started_tick;
 } CompletionWork;
@@ -275,7 +276,7 @@ static bool build_request(const CompletionWork *work, JsonBuf *body) {
         messages[i].text = work->texts[i];
     }
     bool ok = chat_completion_request_build(body, work->backend, work->model,
-        messages, work->count, &work->routing);
+        messages, work->count, &work->routing, work->reasoning);
     free(messages);
     return ok;
 }
@@ -735,7 +736,7 @@ static unsigned __stdcall worker(void *parameter) {
 int completion_request(CompletionClient *client, ChatBackend backend,
     const char *api_key_utf8, const wchar_t *model,
     const CompletionMessage *messages, int count,
-    const ChatProviderRouting *routing) {
+    const ChatProviderRouting *routing, bool reasoning) {
     if (!client || !client->notify || backend < 0 ||
         backend >= CHAT_BACKEND_COUNT || !model || !model[0] || count < 0 ||
         (count > 0 && !messages) || client->thread) return 0;
@@ -760,6 +761,7 @@ int completion_request(CompletionClient *client, ChatBackend backend,
     /* The work item is calloc-zeroed, so a NULL routing keeps OpenRouter's
        defaults; otherwise the caller's routing is copied for this request. */
     if (routing) work->routing = *routing;
+    work->reasoning = reasoning;
     bool ok = true;
     if (api_key_utf8 && api_key_utf8[0]) {
         size_t key_length = strlen(api_key_utf8);

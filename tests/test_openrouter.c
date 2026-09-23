@@ -92,6 +92,7 @@ int main(int argc,char **argv) {
     CompletionWork work={0}; work.notify=window; work.message=CHAT_WM_COMPLETION_EVENT;
     work.client=&client; work.generation=7; generation=7;
     work.backend=CHAT_BACKEND_OPENROUTER;
+    work.reasoning=true;
     work.started_tick=GetTickCount64(); chat_generation_init(&work.metadata);
     work.metadata.backend=CHAT_BACKEND_OPENROUTER;
     Stream stream={0}; stream.work=&work; stream.flush_tick=GetTickCount64();
@@ -256,6 +257,18 @@ int main(int argc,char **argv) {
         "{\"role\":\"system\",\"content\":\"system\"},"
         "{\"role\":\"user\",\"content\":\"question \\\"quoted\\\"\"}],"
         "\"stream\":true,\"reasoning\":{\"enabled\":true}}"));
+    /* Suppressed reasoning omits the object entirely and keeps the body
+       otherwise identical. */
+    work.reasoning=false;
+    JsonBuf plain; CHECK(encode(&work,&plain)); CHECK(json_validate(plain.data));
+    CHECK(strstr(plain.data,"\"reasoning\"")==NULL);
+    CHECK(!strcmp(plain.data,
+        "{\"model\":\"test/model\",\"messages\":["
+        "{\"role\":\"system\",\"content\":\"system\"},"
+        "{\"role\":\"user\",\"content\":\"question \\\"quoted\\\"\"}],"
+        "\"stream\":true}"));
+    json_buf_free(&plain);
+    work.reasoning=true;
     /* OpenRouter credentials and attribution headers are unchanged. */
     {
         static char key[]="secret-key";
@@ -327,8 +340,8 @@ int main(int argc,char **argv) {
     }
     json_buf_free(&body);
     /* The Ollama envelope constant is exactly what the encoder writes. */
-    CHECK(chat_completion_envelope_bytes(CHAT_BACKEND_OLLAMA,work.model,NULL)==
-        78 + json_encoded_string_size(work.model));
+    CHECK(chat_completion_envelope_bytes(CHAT_BACKEND_OLLAMA,work.model,NULL,
+        true)==78 + json_encoded_string_size(work.model));
     work.backend=CHAT_BACKEND_OPENROUTER;
     chat_provider_routing_init(&work.routing);
     /* The request context's measured size must equal the body the real encoder
@@ -355,6 +368,7 @@ int main(int argc,char **argv) {
         CHAT_CONTEXT_BUDGET_BYTES,&context)==CHAT_CONTEXT_OK);
     CHECK(context.count==8 && context.dropped_messages==0);
     CompletionWork sized={0};
+    sized.reasoning=true;   /* the default conversation asks for reasoning */
     ChatRole sized_roles[CHAT_CONTEXT_MAX_ENTRIES];
     wchar_t *sized_texts[CHAT_CONTEXT_MAX_ENTRIES];
     for (int i=0;i<context.count;i++) {
@@ -402,6 +416,22 @@ int main(int argc,char **argv) {
     CHECK(strstr(measured.data,"\"stream_options\":{\"include_usage\":true}")!=NULL);
     CHECK(strstr(measured.data,"\"provider\"")==NULL);
     json_buf_free(&measured);
+    /* Reasoning suppressed: the object leaves both the body and the measured
+       envelope, and the budget parity invariant still holds. */
+    context_chat->backend=CHAT_BACKEND_OPENROUTER;
+    context_chat->conversations[0].reasoning_disabled=true;
+    CHECK(chat_context_build(context_chat,&context_chat->conversations[0],trigger,
+        CHAT_CONTEXT_BUDGET_BYTES,&context)==CHAT_CONTEXT_OK);
+    sized.backend=CHAT_BACKEND_OPENROUTER;
+    sized.model=context_chat->model;
+    sized.routing=context_chat->provider_routing;
+    sized.reasoning=false;
+    JsonBuf plain_body; CHECK(encode(&sized,&plain_body));
+    CHECK(json_validate(plain_body.data));
+    CHECK(plain_body.length==context.bytes);
+    CHECK(strstr(plain_body.data,"\"reasoning\"")==NULL);
+    json_buf_free(&plain_body);
+    context_chat->conversations[0].reasoning_disabled=false;
     chat_dispose(context_chat); free(context_chat);
     puts("The bounded request context measures exactly what the encoder writes");
     puts("Actual request encoder and SSE metadata/error decoding passed for both backends");
@@ -412,7 +442,7 @@ int main(int argc,char **argv) {
         if (size && size<sizeof key) {
             terminal=0; deltas=0;
             generation=completion_request(&client,CHAT_BACKEND_OPENROUTER,key,
-                L"openai/gpt-4o-mini",&message,1,NULL);
+                L"openai/gpt-4o-mini",&message,1,NULL,true);
             CHECK(generation>0);
             CHECK(await_terminal(90000)); completion_complete(&client,generation);
             printf("OpenRouter live outcome=%d, text chunks=%d, usage=%s, cost=%s, model=%s\n",
@@ -421,7 +451,7 @@ int main(int argc,char **argv) {
             CHECK(outcome==COMPLETION_DONE && deltas>0 && metadata.total_tokens>0 && metadata.actual_model[0]);
             terminal=0; deltas=0;
             generation=completion_request(&client,CHAT_BACKEND_OPENROUTER,key,
-                L"openai/gpt-4o-mini",&message,1,NULL);
+                L"openai/gpt-4o-mini",&message,1,NULL,true);
             CHECK(generation>0 && completion_cancel(&client,generation));
             CHECK(await_terminal(10000)); completion_complete(&client,generation);
             CHECK(outcome==COMPLETION_CANCELLED && terminal==1);
@@ -438,7 +468,7 @@ int main(int argc,char **argv) {
             MultiByteToWideChar(CP_UTF8,0,ollama_model,-1,wide_model,256);
             terminal=0; deltas=0;
             generation=completion_request(&client,CHAT_BACKEND_OLLAMA,NULL,
-                wide_model,&message,1,NULL);
+                wide_model,&message,1,NULL,true);
             if (generation>0 && await_terminal(60000)) {
                 completion_complete(&client,generation);
                 printf("Ollama live outcome=%d, text chunks=%d\n",outcome,deltas);

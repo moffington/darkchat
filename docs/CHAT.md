@@ -135,6 +135,14 @@ No third-party dependencies are required (C17, MinGW-w64, Win32).
   reasoning ever arrives, the temporary row is removed once answer text begins.
   Each turn's reasoning and duration are independent and persist; expansion is
   per-session view state. Reasoning is never invented locally.
+- The composer pairs **Send** with a **brain toggle** directly below it and the
+  same size; the brain is accent-colored when reasoning is on and greyed when
+  off. It is a *session-only, per-conversation* preference: flipping it changes
+  whether this conversation's next OpenRouter request asks for reasoning, the
+  choice is not persisted (every conversation starts on), and it never affects
+  Ollama, whose requests carry no reasoning object either way. Both composer
+  buttons show a native hover tooltip that tracks their current action
+  (Send/Stop and reasoning on/off).
 - The **Customization** menu carries per-conversation overrides and the prompt
   profile library. Its override commands and **Save current prompt as
   profile…** also appear in the `Ctrl+K` command palette under their own
@@ -576,9 +584,11 @@ into the transcript or the payload.
   for both backends. The framing itself comes from the same pure backend-aware
   builder the transport encodes with (`chat/generation/completion_request.c`), so the
   measured envelope and per-message bytes cannot drift from the body. For
-  OpenRouter the body may also carry the optional `provider` object, whose exact
-  bytes are added to the measured envelope by the same pure builder the encoder
-  uses; the Ollama envelope instead carries
+  OpenRouter the body may also carry the optional `provider` object and the
+  `reasoning` object, whose exact bytes are added to the measured envelope by
+  the same pure builder the encoder uses; the reasoning object is emitted only
+  while the active conversation's brain toggle is on, and its absence shrinks
+  the measured envelope by the same bytes. The Ollama envelope instead carries
   `stream_options.include_usage` and never a `provider` object or reasoning
   control.
 - If the indispensable messages cannot fit, the request is not sent at all: the
@@ -697,7 +707,9 @@ reasoning a provider supplied is persisted per message alongside its answer,
 with its duration; the optional fields are appended last so a version 1 snapshot
 without reasoning still loads. Each generation also records the backend that
 produced it, so a transcript's metadata footer remains correct after later
-backend switches.
+backend switches. The composer's reasoning toggle is deliberately outside the
+format: it is session-only per-conversation state, never encoded, and every
+conversation starts enabled again after a load.
 
 Writes serialize explicit fields, flush `state.tmp.jsonl`, then atomically replace
 `state.jsonl` on the same volume using `MoveFileExW` with write-through. Before
@@ -901,8 +913,9 @@ The complete coverage includes:
   reasoning request parameter and reasoning_details/text-summary/plain fallback
   parsing that never fabricates reasoning — exercised for both backends. The
   OpenRouter body is pinned byte-for-byte and still carries its credentials,
-  attribution headers, reasoning control and optional provider object; the
-  Ollama body requests `stream_options.include_usage`, never carries a reason or
+  attribution headers, reasoning control and optional provider object, and a
+  second pinned body proves that a suppressed reasoning preference omits the
+  object; the Ollama body requests `stream_options.include_usage`, never carries a reason or
   provider control, and its headers contain no `Authorization`, `X-Title`,
   `HTTP-Referer` or bearer token even when a key is set. Ollama content,
   reasoning (`reasoning`/`reasoning_content`), usage, `[DONE]`, malformed-stream

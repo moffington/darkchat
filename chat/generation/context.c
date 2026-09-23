@@ -43,7 +43,7 @@ ChatContextResult chat_context_build(const Chat *chat, const ChatConversation *c
         ? CHAT_COMPLETION_SEPARATOR_BYTES : 0;
     size_t envelope_bytes = chat_completion_envelope_bytes(chat->backend,
         chat_effective_model_for_backend(chat, c, chat->backend),
-        &chat->provider_routing);
+        &chat->provider_routing, chat_effective_reasoning(chat, c));
     /* The complete body the indispensable content would require: the envelope,
        the system prompt when set, and the triggering message with the
        separator that precedes it. Reported by every OVERSIZE result, and

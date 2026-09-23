@@ -63,12 +63,13 @@ void completion_init(CompletionClient *client, HWND notify, UINT message);
 CompletionEvent *completion_take(CompletionClient *client);
 /* Starts one streamed request against `backend`. An API key is required only
    for OpenRouter: Ollama needs none, so a missing OPENROUTER_API_KEY never
-   blocks it. `routing` applies to OpenRouter only. Returns the generation
-   (> 0) or 0 when the request could not start. */
+   blocks it. `routing` applies to OpenRouter only. `reasoning` gates
+   OpenRouter's reasoning object and is ignored for Ollama. Returns the
+   generation (> 0) or 0 when the request could not start. */
 int completion_request(CompletionClient *client, ChatBackend backend,
     const char *api_key_utf8, const wchar_t *model,
     const CompletionMessage *messages, int count,
-    const ChatProviderRouting *routing);
+    const ChatProviderRouting *routing, bool reasoning);
 bool completion_cancel(CompletionClient *client, int generation);
 void completion_event_free(CompletionEvent *event);
 /* Frees a linked batch returned by completion_take (single events too). */

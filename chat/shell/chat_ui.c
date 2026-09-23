@@ -446,11 +446,21 @@ bool chat_ui_init(ChatUi *chat_ui, Ui *ui, Chat *chat) {
     UiId send_top = add(chat_ui, send_wrap, UI_COLUMN, L"");
     fill_width(chat_ui, send_top);
     fill_height(chat_ui, send_top);
-    chat_ui->send = icon_button(chat_ui, send_wrap, UI_ICON_SEND,
+    /* The primary action and the reasoning toggle stack as one centered
+       group: Send on top, the brain directly below it. */
+    UiId send_group = add(chat_ui, send_wrap, UI_COLUMN, L"");
+    fill_width(chat_ui, send_group);
+    node(chat_ui, send_group)->style.gap = 6;
+    node(chat_ui, send_group)->style.padding = 0;
+    chat_ui->send = icon_button(chat_ui, send_group, UI_ICON_SEND,
         L"Send message", L"Send the message. Shift+Enter inserts a newline.");
     width(chat_ui, chat_ui->send, CHAT_SEND_BUTTON);
     height(chat_ui, chat_ui->send, CHAT_SEND_BUTTON);
     node(chat_ui, chat_ui->send)->selected = true;
+    chat_ui->reasoning = icon_button(chat_ui, send_group, UI_ICON_BRAIN,
+        L"Reasoning on", L"Turn reasoning on or off for this conversation (OpenRouter).");
+    width(chat_ui, chat_ui->reasoning, CHAT_SEND_BUTTON);
+    height(chat_ui, chat_ui->reasoning, CHAT_SEND_BUTTON);
     UiId send_bottom = add(chat_ui, send_wrap, UI_COLUMN, L"");
     fill_width(chat_ui, send_bottom);
     fill_height(chat_ui, send_bottom);
@@ -497,6 +507,10 @@ void chat_ui_sync(ChatUi *chat_ui) {
     ui_set_text(chat_ui->ui, chat_ui->status, chat->status);
     bool empty = !active || active->message_count == 0;
     set_hidden(chat_ui, chat_ui->empty, !empty);
+
+    /* The brain button mirrors the active conversation's session-only
+       reasoning preference, so switching conversations updates it. */
+    chat_ui_set_reasoning(chat_ui, chat_effective_reasoning(chat, active));
 
     /* The chip shows the effective model of the active conversation. When a
         per-conversation override is active (presence, not value: an override
@@ -688,6 +702,22 @@ void chat_ui_set_generation(ChatUi *chat_ui, bool generating, bool stopping) {
     ui_invalidate(chat_ui->ui, false);
 }
 
+void chat_ui_set_reasoning(ChatUi *chat_ui, bool enabled) {
+    UiNode *item = node(chat_ui, chat_ui->reasoning);
+    if (!item) return;
+    UiColorRole foreground = enabled ? UI_BRIGHT : UI_FAINT;
+    if (item->selected == enabled && item->style.foreground == foreground)
+        return;
+    item->selected = enabled;
+    item->style.foreground = foreground;
+    ui_set_accessible_name(chat_ui->ui, chat_ui->reasoning,
+        enabled ? L"Reasoning on" : L"Reasoning off");
+    ui_set_help_text(chat_ui->ui, chat_ui->reasoning,
+        enabled ? L"Reasoning is on for this conversation. Click to turn it off (OpenRouter)."
+                : L"Reasoning is off for this conversation. Click to turn it on (OpenRouter).");
+    ui_invalidate(chat_ui->ui, false);
+}
+
 void chat_ui_set_search_status(ChatUi *chat_ui, const wchar_t *text) {
     ui_set_text(chat_ui->ui, chat_ui->search_status, text ? text : L"");
     ui_invalidate(chat_ui->ui, false);
@@ -727,6 +757,8 @@ void chat_ui_event(void *user, Ui *ui, UiEvent event) {
         command(chat_ui->command_user, CHAT_COMMAND_OVERFLOW, -1);
     } else if (event.id == chat_ui->model_picker) {
         command(chat_ui->command_user, CHAT_COMMAND_MODEL_PICKER, -1);
+    } else if (event.id == chat_ui->reasoning) {
+        command(chat_ui->command_user, CHAT_COMMAND_TOGGLE_REASONING, -1);
     } else {
         /* Selection is identity-based: the row's tag holds the stable
            conversation id, resolved to an index only at this instant. */

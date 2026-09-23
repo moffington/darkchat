@@ -12,6 +12,11 @@
 #define REQUEST_OPENROUTER_SUFFIX \
     "],\"stream\":true,\"reasoning\":{\"enabled\":true}"
 #define REQUEST_OPENROUTER_SUFFIX_BYTES (sizeof REQUEST_OPENROUTER_SUFFIX - 1)
+/* The same envelope with reasoning suppressed: the reasoning object is
+   omitted entirely, so the provider applies its own default. */
+#define REQUEST_OPENROUTER_PLAIN_SUFFIX "],\"stream\":true"
+#define REQUEST_OPENROUTER_PLAIN_SUFFIX_BYTES \
+    (sizeof REQUEST_OPENROUTER_PLAIN_SUFFIX - 1)
 #define REQUEST_OLLAMA_SUFFIX \
     "],\"stream\":true,\"stream_options\":{\"include_usage\":true}"
 #define REQUEST_OLLAMA_SUFFIX_BYTES (sizeof REQUEST_OLLAMA_SUFFIX - 1)
@@ -33,14 +38,15 @@ static size_t role_name_bytes(ChatRole role) {
 }
 
 size_t chat_completion_envelope_bytes(ChatBackend backend, const wchar_t *model,
-    const ChatProviderRouting *routing) {
+    const ChatProviderRouting *routing, bool reasoning) {
     size_t total = REQUEST_PREFIX_MODEL_BYTES +
         json_encoded_string_size(model) + REQUEST_PREFIX_MESSAGES_BYTES +
         REQUEST_FINAL_BYTES;
     if (backend == CHAT_BACKEND_OLLAMA)
         total += REQUEST_OLLAMA_SUFFIX_BYTES;
     else
-        total += REQUEST_OPENROUTER_SUFFIX_BYTES +
+        total += (reasoning ? REQUEST_OPENROUTER_SUFFIX_BYTES
+            : REQUEST_OPENROUTER_PLAIN_SUFFIX_BYTES) +
             chat_provider_envelope_bytes(routing);
     return total;
 }
@@ -52,7 +58,7 @@ size_t chat_completion_message_bytes(ChatRole role, const wchar_t *text) {
 
 bool chat_completion_request_build(JsonBuf *buf, ChatBackend backend,
     const wchar_t *model, const ChatRequestMessage *messages, int count,
-    const ChatProviderRouting *routing) {
+    const ChatProviderRouting *routing, bool reasoning) {
     if (!buf) return false;
     json_buf_init(buf, 8192);
     if (!json_buf_append_raw(buf, REQUEST_PREFIX_MODEL,
@@ -76,8 +82,11 @@ bool chat_completion_request_build(JsonBuf *buf, ChatBackend backend,
         if (!json_buf_append_raw(buf, REQUEST_OLLAMA_SUFFIX,
                 REQUEST_OLLAMA_SUFFIX_BYTES)) return false;
     } else {
-        if (!json_buf_append_raw(buf, REQUEST_OPENROUTER_SUFFIX,
+        if (reasoning && !json_buf_append_raw(buf, REQUEST_OPENROUTER_SUFFIX,
                 REQUEST_OPENROUTER_SUFFIX_BYTES)) return false;
+        if (!reasoning && !json_buf_append_raw(buf,
+                REQUEST_OPENROUTER_PLAIN_SUFFIX,
+                REQUEST_OPENROUTER_PLAIN_SUFFIX_BYTES)) return false;
         if (!chat_provider_append(buf, routing)) return false;
     }
     return json_buf_append_raw(buf, REQUEST_FINAL, REQUEST_FINAL_BYTES);
