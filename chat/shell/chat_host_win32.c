@@ -3473,6 +3473,17 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
     return DefWindowProcW(window, message, w, l);
 }
 
+/* Whether a saved top-left and pixel size would land on a current monitor. A
+   minimized window stores the sentinel x == -32000, and a window saved on a
+   since-removed monitor intersects none: both fall back to CW_USEDEFAULT at
+   startup. Pure predicate so the fallback is unit-testable away from
+   chat_host_run. */
+static bool saved_geometry_visible(int x, int y, int width, int height) {
+    if (x == -32000) return false;
+    RECT rect = { x, y, x + width, y + height };
+    return MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) != NULL;
+}
+
 int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
     if (!config || !config->ui || !config->chat) return 1;
     if (!SetProcessDpiAwarenessContext(
@@ -3549,8 +3560,8 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
     AdjustWindowRectExForDpi(&bounds, WS_OVERLAPPEDWINDOW, FALSE, 0,
         (UINT)host->dpi);
     int x=config->chat->window_x, y=config->chat->window_y;
-    RECT saved_rect={x,y,x+px(host,(float)config->chat->window_width),y+px(host,(float)config->chat->window_height)};
-    if (x==-32000 || !MonitorFromRect(&saved_rect,MONITOR_DEFAULTTONULL)) x=y=CW_USEDEFAULT;
+    if (!saved_geometry_visible(x, y, px(host,(float)config->chat->window_width),
+        px(host,(float)config->chat->window_height))) x=y=CW_USEDEFAULT;
     HWND window = CreateWindowExW(0, cls.lpszClassName, config->title,
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y,
         loaded ? px(host,(float)config->chat->window_width) : bounds.right - bounds.left,

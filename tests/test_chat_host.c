@@ -6607,6 +6607,66 @@ static int notify_suite(void) {
     return 0;
 }
 
+/* ---- DPI reflow + saved-geometry hardening suite ------------------------ */
+
+static int hardening_suite(void) {
+    /* Saved-geometry fallback is a pure predicate: the minimized sentinel and
+       an off-monitor rectangle both force default placement, while an ordinary
+       on-screen rectangle is kept. */
+    CHECK(!saved_geometry_visible(-32000,0,800,600));
+    CHECK(saved_geometry_visible(0,0,800,600));
+    CHECK(!saved_geometry_visible(300000,-300000,800,600));
+
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui); Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Hardening host",1100,720,720,480,NULL,
+        false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256]; swprintf(dir,256,L"build\\host-harden-%lu",GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
+    CHECK(register_class_once(&cls));
+    WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
+    CHECK(register_class_once(&view_cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Hardening integration",
+        WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+
+    /* A DPI change carries the new scale in both words of wParam and a
+       suggested rectangle in lParam. The host adopts the DPI on itself and
+       re-derives every native surface (the fields, the transcript and the
+       renderer), and takes the suggested rectangle. */
+    CHECK(h->dpi==96);
+    CHECK(h->field.window && h->search.window && h->composer.window);
+    RECT suggested={0,0,2000,1400};
+    SendMessageW(window,WM_DPICHANGED,MAKELONG(192,192),(LPARAM)&suggested);
+    CHECK(h->dpi==192);
+    CHECK(h->renderer.dpi==192);
+    CHECK(h->field.dpi==192);
+    CHECK(h->search.dpi==192);
+    CHECK(h->composer.dpi==192);
+    CHECK(h->transcript.dpi==192);
+    RECT grown; GetWindowRect(window,&grown);
+    CHECK(grown.left==0 && grown.top==0 &&
+        grown.right==2000 && grown.bottom==1400);
+
+    saver_shutdown(&h->saver); storage_close(&h->storage);
+    DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup);
+    DeleteFileW(h->storage.temporary);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir);
+    DeleteFileW(lock); RemoveDirectoryW(dir);
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer);
+    DeleteObject(h->background);
+    transcript_dispose(&h->transcript);
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
 int main(void) {
     /* The fixtures share one process and never unload Msftedit: repeated
         unload/reload cycles across fixtures can fail its DllMain with
@@ -6636,6 +6696,8 @@ int main(void) {
     if (failed) return failed;
     failed=notify_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy + export + import + notifications fixtures) passed");
+    failed=hardening_suite();
+    if (failed) return failed;
+    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy + export + import + notifications + hardening fixtures) passed");
     return failed;
 }
