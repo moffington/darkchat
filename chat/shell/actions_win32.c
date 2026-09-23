@@ -3,6 +3,7 @@
 #include "platform/dark_mode_win32.h"
 #include "ui/ui.h"
 #include <commdlg.h>
+#include <imm.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -212,6 +213,13 @@ HWND chat_foreground_window(void) {
 }
 bool chat_set_foreground(HWND window) {
     return SetForegroundWindow(window) != FALSE;
+}
+bool chat_ime_active(void) {
+    /* The thread's active layout is the input locale the user is typing in,
+       independent of which control holds focus. ImmIsIME reports an IME
+       layout even while the IME is still closed, so the press that would turn
+       it on is yielded too. */
+    return ImmIsIME(GetKeyboardLayout(0)) != FALSE;
 }
 bool chat_copy_text(HWND owner,const wchar_t *text) {
     size_t bytes=(wcslen(text)+1)*sizeof(wchar_t);

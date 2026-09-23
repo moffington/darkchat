@@ -2648,7 +2648,16 @@ static bool host_shortcut(ChatHost *host, WPARAM key, bool shift,
         search_step(host, shift);
         return true;
     }
-    if (control && key == VK_SPACE) { action(host, ACTION_MODELS); return true; }
+    /* Ctrl+Space opens the model palette -- unless an IME owns the thread's
+       input locale, where Ctrl+Space is the standard IME toggle. The key is
+       then left to the focused control (surface path) or DefWindowProc (top
+       level) so the IME still sees it; Ctrl+K remains the canonical palette
+       shortcut. */
+    if (control && key == VK_SPACE) {
+        if (chat_ime_active()) return false;
+        action(host, ACTION_MODELS);
+        return true;
+    }
     /* Ctrl+K opens the retained command palette: the same registry the
        overflow menu renders, filtered as you type. */
     if (control && (key == L'K' || key == L'k')) {

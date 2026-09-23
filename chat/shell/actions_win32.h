@@ -22,6 +22,12 @@ HWND chat_foreground_window(void);
    reason: a hidden test window must not drive the real foreground/IME path. */
 bool chat_set_foreground(HWND window);
 
+/* Whether the host thread's active input locale is an IME. When it is,
+   Ctrl+Space is the OS/IME on/off toggle and the host must not consume it;
+   the keyboard-layout query is wrapped so a hidden test is deterministic on
+   any developer machine. */
+bool chat_ime_active(void);
+
 /* Tray lifecycle. Defined in the host translation unit (again, so calls to
    chat_shell_notify are cross-unit and wrap-reliable). show performs NIM_ADD
    and then NIM_SETVERSION(NOTIFYICON_VERSION_4), rolling back with NIM_DELETE

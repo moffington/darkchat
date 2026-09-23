@@ -194,6 +194,15 @@ bool __wrap_chat_set_foreground(HWND window) {
     ++set_foreground_calls;
     return true;
 }
+/* IME seam (linked with -Wl,--wrap=chat_ime_active): the thread's real input
+   locale is machine-dependent, so the Ctrl+Space guard is driven through a
+   deterministic override instead. Default is "no IME", which keeps the
+   existing Ctrl+Space palette expectations valid everywhere. */
+static bool ime_forced, ime_value;
+bool __real_chat_ime_active(void);
+bool __wrap_chat_ime_active(void) {
+    return ime_forced ? ime_value : false;
+}
 /* Edit-dialog seam (linked with -Wl,--wrap=chat_edit_dialog): dialog-opening
     actions (per-conversation prompts, profile save/edit) are driven
     deterministically. Each call consumes the next queued answer; with the
@@ -6118,6 +6127,40 @@ static int model_palette_suite(void) {
         h->dirty=false;
         CHECK(host_shortcut(h,L'K',false,true,false));
         CHECK(palette_pump_calls==3 && !h->open_palette);
+        CHECK(!h->dirty);
+    }
+
+    /* IME yield: when the thread's active input locale is an IME, Ctrl+Space
+       belongs to the IME on/off toggle and must neither open the model palette
+       nor be consumed. Ctrl+K remains the canonical palette shortcut. */
+    {
+        palette_pump_calls=0; h->dirty=false;
+        ime_forced=true; ime_value=true;
+        CHECK(!host_shortcut(h,L' ',false,true,false));
+        CHECK(palette_pump_calls==0 && !h->open_palette);
+        CHECK(!h->model_applied && !h->dirty);
+        CHECK(host_shortcut(h,L'K',false,true,false));
+        CHECK(palette_pump_calls==1 && !h->open_palette);
+        /* A non-IME locale keeps the original Ctrl+Space behavior. */
+        ime_value=false;
+        CHECK(host_shortcut(h,L' ',false,true,false));
+        CHECK(palette_pump_calls==2 && !h->open_palette);
+        ime_forced=false;
+    }
+
+    /* VK_PROCESSKEY -- what Windows delivers while an IME is composing -- is
+       unmapped by the retained key map and passes through both shortcut paths
+       untouched: no palette, no command, no dirty state. */
+    {
+        palette_pump_calls=0; h->dirty=false;
+        UiKey key=UI_KEY_ENTER;
+        CHECK(!key_from_win32(VK_PROCESSKEY,&key));
+        CHECK(key==UI_KEY_ENTER);                       /* left unchanged */
+        CHECK(!host_shortcut(h,VK_PROCESSKEY,false,false,false));
+        CHECK(!surface_key(h,VK_PROCESSKEY,false,false,true));
+        SendMessageW(window,WM_KEYDOWN,VK_PROCESSKEY,0);
+        SendMessageW(h->composer.window,WM_KEYDOWN,VK_PROCESSKEY,0);
+        CHECK(palette_pump_calls==0 && !h->open_palette);
         CHECK(!h->dirty);
     }
 
