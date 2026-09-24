@@ -1292,21 +1292,23 @@ static void sync_tooltips(ChatHost *host) {
     }
 }
 
-/* Shows the tracking tooltip for one composer button just above the cursor.
+/* Shows the tracking tooltip for one composer button just above `client`
+   (the WM_MOUSEMOVE client coordinates that selected the slot). Position
+   comes from the event, not GetCursorPos: a synthetic move does not move
+   the desktop cursor, and GetCursorPos can fail in headless test hosts.
    `slot` < 0 hides whichever tool is showing. */
-static void tooltip_show(ChatHost *host, int slot) {
+static void tooltip_show(ChatHost *host, int slot, POINT client) {
     if (host->tooltip_shown == slot) return;
     if (!host->tooltip || slot < 0 || slot >= CHAT_TOOLTIP_COUNT) {
         tooltip_hide(host);
         return;
     }
-    POINT cursor;
-    if (!GetCursorPos(&cursor)) return;
+    if (!ClientToScreen(host->window, &client)) return;
     TOOLINFOW info;
     tooltip_info(host, &info, slot);
     SendMessageW(host->tooltip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&info);
     SendMessageW(host->tooltip, TTM_TRACKPOSITION, 0,
-        MAKELPARAM(cursor.x + 16, cursor.y - 34));
+        MAKELPARAM(client.x + 16, client.y - 34));
     SendMessageW(host->tooltip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&info);
     host->tooltip_shown = slot;
 }
@@ -3414,7 +3416,8 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         }
         float x = dip(host, GET_X_LPARAM(l)), y = dip(host, GET_Y_LPARAM(l));
         ui_pointer_move(u, x, y);
-        tooltip_show(host, tooltip_slot_at(host, x, y));
+        POINT client = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        tooltip_show(host, tooltip_slot_at(host, x, y), client);
         flush(host);
         return 0;
     }
