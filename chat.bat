@@ -15,7 +15,7 @@ start "" /b powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$f='.oOo
 
 windres app.rc -O coff -o build\chat_app.res >> "%progress_log%" 2>&1
 if errorlevel 1 goto failed
-gcc -std=c17 -I. -municode -mwindows -Wall -Wextra -Wpedantic -Werror -O2 chat_main.c chat\core\chat.c chat\generation\context.c chat\generation\provider_routing.c chat\core\search.c chat\shell\chat_ui.c chat\transcript\transcript_policy.c chat\transcript\transcript_win32.c chat\shell\chat_host_win32.c chat\persistence\storage.c chat\persistence\saver.c chat\shell\actions_win32.c chat\core\commands.c chat\shell\palette.c chat\shell\palette_win32.c chat\transcript\rich_text_win32.c chat\transcript\markdown.c chat\transcript\table_layout.c chat\json.c chat\export\export.c chat\import\import.c chat\generation\sse.c chat\generation\completion_request.c chat\generation\completion_winhttp.c chat\models\model_catalog.c chat\models\model_catalog_winhttp.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c platform\dark_mode_win32.c build\chat_app.res -o build\darkchat.exe -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp -ladvapi32 -lcomdlg32 -limm32 -lcomctl32 >> "%progress_log%" 2>&1
+gcc -std=c17 -I. -municode -mwindows -Wall -Wextra -Wpedantic -Werror -O2 chat_main.c chat\core\chat.c chat\generation\context.c chat\generation\provider_routing.c chat\core\search.c chat\shell\chat_ui.c chat\transcript\transcript_policy.c chat\transcript\transcript_win32.c chat\shell\chat_host_win32.c chat\persistence\storage.c chat\persistence\saver.c chat\persistence\attachments.c chat\shell\actions_win32.c chat\core\commands.c chat\shell\palette.c chat\shell\palette_win32.c chat\transcript\rich_text_win32.c chat\transcript\markdown.c chat\transcript\table_layout.c chat\json.c chat\export\export.c chat\import\import.c chat\generation\sse.c chat\generation\completion_request.c chat\generation\completion_winhttp.c chat\models\model_catalog.c chat\models\model_catalog_winhttp.c ui\ui.c ui\theme.c ui\paint.c platform\renderer.c platform\accessibility.c platform\dark_mode_win32.c build\chat_app.res -o build\darkchat.exe -ld2d1 -ldwrite -ldwmapi -luiautomationcore -loleaut32 -lole32 -lgdi32 -lshell32 -lwinhttp -ladvapi32 -lcomdlg32 -limm32 -lcomctl32 >> "%progress_log%" 2>&1
 if errorlevel 1 goto failed
 call :stop_progress
 echo done - chat build passed
@@ -92,6 +92,10 @@ if /i "%~1"=="test" (
     gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_storage.c chat\persistence\storage.c chat\core\chat.c chat\json.c -o build\test_storage.exe -Wl,--wrap=malloc -Wl,--wrap=realloc -Wl,--wrap=calloc -Wl,--wrap=free
     if errorlevel 1 exit /b 1
     build\test_storage.exe
+    if errorlevel 1 exit /b 1
+    gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_attachments.c chat\persistence\attachments.c -o build\test_attachments.exe -Wl,--wrap=malloc -Wl,--wrap=free
+    if errorlevel 1 exit /b 1
+    build\test_attachments.exe
     if errorlevel 1 exit /b 1
     gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_openrouter.c chat\generation\context.c chat\generation\provider_routing.c chat\generation\completion_request.c chat\core\chat.c chat\json.c chat\generation\sse.c -o build\test_openrouter.exe -lwinhttp
     if errorlevel 1 exit /b 1

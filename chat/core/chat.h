@@ -17,10 +17,10 @@
     documented in docs/CHAT.md. */
 #define CHAT_MAX_CONVERSATIONS 128
 #define CHAT_MAX_MESSAGES 512
-/* Every persisted identity (conversation and stable message ids) comes from
-   one counter that the storage format encodes as an exact double. This is the
-   shared allocation ceiling: exhausting it is treated as corruption on load
-   and blocks further allocation at runtime. */
+/* Every persisted identity (conversation, message, and attachment ids)
+   comes from one counter that the storage format encodes as an exact
+   double. This is the shared allocation ceiling: exhausting it is treated
+   as corruption on load and blocks further allocation at runtime. */
 #define CHAT_MAX_ID 9007199254740000ULL
 /* Composer input, per-conversation drafts and the system prompt keep the
    16,383-code-unit product limit (the composer enforces one less through

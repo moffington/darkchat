@@ -62,6 +62,24 @@ typedef struct {
     wchar_t display_name[64];
 } ChatImagePart;
 
+/* Attachment-store record for one managed blob: identity, digest and the
+   metadata a request/export/sweep needs without opening the file. Loaded
+   from snapshot format 6 `type:"attachment"` records (later commit) and
+   filled by attachment_store_put. `id` shares the conversation/message
+   counter (CHAT_MAX_ID ceiling). `digest` is 64 lowercase hex characters
+   (SHA-256 of the managed bytes) and names the blob file; `bytes` is the
+   stored length. `pixel_*` are display hints (0 when unknown before WIC
+   ingest). `display_name` is never a path. */
+typedef struct {
+    uint64_t id;
+    char digest[64 + 1];
+    char mime[32];
+    size_t bytes;
+    uint32_t pixel_width, pixel_height;
+    int64_t created_at;
+    wchar_t display_name[64];
+} ChatAttachmentMeta;
+
 typedef struct {
     uint8_t kind;      /* ChatPartKind */
     uint8_t flags;     /* CHAT_PART_FLAG_* (IMAGE only); unknown bits = corruption */
