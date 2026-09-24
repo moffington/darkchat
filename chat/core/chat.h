@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <wchar.h>
 #include <stdint.h>
+#include "chat/core/content.h"
 
 /* Up to 128 conversations; snapshot format 2 raised this bound from 16.
     Snapshot format 3 raised the per-conversation message bound from 64 to 512.
@@ -153,10 +154,18 @@ typedef struct {
        supplied none. Never fabricated locally. */
     wchar_t reasoning[CHAT_REASONING_INLINE];
     /* Heap-backed promotion of the text/reasoning residue. Access through
-       chat_message_* helpers. */
+        chat_message_* helpers. */
     wchar_t *text_overflow, *reasoning_overflow;
     size_t text_length, reasoning_length;
     size_t text_capacity, reasoning_capacity;
+    /* Ordered content parts. NULL and 0 = pure text message whose content is
+       `text` (the fast path). Non-NULL = the authoritative ordered content;
+       `text` then mirrors the plain-text projection. Owned; disposed with the
+       message; deep-copied by chat_snapshot; transferred bytewise with the
+       message under conversation memmove (same rules as text_overflow).
+       TEXT part payloads are independent heap copies of the projection, not
+       aliases of text_overflow. */
+    ChatContent parts;
     /* Stable message identity, allocated from the same persisted counter as
        conversation ids and saved in the snapshot: a message keeps its id
        across restarts, and retry/regenerate/edit-and-resend give the new
@@ -206,11 +215,11 @@ typedef struct {
          owns live ChatMessage pointers; preserve that property.
        - A bytewise move of a whole ChatConversation (conversation deletion)
          transfers ownership of the messages allocation and every live
-         message's overflow allocations; the vacated slot must be zeroed so
-         the same pointers cannot be freed twice.
-       - Never byte-copy a live ChatMessage that owns overflow pointers into
-         another independently owned slot; the copies would alias the same
-         allocations and free them twice.
+         message's overflow allocations and parts arrays; the vacated slot
+         must be zeroed so the same pointers cannot be freed twice.
+       - Never byte-copy a live ChatMessage that owns overflow pointers or a
+         parts array into another independently owned slot; the copies would
+         alias the same allocations and free them twice.
        - Before a conversation's message storage is discarded or overwritten,
          dispose every live message in [0, message_count), then free the
          messages allocation and reset pointer/count/capacity (chat_dispose
@@ -326,6 +335,28 @@ bool chat_message_set_text(ChatMessage *message, const wchar_t *text);
 bool chat_message_set_reasoning(ChatMessage *message, const wchar_t *text);
 bool chat_message_append_text(ChatMessage *message, const wchar_t *text);
 bool chat_message_append_reasoning(ChatMessage *message, const wchar_t *text);
+/* Logical ordered-part view. Fast-path messages (parts.items == NULL)
+   present zero or one TEXT part derived from `text`; no ChatPart object
+   exists for them. part_at fills `out` by value and returns false past
+   count (leaving *out zeroed). `has_images` is false on the fast path. */
+size_t chat_message_part_count(const ChatMessage *message);
+bool chat_message_part_at(const ChatMessage *message, size_t index,
+    ChatPartView *out);
+bool chat_message_has_images(const ChatMessage *message);
+/* Transactional part-list mutators. Each successful mutation that changes
+   the part list or the plain-text projection bumps `revision` and
+   `body_revision`. `flags` is the ChatPart.flags value for the new IMAGE
+   part; bits outside CHAT_PART_FLAG_MASK are rejected. v1 shape is
+   [TEXT?, IMAGE...]: remove/move operate only on image slots; TEXT content
+   changes only through set_text/append_text. move_part(i, i) is a
+   successful no-op that does not bump. */
+bool chat_message_add_image(ChatMessage *message, const ChatImagePart *image,
+    uint8_t flags);
+bool chat_message_remove_part(ChatMessage *message, size_t index);
+bool chat_message_move_part(ChatMessage *message, size_t from, size_t to);
+/* Drops every part and returns to the fast path; the plain-text projection
+   remains in `text`. Bumps revision/body_revision when parts existed. */
+void chat_message_clear_parts(ChatMessage *message);
 /* Marks a message as observably changed for view bookkeeping after a direct
    mutation the setters do not cover (generation metadata written in place).
    Bumping must be limited to real changes; never call it speculatively. */

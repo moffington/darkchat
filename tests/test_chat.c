@@ -53,8 +53,43 @@ void *__wrap_malloc(size_t size) {
 }
 
 /* Checks the documented allocation invariants (chat.h) for every
-   conversation of a chat. */
+   conversation of a chat, plus the content-part representation invariants
+   (projection authority, bounded arrays, v1 shape). */
+static int parts_consistent(const ChatMessage *m) {
+    if (!m->parts.items)
+        return m->parts.count == 0 && m->parts.capacity == 0;
+    if (!m->parts.count || m->parts.count > m->parts.capacity ||
+            m->parts.capacity > CHAT_MAX_PARTS ||
+            m->parts.count > CHAT_MAX_PARTS)
+        return 0;
+    int text_parts = 0;
+    for (size_t i = 0; i < m->parts.count; i++) {
+        const ChatPart *p = &m->parts.items[i];
+        if (p->reserved != 0) return 0;
+        if (p->kind == CHAT_PART_TEXT) {
+            if (i != 0 || p->flags != 0 || ++text_parts > 1) return 0;
+        } else if (p->kind == CHAT_PART_IMAGE) {
+            if ((p->flags & (uint8_t)~CHAT_PART_FLAG_MASK) != 0) return 0;
+        } else {
+            return 0;
+        }
+    }
+    /* The plain-text projection equals the concatenation of TEXT parts. */
+    const wchar_t *actual = chat_message_text(m);
+    size_t pos = 0;
+    for (size_t i = 0; i < m->parts.count; i++) {
+        const ChatPart *p = &m->parts.items[i];
+        if (p->kind != CHAT_PART_TEXT) continue;
+        size_t n = p->u.text.length;
+        if (wcsnlen(actual + pos, n) != n) return 0;
+        if (n && wmemcmp(actual + pos, p->u.text.data, n) != 0) return 0;
+        pos += n;
+    }
+    return actual[pos] == 0;
+}
+
 static void check_invariants(Chat *chat) {
+    int parts_bad = 0;
     for (int i = 0; i < chat->conversation_count; i++) {
         const ChatConversation *c = &chat->conversations[i];
         check(c->message_capacity <= CHAT_MAX_MESSAGES,
@@ -65,7 +100,11 @@ static void check_invariants(Chat *chat) {
             "messages is NULL exactly when capacity is zero");
         check(c->message_count == 0 || c->messages != NULL,
             "live messages imply a live allocation");
+        for (size_t j = 0; j < c->message_count; j++)
+            if (!parts_consistent(&c->messages[j])) ++parts_bad;
     }
+    check(parts_bad == 0,
+        "content parts stay within the representation invariants");
 }
 
 /* Builds the active conversation from `pairs` user/assistant turns (the
@@ -1517,6 +1556,511 @@ int main(void) {
         check_invariants(own3);
         chat_dispose(own3); free(own3);
         chat_dispose(cust); free(cust);
+    }
+
+    /* Content parts: fast-path view, promotion, projection, revisions,
+       ownership, OOM staging, and the borrowed-input contract. */
+    {
+        Chat *pc = (Chat *)calloc(1, sizeof *pc);
+        if (!pc) return 2;
+        chat_init(pc);
+        chat_clear(pc);
+
+        /* Fast path: no ChatPart object exists; part_at fills by value. */
+        int fi = chat_append(pc, CHAT_ROLE_USER, L"fast path text");
+        ChatMessage *fm = &pc->conversations[pc->active].messages[fi];
+        check(fm->parts.items == NULL && fm->parts.count == 0 &&
+                fm->parts.capacity == 0,
+            "text-only messages own no parts array");
+        check(chat_message_part_count(fm) == 1,
+            "fast path presents one text part");
+        ChatPartView view;
+        memset(&view, 0xA5, sizeof view);
+        check(chat_message_part_at(fm, 0, &view) &&
+                view.kind == CHAT_PART_TEXT && view.flags == 0 &&
+                view.u.text.data == chat_message_text(fm) &&
+                view.u.text.length == wcslen(L"fast path text"),
+            "fast-path part_at borrows the message text by value view");
+        memset(&view, 0xA5, sizeof view);
+        check(!chat_message_part_at(fm, 1, &view) && view.kind == 0 &&
+                view.u.text.data == NULL && view.u.image.attachment_id == 0,
+            "part_at past count fails and zeroes the out view");
+        check(!chat_message_has_images(fm),
+            "fast path reports no images");
+        int ei = chat_append(pc, CHAT_ROLE_ASSISTANT, L"");
+        ChatMessage *em = &pc->conversations[pc->active].messages[ei];
+        check(chat_message_part_count(em) == 0,
+            "empty fast-path text presents zero parts");
+        check(!chat_message_part_at(em, 0, &view),
+            "empty fast path has no part zero");
+
+        /* Promotion with text: [TEXT, IMAGE], projection preserved. */
+        ChatImagePart img;
+        memset(&img, 0, sizeof img);
+        img.attachment_id = 42;
+        img.pixel_width = 3;
+        img.pixel_height = 4;
+        memcpy(img.mime, "image/png", 10);
+        wcscpy(img.display_name, L"shot.png");
+        uint64_t rev_before = fm->revision;
+        uint64_t body_before = fm->body_revision;
+        check(chat_message_add_image(fm, &img, 0),
+            "add_image promotes a text message");
+        check(fm->parts.items != NULL && fm->parts.count == 2 &&
+                fm->parts.items[0].kind == CHAT_PART_TEXT &&
+                fm->parts.items[1].kind == CHAT_PART_IMAGE &&
+                fm->parts.items[1].u.image.attachment_id == 42 &&
+                fm->parts.items[1].flags == 0,
+            "promotion builds [TEXT, IMAGE] and copies image metadata");
+        check(fm->revision == rev_before + 1 &&
+                fm->body_revision == body_before + 1,
+            "promotion bumps revision and body_revision");
+        check(!wcscmp(chat_message_text(fm), L"fast path text"),
+            "promotion preserves the plain-text projection");
+        check(chat_message_has_images(fm),
+            "promoted message reports images");
+        check(chat_message_part_count(fm) == 2,
+            "promoted part_count is the array length");
+        memset(&view, 0, sizeof view);
+        check(chat_message_part_at(fm, 1, &view) &&
+                view.kind == CHAT_PART_IMAGE &&
+                view.u.image.attachment_id == 42 &&
+                !wcscmp(view.u.image.display_name, L"shot.png"),
+            "part_at copies IMAGE fields by value after promotion");
+        check(parts_consistent(fm),
+            "projection matches TEXT parts after promotion");
+
+        /* Flags: unknown bits rejected; FIRST_FRAME accepted. */
+        check(!chat_message_add_image(fm, &img, 0x02),
+            "add_image rejects flags outside the image mask");
+        check(fm->parts.count == 2 && fm->revision == rev_before + 1,
+            "rejected flags leave the message untouched");
+        check(chat_message_add_image(fm, &img, CHAT_PART_FLAG_FIRST_FRAME),
+            "add_image accepts CHAT_PART_FLAG_FIRST_FRAME");
+        check(fm->parts.items[2].flags == CHAT_PART_FLAG_FIRST_FRAME,
+            "the first-frame flag lands on the new IMAGE part");
+        check(chat_message_remove_part(fm, 2),
+            "the flagged image removes");
+
+        /* Borrowed input: set/append with text owned by the same message. */
+        check(chat_message_set_text(fm, chat_message_text(fm)),
+            "promoted set_text accepts the borrowed projection");
+        check(!wcscmp(chat_message_text(fm), L"fast path text") &&
+                parts_consistent(fm),
+            "aliased set_text keeps content and projection");
+        {
+            ChatPartView text_view;
+            check(chat_message_part_at(fm, 0, &text_view) &&
+                    text_view.u.text.data != NULL,
+                "TEXT part view available for the alias append");
+            check(chat_message_append_text(fm, text_view.u.text.data),
+                "promoted append_text accepts borrowed TEXT part data");
+            check(!wcscmp(chat_message_text(fm),
+                    L"fast path textfast path text") &&
+                    parts_consistent(fm),
+                "aliased append_text doubles the projection consistently");
+        }
+        check(chat_message_append_text(fm, chat_message_text(fm)),
+            "promoted append_text accepts the borrowed projection");
+        check(!wcscmp(chat_message_text(fm),
+                L"fast path textfast path textfast path textfast path text"),
+            "projection tracks the two aliased appends");
+        check(parts_consistent(fm),
+            "projection consistent after aliased appends");
+
+        /* set_text rewrites the leading TEXT part in place. */
+        check(chat_message_set_text(fm, L"rewritten") &&
+                fm->parts.count == 2 &&
+                fm->parts.items[0].kind == CHAT_PART_TEXT &&
+                !wcscmp(chat_message_text(fm), L"rewritten") &&
+                parts_consistent(fm),
+            "promoted set_text rewrites TEXT and projection");
+
+        /* Reorder / remove: image slots only; move(i,i) is a no-op.
+           The message still carries the original promotion image (id 42). */
+        ChatImagePart a, b;
+        memset(&a, 0, sizeof a);
+        memset(&b, 0, sizeof b);
+        a.attachment_id = 1;
+        b.attachment_id = 2;
+        memcpy(a.mime, "image/png", 10);
+        memcpy(b.mime, "image/jpeg", 11);
+        check(chat_message_add_image(fm, &a, 0) &&
+                chat_message_add_image(fm, &b, 0),
+            "two images append for reorder tests");
+        check(fm->parts.count == 4 &&
+                fm->parts.items[1].u.image.attachment_id == 42 &&
+                fm->parts.items[2].u.image.attachment_id == 1 &&
+                fm->parts.items[3].u.image.attachment_id == 2,
+            "images land in display order after the original promotion image");
+        rev_before = fm->revision;
+        body_before = fm->body_revision;
+        check(chat_message_move_part(fm, 2, 2),
+            "move_part(i, i) succeeds");
+        check(fm->revision == rev_before &&
+                fm->body_revision == body_before &&
+                fm->parts.items[2].u.image.attachment_id == 1 &&
+                fm->parts.items[3].u.image.attachment_id == 2,
+            "move_part(i, i) is a no-op with no revision bump");
+        check(chat_message_move_part(fm, 2, 3),
+            "move_part reorders two images");
+        check(fm->revision == rev_before + 1 &&
+                fm->parts.items[2].u.image.attachment_id == 2 &&
+                fm->parts.items[3].u.image.attachment_id == 1,
+            "image order swapped across the TEXT prefix");
+        check(!chat_message_move_part(fm, 0, 1),
+            "move_part cannot displace the leading TEXT part");
+        check(!chat_message_move_part(fm, 0, 0),
+            "move_part(i, i) still rejects the leading TEXT slot");
+        check(!chat_message_remove_part(fm, 0),
+            "remove_part cannot drop the leading TEXT part");
+        check(chat_message_remove_part(fm, 2) &&
+                fm->parts.items[2].u.image.attachment_id == 1,
+            "remove_part drops an image and shifts survivors");
+        check(!chat_message_remove_part(fm, 99),
+            "remove_part past count fails");
+
+        /* Image-only / empty text. */
+        ChatMessage *io = &pc->conversations[pc->active].messages[ei];
+        check(chat_message_set_text(io, L""),
+            "clear assistant text for the image-only case");
+        ChatImagePart only;
+        memset(&only, 0, sizeof only);
+        only.attachment_id = 7;
+        memcpy(only.mime, "image/webp", 11);
+        check(chat_message_add_image(io, &only, 0),
+            "empty message accepts an image");
+        check(chat_message_part_count(io) == 1 &&
+                chat_message_has_images(io) &&
+                chat_message_text(io)[0] == 0 &&
+                parts_consistent(io),
+            "image-only message: one IMAGE part, empty projection");
+
+        /* Lone high surrogate: staged empty must not NULL-deref. */
+        {
+            check(chat_message_set_text(fm, L"\xd800"),
+                "promoted set_text accepts a lone high surrogate");
+            check(chat_message_text(fm)[0] == 0 && parts_consistent(fm),
+                "lone high surrogate stages as empty text");
+            check(chat_message_append_text(fm, L"\xd800"),
+                "promoted append_text accepts a lone high surrogate");
+            check(chat_message_text(fm)[0] == 0 && parts_consistent(fm),
+                "lone high surrogate append stages as empty");
+            check(chat_message_set_text(fm, L"rewritten"),
+                "restore projection after surrogate probes");
+        }
+        {
+            check(chat_message_set_text(io, L"\xd800"),
+                "image-only set_text accepts a lone high surrogate");
+            check(chat_message_text(io)[0] == 0 && parts_consistent(io),
+                "image-only lone surrogate stages as empty");
+            check(chat_message_append_text(io, L"\xd800"),
+                "image-only append_text accepts a lone high surrogate");
+            check(chat_message_text(io)[0] == 0 && parts_consistent(io),
+                "image-only lone surrogate append stages as empty");
+        }
+
+        /* CHAT_MAX_PARTS: fill an image-only message, then reject. */
+        {
+            int mj = chat_append(pc, CHAT_ROLE_USER, L"");
+            ChatMessage *mm = &pc->conversations[pc->active].messages[mj];
+            bool filled = true;
+            for (size_t k = 0; k < CHAT_MAX_PARTS; k++) {
+                ChatImagePart p;
+                memset(&p, 0, sizeof p);
+                p.attachment_id = 1000 + k;
+                memcpy(p.mime, "image/png", 10);
+                if (!chat_message_add_image(mm, &p, 0)) { filled = false; break; }
+            }
+            check(filled && mm->parts.count == CHAT_MAX_PARTS,
+                "image-only message accepts exactly CHAT_MAX_PARTS parts");
+            ChatImagePart extra;
+            memset(&extra, 0, sizeof extra);
+            extra.attachment_id = 9999;
+            memcpy(extra.mime, "image/png", 10);
+            size_t at_cap = mm->parts.count;
+            uint64_t rev_cap = mm->revision;
+            check(!chat_message_add_image(mm, &extra, 0) &&
+                    mm->parts.count == at_cap &&
+                    mm->revision == rev_cap,
+                "add_image past CHAT_MAX_PARTS fails without mutation");
+        }
+
+        /* Demotion: clear_parts returns to the fast path with text intact. */
+        rev_before = fm->revision;
+        body_before = fm->body_revision;
+        chat_message_clear_parts(fm);
+        check(fm->parts.items == NULL && fm->parts.count == 0 &&
+                fm->revision == rev_before + 1 &&
+                fm->body_revision == body_before + 1,
+            "clear_parts demotes and bumps");
+        check(!wcscmp(chat_message_text(fm), L"rewritten"),
+            "clear_parts keeps the plain-text projection");
+        check(chat_message_part_count(fm) == 1 &&
+                !chat_message_has_images(fm),
+            "demoted message reads as one text part again");
+        chat_message_clear_parts(fm);
+        check(fm->revision == rev_before + 1,
+            "clear_parts on the fast path is a no-op");
+
+        /* Removing the last image demotes a TEXT+IMAGE message. */
+        int dj = chat_append(pc, CHAT_ROLE_USER, L"demote me");
+        ChatMessage *dm = &pc->conversations[pc->active].messages[dj];
+        check(chat_message_add_image(dm, &only, 0) && dm->parts.items != NULL,
+            "demote fixture promoted");
+        check(chat_message_remove_part(dm, 1) && dm->parts.items == NULL &&
+                !wcscmp(chat_message_text(dm), L"demote me"),
+            "removing the last image demotes and keeps text");
+
+        /* Revision matrix for part mutations (§3.5). */
+        int rj = chat_append(pc, CHAT_ROLE_USER, L"revision parts");
+        ChatMessage *rm = &pc->conversations[pc->active].messages[rj];
+        uint64_t r0 = rm->revision, b0 = rm->body_revision;
+        check(chat_message_add_image(rm, &only, 0) &&
+                rm->revision == r0 + 1 && rm->body_revision == b0 + 1,
+            "add_image bumps both counters");
+        r0 = rm->revision; b0 = rm->body_revision;
+        check(chat_message_set_reasoning(rm, L"why") &&
+                rm->revision == r0 + 1 && rm->body_revision == b0,
+            "reasoning after promotion still skips body_revision");
+        r0 = rm->revision; b0 = rm->body_revision;
+        chat_message_touch(rm);
+        check(rm->revision == r0 + 1 && rm->body_revision == b0,
+            "touch still skips body_revision");
+
+        /* Staged OOM: every allocation position either fails cleanly or
+           completes; a failure leaves the ChatMessage byte-identical. */
+        {
+            int oj = chat_append(pc, CHAT_ROLE_USER, L"oom fixture");
+            ChatMessage *om = &pc->conversations[pc->active].messages[oj];
+            /* Fast-path promote with text: stage TEXT payload + items array
+               = two allocations. */
+            {
+                bool saw_fail = false, saw_ok = false, damaged = false;
+                for (long pos = 1; pos <= 4; pos++) {
+                    ChatMessage before = *om;
+                    alloc_number = 0;
+                    fail_allocation = pos;
+                    bool ok = chat_message_add_image(om, &only, 0);
+                    alloc_number = 0;
+                    fail_allocation = 0;
+                    if (!ok) {
+                        saw_fail = true;
+                        if (memcmp(om, &before, sizeof *om) != 0)
+                            damaged = true;
+                        continue;
+                    }
+                    saw_ok = true;
+                    chat_message_clear_parts(om);
+                    if (memcmp(om, &before, sizeof *om) != 0 &&
+                            wcscmp(chat_message_text(om), L"oom fixture"))
+                        damaged = true;
+                }
+                check(saw_fail && saw_ok && !damaged,
+                    "add_image promotion is byte-unchanged on each failed alloc");
+            }
+            /* Promoted set_text staging: input copy, TEXT payload, optional
+               items insert, optional projection overflow. */
+            check(chat_message_add_image(om, &only, 0) &&
+                    chat_message_set_text(om, L"seed"),
+                "oom set_text fixture is promoted");
+            {
+                bool saw_fail = false, saw_ok = false, damaged = false;
+                for (long pos = 1; pos <= 6; pos++) {
+                    ChatMessage before = *om;
+                    alloc_number = 0;
+                    fail_allocation = pos;
+                    bool ok = chat_message_set_text(om,
+                        L"a promoted set_text payload long enough to force "
+                        L"overflow allocation on the projection path");
+                    alloc_number = 0;
+                    fail_allocation = 0;
+                    if (!ok) {
+                        saw_fail = true;
+                        if (memcmp(om, &before, sizeof *om) != 0)
+                            damaged = true;
+                        continue;
+                    }
+                    saw_ok = true;
+                    if (!parts_consistent(om)) damaged = true;
+                    chat_message_set_text(om, L"seed");
+                }
+                check(saw_fail && saw_ok && !damaged,
+                    "promoted set_text is byte-unchanged on each failed alloc");
+            }
+            /* append_text: combined buffer then the set path. */
+            {
+                bool saw_fail = false, saw_ok = false, damaged = false;
+                for (long pos = 1; pos <= 6; pos++) {
+                    ChatMessage before = *om;
+                    alloc_number = 0;
+                    fail_allocation = pos;
+                    bool ok = chat_message_append_text(om, L" plus suffix");
+                    alloc_number = 0;
+                    fail_allocation = 0;
+                    if (!ok) {
+                        saw_fail = true;
+                        if (memcmp(om, &before, sizeof *om) != 0)
+                            damaged = true;
+                        continue;
+                    }
+                    saw_ok = true;
+                    if (!parts_consistent(om)) damaged = true;
+                    chat_message_set_text(om, L"seed");
+                }
+                check(saw_fail && saw_ok && !damaged,
+                    "promoted append_text is byte-unchanged on each failed alloc");
+            }
+            /* Image-array growth: promote, fill to capacity, then fail the
+               staged items malloc on the next add. */
+            {
+                chat_message_clear_parts(om);
+                check(chat_message_set_text(om, L"grow"),
+                    "growth fixture text set");
+                check(chat_message_add_image(om, &only, 0) &&
+                        om->parts.items != NULL,
+                    "growth fixture promoted");
+                bool filled = true;
+                while (om->parts.count < om->parts.capacity) {
+                    ChatImagePart p;
+                    memset(&p, 0, sizeof p);
+                    p.attachment_id = 5000 + om->parts.count;
+                    memcpy(p.mime, "image/png", 10);
+                    if (!chat_message_add_image(om, &p, 0)) {
+                        filled = false;
+                        break;
+                    }
+                }
+                check(filled && om->parts.count == om->parts.capacity,
+                    "growth fixture filled to parts capacity");
+                {
+                    ChatMessage before = *om;
+                    alloc_number = 0;
+                    fail_allocation = 1;
+                    bool ok = chat_message_add_image(om, &only, 0);
+                    alloc_number = 0;
+                    fail_allocation = 0;
+                    check(!ok && memcmp(om, &before, sizeof *om) == 0,
+                        "failed image-array growth is byte-unchanged");
+                }
+                size_t cap_before = om->parts.capacity;
+                size_t count_before = om->parts.count;
+                check(chat_message_add_image(om, &only, 0) &&
+                        om->parts.count == count_before + 1 &&
+                        om->parts.capacity > cap_before,
+                    "image-array growth succeeds once allocation is allowed");
+            }
+            chat_message_clear_parts(om);
+        }
+
+        /* Snapshot deep-copies parts and TEXT payloads; isolation both ways. */
+        {
+            Chat *src = (Chat *)calloc(1, sizeof *src);
+            if (!src) return 2;
+            chat_init(src);
+            chat_clear(src);
+            int si = chat_append(src, CHAT_ROLE_USER, L"snapshot parts");
+            ChatMessage *sm = &src->conversations[0].messages[si];
+            check(chat_message_add_image(sm, &img, 0),
+                "snapshot fixture promoted");
+            Chat *snap = chat_snapshot(src);
+            check(snap != NULL, "snapshot of a parts message succeeds");
+            if (snap) {
+                ChatMessage *cm = &snap->conversations[0].messages[si];
+                check(cm->parts.items != NULL &&
+                        cm->parts.items != sm->parts.items &&
+                        cm->parts.count == sm->parts.count,
+                    "snapshot clones the parts array, never aliases it");
+                check(cm->parts.items[0].kind == CHAT_PART_TEXT &&
+                        cm->parts.items[0].u.text.data !=
+                            sm->parts.items[0].u.text.data &&
+                        !wcscmp(cm->parts.items[0].u.text.data,
+                            sm->parts.items[0].u.text.data),
+                    "snapshot clones TEXT part payloads");
+                check(cm->parts.items[1].u.image.attachment_id ==
+                        sm->parts.items[1].u.image.attachment_id,
+                    "snapshot copies IMAGE metadata by value");
+                check(chat_message_set_text(sm, L"source changed") &&
+                        !wcscmp(chat_message_text(cm), L"snapshot parts") &&
+                        !wcscmp(cm->parts.items[0].u.text.data,
+                            L"snapshot parts"),
+                    "mutating the source after snapshot leaves the copy alone");
+                size_t source_count = sm->parts.count;
+                check(chat_message_remove_part(cm, 1) &&
+                        sm->parts.items != NULL &&
+                        sm->parts.count == source_count,
+                    "mutating the copy leaves the source alone");
+                check_invariants(snap);
+                chat_dispose(snap);
+                free(snap);
+                check(sm->parts.items != NULL &&
+                        !wcscmp(chat_message_text(sm), L"source changed"),
+                    "disposing the snapshot leaves the source's parts intact");
+            }
+
+            /* OOM sweep across the snapshot's parts clone positions. */
+            {
+                bool saw_fail = false, saw_ok = false, damaged = false;
+                for (long pos = 1; pos <= 8; pos++) {
+                    alloc_number = 0;
+                    fail_allocation = pos;
+                    Chat *s = chat_snapshot(src);
+                    alloc_number = 0;
+                    fail_allocation = 0;
+                    if (!s) {
+                        saw_fail = true;
+                        if (sm->parts.items == NULL ||
+                                sm->parts.count != 2 ||
+                                !parts_consistent(sm))
+                            damaged = true;
+                        continue;
+                    }
+                    saw_ok = true;
+                    if (!parts_consistent(&s->conversations[0].messages[si]))
+                        damaged = true;
+                    chat_dispose(s);
+                    free(s);
+                }
+                check(saw_fail && saw_ok && !damaged,
+                    "failing any snapshot parts allocation is transactional");
+            }
+            chat_dispose(src);
+            free(src);
+        }
+
+        /* Conversation deletion / clear dispose parts without double-free. */
+        {
+            Chat *del = (Chat *)calloc(1, sizeof *del);
+            if (!del) return 2;
+            chat_init(del);
+            chat_clear(del);
+            chat_append(del, CHAT_ROLE_USER, L"first");
+            chat_message_add_image(
+                &del->conversations[0].messages[0], &img, 0);
+            chat_append(del, CHAT_ROLE_USER, L"second");
+            chat_message_add_image(
+                &del->conversations[0].messages[1], &img, 0);
+            check(chat_new_conversation(del) >= 1,
+                "second conversation for delete transfer");
+            del->active = 0;
+            check(chat_delete(del),
+                "conversation with part messages deletes");
+            check(del->conversations[0].messages == NULL &&
+                    del->conversations[0].message_count == 0,
+                "deleted conversation releases message storage");
+            chat_append(del, CHAT_ROLE_USER, L"after delete");
+            chat_clear(del);
+            check(del->conversations[0].messages == NULL &&
+                    del->conversations[0].message_count == 0,
+                "clear releases message storage");
+            check_invariants(del);
+            chat_dispose(del);
+            free(del);
+        }
+
+        check_invariants(pc);
+        chat_dispose(pc);
+        free(pc);
     }
 
     chat_dispose(chat);

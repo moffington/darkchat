@@ -39,9 +39,13 @@ static bool set_message_value(wchar_t *inline_text, size_t inline_capacity,
     size_t needed=wcslen(text);
     if (needed && text[needed-1]>=0xd800 && text[needed-1]<=0xdbff) --needed;
     if (needed<inline_capacity) {
-        free(*overflow); *overflow=NULL; *capacity=0;
+        /* Copy into the inline residue before releasing overflow: `text` may
+           borrow the message's own overflow (aliased set/append), and freeing
+           first would make the copy read freed storage. */
         if (needed) wmemcpy(inline_text,text,needed);
-        inline_text[needed]=0; *length=needed;
+        inline_text[needed]=0;
+        free(*overflow); *overflow=NULL; *capacity=0;
+        *length=needed;
         return true;
     }
     if (needed==SIZE_MAX/sizeof(wchar_t)) return false;
@@ -89,18 +93,362 @@ static bool append_message_value(wchar_t *inline_text, size_t inline_capacity,
     return true;
 }
 
+/* ---- content parts -----------------------------------------------------
+   Transactional rule for every mutator: stage every new allocation (input
+   copy, TEXT payload, replacement items array) before any owned pointer is
+   replaced. A failure at any stage frees only the staged locals and leaves
+   the message byte-identical to its prior state. */
+
+static void dispose_parts(ChatContent *c) {
+    if (!c || !c->items) return;
+    for (size_t i = 0; i < c->count; i++)
+        if (c->items[i].kind == CHAT_PART_TEXT)
+            free(c->items[i].u.text.data);
+    free(c->items);
+    c->items = NULL;
+    c->count = 0;
+    c->capacity = 0;
+}
+
+/* Stages an owned NUL-terminated copy of `text` (same surrogate trim as
+   set_message_value). Empty input stages nothing (all NULL/0). */
+static bool stage_text_value(const wchar_t *text, wchar_t **out_data,
+    size_t *out_length, size_t *out_capacity) {
+    *out_data = NULL;
+    *out_length = 0;
+    *out_capacity = 0;
+    if (!text) text = L"";
+    size_t needed = wcslen(text);
+    if (needed && text[needed-1] >= 0xd800 && text[needed-1] <= 0xdbff)
+        --needed;
+    if (!needed) return true;
+    if (needed == SIZE_MAX / sizeof(wchar_t)) return false;
+    wchar_t *data = (wchar_t *)malloc((needed + 1) * sizeof(wchar_t));
+    if (!data) return false;
+    wmemcpy(data, text, needed);
+    data[needed] = 0;
+    *out_data = data;
+    *out_length = needed;
+    *out_capacity = needed + 1;
+    return true;
+}
+
+static void stage_text_dispose(wchar_t **data, size_t *length,
+    size_t *capacity) {
+    free(*data);
+    *data = NULL;
+    *length = 0;
+    *capacity = 0;
+}
+
+static bool parts_next_capacity(size_t needed, size_t *out) {
+    if (needed > CHAT_MAX_PARTS) return false;
+    size_t cap = 4;
+    while (cap < needed) cap *= 2;
+    if (cap > CHAT_MAX_PARTS) cap = CHAT_MAX_PARTS;
+    *out = cap;
+    return true;
+}
+
+static bool message_has_text_part(const ChatMessage *m) {
+    return m->parts.items && m->parts.count &&
+        m->parts.items[0].kind == CHAT_PART_TEXT;
+}
+
+static bool set_text_fast_path(ChatMessage *m, const wchar_t *text) {
+    const wchar_t *previous = message_value(m->text, m->text_overflow);
+    bool unchanged = !wcscmp(previous, text);
+    if (!set_message_value(m->text, CHAT_MESSAGE_INLINE, &m->text_overflow,
+        &m->text_length, &m->text_capacity, text)) return false;
+    if (!unchanged) { ++m->revision; ++m->body_revision; }
+    return true;
+}
+
+/* Promoted set_text: stages an input copy first so `text` may borrow the
+   projection, overflow, or a TEXT part payload. Then stages the new TEXT
+   payload and, when inserting a leading TEXT into an image-only message, a
+   replacement items array — all before set_message_value or any free of
+   owned pointers. */
+static bool set_text_promoted(ChatMessage *m, const wchar_t *text) {
+    const wchar_t *previous = message_value(m->text, m->text_overflow);
+    bool unchanged = !wcscmp(previous, text);
+
+    wchar_t *input = NULL;
+    size_t input_length = 0, input_capacity = 0;
+    if (text[0]) {
+        if (!stage_text_value(text, &input, &input_length, &input_capacity))
+            return false;
+        /* A lone high surrogate stages as empty (input stays NULL). Read the
+           staged empty as L"" rather than dereferencing NULL. */
+        text = input ? input : L"";
+    }
+
+    bool has_text_part = message_has_text_part(m);
+
+    if (!text[0]) {
+        stage_text_dispose(&input, &input_length, &input_capacity);
+        if (!set_message_value(m->text, CHAT_MESSAGE_INLINE,
+                &m->text_overflow, &m->text_length, &m->text_capacity, L""))
+            return false;
+        if (has_text_part) {
+            free(m->parts.items[0].u.text.data);
+            memmove(&m->parts.items[0], &m->parts.items[1],
+                (m->parts.count - 1) * sizeof(ChatPart));
+            m->parts.count--;
+            if (m->parts.count == 0) {
+                free(m->parts.items);
+                m->parts.items = NULL;
+                m->parts.capacity = 0;
+            }
+        }
+        if (!unchanged) { ++m->revision; ++m->body_revision; }
+        return true;
+    }
+
+    wchar_t *text_data = NULL;
+    size_t text_length = 0, text_capacity = 0;
+    if (!stage_text_value(text, &text_data, &text_length, &text_capacity)) {
+        stage_text_dispose(&input, &input_length, &input_capacity);
+        return false;
+    }
+
+    ChatPart *new_items = NULL;
+    size_t new_capacity = 0;
+    if (!has_text_part) {
+        if (m->parts.count >= CHAT_MAX_PARTS ||
+                !parts_next_capacity(m->parts.count + 1, &new_capacity)) {
+            stage_text_dispose(&text_data, &text_length, &text_capacity);
+            stage_text_dispose(&input, &input_length, &input_capacity);
+            return false;
+        }
+        new_items = (ChatPart *)malloc(new_capacity * sizeof *new_items);
+        if (!new_items) {
+            stage_text_dispose(&text_data, &text_length, &text_capacity);
+            stage_text_dispose(&input, &input_length, &input_capacity);
+            return false;
+        }
+        if (m->parts.count)
+            memcpy(new_items + 1, m->parts.items,
+                m->parts.count * sizeof *new_items);
+        new_items[0].kind = CHAT_PART_TEXT;
+        new_items[0].flags = 0;
+        new_items[0].reserved = 0;
+        new_items[0].u.text.data = text_data;
+        new_items[0].u.text.length = text_length;
+        new_items[0].u.text.capacity = text_capacity;
+    }
+
+    if (!set_message_value(m->text, CHAT_MESSAGE_INLINE, &m->text_overflow,
+            &m->text_length, &m->text_capacity, text)) {
+        stage_text_dispose(&text_data, &text_length, &text_capacity);
+        free(new_items);
+        stage_text_dispose(&input, &input_length, &input_capacity);
+        return false;
+    }
+
+    if (has_text_part) {
+        free(m->parts.items[0].u.text.data);
+        m->parts.items[0].u.text.data = text_data;
+        m->parts.items[0].u.text.length = text_length;
+        m->parts.items[0].u.text.capacity = text_capacity;
+    } else {
+        free(m->parts.items);
+        m->parts.items = new_items;
+        m->parts.count += 1;
+        m->parts.capacity = new_capacity;
+    }
+    stage_text_dispose(&input, &input_length, &input_capacity);
+    if (!unchanged) { ++m->revision; ++m->body_revision; }
+    return true;
+}
+
+static bool append_text_fast_path(ChatMessage *m, const wchar_t *text) {
+    if (!append_message_value(m->text, CHAT_MESSAGE_INLINE, &m->text_overflow,
+        &m->text_length, &m->text_capacity, text)) return false;
+    if (text && text[0]) { ++m->revision; ++m->body_revision; }
+    return true;
+}
+
+/* Promoted append: stage the combined string first (so `text` may borrow the
+   projection or a TEXT part), then run the promoted set path. */
+static bool append_text_promoted(ChatMessage *m, const wchar_t *text) {
+    const wchar_t *current = message_value(m->text, m->text_overflow);
+    size_t current_length = wcslen(current);
+    size_t added = wcslen(text);
+    if (added > SIZE_MAX - 1 - current_length) return false;
+    wchar_t *combined = (wchar_t *)malloc(
+        (current_length + added + 1) * sizeof(wchar_t));
+    if (!combined) return false;
+    if (current_length) wmemcpy(combined, current, current_length);
+    wmemcpy(combined + current_length, text, added);
+    combined[current_length + added] = 0;
+    bool ok = set_text_promoted(m, combined);
+    free(combined);
+    return ok;
+}
+
+size_t chat_message_part_count(const ChatMessage *m) {
+    if (!m) return 0;
+    if (m->parts.items) return m->parts.count;
+    return message_value(m->text, m->text_overflow)[0] ? 1u : 0u;
+}
+
+bool chat_message_part_at(const ChatMessage *m, size_t index,
+    ChatPartView *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof *out);
+    if (!m) return false;
+    if (m->parts.items) {
+        if (index >= m->parts.count) return false;
+        const ChatPart *part = &m->parts.items[index];
+        out->kind = part->kind;
+        out->flags = part->flags;
+        if (part->kind == CHAT_PART_TEXT) {
+            out->u.text.data = part->u.text.data;
+            out->u.text.length = part->u.text.length;
+        } else {
+            out->u.image = part->u.image;
+        }
+        return true;
+    }
+    if (index > 0) return false;
+    const wchar_t *text = message_value(m->text, m->text_overflow);
+    if (!text[0]) return false;
+    out->kind = CHAT_PART_TEXT;
+    out->flags = 0;
+    out->u.text.data = text;
+    out->u.text.length = m->text_length ? m->text_length : wcslen(text);
+    return true;
+}
+
+bool chat_message_has_images(const ChatMessage *m) {
+    if (!m || !m->parts.items) return false;
+    for (size_t i = 0; i < m->parts.count; i++)
+        if (m->parts.items[i].kind == CHAT_PART_IMAGE) return true;
+    return false;
+}
+
+bool chat_message_add_image(ChatMessage *m, const ChatImagePart *image,
+    uint8_t flags) {
+    if (!m || !image) return false;
+    if ((flags & CHAT_PART_FLAG_MASK) != flags) return false;
+
+    ChatPart part;
+    memset(&part, 0, sizeof part);
+    part.kind = (uint8_t)CHAT_PART_IMAGE;
+    part.flags = flags;
+    part.u.image = *image;
+
+    if (!m->parts.items) {
+        const wchar_t *text = message_value(m->text, m->text_overflow);
+        bool has_text = text[0] != 0;
+        size_t new_count = has_text ? 2u : 1u;
+        size_t capacity = 0;
+        if (!parts_next_capacity(new_count, &capacity)) return false;
+
+        wchar_t *text_data = NULL;
+        size_t text_length = 0, text_capacity = 0;
+        if (has_text && !stage_text_value(text, &text_data, &text_length,
+                &text_capacity))
+            return false;
+        ChatPart *items = (ChatPart *)malloc(capacity * sizeof *items);
+        if (!items) {
+            stage_text_dispose(&text_data, &text_length, &text_capacity);
+            return false;
+        }
+        size_t at = 0;
+        if (has_text) {
+            items[0].kind = (uint8_t)CHAT_PART_TEXT;
+            items[0].flags = 0;
+            items[0].reserved = 0;
+            items[0].u.text.data = text_data;
+            items[0].u.text.length = text_length;
+            items[0].u.text.capacity = text_capacity;
+            at = 1;
+        }
+        items[at] = part;
+        m->parts.items = items;
+        m->parts.count = new_count;
+        m->parts.capacity = capacity;
+        ++m->revision;
+        ++m->body_revision;
+        return true;
+    }
+
+    if (m->parts.count >= CHAT_MAX_PARTS) return false;
+    if (m->parts.count == m->parts.capacity) {
+        size_t capacity = m->parts.capacity * 2;
+        if (capacity > CHAT_MAX_PARTS) capacity = CHAT_MAX_PARTS;
+        ChatPart *items = (ChatPart *)malloc(capacity * sizeof *items);
+        if (!items) return false;
+        memcpy(items, m->parts.items, m->parts.count * sizeof *items);
+        free(m->parts.items);
+        m->parts.items = items;
+        m->parts.capacity = capacity;
+    }
+    m->parts.items[m->parts.count++] = part;
+    ++m->revision;
+    ++m->body_revision;
+    return true;
+}
+
+bool chat_message_remove_part(ChatMessage *m, size_t index) {
+    if (!m || !m->parts.items || index >= m->parts.count) return false;
+    if (m->parts.items[index].kind == CHAT_PART_TEXT) return false;
+    memmove(&m->parts.items[index], &m->parts.items[index + 1],
+        (m->parts.count - index - 1) * sizeof(ChatPart));
+    m->parts.count--;
+    if (m->parts.count == 0) {
+        free(m->parts.items);
+        m->parts.items = NULL;
+        m->parts.capacity = 0;
+    } else if (m->parts.count == 1 &&
+            m->parts.items[0].kind == CHAT_PART_TEXT) {
+        free(m->parts.items[0].u.text.data);
+        free(m->parts.items);
+        m->parts.items = NULL;
+        m->parts.count = 0;
+        m->parts.capacity = 0;
+    }
+    ++m->revision;
+    ++m->body_revision;
+    return true;
+}
+
+bool chat_message_move_part(ChatMessage *m, size_t from, size_t to) {
+    if (!m || !m->parts.items) return false;
+    if (from >= m->parts.count || to >= m->parts.count) return false;
+    /* Image slots only — reject TEXT (index 0 when present) before the
+       from==to no-op so move_part(0,0) cannot succeed on a TEXT slot. */
+    size_t first_image = message_has_text_part(m) ? 1u : 0u;
+    if (from < first_image || to < first_image) return false;
+    if (from == to) return true;
+    ChatPart moving = m->parts.items[from];
+    if (from < to) {
+        memmove(&m->parts.items[from], &m->parts.items[from + 1],
+            (to - from) * sizeof(ChatPart));
+    } else {
+        memmove(&m->parts.items[to + 1], &m->parts.items[to],
+            (from - to) * sizeof(ChatPart));
+    }
+    m->parts.items[to] = moving;
+    ++m->revision;
+    ++m->body_revision;
+    return true;
+}
+
+void chat_message_clear_parts(ChatMessage *m) {
+    if (!m || !m->parts.items) return;
+    dispose_parts(&m->parts);
+    ++m->revision;
+    ++m->body_revision;
+}
+
 bool chat_message_set_text(ChatMessage *m,const wchar_t *text) {
     if (!m) return false;
     if (!text) text=L"";
-    const wchar_t *previous=message_value(m->text,m->text_overflow);
-    bool unchanged=!wcscmp(previous,text);
-    if (!set_message_value(m->text,CHAT_MESSAGE_INLINE,&m->text_overflow,
-        &m->text_length,&m->text_capacity,text)) return false;
-    /* Bump only when the stored value actually changes. The text-only
-       revision lets the transcript keep the rendered body when only metadata
-       or reasoning changed. */
-    if (!unchanged) { ++m->revision; ++m->body_revision; }
-    return true;
+    if (m->parts.items) return set_text_promoted(m, text);
+    return set_text_fast_path(m, text);
 }
 bool chat_message_set_reasoning(ChatMessage *m,const wchar_t *text) {
     if (!m) return false;
@@ -113,11 +461,13 @@ bool chat_message_set_reasoning(ChatMessage *m,const wchar_t *text) {
     if (!unchanged) ++m->revision;
     return true;
 }
-bool chat_message_append_text(ChatMessage *m,const wchar_t *text) {    if (!m) return false;
-    if (!append_message_value(m->text,CHAT_MESSAGE_INLINE,&m->text_overflow,
-        &m->text_length,&m->text_capacity,text)) return false;
-    if (text && text[0]) { ++m->revision; ++m->body_revision; }
-    return true;
+bool chat_message_append_text(ChatMessage *m,const wchar_t *text) {
+    if (!m) return false;
+    if (m->parts.items) {
+        if (!text || !text[0]) return true;
+        return append_text_promoted(m, text);
+    }
+    return append_text_fast_path(m, text);
 }
 bool chat_message_append_reasoning(ChatMessage *m,const wchar_t *text) {
     if (!m) return false;
@@ -137,6 +487,7 @@ void chat_message_dispose(ChatMessage *m) {
     free(m->text_overflow); free(m->reasoning_overflow);
     m->text_overflow=m->reasoning_overflow=NULL;
     m->text_capacity=m->reasoning_capacity=0;
+    dispose_parts(&m->parts);
 }
 
 /* Owned customization text. The set/clone pair is transactional exactly like
@@ -504,12 +855,18 @@ Chat *chat_snapshot(const Chat *chat) {
         for (size_t j=0;j<source->message_count;j++) {
             const ChatMessage *from=&source->messages[j];
             ChatMessage *to=&destination->messages[j];
-            /* The struct copy would alias the source's overflow pointers;
-               detach them before the slot becomes live, so a failed overflow
-               copy disposes exactly the state this copy built. */
+            /* The struct copy would alias the source's overflow pointers and
+               parts array; detach them before the slot becomes live, so a
+               failed overflow or parts copy disposes exactly the state this
+               copy built. Parts count/capacity stay 0 until each entry is
+               individually disposable — never expose uninitialized slots to
+               the failure-path dispose. */
             *to=*from;
             to->text_overflow=to->reasoning_overflow=NULL;
             to->text_capacity=to->reasoning_capacity=0;
+            to->parts.items=NULL;
+            to->parts.count=0;
+            to->parts.capacity=0;
             destination->message_count=j+1;
             if (from->text_overflow) {
                 size_t bytes=(from->text_length+1)*sizeof(wchar_t);
@@ -528,6 +885,39 @@ Chat *chat_snapshot(const Chat *chat) {
                 }
                 memcpy(to->reasoning_overflow,from->reasoning_overflow,bytes);
                 to->reasoning_capacity=from->reasoning_length+1;
+            }
+            if (from->parts.items) {
+                to->parts.items=(ChatPart *)malloc(
+                    from->parts.count*sizeof *to->parts.items);
+                if (!to->parts.items) {
+                    chat_dispose(copy); free(copy); return NULL;
+                }
+                to->parts.capacity=from->parts.count;
+                for (size_t pi=0;pi<from->parts.count;pi++) {
+                    ChatPart slot=from->parts.items[pi];
+                    if (slot.kind==CHAT_PART_TEXT) {
+                        slot.u.text.data=NULL;
+                        slot.u.text.length=0;
+                        slot.u.text.capacity=0;
+                    }
+                    to->parts.items[pi]=slot;
+                    to->parts.count=pi+1;
+                    if (from->parts.items[pi].kind==CHAT_PART_TEXT &&
+                            from->parts.items[pi].u.text.data) {
+                        size_t units=from->parts.items[pi].u.text.length+1;
+                        to->parts.items[pi].u.text.data=
+                            (wchar_t *)malloc(units*sizeof(wchar_t));
+                        if (!to->parts.items[pi].u.text.data) {
+                            chat_dispose(copy); free(copy); return NULL;
+                        }
+                        memcpy(to->parts.items[pi].u.text.data,
+                            from->parts.items[pi].u.text.data,
+                            units*sizeof(wchar_t));
+                        to->parts.items[pi].u.text.length=
+                            from->parts.items[pi].u.text.length;
+                        to->parts.items[pi].u.text.capacity=units;
+                    }
+                }
             }
         }
     }
