@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 /* Pure-C JSON encoding/decoding tests for the OpenRouter client. No Windows
    APIs, so they run anywhere. Built and run by `chat.bat test`. */
@@ -11,6 +12,30 @@ static int failures;
 static void check(int condition, const char *what) {
     if (!condition) { printf("FAIL: %s\n", what); ++failures; }
     else printf("ok: %s\n", what);
+}
+
+/* Allocation seam for the base64 append's growth path: pass `pass_allocs`
+   wrapped allocations, fail the next `fail_allocs`, then resume. Mirrors
+   tests/test_export.c. */
+void *__real_malloc(size_t size);
+void *__real_realloc(void *pointer, size_t size);
+void __real_free(void *pointer);
+static long pass_allocs, fail_allocs;
+void *__wrap_malloc(size_t size) {
+    if (pass_allocs > 0) { --pass_allocs; return __real_malloc(size); }
+    if (fail_allocs > 0) { --fail_allocs; return NULL; }
+    return __real_malloc(size);
+}
+void *__wrap_realloc(void *pointer, size_t size) {
+    if (pass_allocs > 0) { --pass_allocs; return __real_realloc(pointer, size); }
+    if (fail_allocs > 0) { --fail_allocs; return NULL; }
+    return __real_realloc(pointer, size);
+}
+void __wrap_free(void *pointer) {
+    __real_free(pointer);
+}
+static void seam_reset(void) {
+    pass_allocs = fail_allocs = 0;
 }
 
 /* Decodes a UTF-8 string literal into a UTF-16 buffer for comparisons. */
@@ -411,6 +436,94 @@ static void test_spans_and_cursors(void) {
     }
 }
 
+/* Base64: payload size is the closed form 4*ceil(n/3), the quoted size adds
+   exactly the two string quotes, and the chunked encoder writes exactly the
+   measured bytes. The quote split is load-bearing: an image part's literals
+   carry the URL's quotes, so they must charge the payload size alone. */
+static void test_base64(void) {
+    struct { const unsigned char *bytes; size_t n; const char *expected; }
+    vectors[] = {
+        { (const unsigned char *)"", 0, "" },
+        { (const unsigned char *)"M", 1, "TQ==" },
+        { (const unsigned char *)"Ma", 2, "TWE=" },
+        { (const unsigned char *)"Man", 3, "TWFu" },
+        { (const unsigned char *)"Mana", 4, "TWFuYQ==" },
+        { (const unsigned char *)"Manan", 5, "TWFuYW4=" },
+        { (const unsigned char *)"\x00\x00\x00", 3, "AAAA" },
+        { (const unsigned char *)"\xfb\xff\xbf", 3, "+/+/" }
+    };
+    JsonBuf buf;
+    json_buf_init(&buf, 0);
+    for (size_t i = 0; i < sizeof vectors / sizeof vectors[0]; i++) {
+        json_buf_free(&buf);
+        /* Capacity up front: a zero-length append on a buffer with no storage
+           reports its state exactly like json_buf_append_raw does. */
+        json_buf_init(&buf, 8);
+        check(json_buf_append_base64(&buf, vectors[i].bytes, vectors[i].n),
+            "base64 append succeeds");
+        check(buf.length == json_base64_payload_size(vectors[i].n),
+            "the measured payload size equals the encoded length");
+        check(buf.length == strlen(vectors[i].expected) &&
+            !memcmp(buf.data, vectors[i].expected, buf.length),
+            "the encoding matches the standard alphabet and padding");
+    }
+    /* Closed form at the group boundaries and beyond one chunk. */
+    size_t sizes[] = { 0, 1, 2, 3, 4, 5, 6, 1000, (1u << 20) - 1, 1u << 20,
+        (1u << 20) + 1 };
+    for (size_t i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+        size_t n = sizes[i];
+        check(json_base64_payload_size(n) == 4 * ((n + 2) / 3),
+            "the payload size is 4*ceil(n/3)");
+        check(json_encoded_base64_size(n) == json_base64_payload_size(n) + 2,
+            "the quoted size adds exactly the two quotes");
+    }
+    /* The quoted size is what json_encoded_string_size measures for the same
+       ASCII payload -- base64 never needs an escape. */
+    json_buf_free(&buf);
+    json_buf_init(&buf, 0);
+    check(json_buf_append_base64(&buf, (const unsigned char *)"Ma", 2),
+        "fixture: a small payload encodes");
+    wchar_t wide[8];
+    for (size_t i = 0; i < buf.length; i++) wide[i] = (wchar_t)buf.data[i];
+    wide[buf.length] = 0;
+    check(json_encoded_base64_size(2) == json_encoded_string_size(wide),
+        "the quoted base64 size agrees with the string encoder");
+    /* A payload spanning several internal chunks still measures right. */
+    unsigned char *big = (unsigned char *)malloc(2000);
+    if (!big) { check(0, "fixture: big payload allocated"); return; }
+    for (size_t i = 0; i < 2000; i++) big[i] = (unsigned char)(i & 0xff);
+    json_buf_free(&buf);
+    json_buf_init(&buf, 0);
+    check(json_buf_append_base64(&buf, big, 2000) &&
+        buf.length == json_base64_payload_size(2000),
+        "a multi-chunk payload measures what it encodes");
+    /* Saturation: an unrepresentable size never wraps to a small number. */
+    check(json_base64_payload_size(SIZE_MAX) == SIZE_MAX &&
+        json_encoded_base64_size(SIZE_MAX) == SIZE_MAX,
+        "an unrepresentable base64 size saturates");
+    /* Growth failure at every allocation point of the multi-chunk append:
+       the call fails with the sticky oom flag and a length that holds only
+       whole groups it actually wrote. */
+    for (int k = 0; k < 4; k++) {
+        json_buf_free(&buf);
+        json_buf_init(&buf, 8);
+        pass_allocs = k;
+        fail_allocs = 1;
+        bool ok = json_buf_append_base64(&buf, big, 2000);
+        seam_reset();
+        if (ok) {
+            check(buf.length == json_base64_payload_size(2000),
+                "an unfailed append writes every group");
+        } else {
+            check(!json_buf_ok(&buf) && buf.length % 4 == 0 &&
+                buf.length < json_base64_payload_size(2000),
+                "a failed base64 append reports oom and only whole groups");
+        }
+    }
+    free(big);
+    json_buf_free(&buf);
+}
+
 int main(void) {
     double value;
     check(json_validate("{\"n\":-1.25e+2,\"s\":\"\\uD83D\\uDE80\"}"), "strict document validates");
@@ -425,6 +538,7 @@ int main(void) {
     test_escapes();
     test_queries();
     test_encoded_size();
+    test_base64();
     test_buffers();
     test_utf16_conversion();
     test_field_kind();

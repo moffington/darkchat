@@ -84,6 +84,17 @@ static unsigned __stdcall signal_after(void *parameter) {
 static bool encode(CompletionWork *work, JsonBuf *body) {
     return build_request(work, body);
 }
+/* The host's commit-7 job: point every run's image slot at fixture bytes of
+   exactly byte_length so the pure encoder can be exercised against a built
+   view. The calculator only ever reads the metadata. */
+static void supply_bytes(ChatRequestContext *context, unsigned char *blob,
+    size_t n) {
+    for (int i=0;i<context->part_slots_used;i++) {
+        ChatRequestPart *part=&context->part_scratch[i];
+        if (part->kind==CHAT_PART_IMAGE && part->u.image.byte_length<=n)
+            part->u.image.bytes=blob;
+    }
+}
 int main(int argc,char **argv) {
     WNDCLASSW cls={0}; cls.lpfnWndProc=test_proc; cls.lpszClassName=L"DarkChat.NetworkTest";
     CHECK(RegisterClassW(&cls));
@@ -434,11 +445,14 @@ int main(int argc,char **argv) {
     CHECK(strstr(plain_body.data,"\"reasoning\"")==NULL);
     json_buf_free(&plain_body);
     context_chat->conversations[0].reasoning_disabled=false;
-    /* Commit-5 boundary pin: a view that carries a part run still encodes its
-       plain-text projection as a plain JSON string content. The content-array
-       encoding lands with the encoder commit; at this boundary not one
-       request byte may depend on the parts. */
+    /* Commit-6: content-array encoding. The host's commit-7 job of loading
+       blob bytes is simulated by pointing each run's image slot at fixture
+       bytes of exactly byte_length; the calculator must agree with the
+       encoder either way. */
     {
+        static unsigned char blob[70000];
+        for (size_t i=0;i<sizeof blob;i++) blob[i]=(unsigned char)(i&0xff);
+        unsigned char one_byte=0x41;   /* base64 "QQ==" */
         ChatAttachmentMeta rec={0};
         rec.id=1;
         for (int i=0;i<64;i++) rec.digest[i]='a';
@@ -463,15 +477,168 @@ int main(int argc,char **argv) {
         CHECK(context.messages[mm].part_count==2);      /* TEXT + IMAGE */
         CHECK(context.messages[mm].parts!=NULL);
         CHECK(!wcscmp(context.messages[mm].text,L"what's this?"));
+        supply_bytes(&context,blob,sizeof blob);
         JsonBuf pinned;
         CHECK(chat_completion_request_build(&pinned,CHAT_BACKEND_OPENROUTER,
             context_chat->model,context.messages,context.count,NULL,true));
         CHECK(json_validate(pinned.data));
         CHECK(pinned.length==context.bytes);
-        CHECK(strstr(pinned.data,"\"content\":[")==NULL);
-        CHECK(strstr(pinned.data,"\"content\":\"what's this?\"")!=NULL);
+        CHECK(context.text_bytes+context.attachment_bytes==context.bytes);
+        /* The multimodal turn is a content array in run order; a text-only
+           message in the same request keeps its plain string content. */
+        CHECK(strstr(pinned.data,
+            "\"content\":[{\"type\":\"text\",\"text\":\"what's this?\"},"
+            "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,")
+            !=NULL);
         CHECK(strstr(pinned.data,"\"content\":\"and this?\"")!=NULL);
+        CHECK(strstr(pinned.data,
+            "\"content\":\"Answer in one short sentence.\"")!=NULL);
+        /* Per-message agreement: the split is exactly the encoded span. */
+        ChatMessageCost cost=chat_completion_message_costs(
+            CHAT_BACKEND_OPENROUTER,CHAT_ROLE_USER,&context.messages[mm]);
+        CHECK(cost.text_bytes>0 && cost.attachment_bytes>0);
+        JsonBuf one;
+        CHECK(chat_completion_request_build(&one,CHAT_BACKEND_OPENROUTER,
+            context_chat->model,&context.messages[mm],1,NULL,true));
+        CHECK(one.length==chat_completion_envelope_bytes(
+            CHAT_BACKEND_OPENROUTER,context_chat->model,NULL,true)
+            +cost.text_bytes+cost.attachment_bytes);
+        json_buf_free(&one);
         json_buf_free(&pinned);
+        /* Ollama: the same view, the bare-string image_url form. */
+        context_chat->backend=CHAT_BACKEND_OLLAMA;
+        wcscpy(context_chat->ollama_model,L"local/model:latest");
+        CHECK(chat_context_build(context_chat,&context_chat->conversations[0],
+            ask,CHAT_CONTEXT_BUDGET_BYTES,&context)==CHAT_CONTEXT_OK);
+        supply_bytes(&context,blob,sizeof blob);
+        CHECK(chat_completion_request_build(&pinned,CHAT_BACKEND_OLLAMA,
+            context_chat->ollama_model,context.messages,context.count,NULL,true));
+        CHECK(json_validate(pinned.data));
+        CHECK(pinned.length==context.bytes);
+        CHECK(context.text_bytes+context.attachment_bytes==context.bytes);
+        CHECK(strstr(pinned.data,
+            "\"content\":[{\"type\":\"text\",\"text\":\"what's this?\"},"
+            "{\"type\":\"image_url\",\"image_url\":\"data:image/png;base64,")
+            !=NULL);
+        CHECK(strstr(pinned.data,"\"image_url\":{\"url\":")==NULL);
+        cost=chat_completion_message_costs(CHAT_BACKEND_OLLAMA,
+            CHAT_ROLE_USER,&context.messages[mm]);
+        CHECK(chat_completion_request_build(&one,CHAT_BACKEND_OLLAMA,
+            context_chat->ollama_model,&context.messages[mm],1,NULL,true));
+        CHECK(one.length==chat_completion_envelope_bytes(
+            CHAT_BACKEND_OLLAMA,context_chat->ollama_model,NULL,true)
+            +cost.text_bytes+cost.attachment_bytes);
+        json_buf_free(&one);
+        json_buf_free(&pinned);
+        context_chat->backend=CHAT_BACKEND_OPENROUTER;
+
+        /* One-byte image golden: the literals carry the URL's quotes, so the
+           payload between them is exactly 4 bytes of base64 -- a double-count
+           of the quotes or the payload size fails here. */
+        CHECK(chat_completion_image_part_bytes(CHAT_BACKEND_OPENROUTER,
+            "image/png",1)==69);
+        CHECK(chat_completion_image_part_bytes(CHAT_BACKEND_OPENROUTER,
+            "image/png",1)==strlen(
+            "{\"type\":\"image_url\",\"image_url\":{\"url\":"
+            "\"data:image/png;base64,QQ==\"}}"));
+        ChatAttachmentMeta rec1={0};
+        rec1.id=2;
+        for (int i=0;i<64;i++) rec1.digest[i]='b';
+        rec1.digest[64]=0;
+        strcpy(rec1.mime,"image/png");
+        rec1.bytes=1;
+        rec1.created_at=1;
+        wcscpy(rec1.display_name,L"one.png");
+        CHECK(chat_attachment_add(context_chat,&rec1));
+        ChatRequestMessage alone_view={0};
+        ChatRequestPart alone_part={0};
+        alone_view.role=CHAT_ROLE_USER;
+        alone_view.text=L"";
+        alone_part.kind=CHAT_PART_IMAGE;
+        alone_part.u.image.rec=chat_attachment(context_chat,2);
+        alone_part.u.image.bytes=&one_byte;
+        alone_part.u.image.byte_length=1;
+        alone_view.parts=&alone_part;
+        alone_view.part_count=1;
+        JsonBuf golden;
+        CHECK(chat_completion_request_build(&golden,CHAT_BACKEND_OPENROUTER,
+            context_chat->model,&alone_view,1,NULL,true));
+        CHECK(strstr(golden.data,"\"content\":[{\"type\":\"image_url\","
+            "\"image_url\":{\"url\":\"data:image/png;base64,QQ==\"}}]}")!=NULL);
+        CHECK(strstr(golden.data,"\"content\":[{\"type\":\"text\"")==NULL);
+        json_buf_free(&golden);
+
+        /* Two images in one run: multi-image body equality and run order on
+           both backends (the context tests cover the costing side). */
+        ChatRequestMessage two_view={0};
+        ChatRequestPart two_parts[3];
+        memset(two_parts,0,sizeof two_parts);
+        two_view.role=CHAT_ROLE_USER;
+        two_view.text=L"two images";
+        two_parts[0].kind=CHAT_PART_TEXT;
+        two_parts[0].u.text=L"two images";
+        two_parts[1].kind=CHAT_PART_IMAGE;
+        two_parts[1].u.image.rec=chat_attachment(context_chat,1);
+        two_parts[1].u.image.bytes=blob;
+        two_parts[1].u.image.byte_length=rec.bytes;
+        two_parts[2].kind=CHAT_PART_IMAGE;
+        two_parts[2].u.image.rec=chat_attachment(context_chat,2);
+        two_parts[2].u.image.bytes=&one_byte;
+        two_parts[2].u.image.byte_length=1;
+        two_view.parts=two_parts;
+        two_view.part_count=3;
+        for (int b=0;b<2;b++) {
+            ChatBackend backend=b ? CHAT_BACKEND_OLLAMA : CHAT_BACKEND_OPENROUTER;
+            const wchar_t *two_model=b ? context_chat->ollama_model
+                : context_chat->model;
+            ChatMessageCost two_cost=chat_completion_message_costs(
+                backend,CHAT_ROLE_USER,&two_view);
+            CHECK(two_cost.attachment_bytes>
+                chat_completion_image_part_bytes(backend,"image/png",rec.bytes));
+            JsonBuf two;
+            CHECK(chat_completion_request_build(&two,backend,two_model,
+                &two_view,1,NULL,true));
+            CHECK(json_validate(two.data));
+            CHECK(two.length==chat_completion_envelope_bytes(backend,
+                two_model,NULL,true)+two_cost.text_bytes+
+                two_cost.attachment_bytes);
+            /* Run order: the text term leads, both image terms follow. */
+            const char *text_part=strstr(two.data,"\"type\":\"text\"");
+            const char *first_image=strstr(two.data,"\"type\":\"image_url\"");
+            CHECK(text_part && first_image && text_part<first_image);
+            int images=0;
+            for (const char *p=two.data;
+                (p=strstr(p,"\"type\":\"image_url\""))!=NULL;p+=8) ++images;
+            CHECK(images==2);
+            /* The last term is the one-byte image; its payload closes the
+               part, the array and the message. */
+            CHECK(strstr(two.data,b ? "data:image/png;base64,QQ==\"}]}" :
+                "data:image/png;base64,QQ==\"}}]}")!=NULL);
+            json_buf_free(&two);
+        }
+
+        /* Fail closed on untrustworthy image terms: no bytes to write, or no
+           record to name the MIME. */
+        {
+            ChatRequestMessage bad_message={0};
+            ChatRequestPart bad_part={0};
+            bad_message.role=CHAT_ROLE_USER;
+            bad_message.text=L"";
+            bad_part.kind=CHAT_PART_IMAGE;
+            bad_part.u.image.rec=&rec;
+            bad_part.u.image.byte_length=1000;
+            bad_message.parts=&bad_part;
+            bad_message.part_count=1;
+            JsonBuf bad;
+            CHECK(!chat_completion_request_build(&bad,CHAT_BACKEND_OPENROUTER,
+                context_chat->model,&bad_message,1,NULL,true));
+            json_buf_free(&bad);
+            bad_part.u.image.bytes=blob;
+            bad_part.u.image.rec=NULL;
+            CHECK(!chat_completion_request_build(&bad,CHAT_BACKEND_OPENROUTER,
+                context_chat->model,&bad_message,1,NULL,true));
+            json_buf_free(&bad);
+        }
     }
     chat_dispose(context_chat); free(context_chat);
     puts("The bounded request context measures exactly what the encoder writes");

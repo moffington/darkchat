@@ -28,6 +28,23 @@ bool json_buf_append_json_string(JsonBuf *buf, const wchar_t *text);
    represented saturates at SIZE_MAX rather than wrapping. */
 size_t json_encoded_string_size(const wchar_t *text);
 
+/* Exact length of the standard-alphabet padded base64 of `raw_bytes`:
+   4 * ceil(n / 3). Saturates at SIZE_MAX rather than wrapping. */
+size_t json_base64_payload_size(size_t raw_bytes);
+
+/* Exact bytes of a standalone QUOTED base64 JSON string: two quotes plus
+   json_base64_payload_size. Use this only where the payload is its own JSON
+   string; inside an already-open string (a data URL, whose quotes live in the
+   caller's framing literals) charge the payload size alone, or the quotes are
+   counted twice. */
+size_t json_encoded_base64_size(size_t raw_bytes);
+
+/* Appends the standard-alphabet padded base64 of bytes[0..n) with no quotes
+   and no escapes -- for a data-URL interior. Encodes in fixed-size chunks
+   with no full-size temporary of the payload. `bytes` may be NULL only when
+   n == 0. False on allocation failure (sticky oom). */
+bool json_buf_append_base64(JsonBuf *buf, const unsigned char *bytes, size_t n);
+
 /* Decodes a quoted JSON string starting at json into out (UTF-8,
    NUL-terminated). Handles \uXXXX escapes and UTF-16 surrogate pairs; a lone
    surrogate becomes U+FFFD. Returns one past the closing quote, or NULL on

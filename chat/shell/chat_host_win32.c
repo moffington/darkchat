@@ -1538,6 +1538,7 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     if (context) built=chat_context_build(chat,c,index-1,
         CHAT_CONTEXT_BUDGET_BYTES,context);
     size_t required_bytes=context ? context->required_bytes : 0;
+    size_t required_attach=context ? context->required_attachment_bytes : 0;
     host->context_dropped=(built==CHAT_CONTEXT_OK && context) ?
         context->dropped_messages : 0;
     /* OpenRouter keeps its credentials and provider routing; Ollama needs
@@ -1563,10 +1564,26 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
             L"Out of memory building the request context; request was not sent.");
         else if (built==CHAT_CONTEXT_INVALID) wcscpy(m->generation.error,
             L"The request context could not be built; the latest turn is inconsistent.");
+        else if (built==CHAT_CONTEXT_OVERSIZE_ATTACHMENTS) {
+            /* The attachment copy names whole KB: the need rounds UP, so a
+               request just over the cap can never display "8192 KB of the
+               8192 KB attachment budget". The budget side is exact. */
+            const size_t bound=sizeof m->generation.error/sizeof *m->generation.error;
+            unsigned long need_kb=(unsigned long)(required_attach/1024u +
+                (required_attach%1024u ? 1u : 0u));
+            unsigned long budget_kb=(unsigned long)
+                (CHAT_ATTACHMENT_BUDGET_BYTES/1024u);
+            swprintf(m->generation.error,bound,
+                L"Request not sent: these images need %lu KB of the %lu KB attachment budget. Remove some or use smaller images.",
+                need_kb,budget_kb);
+            m->generation.error[bound-1]=0;
+        }
         else if (built!=CHAT_CONTEXT_OK) {
             /* required_bytes is the complete body the indispensable content
-               needs, so the diagnostic states the cause and the real size
-               instead of implying a single offending message. */
+               needs, but the budget named here is the text policy: the
+               displayed number is the text-side need (required_bytes minus
+               the image share), so an image-bearing turn cannot make a text
+               failure look larger than the budget it is compared against. */
             const wchar_t *cause = built==CHAT_CONTEXT_OVERSIZE_SYSTEM
                 ? L"the system prompt is too large; shorten it in Settings"
                 : built==CHAT_CONTEXT_OVERSIZE_USER
@@ -1575,7 +1592,7 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
             const size_t bound=sizeof m->generation.error/sizeof *m->generation.error;
             swprintf(m->generation.error,bound,
                 L"Request not sent: %ls. The request body needs %lu bytes; the budget is %lu.",
-                cause,(unsigned long)required_bytes,
+                cause,(unsigned long)(required_bytes-required_attach),
                 (unsigned long)CHAT_CONTEXT_BUDGET_BYTES);
             /* Truncation semantics of a full buffer are unspecified for
                swprintf: terminate explicitly so every reader is safe. */

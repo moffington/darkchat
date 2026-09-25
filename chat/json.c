@@ -209,6 +209,47 @@ size_t json_encoded_string_size(const wchar_t *text) {
     return sink.bytes;
 }
 
+/* --- Base64 ------------------------------------------------------------- */
+
+/* Standard alphabet with '=' padding. Pure ASCII, so the payload needs no
+   JSON escapes wherever it lands. */
+static const char BASE64_ALPHABET[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+size_t json_base64_payload_size(size_t raw_bytes) {
+    /* ceil(n / 3) groups of four characters, saturating. The quotient is
+       formed without adding to n, so n == SIZE_MAX cannot wrap first. */
+    size_t groups = raw_bytes / 3 + (raw_bytes % 3 ? 1 : 0);
+    return groups > SIZE_MAX / 4 ? SIZE_MAX : groups * 4;
+}
+
+size_t json_encoded_base64_size(size_t raw_bytes) {
+    size_t payload = json_base64_payload_size(raw_bytes);
+    return payload > SIZE_MAX - 2 ? SIZE_MAX : payload + 2;
+}
+
+bool json_buf_append_base64(JsonBuf *buf, const unsigned char *bytes, size_t n) {
+    if (!n) return json_buf_ok(buf);
+    if (!bytes) return false;
+    char chunk[512];   /* a multiple of the 4-character group */
+    size_t out = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned b0 = bytes[i];
+        unsigned b1 = i + 1 < n ? bytes[i + 1] : 0;
+        unsigned b2 = i + 2 < n ? bytes[i + 2] : 0;
+        chunk[out++] = BASE64_ALPHABET[b0 >> 2];
+        chunk[out++] = BASE64_ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)];
+        chunk[out++] = i + 1 < n
+            ? BASE64_ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] : '=';
+        chunk[out++] = i + 2 < n ? BASE64_ALPHABET[b2 & 0x3f] : '=';
+        if (out == sizeof chunk) {
+            if (!json_buf_append_raw(buf, chunk, out)) return false;
+            out = 0;
+        }
+    }
+    return out ? json_buf_append_raw(buf, chunk, out) : json_buf_ok(buf);
+}
+
 /* --- Decoding ----------------------------------------------------------- */
 
 static const char *skip_ws(const char *p) {

@@ -25,7 +25,7 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_sse.exe
     if errorlevel 1 exit /b 1
-    gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_json.c chat\json.c -o build\test_json.exe
+    gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_json.c chat\json.c -o build\test_json.exe -Wl,--wrap=malloc -Wl,--wrap=realloc -Wl,--wrap=free
     if errorlevel 1 exit /b 1
     build\test_json.exe
     if errorlevel 1 exit /b 1
@@ -69,7 +69,7 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_lifecycle.exe
     if errorlevel 1 exit /b 1
-    gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_context.c chat\generation\context.c chat\generation\provider_routing.c chat\generation\completion_request.c chat\core\chat.c chat\json.c -o build\test_context.exe
+    gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_context.c chat\generation\context.c chat\generation\provider_routing.c chat\generation\completion_request.c chat\core\chat.c chat\json.c -o build\test_context.exe -Wl,--wrap=fopen -Wl,--wrap=_wfopen
     if errorlevel 1 exit /b 1
     build\test_context.exe
     if errorlevel 1 exit /b 1

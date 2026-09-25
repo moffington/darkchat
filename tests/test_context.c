@@ -1,4 +1,5 @@
 #include "chat/generation/context.h"
+#include "chat/generation/completion_request.h"
 #include "chat/core/chat.h"
 #include "chat/json.h"
 #include "chat/generation/provider_routing.h"
@@ -16,35 +17,141 @@ static void check(int condition, const char *what) {
     else printf("ok: %s\n", what);
 }
 
+/* File-I/O tripwire: costing a request must never open a file. The pure
+   modules include no windows.h, so CreateFileW cannot be reached from them at
+   all; these wraps cover any future CRT file use in the same objects. */
+static long file_opens;
+FILE *__wrap_fopen(const char *path, const char *mode) {
+    (void)path; (void)mode;
+    ++file_opens;
+    return NULL;
+}
+FILE *__wrap__wfopen(const wchar_t *path, const wchar_t *mode) {
+    (void)path; (void)mode;
+    ++file_opens;
+    return NULL;
+}
+
 /* The test keeps its own copy of the request framing, so a divergence in
    chat/generation/context.c is caught here instead of being hidden behind the same
-   helper the implementation uses. */
+   helper the implementation uses. The content-array literals and the base64
+   closed form are copied too; only the JSON string size is shared (that rule
+   predates this work and is pinned in tests/test_json.c). */
 #define TEST_ENVELOPE 67u
 #define TEST_MESSAGE 22u
+#define TEST_TEXT_OPEN "{\"type\":\"text\",\"text\":"
+#define TEST_TEXT_CLOSE "}"
+#define TEST_OR_OPEN "{\"type\":\"image_url\",\"image_url\":{\"url\":\""
+#define TEST_OR_CLOSE "\"}}"
+#define TEST_OL_OPEN "{\"type\":\"image_url\",\"image_url\":\""
+#define TEST_OL_CLOSE "\"}"
+#define TEST_DATA_HEAD 5u   /* "data:" */
+#define TEST_DATA_MID 8u    /* ";base64," */
 
 static size_t role_name_bytes(ChatRole role) {
     return role == CHAT_ROLE_ASSISTANT ? 9u : role == CHAT_ROLE_SYSTEM ? 6u : 4u;
+}
+
+static size_t test_b64(size_t raw_bytes) {
+    return 4u * ((raw_bytes + 2u) / 3u);   /* unquoted payload, 4*ceil(n/3) */
 }
 
 static size_t message_bytes(ChatRole role, const wchar_t *text) {
     return TEST_MESSAGE + role_name_bytes(role) + json_encoded_string_size(text);
 }
 
+/* The modelled split of one live message: the string shape on the fast path,
+   the content-array shape for a run. Every positive part count is an array --
+   a single image still pays the brackets. IMAGE terms use the attachment
+   record's stored length (the same number the budget charges). */
+static void model_message_costs(const Chat *chat, const ChatMessage *m,
+    ChatRole role, size_t *text, size_t *attach) {
+    *attach = 0;
+    if (!m->parts.items) {
+        *text = message_bytes(role, chat_message_text(m));
+        return;
+    }
+    size_t k = m->parts.count;
+    *text = TEST_MESSAGE + role_name_bytes(role) + 2u + (k - 1);
+    for (size_t i = 0; i < k; i++) {
+        const ChatPart *part = &m->parts.items[i];
+        if (part->kind == CHAT_PART_TEXT) {
+            *text += sizeof TEST_TEXT_OPEN - 1 +
+                json_encoded_string_size(part->u.text.data) +
+                sizeof TEST_TEXT_CLOSE - 1;
+        } else {
+            const ChatAttachmentMeta *rec = chat_attachment(chat,
+                part->u.image.attachment_id);
+            if (!rec) { *attach = SIZE_MAX; return; }
+            const char *open = chat->backend == CHAT_BACKEND_OLLAMA
+                ? TEST_OL_OPEN : TEST_OR_OPEN;
+            const char *close = chat->backend == CHAT_BACKEND_OLLAMA
+                ? TEST_OL_CLOSE : TEST_OR_CLOSE;
+            *attach += strlen(open) + TEST_DATA_HEAD + strlen(rec->mime) +
+                TEST_DATA_MID + test_b64(rec->bytes) + strlen(close);
+        }
+    }
+}
+
+/* The same split for a built entry (the runs the encoder sees). */
+static void model_entry_costs(const Chat *chat,
+    const ChatRequestMessage *entry, size_t *text, size_t *attach) {
+    *attach = 0;
+    if (!entry->parts || entry->part_count <= 0) {
+        *text = message_bytes(entry->role, entry->text);
+        return;
+    }
+    int k = entry->part_count;
+    *text = TEST_MESSAGE + role_name_bytes(entry->role) + 2u + (size_t)(k - 1);
+    for (int i = 0; i < k; i++) {
+        const ChatRequestPart *part = &entry->parts[i];
+        if (part->kind == CHAT_PART_TEXT) {
+            *text += sizeof TEST_TEXT_OPEN - 1 +
+                json_encoded_string_size(part->u.text) +
+                sizeof TEST_TEXT_CLOSE - 1;
+        } else {
+            const char *open = chat->backend == CHAT_BACKEND_OLLAMA
+                ? TEST_OL_OPEN : TEST_OR_OPEN;
+            const char *close = chat->backend == CHAT_BACKEND_OLLAMA
+                ? TEST_OL_CLOSE : TEST_OR_CLOSE;
+            *attach += strlen(open) + TEST_DATA_HEAD +
+                strlen(part->u.image.rec->mime) + TEST_DATA_MID +
+                test_b64(part->u.image.byte_length) + strlen(close);
+        }
+    }
+}
+
+/* The modelled split of everything a built context encodes: the envelope and
+   separators are text-side, the image terms are attachment-side. */
+static void expected_split(const Chat *chat, const ChatRequestContext *context,
+    size_t *text, size_t *attach) {
+    *text = TEST_ENVELOPE + json_encoded_string_size(chat->model);
+    *attach = 0;
+    for (int i = 0; i < context->count; i++) {
+        size_t t, a;
+        model_entry_costs(chat, &context->messages[i], &t, &a);
+        *text += t;
+        *attach += a;
+    }
+    if (context->count > 0) *text += (size_t)context->count - 1;
+}
+
 /* Body size the entries of a built context encode to. */
 static size_t expected_body(const Chat *chat, const ChatRequestContext *context) {
-    size_t total = TEST_ENVELOPE + json_encoded_string_size(chat->model);
-    for (int i = 0; i < context->count; i++)
-        total += message_bytes(context->messages[i].role, context->messages[i].text);
-    if (context->count > 0) total += (size_t)context->count - 1;
-    return total;
+    size_t text, attach;
+    expected_split(chat, context, &text, &attach);
+    return text + attach;
 }
 
 /* A rejected build must leave a fully zeroed, readable output: the tests poison
    the struct first, so a field the implementation forgets shows up here. */
 static int zeroed_output(const ChatRequestContext *context) {
     if (context->count != 0 || context->bytes != 0 ||
+        context->text_bytes != 0 || context->attachment_bytes != 0 ||
         context->first_kept_index != -1 || context->dropped_messages != 0 ||
-        context->required_bytes != 0 || context->part_slots_used != 0) return 0;
+        context->required_bytes != 0 ||
+        context->required_attachment_bytes != 0 ||
+        context->part_slots_used != 0) return 0;
     for (int i = 0; i < CHAT_CONTEXT_MAX_ENTRIES; i++)
         if (context->messages[i].text != NULL ||
             context->messages[i].parts != NULL ||
@@ -785,10 +892,18 @@ static void test_view_parts(void) {
     check(context.part_slots_used == 3 + 1 + 2,
         "part_slots_used counts the placed parts and nothing else");
 
-    /* Byte-stability pin: at this commit the images cost nothing and the
-       body is byte-identical to the projection-only framing. */
+    /* Size pin: the images are charged from the attachment records and the
+       two sides split exactly as the model says. */
     check(context.bytes == expected_body(chat, &context),
-        "parts do not change a single request byte yet");
+        "the reported size matches the framing model with image terms");
+    {
+        size_t model_text, model_attach;
+        expected_split(chat, &context, &model_text, &model_attach);
+        check(context.text_bytes == model_text &&
+            context.attachment_bytes == model_attach &&
+            context.bytes == model_text + model_attach,
+            "text_bytes + attachment_bytes equals bytes and the model");
+    }
 
     /* Idempotence: a second build of the same state fills the same views. */
     size_t count = (size_t)context.count;
@@ -872,6 +987,264 @@ static void test_view_dropped_and_dangling(void) {
     chat_dispose(chat); free(chat);
 }
 
+/* ---- Commit 6: dual budgets, encoder cost split ------------------------- */
+
+/* The message frame charges array brackets at every positive part count: a
+   single image is an array and must not fall through to the string shape. */
+static void test_frame_counts(void) {
+    check(chat_completion_message_frame_bytes(CHAT_ROLE_USER, 0) ==
+        TEST_MESSAGE + 4u, "part_count 0 is the string fast path");
+    check(chat_completion_message_frame_bytes(CHAT_ROLE_USER, 1) ==
+        TEST_MESSAGE + 4u + 2u,
+        "a single part is already an array (brackets, no comma)");
+    check(chat_completion_message_frame_bytes(CHAT_ROLE_USER, 2) ==
+        TEST_MESSAGE + 4u + 2u + 1u, "two parts add one comma");
+    check(chat_completion_message_frame_bytes(CHAT_ROLE_ASSISTANT, 1) ==
+        TEST_MESSAGE + 9u + 2u, "the role name is still charged");
+
+    /* A real one-image message must pay the brackets too. */
+    Chat *chat = fresh_chat();
+    add_attachment(chat, 1, 1000);
+    int shown = chat_append(chat, CHAT_ROLE_USER, L"");
+    add_image(&chat->conversations[0].messages[shown], 1, 0, 2, 2);
+    int trigger = chat_append(chat, CHAT_ROLE_USER, L"and?");
+    const ChatConversation *c = active(chat);
+    static ChatRequestContext context;
+    check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) ==
+        CHAT_CONTEXT_OK, "a single-image message builds");
+    size_t text, attach;
+    expected_split(chat, &context, &text, &attach);
+    check(context.bytes == expected_body(chat, &context),
+        "the single-image run costs its array brackets");
+    check(context.attachment_bytes == attach && attach > 0,
+        "the image term lands on the attachment side");
+    chat_dispose(chat); free(chat);
+}
+
+/* The two budgets are independent: image payload never eats the text policy
+   and text pressure never eats the image budget. */
+static void test_dual_budget(void) {
+    /* The plan's split example: a 200 KB image is kept while 100 KB of older
+       history text is still dropped at the 64 KiB policy. */
+    Chat *chat = fresh_chat();
+    add_attachment(chat, 1, 200u * 1024u);
+    wchar_t *huge_text = long_text(100000, L'x');
+    chat_append(chat, CHAT_ROLE_USER, huge_text);
+    free(huge_text);
+    int answered = chat_append(chat, CHAT_ROLE_ASSISTANT, L"old answer");
+    chat->conversations[0].messages[answered].generation.state =
+        CHAT_GENERATION_COMPLETE;
+    int shown = chat_append(chat, CHAT_ROLE_USER, L"look");
+    add_image(&chat->conversations[0].messages[shown], 1, 0, 2, 2);
+    int trigger = chat_append(chat, CHAT_ROLE_USER, L"and?");
+    const ChatConversation *c = active(chat);
+    static ChatRequestContext context;
+    check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES,
+        &context) == CHAT_CONTEXT_OK, "mixed text/image history builds");
+    check(context.dropped_messages == 1 && context.first_kept_index == answered,
+        "the 100 KB text turn is dropped and the image turn is kept");
+    check(context.attachment_bytes > 200u * 1024u,
+        "a 200 KB image is charged and still sends");
+    check(context.text_bytes < CHAT_CONTEXT_BUDGET_BYTES &&
+        context.bytes > CHAT_CONTEXT_BUDGET_BYTES,
+        "the image payload is not charged to the text policy");
+    check(context.bytes == expected_body(chat, &context),
+        "the split matches the model");
+
+    /* Image pressure drops the oldest image turns whole -- their text is
+       never sent without them. Trigger holds ~2.67 MB encoded, one history
+       image of 3 MiB fits behind it, the next one does not. */
+    chat_dispose(chat); free(chat);
+    chat = fresh_chat();
+    add_attachment(chat, 1, 2u * 1024u * 1024u);
+    add_attachment(chat, 2, 3u * 1024u * 1024u);
+    add_attachment(chat, 3, 3u * 1024u * 1024u);
+    int oldest = chat_append(chat, CHAT_ROLE_USER, L"oldest text");
+    add_image(&chat->conversations[0].messages[oldest], 3, 0, 1, 1);
+    int middle = chat_append(chat, CHAT_ROLE_ASSISTANT, L"middle answer");
+    chat->conversations[0].messages[middle].generation.state =
+        CHAT_GENERATION_COMPLETE;
+    int newer = chat_append(chat, CHAT_ROLE_USER, L"newer text");
+    add_image(&chat->conversations[0].messages[newer], 2, 0, 1, 1);
+    trigger = chat_append(chat, CHAT_ROLE_USER, L"q");
+    add_image(&chat->conversations[0].messages[trigger], 1, 0, 1, 1);
+    c = active(chat);
+    check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES,
+        &context) == CHAT_CONTEXT_OK, "image budget pressure builds");
+    check(context.dropped_messages == 1 && context.first_kept_index == middle,
+        "the oldest image turn is dropped whole under image budget pressure");
+    for (int i = 0; i < context.count; i++)
+        check(wcscmp(context.messages[i].text, L"oldest text") != 0,
+            "the dropped turn's text is not sent without its image");
+    check(context.attachment_bytes == context.bytes - context.text_bytes,
+        "the split still sums to the body");
+
+    /* Boundary: the largest image that fits the attachment budget is kept,
+       the next base64 quantum over it is not. The term is 65 + 4*ceil(n/3)
+       for "image/png" on OpenRouter, so 6291405 bytes cost 8388605 (3 under)
+       and 6291408 cost 8388609 (1 over). */
+    chat_dispose(chat); free(chat);
+    chat = fresh_chat();
+    add_attachment(chat, 1, 6291405);
+    trigger = chat_append(chat, CHAT_ROLE_USER, L"q");
+    add_image(&chat->conversations[0].messages[trigger], 1, 0, 1, 1);
+    c = active(chat);
+    check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES,
+        &context) == CHAT_CONTEXT_OK &&
+        context.attachment_bytes == 8388605u,
+        "an image 3 bytes under the attachment budget fits exactly");
+    check(context.bytes == expected_body(chat, &context),
+        "the boundary cost matches the model");
+    chat_dispose(chat); free(chat);
+    chat = fresh_chat();
+    add_attachment(chat, 1, 6291408);
+    trigger = chat_append(chat, CHAT_ROLE_USER, L"q");
+    add_image(&chat->conversations[0].messages[trigger], 1, 0, 1, 1);
+    c = active(chat);
+    check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES,
+        &context) == CHAT_CONTEXT_OVERSIZE_ATTACHMENTS,
+        "one base64 quantum over the attachment budget is oversize");
+    chat_dispose(chat); free(chat);
+}
+
+/* The attachment oversize diagnostic: required_bytes stays the complete
+   body, required_attachment_bytes carries the image need, and the displayed
+   KB rounds up (truncation would show "8192 KB of 8192 KB" just over cap). */
+static void test_attachment_oversize(void) {
+    Chat *chat = fresh_chat();
+    add_attachment(chat, 1, 6291408);   /* encoded cost 8388609: 1 over 8 MiB */
+    int trigger = chat_append(chat, CHAT_ROLE_USER, L"q");
+    ChatMessage *m = &chat->conversations[0].messages[trigger];
+    add_image(m, 1, 0, 1, 1);
+    const ChatConversation *c = active(chat);
+    static ChatRequestContext context;
+    memset(&context, 0xa5, sizeof context);
+    check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES,
+        &context) == CHAT_CONTEXT_OVERSIZE_ATTACHMENTS,
+        "oversized trigger images report the attachment class");
+    size_t text, attach;
+    model_message_costs(chat, m, CHAT_ROLE_USER, &text, &attach);
+    check(attach == 8388609u,
+        "the model agrees on the one-byte-over cost");
+    check(context.required_attachment_bytes == attach,
+        "required_attachment_bytes is the trigger's image need");
+    check(context.required_bytes == TEST_ENVELOPE +
+        json_encoded_string_size(chat->model) + text + attach,
+        "required_bytes is the complete indispensable body");
+    check(context.required_bytes > context.required_attachment_bytes,
+        "the body number dominates the image number");
+    /* The display rounds UP to whole KB: 8388609 -> 8193, never 8192. */
+    unsigned long need_kb = (unsigned long)(context.required_attachment_bytes
+        / 1024u + (context.required_attachment_bytes % 1024u ? 1u : 0u));
+    unsigned long budget_kb = (unsigned long)
+        (CHAT_ATTACHMENT_BUDGET_BYTES / 1024u);
+    check(need_kb == 8193u && budget_kb == 8192u,
+        "the ceiling-KB display reads 8193 KB of 8192 KB");
+    /* Text diagnostics win a dual failure (the established classes first). */
+    wchar_t *big = long_text(100000, L'x');   /* oversize alone */
+    chat_message_set_text(m, big);
+    memset(&context, 0xa5, sizeof context);
+    check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES,
+        &context) == CHAT_CONTEXT_OVERSIZE_USER,
+        "a text oversize is reported before the attachment class");
+    model_message_costs(chat, m, CHAT_ROLE_USER, &text, &attach);
+    check(context.required_attachment_bytes == attach &&
+        context.required_bytes == TEST_ENVELOPE +
+        json_encoded_string_size(chat->model) + text + attach,
+        "even then the numbers include the trigger's images");
+    free(big);
+    chat_dispose(chat); free(chat);
+}
+
+/* Fix: indispensable images are resolved even after a text-budget failure,
+   so required_bytes can include them as promised; a missing trigger record
+   defines the outcome as INVALID before any diagnostic. */
+static void test_required_includes_images(void) {
+    Chat *chat = fresh_chat();
+    add_attachment(chat, 1, 200u * 1024u);
+    wchar_t *big = long_text(100000, L'x');   /* oversize alone */
+    int trigger = chat_append(chat, CHAT_ROLE_USER, big);
+    ChatMessage *m = &chat->conversations[0].messages[trigger];
+    add_image(m, 1, 0, 2, 2);
+    const ChatConversation *c = active(chat);
+    static ChatRequestContext context;
+    check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES,
+        &context) == CHAT_CONTEXT_OVERSIZE_USER,
+        "an oversize trigger text is reported");
+    size_t text, attach;
+    model_message_costs(chat, m, CHAT_ROLE_USER, &text, &attach);
+    check(attach > 0, "fixture: the trigger carries an image");
+    check(context.required_bytes == TEST_ENVELOPE +
+        json_encoded_string_size(chat->model) + text + attach,
+        "the text failure still resolves and reports the trigger's images");
+    check(context.required_attachment_bytes == attach,
+        "the image share is reported alongside");
+
+    /* System oversize with an image-bearing trigger. The system prompt is
+       bounded by CHAT_COMPOSER_TEXT, so the budget shrinks instead (the
+       established trick from test_oversize). */
+    wchar_t *big2 = long_text(4000, L'\u2014');
+    wcscpy(chat->system_prompt, big2);
+    chat_message_set_text(m, L"q");
+    size_t small_budget = TEST_ENVELOPE +
+        json_encoded_string_size(chat->model) + 1000u;
+    check(chat_context_build(chat, c, trigger, small_budget,
+        &context) == CHAT_CONTEXT_OVERSIZE_SYSTEM,
+        "an oversize system prompt is reported first");
+    model_message_costs(chat, m, CHAT_ROLE_USER, &text, &attach);
+    check(context.required_bytes == TEST_ENVELOPE +
+        json_encoded_string_size(chat->model) +
+        message_bytes(CHAT_ROLE_SYSTEM, big2) + 1u + text + attach &&
+        context.required_attachment_bytes == attach,
+        "the system failure reports the same complete body");
+
+    /* A missing trigger record: INVALID wins over any oversize diagnostic --
+       the numbers would be built from untrustworthy metadata. */
+    chat->system_prompt[0] = 0;
+    chat_message_clear_parts(m);
+    add_image(m, 999, 0, 2, 2);   /* no attachment record */
+    chat_message_set_text(m, big);   /* and the text oversizes */
+    memset(&context, 0xa5, sizeof context);
+    check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES,
+        &context) == CHAT_CONTEXT_INVALID && zeroed_output(&context),
+        "a missing trigger record is INVALID before any oversize diagnostic");
+
+    /* The same trigger with a fitting text: still INVALID, zeroed. */
+    chat_message_set_text(m, L"q");
+    memset(&context, 0xa5, sizeof context);
+    check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES,
+        &context) == CHAT_CONTEXT_INVALID && zeroed_output(&context),
+        "a missing trigger record is fatal whenever the trigger is placed");
+    free(big);
+    free(big2);
+    chat_dispose(chat); free(chat);
+}
+
+/* Attachment costing is metadata-only: the charge follows the record's
+   stored length with no blob anywhere on disk, and no file is opened. */
+static void test_metadata_only_cost(void) {
+    Chat *chat = fresh_chat();
+    add_attachment(chat, 1, 200u * 1024u);
+    int trigger = chat_append(chat, CHAT_ROLE_USER, L"q");
+    add_image(&chat->conversations[0].messages[trigger], 1, 0, 2, 2);
+    const ChatConversation *c = active(chat);
+    static ChatRequestContext context;
+    file_opens = 0;
+    check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES,
+        &context) == CHAT_CONTEXT_OK, "a fabricated record builds");
+    check(file_opens == 0, "no file is opened to cost a request");
+    check(context.required_bytes == 0 &&
+        context.required_attachment_bytes == 0,
+        "diagnostics are zero on a successful build");
+    size_t text, attach;
+    model_message_costs(chat, &c->messages[trigger], CHAT_ROLE_USER,
+        &text, &attach);
+    check(context.attachment_bytes == attach &&
+        attach == 65u + test_b64(200u * 1024u),
+        "the cost is the record's stored length, not any blob");
+    chat_dispose(chat); free(chat);
+}
+
 int main(void) {
     test_order_and_identity();
     test_oldest_dropped_first();
@@ -888,6 +1261,11 @@ int main(void) {
     test_provider_routing();
     test_view_parts();
     test_view_dropped_and_dangling();
+    test_frame_counts();
+    test_dual_budget();
+    test_attachment_oversize();
+    test_required_includes_images();
+    test_metadata_only_cost();
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     puts("Bounded request context: budget, oldest-first dropping, eligibility, "
         "diagnostics, read-only access, send-mode and part-view tests passed");

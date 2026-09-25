@@ -805,6 +805,119 @@ static int default_suite(void) {
         h->generating=false; h->context_dropped=0; h->request_generation=0;
         render_transcript(h);
     }
+    /* ---- Attachment-budget oversize diagnostic (ceiling KB) ------------- */
+    {
+        /* A retry whose user turn carries images past the attachment budget
+           fails with the named diagnostic and sends nothing. The displayed
+           need rounds UP to whole KB -- 8388609 bytes reads "8193 KB of the
+           8192 KB attachment budget", never a truncating "8192 KB of 8192
+           KB". */
+        Chat *chat=h->config.chat;
+        ChatAttachmentMeta rec={0};
+        rec.id=1;
+        for (int i=0;i<64;i++) rec.digest[i]='a';
+        rec.digest[64]=0;
+        strcpy(rec.mime,"image/png");
+        rec.bytes=6291408;   /* encoded term 8388609: one byte over 8 MiB */
+        rec.created_at=1;
+        wcscpy(rec.display_name,L"huge.png");
+        CHECK(chat_attachment_add(chat,&rec));
+        ChatImagePart img={0};
+        img.attachment_id=1;
+        strcpy(img.mime,"image/png");
+        wcscpy(img.display_name,L"huge.png");
+        ChatConversation *c=&chat->conversations[0];
+        int turn=chat_append(chat,CHAT_ROLE_USER,L"look at this");
+        CHECK(chat_message_add_image(&c->messages[turn],&img,0));
+        int failed=chat_append(chat,CHAT_ROLE_ASSISTANT,L"partial");
+        c->messages[failed].generation.state=CHAT_GENERATION_FAILED;
+        int calls=completion_request_calls;
+        start_response(h,CHAT_RETRY,NULL);
+        ChatMessage *pending_message=pending(h);
+        CHECK(pending_message->generation.state==CHAT_GENERATION_FAILED);
+        CHECK(!h->generating && h->request_generation==0 &&
+              h->context_dropped==0);
+        CHECK(completion_request_calls==calls);          /* nothing was sent */
+        CHECK(wcsstr(pending_message->generation.error,
+              L"attachment budget")!=NULL);
+        CHECK(wcsstr(pending_message->generation.error,
+              L"8193 KB of the 8192 KB")!=NULL);
+        CHECK(wcsstr(pending_message->generation.error,
+              L"8192 KB of the 8192 KB")==NULL);
+        CHECK(wcsstr(pending_message->generation.error,
+              L"Remove some or use smaller images")!=NULL);
+        CHECK(wcsstr(chat->status,L"Request failed")!=NULL);
+        /* Restore the state the following checks expect. */
+        c=&chat->conversations[0];
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        chat_attachment_prune(chat,NULL,0);
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+    }
+    /* ---- Text oversize diagnostic reports the text side ---------------- */
+    {
+        /* An image-bearing turn that fails the TEXT budget must show the
+           text-side need against the 64 KiB text budget: the image share
+           stays out of the displayed number (it lives in
+           required_attachment_bytes), so the text failure cannot look
+           inflated by the images. */
+        Chat *chat=h->config.chat;
+        ChatAttachmentMeta rec={0};
+        rec.id=1;
+        for (int i=0;i<64;i++) rec.digest[i]='a';
+        rec.digest[64]=0;
+        strcpy(rec.mime,"image/png");
+        rec.bytes=200u*1024u;
+        rec.created_at=1;
+        wcscpy(rec.display_name,L"photo.png");
+        CHECK(chat_attachment_add(chat,&rec));
+        ChatImagePart img={0};
+        img.attachment_id=1;
+        strcpy(img.mime,"image/png");
+        wcscpy(img.display_name,L"photo.png");
+        ChatConversation *c=&chat->conversations[0];
+        wchar_t *big=(wchar_t *)malloc(100001*sizeof *big);
+        CHECK(big);
+        for (int i=0;i<100000;i++) big[i]=L'x';
+        big[100000]=0;
+        int turn=chat_append(chat,CHAT_ROLE_USER,big);
+        CHECK(chat_message_add_image(&c->messages[turn],&img,0));
+        int failed=chat_append(chat,CHAT_ROLE_ASSISTANT,L"partial");
+        c->messages[failed].generation.state=CHAT_GENERATION_FAILED;
+        int calls=completion_request_calls;
+        start_response(h,CHAT_RETRY,NULL);
+        ChatMessage *pending_message=pending(h);
+        CHECK(pending_message->generation.state==CHAT_GENERATION_FAILED);
+        CHECK(completion_request_calls==calls);          /* nothing was sent */
+        /* The same build through the pure layer gives the expected number. */
+        static ChatRequestContext probe;
+        CHECK(chat_context_build(chat,c,turn,CHAT_CONTEXT_BUDGET_BYTES,
+              &probe)==CHAT_CONTEXT_OVERSIZE_USER);
+        CHECK(probe.required_attachment_bytes>0);   /* fixture is meaningful */
+        wchar_t expect[160];
+        swprintf(expect,160,
+            L"The request body needs %lu bytes; the budget is %lu.",
+            (unsigned long)(probe.required_bytes-probe.required_attachment_bytes),
+            (unsigned long)CHAT_CONTEXT_BUDGET_BYTES);
+        CHECK(wcsstr(pending_message->generation.error,expect)!=NULL);
+        CHECK(wcsstr(pending_message->generation.error,
+              L"too large; shorten it")!=NULL);
+        free(big);
+        /* Restore the state the following checks expect. */
+        c=&chat->conversations[0];
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        chat_attachment_prune(chat,NULL,0);
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+    }
     /* ---- Per-send context allocation failure and diagnostic precedence --- */
     {
         /* The request context is heap-allocated per send: failing exactly
