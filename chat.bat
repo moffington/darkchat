@@ -89,7 +89,7 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     build\test_search.exe
     if errorlevel 1 exit /b 1
-    gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_storage.c chat\persistence\storage.c chat\core\chat.c chat\json.c -o build\test_storage.exe -Wl,--wrap=malloc -Wl,--wrap=realloc -Wl,--wrap=calloc -Wl,--wrap=free
+    gcc -std=c17 -I. -Wall -Wextra -Wpedantic -Werror -O0 -g tests\test_storage.c chat\persistence\storage.c chat\core\chat.c chat\json.c chat\persistence\attachments.c -o build\test_storage.exe -Wl,--wrap=malloc -Wl,--wrap=realloc -Wl,--wrap=calloc -Wl,--wrap=free
     if errorlevel 1 exit /b 1
     build\test_storage.exe
     if errorlevel 1 exit /b 1

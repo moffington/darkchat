@@ -618,6 +618,13 @@ static void saver_completed(ChatHost *host, bool ok, uint64_t attempt,
    counter at handoff time, which travels with the job. */
 static Chat *save_snapshot(ChatHost *host, uint64_t *captured) {
     *captured=host->mutations;
+    /* Format-6 attachment pruning runs immediately before every snapshot
+       hand-off: records referenced by neither a live message part nor a
+       pending/staged attachment are dropped so the encoded file omits them
+       and the emitted version can fall back off 6. The keep-set is empty
+       until the attach UI lands pending lists (later commit); pruning never
+       touches blobs. */
+    chat_attachment_prune(host->config.chat,NULL,0);
     Chat *snapshot=chat_snapshot(host->config.chat);
     if (!snapshot) {
         host->save_failed=true;

@@ -289,6 +289,25 @@ typedef struct {
        chat_delete_all preserves them, only chat_dispose releases them. */
     ChatPromptProfile profiles[CHAT_MAX_PROMPT_PROFILES];
     int profile_count;
+    /* Attachment metadata table (snapshot format 6, `type:"attachment"`
+       records). The single runtime authority for each managed blob's digest,
+       byte length and display metadata: request budgeting, export and the
+       mark/sweep resolve records here without opening blobs. Heap array of
+       value records; `attachments` is NULL exactly when `attachment_count`
+       is 0, and only [0, attachment_count) is live (the tail is private
+       backing storage). Content-proportional like ChatText: excluded from
+       the fixed-residue amplification, deep-copied by chat_snapshot as a
+       flat value copy, released by chat_dispose. Entries exist only to
+       serve live references: immediately before every snapshot hand-off
+       chat_attachment_prune drops entries referenced by neither a live
+       message part nor a caller-supplied pending/staged attachment id, so
+       the encoded file omits them and the emitted format version falls
+       back off 6 once nothing multimodal remains. Pruning never touches
+       blobs: blob reclamation is exclusively the store's mark/sweep
+       against the recovery-aware live set. */
+    ChatAttachmentMeta *attachments;
+    size_t attachment_count;
+    size_t attachment_capacity;
     int window_x, window_y, window_width, window_height, maximized, sidebar_width;
     /* Explicit user preference for the collapsible conversation sidebar:
        0 = expanded (the historical default and the meaning of an absent
@@ -363,6 +382,27 @@ void chat_message_clear_parts(ChatMessage *message);
 void chat_message_touch(ChatMessage *message);
 void chat_message_dispose(ChatMessage *message);
 void chat_dispose(Chat *chat);
+
+/* Attachment metadata table. `chat_attachment` resolves one record by its
+   stable id, or NULL when unknown (linear scan; the table is content-sized,
+   deliberately without an index). `chat_attachment_add` appends one record
+   (storage decode and the ingest path); the growth is transactional and a
+   duplicate id or an id of 0 is rejected. `chat_has_any_parts/attachments`
+   feed storage's content-derived format version: `has_any_parts` is true
+   exactly when some message carries a parts array (the same condition that
+   makes the encoder emit the `parts` field). */
+const ChatAttachmentMeta *chat_attachment(const Chat *chat, uint64_t id);
+bool chat_attachment_add(Chat *chat, const ChatAttachmentMeta *meta);
+bool chat_has_any_parts(const Chat *chat);
+bool chat_has_any_attachments(const Chat *chat);
+/* Drops every table entry referenced by neither any live message part (in
+   any conversation) nor any id in [keep_ids, keep_ids + keep_count) -- the
+   pending / import-staged attachments the caller holds. Deterministic
+   in-place compaction of live state: survivor order is preserved, the
+   vacated tail is zeroed, and the call never touches blobs. False only for
+   an invalid call (NULL chat, or keep_count without keep_ids). */
+bool chat_attachment_prune(Chat *chat, const uint64_t *keep_ids,
+    size_t keep_count);
 
 /* Prompt-profile library. Names are unique up to locale-independent ordinal
    case-insensitive comparison (the comparison the profile picker reuses), so

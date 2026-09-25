@@ -580,8 +580,8 @@ static void dispose_conversation(ChatConversation *c) {
 
 /* Releases everything a Chat owns: every conversation's message overflow
    allocations and owned prompt override, then each conversation's message
-   array itself, then the profile library's owned prompts, leaving every
-   dynamic field reset. */
+   array itself, then the profile library's owned prompts, then the
+   attachment metadata table, leaving every dynamic field reset. */
 void chat_dispose(Chat *chat) {
     if (!chat) return;
     for (int i=0;i<chat->conversation_count;i++)
@@ -589,6 +589,115 @@ void chat_dispose(Chat *chat) {
     for (int i=0;i<chat->profile_count;i++)
         chat_text_dispose(&chat->profiles[i].prompt);
     chat->profile_count=0;
+    free(chat->attachments);
+    chat->attachments=NULL;
+    chat->attachment_count=0;
+    chat->attachment_capacity=0;
+}
+
+/* ---- attachment metadata table ---------------------------------------- */
+
+const ChatAttachmentMeta *chat_attachment(const Chat *chat, uint64_t id) {
+    if (!chat || !id) return NULL;
+    for (size_t i=0;i<chat->attachment_count;i++)
+        if (chat->attachments[i].id==id) return &chat->attachments[i];
+    return NULL;
+}
+
+/* A digest is exactly 64 lowercase hex characters (the attachment store's
+   blob-filename rule). */
+static bool digest_shape_ok(const char *s) {
+    size_t n = strlen(s);
+    if (n != 64) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+/* A MIME is empty (unknown) or 1..31 characters of printable ASCII without
+   the JSON structural characters, so storage can emit the field raw. */
+static bool mime_shape_ok(const char *s) {
+    size_t n = strlen(s);
+    if (n >= 32) return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x21 || c > 0x7e || c == '"' || c == '\\') return false;
+    }
+    return true;
+}
+
+bool chat_attachment_add(Chat *chat, const ChatAttachmentMeta *meta) {
+    if (!chat || !meta || !meta->id) return false;
+    if (chat_attachment(chat,meta->id)) return false;
+    /* Table records are storage-grammar records: the structural fields must
+       be exactly what the format defines (64 lowercase hex digest, a
+       bounded NUL-terminated safe-ASCII MIME, a bounded NUL-terminated
+       display name) so the encoder can emit them raw and the round trip is
+       byte-stable. This function is the single choke point for every table
+       entry (storage decode, ingest, tests). */
+    if (!digest_shape_ok(meta->digest) || !mime_shape_ok(meta->mime))
+        return false;
+    if (!memchr(meta->display_name, 0, sizeof meta->display_name))
+        return false;
+    if (chat->attachment_count==chat->attachment_capacity) {
+        size_t capacity=chat->attachment_capacity ?
+            chat->attachment_capacity*2 : 8;
+        ChatAttachmentMeta *grown=(ChatAttachmentMeta *)realloc(
+            chat->attachments,capacity*sizeof *grown);
+        if (!grown) return false;
+        chat->attachments=grown;
+        chat->attachment_capacity=capacity;
+    }
+    chat->attachments[chat->attachment_count++]=*meta;
+    return true;
+}
+
+bool chat_has_any_parts(const Chat *chat) {
+    if (!chat) return false;
+    for (int i=0;i<chat->conversation_count;i++) {
+        const ChatConversation *c=&chat->conversations[i];
+        for (size_t j=0;j<c->message_count;j++)
+            if (c->messages[j].parts.items) return true;
+    }
+    return false;
+}
+
+bool chat_has_any_attachments(const Chat *chat) {
+    return chat && chat->attachment_count>0;
+}
+
+bool chat_attachment_prune(Chat *chat, const uint64_t *keep_ids,
+    size_t keep_count) {
+    if (!chat) return false;
+    if (keep_count && !keep_ids) return false;
+    size_t live=0;
+    for (size_t a=0;a<chat->attachment_count;a++) {
+        uint64_t id=chat->attachments[a].id;
+        bool kept=false;
+        for (size_t k=0;k<keep_count && !kept;k++)
+            if (keep_ids[k]==id) kept=true;
+        for (int i=0;i<chat->conversation_count && !kept;i++) {
+            const ChatConversation *c=&chat->conversations[i];
+            for (size_t j=0;j<c->message_count && !kept;j++) {
+                const ChatMessage *m=&c->messages[j];
+                for (size_t p=0;p<m->parts.count;p++)
+                    if (m->parts.items[p].kind==CHAT_PART_IMAGE &&
+                            m->parts.items[p].u.image.attachment_id==id) {
+                        kept=true;
+                        break;
+                    }
+            }
+        }
+        if (kept) {
+            if (live!=a) chat->attachments[live]=chat->attachments[a];
+            ++live;
+        }
+    }
+    for (size_t i=live;i<chat->attachment_count;i++)
+        memset(&chat->attachments[i],0,sizeof chat->attachments[i]);
+    chat->attachment_count=live;
+    return true;
 }
 
 /* Bounded append that never overruns the destination. */
@@ -815,6 +924,9 @@ Chat *chat_snapshot(const Chat *chat) {
         function allocated and can never reach the source's pointers. This
         includes every owned ChatText: the struct copy aliased the profile
         prompts and the per-conversation prompt overrides. */
+    copy->attachments=NULL;
+    copy->attachment_count=0;
+    copy->attachment_capacity=0;
     for (int i=0;i<chat->profile_count;i++) {
         copy->profiles[i].prompt.data=NULL;
         copy->profiles[i].prompt.length=0;
@@ -833,6 +945,21 @@ Chat *chat_snapshot(const Chat *chat) {
                 &chat->profiles[i].prompt)) {
             chat_dispose(copy); free(copy); return NULL;
         }
+    }
+    /* The attachment metadata table is a flat array of value records (no
+        owned pointers inside), so the deep copy is one exact-count array:
+        the saver can then encode `type:"attachment"` records without ever
+        opening a blob. */
+    if (chat->attachment_count) {
+        copy->attachments=(ChatAttachmentMeta *)malloc(
+            chat->attachment_count*sizeof *copy->attachments);
+        if (!copy->attachments) {
+            chat_dispose(copy); free(copy); return NULL;
+        }
+        memcpy(copy->attachments,chat->attachments,
+            chat->attachment_count*sizeof *copy->attachments);
+        copy->attachment_count=chat->attachment_count;
+        copy->attachment_capacity=chat->attachment_count;
     }
     for (int i=0;i<chat->conversation_count;i++) {
         const ChatConversation *source=&chat->conversations[i];

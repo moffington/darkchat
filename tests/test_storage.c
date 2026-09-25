@@ -1,4 +1,5 @@
 #include "chat/persistence/storage.h"
+#include "chat/persistence/attachments.h"
 #include "chat/json.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,9 +15,11 @@
    - pass_mallocs / fail_mallocs: skip that many mallocs, then fail that many.
    - fail_malloc_size / fail_big_mallocs: fail the next N mallocs of at least
      that size (targets one message's UTF-16 expansion mid-decode).
-   - fail_realloc_index: fail the nth realloc call (the conversation
-     message-array reservations are the only reallocs a load performs).
-   The seam also tracks live wrapped allocations (malloc + calloc minus free),
+   - fail_realloc_index: fail the nth realloc call (a load reallocs for the
+     conversation message-array reservations and the attachment-table
+     growth).
+   The seam also tracks live wrapped allocations (malloc, calloc and fresh
+   realloc minus free),
    so a decode-failure test can assert that the quarantine released exactly
    everything it built — a missed dispose shows up as a leaked allocation. */
 void *__real_malloc(size_t size);
@@ -44,7 +47,14 @@ void *__wrap_realloc(void *pointer, size_t size) {
     ++realloc_seen;
     if (fail_realloc_index > 0 && realloc_seen == fail_realloc_index) return NULL;
     void *grown = __real_realloc(pointer, size);
-    if (grown && !pointer) memset(grown, 0x5C, size);
+    if (grown && !pointer) {
+        memset(grown, 0x5C, size);
+        /* A fresh realloc is a fresh allocation (exactly malloc): count it
+           so the live balance also holds across message-array and
+           attachment-table growth. A resize of a counted block keeps its
+           count. */
+        ++live_allocs;
+    }
     return grown;
 }
 void *__wrap_calloc(size_t count, size_t size) {
@@ -78,12 +88,39 @@ static bool same_generation(const ChatGeneration *a, const ChatGeneration *b) {
         !wcscmp(a->finish_reason, b->finish_reason) &&
         !wcscmp(a->error, b->error);
 }
+/* Compares two messages' ordered content parts field-for-field through the
+   logical view: kind, flags and the payload (TEXT compares its string,
+   IMAGE every ChatImagePart field). */
+static bool same_parts(const ChatMessage *a, const ChatMessage *b) {
+    size_t count = chat_message_part_count(a);
+    if (count != chat_message_part_count(b)) return false;
+    for (size_t i = 0; i < count; i++) {
+        ChatPartView x, y;
+        if (!chat_message_part_at(a, i, &x) ||
+            !chat_message_part_at(b, i, &y)) return false;
+        if (x.kind != y.kind || x.flags != y.flags) return false;
+        if (x.kind == CHAT_PART_TEXT) {
+            if (x.u.text.length != y.u.text.length) return false;
+            if (wcsncmp(x.u.text.data, y.u.text.data, x.u.text.length))
+                return false;
+        } else {
+            const ChatImagePart *p = &x.u.image, *q = &y.u.image;
+            if (p->attachment_id != q->attachment_id ||
+                p->pixel_width != q->pixel_width ||
+                p->pixel_height != q->pixel_height ||
+                strcmp(p->mime, q->mime) ||
+                wcscmp(p->display_name, q->display_name)) return false;
+        }
+    }
+    return true;
+}
 static bool same_message(const ChatMessage *a, const ChatMessage *b) {
     return a->role == b->role && a->id == b->id &&
         a->created_at == b->created_at &&
         a->modified_at == b->modified_at &&
         !wcscmp(chat_message_text(a), chat_message_text(b)) &&
         !wcscmp(chat_message_reasoning(a), chat_message_reasoning(b)) &&
+        same_parts(a, b) &&
         same_generation(&a->generation, &b->generation);
 }
 /* Compares every logically persisted field, including the stable message ids.
@@ -139,6 +176,22 @@ static bool same_chat(const Chat *a, const Chat *b) {
         if (ca->message_count && (!ca->messages || !cb->messages)) return false;
         for (size_t j = 0; j < ca->message_count; j++)
             if (!same_message(&ca->messages[j], &cb->messages[j])) return false;
+    }
+    /* The attachment metadata table is persisted state from format 6 and
+       compared record-by-record, in order. */
+    if (a->attachment_count != b->attachment_count) return false;
+    if (a->attachment_count && (!a->attachments || !b->attachments))
+        return false;
+    for (size_t i = 0; i < a->attachment_count; i++) {
+        const ChatAttachmentMeta *x = &a->attachments[i];
+        const ChatAttachmentMeta *y = &b->attachments[i];
+        if (x->id != y->id || x->bytes != y->bytes ||
+            x->pixel_width != y->pixel_width ||
+            x->pixel_height != y->pixel_height ||
+            x->created_at != y->created_at ||
+            strcmp(x->digest, y->digest) || strcmp(x->mime, y->mime) ||
+            wcscmp(x->display_name, y->display_name))
+            return false;
     }
     return true;
 }
@@ -323,6 +376,78 @@ static int load_v4_case(const wchar_t *tag, int version,
     storage_close(&store);
     remove_store(&store, dir);
     return result;
+}
+/* One version-6 message record. `id_field` is `""` or something like
+   `"\"id\":2,"`; `text` is the JSON-encoded `text` field; `parts_field` is
+   `""` or a trailing `,"parts":...` spliced before the closing brace. */
+static void msg6(char *out, size_t cap, const char *id_field,
+    const char *text, const char *parts_field) {
+    snprintf(out, cap,
+        "{\"type\":\"message\",%s\"role\":0,\"created_at\":1000,"
+        "\"modified_at\":1000,\"text\":%s,\"state\":0,\"started_at\":0,"
+        "\"finished_at\":0,\"first_token_at\":0,\"ttft_ms\":-1,\"latency_ms\":-1,"
+        "\"prompt_tokens\":-1,\"completion_tokens\":-1,\"total_tokens\":-1,"
+        "\"cost\":-1,\"requested_model\":\"\",\"actual_model\":\"\","
+        "\"finish_reason\":\"\",\"error\":\"\"%s}", id_field, text, parts_field);
+}
+/* Builds a one-conversation snapshot whose version is `version`, whose
+   `attachment_lines` (may be none) sit between the settings record and the
+   conversation record, and whose `message_lines` (may be none) follow it.
+   Every line is a complete record. Returns storage_load's result (or -2
+   when building failed). */
+static int load_v6_case(const wchar_t *tag, int version, long long next_id,
+    const char *const *attachment_lines, size_t attachment_count,
+    const char *const *message_lines, size_t message_count, Chat *dest) {
+    wchar_t dir[256];
+    swprintf(dir, 256, L"build\\storage-v6-%ls-%lu", tag,
+        GetCurrentProcessId());
+    ChatStorage store;
+    if (!storage_open(&store, dir)) return -2;
+    char settings[384], conversation[256];
+    snprintf(settings, sizeof settings,
+        "{\"type\":\"settings\",\"version\":%d,\"next_id\":%lld,\"active\":0,"
+        "\"conversation_count\":1,\"model_history_count\":0,\"window_x\":0,"
+        "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+        "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+        "\"system_prompt\":\"\",\"profile_count\":0}", version, next_id);
+    snprintf(conversation, sizeof conversation,
+        "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
+        "\"modified_at\":1000,\"renamed\":0,\"message_count\":%zu,"
+        "\"title\":\"c\",\"draft\":\"\"}", message_count);
+    size_t total = 2 + attachment_count + message_count;
+    const char **lines = malloc(total * sizeof *lines);
+    if (!lines) {
+        storage_close(&store); remove_store(&store, dir); return -2;
+    }
+    size_t at = 0;
+    lines[at++] = settings;
+    for (size_t i = 0; i < attachment_count; i++)
+        lines[at++] = attachment_lines[i];
+    lines[at++] = conversation;
+    for (size_t i = 0; i < message_count; i++)
+        lines[at++] = message_lines[i];
+    int result = write_snapshot(store.path, lines, total) ?
+        storage_load(&store, dest) : -2;
+    free(lines);
+    storage_close(&store);
+    remove_store(&store, dir);
+    return result;
+}
+
+/* Two fixed 64-hex digests for the format-6 cases: load never hashes blob
+   content, so any stable hex names work. */
+static const char k_digest_a[65] =
+    "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+static const char k_digest_b[65] =
+    "1111111111111111111111111111111111111111111111111111111111111111";
+
+/* Collects scanned digests for the live-set scan tests. */
+struct DigestSet { char dig[8][65]; size_t count; };
+static bool collect_digest(void *user, const char digest[65]) {
+    struct DigestSet *set = (struct DigestSet *)user;
+    if (set->count >= 8) return false;
+    memcpy(set->dig[set->count++], digest, 65);
+    return true;
 }
 /* Downgrade simulation: removes the stable id field from every message
     record, recomputes the commit checksum and rewrites the file, so an older
@@ -780,9 +905,9 @@ int main(void) {
     char header[64]={0}; CHECK(fread(header,1,63,future)==63);
     char *version=strstr(header,"\"version\":3"); CHECK(version);
     CHECK(fseek(future,(long)(version-header)+(long)strlen("\"version\":"),SEEK_SET)==0);
-    /* This build writes at most format 5, so the unsupported-boundary
+    /* This build writes at most format 6, so the unsupported-boundary
         fixture must claim a version beyond what this build decodes. */
-    fputc('6',future); fclose(future);
+    fputc('7',future); fclose(future);
     CHECK(storage_load(&store,loaded)==-1 && !store.writable);
     storage_close(&store);
     DeleteFileW(store.path); DeleteFileW(store.backup); DeleteFileW(store.temporary);
@@ -1621,6 +1746,647 @@ int main(void) {
         }
         storage_close(&cstore);
         remove_store(&cstore, cdir);
+    }
+
+    /* ---- Format 6: content parts and attachment records ------------- */
+
+    /* Round trip through the app API: parts and attachment records persist
+        field-for-field, repeated saves are byte-stable, and text-only
+        messages keep their byte shape inside a v6 file. */
+    {
+        Chat *six = calloc(1, sizeof *six);
+        CHECK(six);
+        chat_init(six);
+        chat_clear(six);
+        ChatAttachmentMeta meta;
+        memset(&meta, 0, sizeof meta);
+        meta.id = 77;
+        memcpy(meta.digest, k_digest_a, sizeof meta.digest);
+        strcpy(meta.mime, "image/png");
+        meta.bytes = 184320;
+        meta.pixel_width = 1280;
+        meta.pixel_height = 720;
+        meta.created_at = 1758000000000;
+        wcscpy(meta.display_name, L"photo.jpg");
+        CHECK(chat_attachment_add(six, &meta));
+        int u0 = chat_append(six, CHAT_ROLE_USER, L"what's this?");
+        CHECK(u0 == 0);
+        ChatImagePart image;
+        memset(&image, 0, sizeof image);
+        image.attachment_id = meta.id;
+        image.pixel_width = meta.pixel_width;
+        image.pixel_height = meta.pixel_height;
+        memcpy(image.mime, meta.mime, sizeof image.mime);
+        wcscpy(image.display_name, meta.display_name);
+        CHECK(chat_message_add_image(&six->conversations[0].messages[u0],
+            &image, CHAT_PART_FLAG_FIRST_FRAME));
+        int a0 = chat_append(six, CHAT_ROLE_ASSISTANT, L"A cat.");
+        CHECK(a0 == 1);
+        ChatAttachmentMeta meta2 = meta;
+        meta2.id = 78;
+        memcpy(meta2.digest, k_digest_b, sizeof meta2.digest);
+        strcpy(meta2.mime, "image/jpeg");
+        meta2.bytes = 2048;
+        meta2.pixel_width = 0;
+        meta2.pixel_height = 0;
+        meta2.created_at = 1758000000001;
+        meta2.display_name[0] = 0;
+        CHECK(chat_attachment_add(six, &meta2));
+        int u1 = chat_append(six, CHAT_ROLE_USER, L"");
+        CHECK(u1 == 2);
+        ChatImagePart image2;
+        memset(&image2, 0, sizeof image2);
+        image2.attachment_id = meta2.id;
+        memcpy(image2.mime, meta2.mime, sizeof image2.mime);
+        CHECK(chat_message_add_image(&six->conversations[0].messages[u1],
+            &image2, 0));
+        /* A part may reference a record another message also references. */
+        CHECK(chat_message_add_image(&six->conversations[0].messages[u1],
+            &image, 0));
+        CHECK(chat_message_part_count(&six->conversations[0].messages[u0]) == 2);
+        CHECK(chat_message_part_count(&six->conversations[0].messages[u1]) == 2);
+        CHECK(six->attachment_count == 2);
+        wchar_t sdir[256];
+        swprintf(sdir, 256, L"build\\storage-six-%lu", GetCurrentProcessId());
+        ChatStorage sstore;
+        CHECK(storage_open(&sstore, sdir));
+        CHECK(storage_save(&sstore, six));
+        {
+            char *bytes = NULL;
+            size_t size = 0;
+            CHECK(read_file_bytes(sstore.path, &bytes, &size));
+            CHECK(strstr(bytes, "\"version\":6") != NULL);
+            CHECK(strstr(bytes, "\"type\":\"attachment\"") != NULL);
+            CHECK(strstr(bytes, "\"parts\":[") != NULL);
+            CHECK(strstr(bytes, "\"flags\":1") != NULL);
+            CHECK(strstr(bytes, "\"k\":\"text\"") != NULL);
+            CHECK(strstr(bytes, "\"k\":\"image\"") != NULL);
+            free(bytes);
+        }
+        CHECK(storage_load(&sstore, loaded) == 1 && !sstore.recovered);
+        CHECK(same_chat(six, loaded));
+        {
+            char *first = NULL, *second = NULL;
+            size_t first_size = 0, second_size = 0;
+            CHECK(storage_save(&sstore, loaded));
+            CHECK(read_file_bytes(sstore.path, &first, &first_size));
+            CHECK(storage_save(&sstore, loaded));
+            CHECK(read_file_bytes(sstore.path, &second, &second_size));
+            CHECK(first_size == second_size &&
+                !memcmp(first, second, first_size));
+            CHECK(strstr(first, "\"version\":6") != NULL);
+            free(first); free(second);
+        }
+        chat_dispose(six); free(six);
+        storage_close(&sstore);
+        remove_store(&sstore, sdir);
+    }
+
+    /* The checked-in v6 fixture loads field-for-field; a missing blob is a
+        degraded load, never corruption; the round trip is exact. */
+    {
+        wchar_t fdir[256];
+        swprintf(fdir, 256, L"build\\storage-v6fix-%lu", GetCurrentProcessId());
+        ChatStorage fstore;
+        CHECK(storage_open(&fstore, fdir));
+        CHECK(CopyFileW(L"tests\\state-v6-fixture.jsonl", fstore.path, FALSE));
+        Chat *fixture = calloc(1, sizeof *fixture);
+        CHECK(fixture);
+        CHECK(storage_load(&fstore, fixture) == 1 && !fstore.recovered);
+        CHECK(fixture->attachment_count == 2);
+        CHECK(fixture->attachments[0].id == 5);
+        CHECK(!strcmp(fixture->attachments[0].digest, k_digest_a));
+        CHECK(!strcmp(fixture->attachments[0].mime, "image/png"));
+        CHECK(fixture->attachments[0].bytes == 184320);
+        CHECK(fixture->attachments[0].pixel_width == 1280);
+        CHECK(fixture->attachments[0].pixel_height == 720);
+        CHECK(fixture->attachments[0].created_at == 1758000000000);
+        CHECK(!wcscmp(fixture->attachments[0].display_name, L"photo.jpg"));
+        CHECK(fixture->attachments[1].id == 6);
+        CHECK(!strcmp(fixture->attachments[1].digest, k_digest_b));
+        CHECK(!strcmp(fixture->attachments[1].mime, "image/jpeg"));
+        CHECK(fixture->attachments[1].bytes == 2048);
+        CHECK(fixture->attachments[1].pixel_width == 0);
+        CHECK(fixture->attachments[1].pixel_height == 0);
+        CHECK(fixture->attachments[1].created_at == 1758000000001);
+        CHECK(fixture->attachments[1].display_name[0] == 0);
+        CHECK(fixture->conversation_count == 1);
+        const ChatConversation *fc = &fixture->conversations[0];
+        CHECK(fc->message_count == 3);
+        ChatPartView view;
+        CHECK(!wcscmp(chat_message_text(&fc->messages[0]), L"what's this?"));
+        CHECK(chat_message_part_count(&fc->messages[0]) == 2);
+        CHECK(chat_message_part_at(&fc->messages[0], 0, &view) &&
+            view.kind == CHAT_PART_TEXT && view.flags == 0 &&
+            !wcscmp(view.u.text.data, L"what's this?"));
+        CHECK(chat_message_part_at(&fc->messages[0], 1, &view) &&
+            view.kind == CHAT_PART_IMAGE &&
+            view.flags == CHAT_PART_FLAG_FIRST_FRAME &&
+            view.u.image.attachment_id == 5 &&
+            view.u.image.pixel_width == 1280 &&
+            view.u.image.pixel_height == 720 &&
+            !strcmp(view.u.image.mime, "image/png") &&
+            !wcscmp(view.u.image.display_name, L"photo.jpg"));
+        /* A text-only message inside a v6 file stays on the fast path. */
+        CHECK(chat_message_part_count(&fc->messages[1]) == 1);
+        CHECK(!chat_message_has_images(&fc->messages[1]));
+        CHECK(!wcscmp(chat_message_text(&fc->messages[1]), L"A cat."));
+        /* Image-only: empty projection, two image parts, shared record. */
+        CHECK(!wcscmp(chat_message_text(&fc->messages[2]), L""));
+        CHECK(chat_message_part_count(&fc->messages[2]) == 2);
+        CHECK(chat_message_part_at(&fc->messages[2], 0, &view) &&
+            view.kind == CHAT_PART_IMAGE && view.flags == 0 &&
+            view.u.image.attachment_id == 6);
+        CHECK(chat_message_part_at(&fc->messages[2], 1, &view) &&
+            view.kind == CHAT_PART_IMAGE && view.flags == 0 &&
+            view.u.image.attachment_id == 5);
+        CHECK(storage_save(&fstore, fixture));
+        CHECK(storage_load(&fstore, loaded) == 1 && !fstore.recovered);
+        CHECK(same_chat(fixture, loaded));
+        {
+            char *first = NULL, *second = NULL;
+            size_t first_size = 0, second_size = 0;
+            CHECK(storage_save(&fstore, fixture));
+            CHECK(read_file_bytes(fstore.path, &first, &first_size));
+            CHECK(storage_save(&fstore, fixture));
+            CHECK(read_file_bytes(fstore.path, &second, &second_size));
+            CHECK(first_size == second_size &&
+                !memcmp(first, second, first_size));
+            CHECK(strstr(first, "\"version\":6") != NULL);
+            free(first); free(second);
+        }
+        chat_dispose(fixture); free(fixture);
+        storage_close(&fstore);
+        remove_store(&fstore, fdir);
+    }
+
+    /* Reverse gate: the parts field and attachment records are grammar
+        changes gated to v6 in both directions. */
+    {
+        char att[256], msg[512];
+        snprintf(att, sizeof att,
+            "{\"type\":\"attachment\",\"id\":5,\"digest\":\"%s\","
+            "\"mime\":\"image/png\",\"bytes\":184320,\"pixel_width\":1280,"
+            "\"pixel_height\":720,\"created_at\":1758000000000,"
+            "\"display_name\":\"photo.jpg\"}", k_digest_a);
+        msg6(msg, sizeof msg, "\"id\":2,", "\"hi\"",
+            ",\"parts\":[{\"k\":\"text\",\"text\":\"hi\"},"
+            "{\"k\":\"image\",\"id\":5}]");
+        const char *one_msg[1] = { msg };
+        CHECK(load_v6_case(L"rev-parts", 5, 10, NULL, 0, one_msg, 1,
+            loaded) == -1);
+        const char *one_att[1] = { att };
+        msg6(msg, sizeof msg, "\"id\":2,", "\"hi\"", "");
+        CHECK(load_v6_case(L"rev-att", 5, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+    }
+
+    /* Corruption matrix: every non-canonical or malformed format-6 shape is
+        rejected transactionally (the destination stays untouched). */
+    {
+        char att[256], att_bad[256], att_min[256], a[512], big[2048];
+        snprintf(att, sizeof att,
+            "{\"type\":\"attachment\",\"id\":5,\"digest\":\"%s\","
+            "\"mime\":\"image/png\",\"bytes\":184320,\"pixel_width\":1280,"
+            "\"pixel_height\":720,\"created_at\":1758000000000,"
+            "\"display_name\":\"photo.jpg\"}", k_digest_a);
+        /* 63 hex characters: one short of a digest. */
+        snprintf(att_bad, sizeof att_bad,
+            "{\"type\":\"attachment\",\"id\":5,\"digest\":\"%.63s\","
+            "\"mime\":\"image/png\",\"bytes\":10}", k_digest_a);
+        /* The required core only: every optional field absent. */
+        snprintf(att_min, sizeof att_min,
+            "{\"type\":\"attachment\",\"id\":5,\"digest\":\"%s\","
+            "\"bytes\":10}", k_digest_a);
+        const char *one_att[1] = { att };
+        const char *bad_att[1] = { att_bad };
+        const char *min_att[1] = { att_min };
+        const char *dup_att[2] = { att, att };
+        const char *no_id[1] = {
+            "{\"type\":\"attachment\",\"digest\":\"000000000000000000000000"
+            "0000000000000000000000000000000000000000\",\"bytes\":10}" };
+        const char *no_bytes[1] = {
+            "{\"type\":\"attachment\",\"id\":5,\"digest\":\"0000000000000000"
+            "000000000000000000000000000000000000000000000000\"}" };
+        const char *one_msg[1];
+        /* Unknown part kind. */
+        msg6(a, sizeof a, "\"id\":2,", "\"\"",
+            ",\"parts\":[{\"k\":\"audio\",\"id\":5}]");
+        one_msg[0] = a;
+        CHECK(load_v6_case(L"bad-kind", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* Flags outside CHAT_PART_FLAG_MASK. */
+        msg6(a, sizeof a, "\"id\":2,", "\"\"",
+            ",\"parts\":[{\"k\":\"image\",\"id\":5,\"flags\":2}]");
+        CHECK(load_v6_case(L"bad-flags", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* Nonzero flags on a TEXT part. */
+        msg6(a, sizeof a, "\"id\":2,", "\"hi\"",
+            ",\"parts\":[{\"k\":\"text\",\"text\":\"hi\",\"flags\":1},"
+            "{\"k\":\"image\",\"id\":5}]");
+        CHECK(load_v6_case(L"text-flags", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* Flags of the wrong type. */
+        msg6(a, sizeof a, "\"id\":2,", "\"\"",
+            ",\"parts\":[{\"k\":\"image\",\"id\":5,\"flags\":\"1\"}]");
+        CHECK(load_v6_case(L"flags-type", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* A part referencing an id with no attachment record. */
+        msg6(a, sizeof a, "\"id\":2,", "\"\"",
+            ",\"parts\":[{\"k\":\"image\",\"id\":9}]");
+        CHECK(load_v6_case(L"dangling", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* An attachment record without an id (no synthesis for these). */
+        CHECK(load_v6_case(L"no-id", 6, 10, no_id, 1, NULL, 0, loaded) == -1);
+        /* An attachment record without the required byte length. */
+        CHECK(load_v6_case(L"no-bytes", 6, 10, no_bytes, 1, NULL, 0,
+            loaded) == -1);
+        /* Duplicate attachment ids. */
+        msg6(a, sizeof a, "\"id\":2,", "\"hi\"", "");
+        one_msg[0] = a;
+        CHECK(load_v6_case(L"dup-att", 6, 10, dup_att, 2, one_msg, 1,
+            loaded) == -1);
+        /* A malformed digest (63 hex characters). */
+        CHECK(load_v6_case(L"bad-digest", 6, 10, bad_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* Attachment id == message id (one shared counter). */
+        msg6(a, sizeof a, "\"id\":5,", "\"hi\"", "");
+        CHECK(load_v6_case(L"collide-msg", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* Attachment id == conversation id (the fixture conversation is 1). */
+        char att1[256];
+        snprintf(att1, sizeof att1,
+            "{\"type\":\"attachment\",\"id\":1,\"digest\":\"%s\","
+            "\"bytes\":10}", k_digest_a);
+        const char *conv_att[1] = { att1 };
+        msg6(a, sizeof a, "\"id\":2,", "\"hi\"", "");
+        CHECK(load_v6_case(L"collide-conv", 6, 10, conv_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* text != the projection of the TEXT parts. */
+        msg6(a, sizeof a, "\"id\":2,", "\"foo\"",
+            ",\"parts\":[{\"k\":\"text\",\"text\":\"bar\"},"
+            "{\"k\":\"image\",\"id\":5}]");
+        CHECK(load_v6_case(L"proj-mismatch", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* TEXT after IMAGE (outside the v1 shape). */
+        msg6(a, sizeof a, "\"id\":2,", "\"hi\"",
+            ",\"parts\":[{\"k\":\"image\",\"id\":5},"
+            "{\"k\":\"text\",\"text\":\"hi\"}]");
+        CHECK(load_v6_case(L"order", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* More than one TEXT part. */
+        msg6(a, sizeof a, "\"id\":2,", "\"hi\"",
+            ",\"parts\":[{\"k\":\"text\",\"text\":\"hi\"},"
+            "{\"k\":\"text\",\"text\":\"hi\"}]");
+        CHECK(load_v6_case(L"two-text", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* A TEXT-only array (no IMAGE) is not emittable. */
+        msg6(a, sizeof a, "\"id\":2,", "\"hi\"",
+            ",\"parts\":[{\"k\":\"text\",\"text\":\"hi\"}]");
+        CHECK(load_v6_case(L"text-only", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* An empty TEXT part with an empty projection. */
+        msg6(a, sizeof a, "\"id\":2,", "\"\"",
+            ",\"parts\":[{\"k\":\"text\",\"text\":\"\"},"
+            "{\"k\":\"image\",\"id\":5}]");
+        CHECK(load_v6_case(L"empty-text", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* A nonempty projection with no TEXT part. */
+        msg6(a, sizeof a, "\"id\":2,", "\"hi\"",
+            ",\"parts\":[{\"k\":\"image\",\"id\":5}]");
+        CHECK(load_v6_case(L"no-text-part", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* parts of the wrong type. */
+        msg6(a, sizeof a, "\"id\":2,", "\"hi\"", ",\"parts\":5");
+        CHECK(load_v6_case(L"parts-num", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        msg6(a, sizeof a, "\"id\":2,", "\"hi\"", ",\"parts\":\"x\"");
+        CHECK(load_v6_case(L"parts-str", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        msg6(a, sizeof a, "\"id\":2,", "\"hi\"", ",\"parts\":null");
+        CHECK(load_v6_case(L"parts-null", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* More parts than CHAT_MAX_PARTS. */
+        {
+            size_t at = (size_t)snprintf(big, sizeof big, ",\"parts\":[");
+            for (int i = 0; i < CHAT_MAX_PARTS + 1; i++)
+                at += (size_t)snprintf(big + at, sizeof big - at,
+                    "%s{\"k\":\"image\",\"id\":5}", i ? "," : "");
+            snprintf(big + at, sizeof big - at, "]");
+        }
+        msg6(a, sizeof a, "\"id\":2,", "\"\"", big);
+        one_msg[0] = a;
+        CHECK(load_v6_case(L"too-many", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == -1);
+        /* Accepted: an empty parts array is the fast path. */
+        msg6(a, sizeof a, "\"id\":2,", "\"hi\"", ",\"parts\":[]");
+        one_msg[0] = a;
+        CHECK(load_v6_case(L"empty-array", 6, 10, one_att, 1, one_msg, 1,
+            loaded) == 1);
+        CHECK(loaded->conversation_count == 1);
+        CHECK(loaded->conversations[0].message_count == 1);
+        CHECK(chat_message_part_count(&loaded->conversations[0].messages[0]) == 1);
+        CHECK(!chat_message_has_images(&loaded->conversations[0].messages[0]));
+        CHECK(!wcscmp(chat_message_text(&loaded->conversations[0].messages[0]),
+            L"hi"));
+        /* Accepted: optional record fields default (absent MIME is empty). */
+        msg6(a, sizeof a, "\"id\":2,", "\"\"",
+            ",\"parts\":[{\"k\":\"image\",\"id\":5}]");
+        CHECK(load_v6_case(L"defaults", 6, 10, min_att, 1, one_msg, 1,
+            loaded) == 1);
+        CHECK(loaded->attachment_count == 1);
+        CHECK(!strcmp(loaded->attachments[0].mime, ""));
+        CHECK(loaded->attachments[0].bytes == 10);
+        CHECK(loaded->attachments[0].pixel_width == 0);
+        CHECK(loaded->attachments[0].created_at == 0);
+        CHECK(loaded->attachments[0].display_name[0] == 0);
+        CHECK(chat_message_part_count(&loaded->conversations[0].messages[0]) == 1);
+        {
+            ChatPartView v;
+            CHECK(chat_message_part_at(&loaded->conversations[0].messages[0],
+                0, &v) && v.kind == CHAT_PART_IMAGE &&
+                !strcmp(v.u.image.mime, "") &&
+                v.u.image.attachment_id == 5);
+        }
+    }
+
+    /* OOM during decode: the quarantine releases exactly what it built and
+        the load fails cleanly (or succeeds when the injection misses). */
+    {
+        long baseline = live_allocs;
+        for (int pass = 0; pass < 2; pass++) {
+            for (long n = 0; n < 32; n++) {
+                wchar_t odir[256];
+                swprintf(odir, 256, L"build\\storage-oom-%d-%ld-%lu",
+                    pass, n, GetCurrentProcessId());
+                ChatStorage ostore;
+                CHECK(storage_open(&ostore, odir));
+                CHECK(CopyFileW(L"tests\\state-v6-fixture.jsonl",
+                    ostore.path, FALSE));
+                Chat *scratch = calloc(1, sizeof *scratch);
+                CHECK(scratch);
+                seam_reset();
+                if (pass == 0) {
+                    pass_mallocs = n;
+                    fail_mallocs = 1;
+                } else {
+                    fail_realloc_index = n + 1;
+                }
+                int result = storage_load(&ostore, scratch);
+                seam_reset();
+                CHECK(result == 1 || result == -1);
+                chat_dispose(scratch);
+                free(scratch);
+                CHECK(live_allocs == baseline);
+                storage_close(&ostore);
+                remove_store(&ostore, odir);
+            }
+        }
+    }
+
+    /* Live-set scan (A4.4.4): digests are collected from all three state
+        files, so a blob referenced only by state.bak.jsonl survives
+        attachment_store_collect after a delete + single save; unreferenced
+        orphans are swept and pending keep-ids survive. */
+    {
+        wchar_t ldir[256];
+        swprintf(ldir, 256, L"build\\storage-live-%lu", GetCurrentProcessId());
+        ChatStorage lstore;
+        CHECK(storage_open(&lstore, ldir));
+        Chat *lc = calloc(1, sizeof *lc);
+        CHECK(lc);
+        chat_init(lc);
+        chat_clear(lc);
+        ChatAttachmentStore astore;
+        CHECK(attachment_store_open(&astore, ldir, &lc->next_id));
+        /* Blob A: referenced by a message and saved. Blob C: pending (put
+           this session, referenced by no message). Blob B: an orphan. */
+        ChatAttachmentMeta meta_a, meta_b, meta_c;
+        CHECK(attachment_store_put(&astore, "png-a", 5, "image/png", L"a.png",
+            &meta_a, NULL));
+        CHECK(attachment_store_put(&astore, "png-c", 5, "image/png", L"c.png",
+            &meta_c, NULL));
+        CHECK(attachment_store_put(&astore, "png-b", 5, "image/png", L"b.png",
+            &meta_b, NULL));
+        CHECK(chat_attachment_add(lc, &meta_a));
+        int mi = chat_append(lc, CHAT_ROLE_USER, L"hi");
+        CHECK(mi == 0);
+        ChatImagePart image;
+        memset(&image, 0, sizeof image);
+        image.attachment_id = meta_a.id;
+        memcpy(image.mime, meta_a.mime, sizeof image.mime);
+        CHECK(chat_message_add_image(&lc->conversations[0].messages[mi],
+            &image, 0));
+        CHECK(storage_save(&lstore, lc));
+        /* Delete the last image and save once: the record rotates into the
+           backup and the primary no longer names blob A. */
+        chat_message_clear_parts(&lc->conversations[0].messages[mi]);
+        CHECK(chat_attachment_prune(lc, NULL, 0));
+        CHECK(lc->attachment_count == 0);
+        CHECK(storage_save(&lstore, lc));
+        /* The A4.4.4 live set: all three state files plus the live parts
+           (none) plus the pending keep-ids. */
+        struct DigestSet set;
+        memset(&set, 0, sizeof set);
+        CHECK(storage_scan_attachment_digests(lstore.path, collect_digest,
+            &set));
+        CHECK(storage_scan_attachment_digests(lstore.backup, collect_digest,
+            &set));
+        CHECK(storage_scan_attachment_digests(lstore.temporary,
+            collect_digest, &set));
+        CHECK(set.count == 1);
+        CHECK(!memcmp(set.dig[0], meta_a.digest, 64));
+        /* The pending attachment's digest joins the live set as a keep. */
+        memcpy(set.dig[set.count++], meta_c.digest, 65);
+        const char *live[8];
+        for (size_t i = 0; i < set.count; i++) live[i] = set.dig[i];
+        CHECK(attachment_store_collect(&astore, live, set.count));
+        /* A survives (backup-referenced), C survives (pending), B is swept. */
+        unsigned char *data = NULL;
+        size_t n = 0;
+        CHECK(attachment_store_get(&astore, meta_a.digest, &data, &n));
+        free(data); data = NULL;
+        CHECK(attachment_store_get(&astore, meta_c.digest, &data, &n));
+        free(data); data = NULL;
+        CHECK(!attachment_store_get(&astore, meta_b.digest, &data, &n));
+        /* A corrupt file contributes nothing and reports the failure. */
+        {
+            FILE *bad = _wfopen(lstore.backup, L"wb");
+            CHECK(bad);
+            fputs("{\"truncated\":", bad);
+            fclose(bad);
+            struct DigestSet empty;
+            memset(&empty, 0, sizeof empty);
+            CHECK(!storage_scan_attachment_digests(lstore.backup,
+                collect_digest, &empty));
+            CHECK(empty.count == 0);
+            CHECK(storage_scan_attachment_digests(lstore.temporary,
+                collect_digest, &empty));
+        }
+        /* Teardown: sweep the remaining blobs and remove the store tree. */
+        CHECK(attachment_store_collect(&astore, NULL, 0));
+        attachment_store_close(&astore);
+        wchar_t sub[1200];
+        swprintf(sub, 1200, L"%ls\\attachments\\.tmp", ldir);
+        RemoveDirectoryW(sub);
+        swprintf(sub, 1200, L"%ls\\attachments\\corrupt", ldir);
+        RemoveDirectoryW(sub);
+        swprintf(sub, 1200, L"%ls\\attachments", ldir);
+        RemoveDirectoryW(sub);
+        chat_dispose(lc); free(lc);
+        storage_close(&lstore);
+        remove_store(&lstore, ldir);
+    }
+
+    /* Digest collector contract: the whole snapshot is validated through
+        the loader's grammar and its digests staged before any callback runs,
+        file-not-found is the only empty contribution, and an uninspectable
+        file reports failure so a sweep can never run against a live set it
+        could not verify. */
+    {
+        wchar_t sdir[256];
+        swprintf(sdir, 256, L"build\\storage-scan-%lu", GetCurrentProcessId());
+        ChatStorage sstore;
+        CHECK(storage_open(&sstore, sdir));
+        char settings[384], conversation[256], att[256], msg[512];
+        snprintf(settings, sizeof settings,
+            "{\"type\":\"settings\",\"version\":6,\"next_id\":10,\"active\":0,"
+            "\"conversation_count\":1,\"model_history_count\":0,\"window_x\":0,"
+            "\"window_y\":0,\"window_width\":1100,\"window_height\":720,"
+            "\"maximized\":0,\"sidebar_width\":232,\"model\":\"m\","
+            "\"system_prompt\":\"\",\"profile_count\":0}");
+        snprintf(conversation, sizeof conversation,
+            "{\"type\":\"conversation\",\"id\":1,\"created_at\":1000,"
+            "\"modified_at\":1000,\"renamed\":0,\"message_count\":1,"
+            "\"title\":\"c\",\"draft\":\"\"}");
+        snprintf(att, sizeof att,
+            "{\"type\":\"attachment\",\"id\":5,\"digest\":\"%s\","
+            "\"mime\":\"image/png\",\"bytes\":184320,\"pixel_width\":1280,"
+            "\"pixel_height\":720,\"created_at\":1758000000000,"
+            "\"display_name\":\"photo.jpg\"}", k_digest_a);
+        const char *lines[4] = { settings, att, conversation, NULL };
+        struct DigestSet set;
+        /* Checksum-valid but loader-rejected (unknown part kind): the
+           record's digest must never reach the live set. */
+        msg6(msg, sizeof msg, "\"id\":2,", "\"\"",
+            ",\"parts\":[{\"k\":\"audio\",\"id\":5}]");
+        lines[3] = msg;
+        CHECK(write_snapshot(sstore.path, lines, 4));
+        memset(&set, 0, sizeof set);
+        CHECK(!storage_scan_attachment_digests(sstore.path, collect_digest,
+            &set));
+        CHECK(set.count == 0);
+        /* The same file really is rejected by the loader. */
+        Chat *scratch = calloc(1, sizeof *scratch);
+        CHECK(scratch);
+        CHECK(storage_load(&sstore, scratch) == -1 && !sstore.writable);
+        chat_dispose(scratch); free(scratch);
+        /* A valid snapshot reports exactly its own records. */
+        msg6(msg, sizeof msg, "\"id\":2,", "\"hi\"", "");
+        lines[3] = msg;
+        CHECK(write_snapshot(sstore.path, lines, 4));
+        memset(&set, 0, sizeof set);
+        CHECK(storage_scan_attachment_digests(sstore.path, collect_digest,
+            &set));
+        CHECK(set.count == 1);
+        CHECK(!memcmp(set.dig[0], k_digest_a, 64));
+        /* File-not-found inside an existing directory is the only empty
+           contribution. */
+        wchar_t absent[1200];
+        swprintf(absent, 1200, L"%ls\\absent.jsonl", sdir);
+        memset(&set, 0, sizeof set);
+        CHECK(storage_scan_attachment_digests(absent, collect_digest, &set));
+        CHECK(set.count == 0);
+        /* A missing parent directory is uninspectable, not empty. */
+        wchar_t notdir[1200];
+        swprintf(notdir, 1200, L"%ls\\no-such-dir\\state.jsonl", sdir);
+        CHECK(!storage_scan_attachment_digests(notdir, collect_digest, &set));
+        CHECK(set.count == 0);
+        /* A file that exists but cannot be opened reports failure too. */
+        HANDLE lock = CreateFileW(sstore.path, GENERIC_READ, 0, NULL,
+            OPEN_EXISTING, 0, NULL);
+        CHECK(lock != INVALID_HANDLE_VALUE);
+        memset(&set, 0, sizeof set);
+        CHECK(!storage_scan_attachment_digests(sstore.path, collect_digest,
+            &set));
+        CHECK(set.count == 0);
+        CloseHandle(lock);
+        storage_close(&sstore);
+        remove_store(&sstore, sdir);
+    }
+
+    /* Pruning: unreferenced records are dropped before the snapshot
+        hand-off, the emitted version falls back off 6, keep-ids protect
+        pending records, and survivor order is preserved. */
+    {
+        wchar_t pdir[256];
+        swprintf(pdir, 256, L"build\\storage-prune-%lu", GetCurrentProcessId());
+        ChatStorage pstore;
+        CHECK(storage_open(&pstore, pdir));
+        Chat *pc = calloc(1, sizeof *pc);
+        CHECK(pc);
+        chat_init(pc);
+        chat_clear(pc);
+        ChatAttachmentMeta m1, m2;
+        memset(&m1, 0, sizeof m1);
+        m1.id = 301;
+        memcpy(m1.digest, k_digest_a, sizeof m1.digest);
+        strcpy(m1.mime, "image/png");
+        m1.bytes = 10;
+        m2 = m1;
+        m2.id = 302;
+        memcpy(m2.digest, k_digest_b, sizeof m2.digest);
+        CHECK(chat_attachment_add(pc, &m1));
+        CHECK(chat_attachment_add(pc, &m2));
+        int mi = chat_append(pc, CHAT_ROLE_USER, L"both");
+        CHECK(mi == 0);
+        ChatImagePart image;
+        memset(&image, 0, sizeof image);
+        image.attachment_id = 301;
+        CHECK(chat_message_add_image(&pc->conversations[0].messages[mi],
+            &image, 0));
+        image.attachment_id = 302;
+        CHECK(chat_message_add_image(&pc->conversations[0].messages[mi],
+            &image, 0));
+        CHECK(storage_save(&pstore, pc));
+        {
+            char *bytes = NULL;
+            size_t size = 0;
+            CHECK(read_file_bytes(pstore.path, &bytes, &size));
+            CHECK(strstr(bytes, "\"version\":6") != NULL);
+            CHECK(strstr(bytes, "\"type\":\"attachment\"") != NULL);
+            free(bytes);
+        }
+        /* Delete the last image parts and prune: the records go with them
+           and the emitted version falls back off 6. */
+        chat_message_clear_parts(&pc->conversations[0].messages[mi]);
+        CHECK(chat_attachment_prune(pc, NULL, 0));
+        CHECK(pc->attachment_count == 0);
+        CHECK(storage_save(&pstore, pc));
+        {
+            char *bytes = NULL;
+            size_t size = 0;
+            CHECK(read_file_bytes(pstore.path, &bytes, &size));
+            CHECK(strstr(bytes, "\"version\":3") != NULL);
+            CHECK(strstr(bytes, "\"type\":\"attachment\"") == NULL);
+            CHECK(strstr(bytes, "\"parts\"") == NULL);
+            free(bytes);
+        }
+        /* A pending/staged keep-id protects its record from pruning, and
+           compaction preserves the survivors' order. */
+        CHECK(chat_attachment_add(pc, &m1));
+        CHECK(chat_attachment_add(pc, &m2));
+        uint64_t keep = 302;
+        CHECK(chat_attachment_prune(pc, &keep, 1));
+        CHECK(pc->attachment_count == 1);
+        CHECK(pc->attachments[0].id == 302);
+        CHECK(chat_attachment(pc, 301) == NULL);
+        CHECK(chat_attachment(pc, 302) != NULL);
+        CHECK(chat_attachment_prune(pc, NULL, 0));
+        CHECK(pc->attachment_count == 0);
+        chat_dispose(pc); free(pc);
+        storage_close(&pstore);
+        remove_store(&pstore, pdir);
     }
 
     chat_dispose(chat); chat_dispose(loaded);
