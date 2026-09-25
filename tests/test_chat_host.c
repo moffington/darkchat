@@ -33,6 +33,11 @@ static int completion_request_calls;
 static int completion_request_last_count;
 static ChatRole completion_request_last_roles[CHAT_CONTEXT_MAX_ENTRIES];
 static const wchar_t *completion_request_last_texts[CHAT_CONTEXT_MAX_ENTRIES];
+/* Scalar summaries of the ordered-part view the client was handed: the
+   borrowed ChatRequestPart runs die with the per-send request context, so the
+   seam records what it saw instead of aliasing it. */
+static int completion_request_last_part_counts[CHAT_CONTEXT_MAX_ENTRIES];
+static size_t completion_request_last_image_bytes[CHAT_CONTEXT_MAX_ENTRIES];
 static int completion_request_fake_generation;   /* 0: delegate to the real client */
 static ChatProviderRouting completion_request_last_routing;
 static ChatBackend completion_request_last_backend;
@@ -58,6 +63,12 @@ int __wrap_completion_request(CompletionClient *client, ChatBackend backend,
     for (int i=0;i<count && i<CHAT_CONTEXT_MAX_ENTRIES;i++) {
         completion_request_last_roles[i]=messages[i].role;
         completion_request_last_texts[i]=messages[i].text;
+        completion_request_last_part_counts[i]=messages[i].part_count;
+        completion_request_last_image_bytes[i]=0;
+        for (int p=0;p<messages[i].part_count;p++)
+            if (messages[i].parts[p].kind==CHAT_PART_IMAGE)
+                completion_request_last_image_bytes[i]+=
+                    messages[i].parts[p].u.image.byte_length;
     }
     completion_request_last_had_routing=routing!=NULL;
     if (routing) completion_request_last_routing=*routing;
@@ -98,12 +109,16 @@ int __wrap_model_catalog_request(ModelCatalogClient *client, ChatBackend backend
     return generation;
 }
 /* Focused allocation-failure seams for the picker's transactional refresh;
-   disarmed (-1) they forward to the CRT. */
+   disarmed (-1) they forward to the CRT. `alloc_fail_malloc_size` narrows the
+   malloc seam to one allocation size (0 = any), so a test can fail exactly the
+   per-send request context without arming every earlier malloc on the path. */
 static long alloc_fail_malloc=-1, alloc_fail_realloc=-1;
+static size_t alloc_fail_malloc_size=0;
 void *__real_malloc(size_t size);
 void *__real_realloc(void *pointer, size_t size);
 void *__wrap_malloc(size_t size) {
-    if (alloc_fail_malloc>=0) {
+    if (alloc_fail_malloc>=0 &&
+        (alloc_fail_malloc_size==0 || size==alloc_fail_malloc_size)) {
         if (alloc_fail_malloc==0) return NULL;
         --alloc_fail_malloc;
     }
@@ -736,6 +751,111 @@ static int default_suite(void) {
         h->generating=false; h->context_dropped=0; h->request_generation=0;
         render_transcript(h);
         free(huge);
+    }
+    /* ---- Content parts ride the borrowed request view ------------------- */
+    {
+        /* A user turn carrying one managed image: the send must still start,
+           and the client must see the projection text plus a two-part run
+           (TEXT + IMAGE) whose image budget size comes from the attachment
+           record with no blob loaded. */
+        Chat *chat=h->config.chat;
+        ChatAttachmentMeta rec={0};
+        rec.id=1;
+        for (int i=0;i<64;i++) rec.digest[i]='a';
+        rec.digest[64]=0;
+        strcpy(rec.mime,"image/png");
+        rec.bytes=1234;
+        rec.created_at=1;
+        wcscpy(rec.display_name,L"photo.png");
+        CHECK(chat_attachment_add(chat,&rec));
+        ChatImagePart img={0};
+        img.attachment_id=1; img.pixel_width=2; img.pixel_height=3;
+        strcpy(img.mime,"image/png");
+        wcscpy(img.display_name,L"photo.png");
+        ChatConversation *c=&chat->conversations[0];
+        int shown=chat_append(chat,CHAT_ROLE_USER,L"look at this");
+        CHECK(chat_message_add_image(&c->messages[shown],&img,0));
+        int seen=chat_append(chat,CHAT_ROLE_ASSISTANT,L"seen it");
+        c->messages[seen].generation.state=CHAT_GENERATION_COMPLETE;
+        int calls=completion_request_calls;
+        rich_text_set_text(&h->composer,L"and now?");
+        completion_request_fake_generation=5151;
+        perform_send(h);
+        completion_request_fake_generation=0;
+        CHECK(completion_request_calls==calls+1);          /* exactly one send */
+        CHECK(h->generating && h->request_generation==5151);
+        CHECK(completion_request_last_count==4);           /* Q0, shown, seen, trigger */
+        CHECK(completion_request_last_roles[1]==CHAT_ROLE_USER &&
+              !wcscmp(completion_request_last_texts[1],L"look at this"));
+        CHECK(completion_request_last_part_counts[1]==2);   /* TEXT + IMAGE */
+        CHECK(completion_request_last_image_bytes[1]==1234);
+        CHECK(completion_request_last_part_counts[0]==0 &&
+              completion_request_last_part_counts[2]==0 &&
+              completion_request_last_part_counts[3]==0);
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+        CHECK(!h->generating);
+        /* Restore the state the following checks expect. */
+        c=&chat->conversations[0];
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        chat_attachment_prune(chat,NULL,0);
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+    }
+    /* ---- Per-send context allocation failure and diagnostic precedence --- */
+    {
+        /* The request context is heap-allocated per send: failing exactly
+           that allocation fails the turn cleanly with a named error, sends
+           nothing, and leaves the turn retryable. */
+        Chat *chat=h->config.chat;
+        int calls=completion_request_calls;
+        rich_text_set_text(&h->composer,L"oom question");
+        alloc_fail_malloc=0;
+        alloc_fail_malloc_size=sizeof(ChatRequestContext);
+        perform_send(h);
+        alloc_fail_malloc=-1; alloc_fail_malloc_size=0;
+        CHECK(completion_request_calls==calls);            /* nothing sent */
+        CHECK(!h->generating && h->request_generation==0 && h->context_dropped==0);
+        { ChatConversation *c=&chat->conversations[chat->active];
+          size_t last=c->message_count-1;
+          CHECK(c->messages[last].generation.state==CHAT_GENERATION_FAILED);
+          CHECK(wcsstr(c->messages[last].generation.error,
+              L"Out of memory building the request context")!=NULL);
+          CHECK(wcsstr(c->messages[last].generation.error,
+              L"request was not sent")!=NULL); }
+        CHECK(wcsstr(chat->status,L"Request failed")!=NULL);
+        /* A save failure outranks the allocation diagnostic: the same send
+           with the durability gate broken reports the save, not the OOM. */
+        HANDLE block=CreateFileW(h->storage.temporary,GENERIC_WRITE,0,NULL,
+            OPEN_ALWAYS,0,NULL);
+        CHECK(block!=INVALID_HANDLE_VALUE);
+        calls=completion_request_calls;
+        rich_text_set_text(&h->composer,L"gate and oom question");
+        alloc_fail_malloc=0;
+        alloc_fail_malloc_size=sizeof(ChatRequestContext);
+        perform_send(h);
+        alloc_fail_malloc=-1; alloc_fail_malloc_size=0;
+        CHECK(completion_request_calls==calls);            /* nothing sent */
+        { ChatConversation *c=&chat->conversations[chat->active];
+          size_t last=c->message_count-1;
+          CHECK(c->messages[last].generation.state==CHAT_GENERATION_FAILED);
+          CHECK(wcsstr(c->messages[last].generation.error,
+              L"Could not save pending response")!=NULL); }
+        CloseHandle(block);
+        save(h);
+        CHECK(wait_save_settled(h,5000));
+        /* Restore the state the following checks expect. */
+        ChatConversation *c=&chat->conversations[chat->active];
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
     }
     /* ---- Provider routing: menu action -> persisted setting -> request ---- */
     {

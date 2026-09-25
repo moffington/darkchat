@@ -1527,11 +1527,19 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     /* The request context is a bounded projection of the conversation: the
        system prompt, the triggering user message and the newest eligible
        history that fits CHAT_CONTEXT_BUDGET_BYTES. Persisted history is never
-       changed by this. A save failure outranks every context diagnostic. */
-    ChatRequestContext context;
-    ChatContextResult built=chat_context_build(chat,c,index-1,
-        CHAT_CONTEXT_BUDGET_BYTES,&context);
-    host->context_dropped=built==CHAT_CONTEXT_OK ? context.dropped_messages : 0;
+       changed by this. A save failure outranks every context or allocation
+       diagnostic. The context is too large for the stack once its part_scratch
+       pool is counted (~350 KiB), so it is allocated per send and released
+       right after the client has deep-copied the view; the fields the error
+       path reports are captured first. */
+    ChatRequestContext *context=(ChatRequestContext *)malloc(sizeof *context);
+    bool context_oom=!context;
+    ChatContextResult built=CHAT_CONTEXT_INVALID;
+    if (context) built=chat_context_build(chat,c,index-1,
+        CHAT_CONTEXT_BUDGET_BYTES,context);
+    size_t required_bytes=context ? context->required_bytes : 0;
+    host->context_dropped=(built==CHAT_CONTEXT_OK && context) ?
+        context->dropped_messages : 0;
     /* OpenRouter keeps its credentials and provider routing; Ollama needs
         neither, so a missing OPENROUTER_API_KEY never blocks it. The model
         sent is the one chat_begin_response recorded in requested_model: the
@@ -1540,16 +1548,19 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     host->request_generation=saved && built==CHAT_CONTEXT_OK ?
         completion_request(&host->client,chat->backend,
             host->config.api_key_utf8,m->generation.requested_model,
-            context.messages,context.count,
+            context->messages,context->count,
             chat->backend==CHAT_BACKEND_OPENROUTER ?
                 &chat->provider_routing : NULL,
             chat_effective_reasoning(chat, c)) : 0;
+    free(context);
     if (!host->request_generation) {
         m->generation.state=CHAT_GENERATION_FAILED;
         m->generation.finished_at=chat_now();
         m->generation.latency_ms=0;
         if (!saved) wcscpy(m->generation.error,
             L"Could not save pending response; request was not sent.");
+        else if (context_oom) wcscpy(m->generation.error,
+            L"Out of memory building the request context; request was not sent.");
         else if (built==CHAT_CONTEXT_INVALID) wcscpy(m->generation.error,
             L"The request context could not be built; the latest turn is inconsistent.");
         else if (built!=CHAT_CONTEXT_OK) {
@@ -1564,7 +1575,7 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
             const size_t bound=sizeof m->generation.error/sizeof *m->generation.error;
             swprintf(m->generation.error,bound,
                 L"Request not sent: %ls. The request body needs %lu bytes; the budget is %lu.",
-                cause,(unsigned long)context.required_bytes,
+                cause,(unsigned long)required_bytes,
                 (unsigned long)CHAT_CONTEXT_BUDGET_BYTES);
             /* Truncation semantics of a full buffer are unspecified for
                swprintf: terminate explicitly so every reader is safe. */

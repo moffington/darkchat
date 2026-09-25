@@ -44,9 +44,11 @@ static size_t expected_body(const Chat *chat, const ChatRequestContext *context)
 static int zeroed_output(const ChatRequestContext *context) {
     if (context->count != 0 || context->bytes != 0 ||
         context->first_kept_index != -1 || context->dropped_messages != 0 ||
-        context->required_bytes != 0) return 0;
+        context->required_bytes != 0 || context->part_slots_used != 0) return 0;
     for (int i = 0; i < CHAT_CONTEXT_MAX_ENTRIES; i++)
-        if (context->messages[i].text != NULL) return 0;
+        if (context->messages[i].text != NULL ||
+            context->messages[i].parts != NULL ||
+            context->messages[i].part_count != 0) return 0;
     return 1;
 }
 
@@ -89,7 +91,7 @@ static void test_order_and_identity(void) {
     int trigger = chat_append(chat, CHAT_ROLE_USER, L"three");
     const ChatConversation *c = active(chat);
 
-    ChatRequestContext context;
+    static ChatRequestContext context;
     check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) == CHAT_CONTEXT_OK,
         "a huge budget builds a context");
     check(context.count == 5, "every eligible message is kept");
@@ -129,7 +131,7 @@ static void test_oldest_dropped_first(void) {
     size_t a2 = message_bytes(CHAT_ROLE_ASSISTANT, L"answer two");
     size_t u3 = message_bytes(CHAT_ROLE_USER, L"three");
 
-    ChatRequestContext context;
+    static ChatRequestContext context;
     /* Exactly room for the newest history message and the trigger. */
     size_t budget = base + u2 + a2 + u3 + 2;
     check(chat_context_build(chat, c, trigger, budget, &context) == CHAT_CONTEXT_OK &&
@@ -186,7 +188,7 @@ static void test_exclusions(void) {
     int trigger = chat_append(chat, CHAT_ROLE_USER, L"trigger");            /* 13 kept */
     const ChatConversation *c = active(chat);
 
-    ChatRequestContext context;
+    static ChatRequestContext context;
     check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) == CHAT_CONTEXT_OK,
         "the mixed conversation builds");
     static const ChatRole expected_roles[] = {
@@ -220,7 +222,7 @@ static void test_system_prompt(void) {
     const ChatConversation *c = active(chat);
     wcscpy(chat->system_prompt, L"Be concise.");
 
-    ChatRequestContext context;
+    static ChatRequestContext context;
     size_t base = TEST_ENVELOPE + json_encoded_string_size(chat->model);
     size_t system = message_bytes(CHAT_ROLE_SYSTEM, L"Be concise.");
     size_t trigger_bytes = message_bytes(CHAT_ROLE_USER, L"two");
@@ -256,7 +258,7 @@ static void test_effective_prompt(void) {
     wcscpy(chat->system_prompt, L"Global persona.");
     check(chat_conversation_apply_system_prompt(chat, 0, L"Local persona."),
         "fixture: a text override is applied");
-    ChatRequestContext context;
+    static ChatRequestContext context;
     check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) == CHAT_CONTEXT_OK,
         "an overridden prompt builds");
     check(context.messages[0].role == CHAT_ROLE_SYSTEM &&
@@ -299,7 +301,7 @@ static void test_effective_prompt(void) {
 static void test_oversize(void) {
     Chat *chat = fresh_chat();
     const ChatConversation *c;
-    ChatRequestContext context;
+    static ChatRequestContext context;
     size_t base = TEST_ENVELOPE + json_encoded_string_size(chat->model);
     /* 3 UTF-8 bytes per code unit, so the indispensable pair outgrows a small
        budget without any single message being enormous. Promoted overflow
@@ -356,7 +358,7 @@ static void test_invalid(void) {
     Chat *chat = fresh_chat();
     int user = chat_append(chat, CHAT_ROLE_USER, L"only");
     const ChatConversation *c = active(chat);
-    ChatRequestContext context;
+    static ChatRequestContext context;
 
     /* Every rejected build must return -- and zero -- the output it was given,
        whatever the reason: the struct is poisoned before each call and the
@@ -412,7 +414,7 @@ static void test_beyond_trigger(void) {
     const ChatConversation *c = active(chat);
     chat->conversations[0].messages[running].generation.state = CHAT_GENERATION_RUNNING;
 
-    ChatRequestContext context;
+    static ChatRequestContext context;
     check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) == CHAT_CONTEXT_OK &&
         context.count == 3, "the running response after the trigger is not part of the context");
     check(context.messages[context.count - 1].role == CHAT_ROLE_USER &&
@@ -431,7 +433,7 @@ static void test_huge_dropped_history(void) {
     int trigger = chat_append(chat, CHAT_ROLE_USER, L"small two");
     const ChatConversation *c = active(chat);
 
-    ChatRequestContext context;
+    static ChatRequestContext context;
     check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES, &context) ==
         CHAT_CONTEXT_OK, "a history message far past the budget does not fail the request");
     check(context.count == 3 && context.first_kept_index == 2,
@@ -459,7 +461,7 @@ static void test_read_only(void) {
     if (!before) { check(0, "allocate the read-only snapshot"); return; }
     memcpy(before, c->messages, count * sizeof *before);
 
-    ChatRequestContext context;
+    static ChatRequestContext context;
     check(chat_context_build(chat, c, trigger, 200, &context) == CHAT_CONTEXT_OK,
         "a tiny budget builds");
     check(chat_context_build(chat, c, trigger, 0, &context) == CHAT_CONTEXT_INVALID,
@@ -515,7 +517,7 @@ static void test_budget_sweep(void) {
     size_t budgets[] = { 1u, 90u, 200u, 1000u, 4000u, 16000u, 65536u, SIZE_MAX };
     int previous_dropped = -1;
     for (size_t b = 0; b < sizeof budgets / sizeof budgets[0]; b++) {
-        ChatRequestContext context;
+        static ChatRequestContext context;
         ChatContextResult result = chat_context_build(chat, c, trigger, budgets[b], &context);
         if (result != CHAT_CONTEXT_OK) {
             check(result == CHAT_CONTEXT_OVERSIZE_SYSTEM ||
@@ -565,7 +567,7 @@ static void check_mode(ChatSendMode mode, const wchar_t *prompt, const wchar_t *
         mode == CHAT_RETRY ? CHAT_GENERATION_FAILED : CHAT_GENERATION_COMPLETE);
     int response = chat_begin_response(chat, mode, prompt);
     check(response > 0, "the send mode starts a response");
-    ChatRequestContext context;
+    static ChatRequestContext context;
     check(chat_context_build(chat, &chat->conversations[0], response - 1,
         CHAT_CONTEXT_BUDGET_BYTES, &context) == CHAT_CONTEXT_OK,
         "the send mode's user message is a valid trigger");
@@ -590,7 +592,7 @@ static void test_provider_routing(void) {
     Chat *chat = fresh_chat();
     int trigger = chat_append(chat, CHAT_ROLE_USER, L"hello");
     const ChatConversation *c = active(chat);
-    ChatRequestContext context;
+    static ChatRequestContext context;
     size_t base = TEST_ENVELOPE + json_encoded_string_size(chat->model);
     size_t trigger_bytes = message_bytes(CHAT_ROLE_USER, L"hello");
 
@@ -649,6 +651,227 @@ static void test_provider_routing(void) {
     chat_dispose(chat); free(chat);
 }
 
+/* ---- Commit 5: the ordered-part request view ---------------------------- */
+
+/* Fixture: one attachment record, so an IMAGE part can resolve its rec. */
+static void add_attachment(Chat *chat, uint64_t id, size_t bytes) {
+    ChatAttachmentMeta rec;
+    memset(&rec, 0, sizeof rec);
+    rec.id = id;
+    memset(rec.digest, 'a', 64);
+    rec.digest[64] = 0;
+    strcpy(rec.mime, "image/png");
+    rec.bytes = bytes;
+    rec.created_at = 1;
+    wcscpy(rec.display_name, L"photo.png");
+    check(chat_attachment_add(chat, &rec), "fixture: the attachment record is added");
+}
+
+/* Fixture: one image part on a message (promotes on first call). */
+static void add_image(ChatMessage *m, uint64_t id, uint8_t flags,
+    uint32_t w, uint32_t h) {
+    ChatImagePart image;
+    memset(&image, 0, sizeof image);
+    image.attachment_id = id;
+    image.pixel_width = w;
+    image.pixel_height = h;
+    strcpy(image.mime, "image/png");
+    wcscpy(image.display_name, L"photo.png");
+    check(chat_message_add_image(m, &image, flags),
+        "fixture: the image part is added");
+}
+
+/* True when every placed run lies inside the scratch pool, runs are disjoint
+   and ordered like the entries that own them, and part_slots_used is exactly
+   the sum of the placed part counts. */
+static int runs_consistent(const ChatRequestContext *context) {
+    const ChatRequestPart *next = context->part_scratch;
+    for (int i = 0; i < context->count; i++) {
+        const ChatRequestMessage *entry = &context->messages[i];
+        if (entry->part_count == 0) {
+            if (entry->parts != NULL) return 0;
+            continue;
+        }
+        if (entry->parts != next) return 0;
+        if (entry->parts < context->part_scratch ||
+            entry->parts + entry->part_count >
+                context->part_scratch + context->part_slots_used) return 0;
+        next += entry->part_count;
+    }
+    return next == context->part_scratch + context->part_slots_used;
+}
+
+static void test_view_parts(void) {
+    Chat *chat = fresh_chat();
+    add_attachment(chat, 1, 1000);
+    add_attachment(chat, 2, 2000);
+    add_attachment(chat, 3, 3000);
+
+    /* Fast path with nonempty text: no run, identical bytes. */
+    int plain = chat_append(chat, CHAT_ROLE_USER, L"plain question");
+    int plain_answer = chat_append(chat, CHAT_ROLE_ASSISTANT, L"plain answer");
+    chat->conversations[0].messages[plain_answer].generation.state =
+        CHAT_GENERATION_COMPLETE;
+
+    /* Promoted: text + two images. */
+    int shown = chat_append(chat, CHAT_ROLE_USER, L"what's this?");
+    ChatMessage *m = &chat->conversations[0].messages[shown];
+    add_image(m, 1, 0, 2, 3);
+    add_image(m, 2, CHAT_PART_FLAG_FIRST_FRAME, 4, 5);
+
+    /* Image-only: empty projection. */
+    int only = chat_append(chat, CHAT_ROLE_USER, L"");
+    add_image(&chat->conversations[0].messages[only], 3, 0, 6, 7);
+
+    int trigger = chat_append(chat, CHAT_ROLE_USER, L"follow up");
+    add_image(&chat->conversations[0].messages[trigger], 4, 0, 8, 9);
+    add_attachment(chat, 4, 4000);
+    const ChatConversation *c = active(chat);
+
+    static ChatRequestContext context;
+    check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) ==
+        CHAT_CONTEXT_OK, "a multimodal conversation builds");
+    check(context.count == 5, "every message is placed");
+
+    /* Fast-path entries carry no run even with nonempty text. */
+    check(context.messages[0].parts == NULL &&
+        context.messages[0].part_count == 0,
+        "a text-only entry has no part run");
+    check(context.messages[0].text == chat_message_text(&c->messages[plain]),
+        "the fast-path entry still borrows the live text");
+
+    /* The promoted run mirrors chat_message_part_count/at exactly. */
+    const ChatRequestMessage *shown_entry = &context.messages[2];
+    check(shown_entry->part_count == (int)chat_message_part_count(m),
+        "the run length equals chat_message_part_count");
+    check(shown_entry->part_count == 3, "text + two images is three parts");
+    check(shown_entry->text == chat_message_text(m),
+        "the entry text is the plain-text projection");
+    for (size_t i = 0; i < chat_message_part_count(m); i++) {
+        ChatPartView view;
+        check(chat_message_part_at(m, i, &view), "the logical view is readable");
+        const ChatRequestPart *part = &shown_entry->parts[i];
+        check(part->kind == view.kind, "run kind mirrors the logical view");
+        check(part->flags == view.flags, "run flags mirror the logical view");
+        if (view.kind == CHAT_PART_TEXT) {
+            check(part->u.text == view.u.text.data,
+                "the TEXT run entry borrows the part payload");
+        } else {
+            check(part->u.image.meta->attachment_id ==
+                view.u.image.attachment_id, "meta carries the attachment id");
+            check(part->u.image.meta->pixel_width == view.u.image.pixel_width &&
+                part->u.image.meta->pixel_height == view.u.image.pixel_height,
+                "meta carries the display pixel size");
+            check(part->u.image.rec == chat_attachment(chat,
+                view.u.image.attachment_id),
+                "rec resolves from the attachment table");
+            check(part->u.image.byte_length == part->u.image.rec->bytes,
+                "byte_length is the stored length");
+            check(part->u.image.bytes == NULL,
+                "no blob bytes are read at view construction");
+        }
+    }
+
+    /* Image-only: empty projection, all-image run. */
+    const ChatRequestMessage *only_entry = &context.messages[3];
+    check(!wcscmp(only_entry->text, L""), "an image-only entry has an empty projection");
+    check(only_entry->part_count == 1 &&
+        only_entry->parts[0].kind == CHAT_PART_IMAGE,
+        "an image-only entry carries just the image parts");
+
+    /* Slot accounting: only placed multimodal messages consume slots, runs
+       are disjoint and in entry order. */
+    check(runs_consistent(&context), "runs lie in the scratch pool and add up");
+    check(context.part_slots_used == 3 + 1 + 2,
+        "part_slots_used counts the placed parts and nothing else");
+
+    /* Byte-stability pin: at this commit the images cost nothing and the
+       body is byte-identical to the projection-only framing. */
+    check(context.bytes == expected_body(chat, &context),
+        "parts do not change a single request byte yet");
+
+    /* Idempotence: a second build of the same state fills the same views. */
+    size_t count = (size_t)context.count;
+    int slots = context.part_slots_used;
+    ChatRequestMessage *saved_messages = (ChatRequestMessage *)malloc(
+        count * sizeof *saved_messages);
+    ChatRequestPart *saved_scratch = (ChatRequestPart *)malloc(
+        (size_t)slots * sizeof *saved_scratch);
+    check(saved_messages && saved_scratch, "fixture: the view copies are allocated");
+    if (saved_messages && saved_scratch) {
+        memcpy(saved_messages, context.messages, count * sizeof *saved_messages);
+        memcpy(saved_scratch, context.part_scratch, (size_t)slots * sizeof *saved_scratch);
+        check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) ==
+            CHAT_CONTEXT_OK, "the second build succeeds");
+        check(context.count == (int)count && context.part_slots_used == slots &&
+            memcmp(saved_messages, context.messages, count * sizeof *saved_messages) == 0 &&
+            memcmp(saved_scratch, context.part_scratch,
+                (size_t)slots * sizeof *saved_scratch) == 0,
+            "two builds of the same state produce identical views");
+    }
+    free(saved_messages); free(saved_scratch);
+
+    chat_dispose(chat); free(chat);
+}
+
+/* Dropped multimodal history consumes no scratch and never resolves its
+   attachments -- even a dangling reference in dropped history must not block
+   the send, while a dangling reference in a placed message is fatal. */
+static void test_view_dropped_and_dangling(void) {
+    Chat *chat = fresh_chat();
+    add_attachment(chat, 1, 500);
+
+    /* Oldest: huge text + a DANGLING image (no attachment record at all). */
+    wchar_t *huge = long_text(200000, L'x');
+    int old = chat_append(chat, CHAT_ROLE_USER, huge);
+    add_image(&chat->conversations[0].messages[old], 999, 0, 1, 1);
+    int mid = chat_append(chat, CHAT_ROLE_ASSISTANT, L"old answer");
+    chat->conversations[0].messages[mid].generation.state =
+        CHAT_GENERATION_COMPLETE;
+    int kept = chat_append(chat, CHAT_ROLE_USER, L"kept question");
+    add_image(&chat->conversations[0].messages[kept], 1, 0, 2, 2);
+    int trigger = chat_append(chat, CHAT_ROLE_USER, L"trigger");
+    add_image(&chat->conversations[0].messages[trigger], 1, 0, 3, 3);
+    const ChatConversation *c = active(chat);
+
+    static ChatRequestContext context;
+    check(chat_context_build(chat, c, trigger, CHAT_CONTEXT_BUDGET_BYTES,
+        &context) == CHAT_CONTEXT_OK,
+        "a dangling reference in dropped history does not block the send");
+    check(context.count == 3 && context.dropped_messages == 1,
+        "the huge turn is dropped and the rest is kept");
+    check(runs_consistent(&context), "the kept runs still add up");
+    check(context.part_slots_used == 2 + 2,
+        "the dropped multimodal message consumes no scratch");
+    check(context.messages[0].part_count == 0 &&
+        context.messages[1].part_count == 2 &&
+        context.messages[2].part_count == 2,
+        "each placed entry carries exactly its own parts");
+
+    /* A dangling reference in a placed history message is fatal, and the
+       partial fill is reset to the zeroed INVALID output. */
+    chat_message_clear_parts(&chat->conversations[0].messages[old]);
+    chat_message_clear_parts(&chat->conversations[0].messages[kept]);
+    add_image(&chat->conversations[0].messages[kept], 888, 0, 2, 2);
+    memset(&context, 0xa5, sizeof context);
+    check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) ==
+        CHAT_CONTEXT_INVALID && zeroed_output(&context),
+        "a dangling reference in placed history fails and zeroes the output");
+
+    /* The same for a dangling reference on the trigger itself. */
+    chat_message_clear_parts(&chat->conversations[0].messages[kept]);
+    add_image(&chat->conversations[0].messages[kept], 1, 0, 2, 2);
+    chat_message_clear_parts(&chat->conversations[0].messages[trigger]);
+    add_image(&chat->conversations[0].messages[trigger], 777, 0, 3, 3);
+    memset(&context, 0xa5, sizeof context);
+    check(chat_context_build(chat, c, trigger, SIZE_MAX, &context) ==
+        CHAT_CONTEXT_INVALID && zeroed_output(&context),
+        "a dangling reference on the trigger fails and zeroes the output");
+
+    free(huge);
+    chat_dispose(chat); free(chat);
+}
+
 int main(void) {
     test_order_and_identity();
     test_oldest_dropped_first();
@@ -663,9 +886,11 @@ int main(void) {
     test_budget_sweep();
     test_send_modes();
     test_provider_routing();
+    test_view_parts();
+    test_view_dropped_and_dangling();
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     puts("Bounded request context: budget, oldest-first dropping, eligibility, "
-        "diagnostics, read-only access and send-mode tests passed");
+        "diagnostics, read-only access, send-mode and part-view tests passed");
     return 0;
 }
 

@@ -55,6 +55,17 @@ typedef struct {
        content (system prompt plus triggering message, with separators) would
        require, which is greater than the budget. */
     size_t required_bytes;
+    /* Explicitly owned backing storage for every ChatRequestMessage.parts run
+       (the view is borrowed; the run lives here). Sized to the hard worst
+       case -- CHAT_CONTEXT_MAX_ENTRIES messages x CHAT_MAX_PARTS parts -- so
+       the builder can never fail for lack of a slot: a message carries at
+       most CHAT_MAX_PARTS parts and at most CHAT_CONTEXT_MAX_ENTRIES entries
+       are placed, while text-only messages consume no slots. Allocation-free
+       contract preserved: the builder fills caller-owned storage only.
+       sizeof(ChatRequestContext) is roughly 350 KiB with this pool, so
+       callers must not stack-allocate it. */
+    ChatRequestPart part_scratch[CHAT_CONTEXT_MAX_ENTRIES * CHAT_MAX_PARTS];
+    int part_slots_used;
 } ChatRequestContext;
 
 /* Builds the bounded request context for conversation `c` as of the triggering

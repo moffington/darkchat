@@ -18,6 +18,45 @@ static size_t add_bytes(size_t total, size_t part) {
     return total > SIZE_MAX - part ? SIZE_MAX : total + part;
 }
 
+/* Carves one placed message's borrowed part run from the context's scratch
+   pool. Only placed messages are resolved (JEV-A: a dangling image in dropped
+   history must not block sending), and resolution is metadata-only --
+   chat_attachment() reads the table, never a blob. A missing attachment
+   record or a scratch bound breach fails the build; the caller resets the
+   output. Fast-path messages (no parts array) get parts == NULL and consume
+   no slots. */
+static bool fill_parts(const Chat *chat, const ChatMessage *m,
+    ChatRequestMessage *entry, ChatRequestContext *out) {
+    entry->parts = NULL;
+    entry->part_count = 0;
+    if (!m->parts.items) return true;
+    size_t count = m->parts.count;
+    if (count > (size_t)(CHAT_CONTEXT_MAX_ENTRIES * CHAT_MAX_PARTS) -
+            (size_t)out->part_slots_used)
+        return false;
+    ChatRequestPart *run = &out->part_scratch[out->part_slots_used];
+    for (size_t i = 0; i < count; i++) {
+        const ChatPart *part = &m->parts.items[i];
+        run[i].kind = part->kind;
+        run[i].flags = part->flags;
+        if (part->kind == CHAT_PART_TEXT) {
+            run[i].u.text = part->u.text.data;
+        } else {
+            const ChatAttachmentMeta *rec = chat_attachment(chat,
+                part->u.image.attachment_id);
+            if (!rec) return false;
+            run[i].u.image.meta = &part->u.image;
+            run[i].u.image.rec = rec;
+            run[i].u.image.bytes = NULL;
+            run[i].u.image.byte_length = rec->bytes;
+        }
+    }
+    entry->parts = run;
+    entry->part_count = (int)count;
+    out->part_slots_used += (int)count;
+    return true;
+}
+
 ChatContextResult chat_context_build(const Chat *chat, const ChatConversation *c,
     int user_index, size_t budget, ChatRequestContext *out) {
     if (!out) return CHAT_CONTEXT_INVALID;
@@ -93,18 +132,38 @@ ChatContextResult chat_context_build(const Chat *chat, const ChatConversation *c
     if (has_system) {
         out->messages[count].role = CHAT_ROLE_SYSTEM;
         out->messages[count].text = system_prompt;
+        out->messages[count].parts = NULL;
+        out->messages[count].part_count = 0;
         ++count;
     }
-    for (int i = first_kept; i < user_index; i++) {
+    /* Runs are carved only for placed messages: the budget above resolved
+       nothing, so a dangling attachment reference in dropped history never
+       blocks the send (JEV-A). */
+    bool placed = true;
+    for (int i = first_kept; i < user_index && placed; i++) {
         const ChatMessage *message = &c->messages[i];
         if (!chat_history_message(message)) continue;
         out->messages[count].role = message->role;
         out->messages[count].text = chat_message_text(message);
-        ++count;
+        placed = fill_parts(chat, message, &out->messages[count], out);
+        if (placed) ++count;
     }
-    out->messages[count].role = CHAT_ROLE_USER;
-    out->messages[count].text = chat_message_text(trigger);
-    ++count;
+    if (placed) {
+        out->messages[count].role = CHAT_ROLE_USER;
+        out->messages[count].text = chat_message_text(trigger);
+        placed = fill_parts(chat, trigger, &out->messages[count], out);
+        if (placed) ++count;
+    }
+    if (!placed) {
+        /* A placed message referenced an attachment record the table does not
+           hold (or the scratch bound was breached): fail closed rather than
+           emit a run with an untrustworthy rec/byte_length. The output has
+           been partially filled, so reset it explicitly to the same state
+           every INVALID return promises. */
+        memset(out, 0, sizeof *out);
+        out->first_kept_index = -1;
+        return CHAT_CONTEXT_INVALID;
+    }
 
     out->count = count;
     /* The body size is the budgeted remainder rather than a second sum of the

@@ -363,7 +363,9 @@ int main(int argc,char **argv) {
     context_chat->conversations[0].messages[failed].generation.state=CHAT_GENERATION_FAILED;
     chat_append(context_chat,CHAT_ROLE_USER,L"final \U0001f600 question");
     int trigger=(int)context_chat->conversations[0].message_count-1;
-    ChatRequestContext context;
+    /* Static: the context carries its part_scratch pool and is far past the
+       safe stack budget for a test frame. */
+    static ChatRequestContext context;
     CHECK(chat_context_build(context_chat,&context_chat->conversations[0],trigger,
         CHAT_CONTEXT_BUDGET_BYTES,&context)==CHAT_CONTEXT_OK);
     CHECK(context.count==8 && context.dropped_messages==0);
@@ -432,13 +434,54 @@ int main(int argc,char **argv) {
     CHECK(strstr(plain_body.data,"\"reasoning\"")==NULL);
     json_buf_free(&plain_body);
     context_chat->conversations[0].reasoning_disabled=false;
+    /* Commit-5 boundary pin: a view that carries a part run still encodes its
+       plain-text projection as a plain JSON string content. The content-array
+       encoding lands with the encoder commit; at this boundary not one
+       request byte may depend on the parts. */
+    {
+        ChatAttachmentMeta rec={0};
+        rec.id=1;
+        for (int i=0;i<64;i++) rec.digest[i]='a';
+        rec.digest[64]=0;
+        strcpy(rec.mime,"image/png");
+        rec.bytes=1000;
+        rec.created_at=1;
+        wcscpy(rec.display_name,L"photo.png");
+        CHECK(chat_attachment_add(context_chat,&rec));
+        ChatImagePart meta={0};
+        meta.attachment_id=1;
+        strcpy(meta.mime,"image/png");
+        wcscpy(meta.display_name,L"photo.png");
+        int shown=chat_append(context_chat,CHAT_ROLE_USER,L"what's this?");
+        CHECK(chat_message_add_image(&context_chat->conversations[0].
+            messages[shown],&meta,0));
+        int ask=chat_append(context_chat,CHAT_ROLE_USER,L"and this?");
+        CHECK(chat_context_build(context_chat,&context_chat->conversations[0],
+            ask,CHAT_CONTEXT_BUDGET_BYTES,&context)==CHAT_CONTEXT_OK);
+        /* The multimodal turn is the entry before the trigger. */
+        int mm=context.count-2;
+        CHECK(context.messages[mm].part_count==2);      /* TEXT + IMAGE */
+        CHECK(context.messages[mm].parts!=NULL);
+        CHECK(!wcscmp(context.messages[mm].text,L"what's this?"));
+        JsonBuf pinned;
+        CHECK(chat_completion_request_build(&pinned,CHAT_BACKEND_OPENROUTER,
+            context_chat->model,context.messages,context.count,NULL,true));
+        CHECK(json_validate(pinned.data));
+        CHECK(pinned.length==context.bytes);
+        CHECK(strstr(pinned.data,"\"content\":[")==NULL);
+        CHECK(strstr(pinned.data,"\"content\":\"what's this?\"")!=NULL);
+        CHECK(strstr(pinned.data,"\"content\":\"and this?\"")!=NULL);
+        json_buf_free(&pinned);
+    }
     chat_dispose(context_chat); free(context_chat);
     puts("The bounded request context measures exactly what the encoder writes");
     puts("Actual request encoder and SSE metadata/error decoding passed for both backends");
     if (argc>1 && !strcmp(argv[1],"--live")) {
         char key[8192]={0};
         DWORD size=GetEnvironmentVariableA("OPENROUTER_API_KEY",key,sizeof key);
-        CompletionMessage message={CHAT_ROLE_USER,L"Reply with exactly the word OK."};
+        CompletionMessage message={0};
+        message.role=CHAT_ROLE_USER;
+        message.text=L"Reply with exactly the word OK.";
         if (size && size<sizeof key) {
             terminal=0; deltas=0;
             generation=completion_request(&client,CHAT_BACKEND_OPENROUTER,key,

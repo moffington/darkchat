@@ -274,6 +274,10 @@ static bool build_request(const CompletionWork *work, JsonBuf *body) {
     for (int i = 0; i < work->count; i++) {
         messages[i].role = work->roles[i];
         messages[i].text = work->texts[i];
+        /* The worker carries text only: until owned parts land here, every
+           re-wrapped entry is the fast path with no part run. */
+        messages[i].parts = NULL;
+        messages[i].part_count = 0;
     }
     bool ok = chat_completion_request_build(body, work->backend, work->model,
         messages, work->count, &work->routing, work->reasoning);

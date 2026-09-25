@@ -115,10 +115,41 @@ typedef enum {
     CHAT_ROLE_USER, CHAT_ROLE_ASSISTANT, CHAT_ROLE_SYSTEM, CHAT_ROLE_ERROR
 } ChatRole;
 
+/* A borrowed view of one request content part. Nothing here is owned. `meta`
+   points into the owning message's live parts array and `rec` into the
+   chat->attachments table; both follow the ChatRequestMessage borrow rule and
+   are invalidated by the next Chat mutation (parts growth/reorder for `meta`,
+   chat_attachment_add/prune reallocation for `rec`). */
+typedef struct {
+    ChatPartKind kind;
+    uint8_t flags;                 /* CHAT_PART_FLAG_* of the source part */
+    union {
+        const wchar_t *text;       /* TEXT: borrows the part payload */
+        struct {
+            const ChatImagePart *meta;     /* borrowed display metadata */
+            const ChatAttachmentMeta *rec; /* borrowed attachment record */
+            const unsigned char *bytes;    /* NULL until the host loads the
+                                              blob at send time */
+            size_t byte_length;            /* rec->bytes: budgetable with no
+                                              blob I/O */
+        } image;
+    } u;
+} ChatRequestPart;
+
 /* A borrowed role/text view of one message for a request payload: the shape a
    provider client consumes. It points into live Chat state and is never owned,
-   copied into persistent state or persisted. */
-typedef struct { ChatRole role; const wchar_t *text; } ChatRequestMessage;
+   copied into persistent state or persisted. `text` is always the plain-text
+   projection. `parts` is NULL on the fast path (a text-only message, content
+   is `text`) and `part_count` is then 0; for a promoted message `parts` is a
+   run carved from the owning ChatRequestContext's part_scratch and mirrors
+   chat_message_part_count/at exactly ([TEXT?, IMAGE...] with at least one
+   IMAGE). */
+typedef struct {
+    ChatRole role;
+    const wchar_t *text;
+    const ChatRequestPart *parts;
+    int part_count;
+} ChatRequestMessage;
 
 typedef enum {
     CHAT_PROVIDER_SORT_DEFAULT = 0,   /* OpenRouter's balanced load balancing */
