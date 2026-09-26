@@ -35,9 +35,28 @@ static ChatRole completion_request_last_roles[CHAT_CONTEXT_MAX_ENTRIES];
 static const wchar_t *completion_request_last_texts[CHAT_CONTEXT_MAX_ENTRIES];
 /* Scalar summaries of the ordered-part view the client was handed: the
    borrowed ChatRequestPart runs die with the per-send request context, so the
-   seam records what it saw instead of aliasing it. */
+   seam records what it saw instead of aliasing it. Kinds, per-part lengths
+   and the loaded-ness of each image slot pin the commit-7 contract: the host
+   fills every kept image with its bytes before the hand-off. */
 static int completion_request_last_part_counts[CHAT_CONTEXT_MAX_ENTRIES];
 static size_t completion_request_last_image_bytes[CHAT_CONTEXT_MAX_ENTRIES];
+static uint8_t completion_request_last_part_kinds[CHAT_CONTEXT_MAX_ENTRIES]
+    [CHAT_MAX_PARTS];
+static size_t completion_request_last_part_lengths[CHAT_CONTEXT_MAX_ENTRIES]
+    [CHAT_MAX_PARTS];
+static bool completion_request_last_part_loaded[CHAT_CONTEXT_MAX_ENTRIES]
+    [CHAT_MAX_PARTS];
+/* Focused allocation-failure knobs, disarmed (-1) they forward to the CRT.
+   `alloc_fail_malloc_size` narrows the malloc seam to one allocation size
+   (0 = any), so a test can fail exactly one allocation on a path. */
+static long alloc_fail_malloc=-1, alloc_fail_realloc=-1;
+static size_t alloc_fail_malloc_size=0;
+static long alloc_fail_hits;
+/* Nonzero: the completion wrap arms the malloc seam for exactly this size
+   immediately before delegating to the real client -- after the host has
+   already read the blobs (the attachment store allocates the blob size on
+   read), so the failure lands on the worker's byte copy and nothing else. */
+static size_t completion_request_arm_copy_oom;
 static int completion_request_fake_generation;   /* 0: delegate to the real client */
 static ChatProviderRouting completion_request_last_routing;
 static ChatBackend completion_request_last_backend;
@@ -65,15 +84,29 @@ int __wrap_completion_request(CompletionClient *client, ChatBackend backend,
         completion_request_last_texts[i]=messages[i].text;
         completion_request_last_part_counts[i]=messages[i].part_count;
         completion_request_last_image_bytes[i]=0;
-        for (int p=0;p<messages[i].part_count;p++)
-            if (messages[i].parts[p].kind==CHAT_PART_IMAGE)
-                completion_request_last_image_bytes[i]+=
-                    messages[i].parts[p].u.image.byte_length;
+        for (int p=0;p<messages[i].part_count && p<CHAT_MAX_PARTS;p++) {
+            const ChatRequestPart *part=&messages[i].parts[p];
+            completion_request_last_part_kinds[i][p]=part->kind;
+            completion_request_last_part_lengths[i][p]=
+                part->kind==CHAT_PART_IMAGE ? part->u.image.byte_length : 0;
+            completion_request_last_part_loaded[i][p]=
+                part->kind!=CHAT_PART_IMAGE || part->u.image.bytes!=NULL;
+            if (part->kind==CHAT_PART_IMAGE)
+                completion_request_last_image_bytes[i]+=part->u.image.byte_length;
+        }
     }
     completion_request_last_had_routing=routing!=NULL;
     if (routing) completion_request_last_routing=*routing;
     else chat_provider_routing_init(&completion_request_last_routing);
     if (completion_request_fake_generation) return completion_request_fake_generation;
+    if (completion_request_arm_copy_oom) {
+        alloc_fail_malloc=0;
+        alloc_fail_malloc_size=completion_request_arm_copy_oom;
+        int started=__real_completion_request(client,backend,api_key_utf8,model,
+            messages,count,routing,reasoning);
+        alloc_fail_malloc=-1; alloc_fail_malloc_size=0;
+        return started;
+    }
     return __real_completion_request(client,backend,api_key_utf8,model,messages,
         count,routing,reasoning);
 }
@@ -108,18 +141,14 @@ int __wrap_model_catalog_request(ModelCatalogClient *client, ChatBackend backend
     client->generation=generation;
     return generation;
 }
-/* Focused allocation-failure seams for the picker's transactional refresh;
-   disarmed (-1) they forward to the CRT. `alloc_fail_malloc_size` narrows the
-   malloc seam to one allocation size (0 = any), so a test can fail exactly the
-   per-send request context without arming every earlier malloc on the path. */
-static long alloc_fail_malloc=-1, alloc_fail_realloc=-1;
-static size_t alloc_fail_malloc_size=0;
+/* Focused allocation-failure seams for the picker's transactional refresh
+   and the byte-copy OOM test (knobs declared with the client seam above). */
 void *__real_malloc(size_t size);
 void *__real_realloc(void *pointer, size_t size);
 void *__wrap_malloc(size_t size) {
     if (alloc_fail_malloc>=0 &&
         (alloc_fail_malloc_size==0 || size==alloc_fail_malloc_size)) {
-        if (alloc_fail_malloc==0) return NULL;
+        if (alloc_fail_malloc==0) { ++alloc_fail_hits; return NULL; }
         --alloc_fail_malloc;
     }
     return __real_malloc(size);
@@ -130,6 +159,50 @@ void *__wrap_realloc(void *pointer, size_t size) {
         --alloc_fail_realloc;
     }
     return __real_realloc(pointer,size);
+}
+/* Blob-read observation + free watch for the commit-7 load tests: the read
+   stub wraps the store's own read seam and records every buffer it hands
+   out; the free wrap proves each was released -- and, for buffers the host
+   frees itself, already scrubbed (a buffer the store frees on a digest
+   mismatch is released by commit-2 code and is only checked for freedom). */
+static bool (*attachment_real_read)(const wchar_t *, unsigned char **, size_t *);
+static unsigned char *read_seen[8];
+static size_t read_seen_n[8];
+static bool read_seen_freed[8], read_seen_zeroed[8];
+static int read_seen_count;
+static bool record_blob_read(const wchar_t *path, unsigned char **out,
+    size_t *out_n) {
+    if (!attachment_real_read(path,out,out_n)) return false;
+    if (*out && read_seen_count<8) {
+        read_seen[read_seen_count]=*out;
+        read_seen_n[read_seen_count]=*out_n;
+        read_seen_freed[read_seen_count]=false;
+        read_seen_zeroed[read_seen_count]=false;
+        ++read_seen_count;
+    }
+    return true;
+}
+static void read_watch_begin(void) {
+    read_seen_count=0;
+    for (int i=0;i<8;i++) {
+        read_seen[i]=NULL; read_seen_n[i]=0;
+        read_seen_freed[i]=false; read_seen_zeroed[i]=false;
+    }
+}
+void __real_free(void *pointer);
+void __wrap_free(void *pointer) {
+    /* First free only: the CRT may hand the same address to a later
+       allocation, and that owner's free must not re-scrutinize the bytes. */
+    for (int i=0;i<read_seen_count;i++) {
+        if (pointer && pointer==read_seen[i] && !read_seen_freed[i]) {
+            read_seen_freed[i]=true;
+            read_seen_zeroed[i]=true;
+            for (size_t j=0;j<read_seen_n[i];j++)
+                if (read_seen[i][j]) { read_seen_zeroed[i]=false; break; }
+            break;
+        }
+    }
+    __real_free(pointer);
 }
 /* Palette seam (linked with -Wl,--wrap=palette_popup_pump): the modal pump
    returns at once so the suite can drive open/filter/accept/cancel and
@@ -609,6 +682,32 @@ static bool visible_realized(ChatHost *h) {
     }
     return true;
 }
+/* The load-test fixture writes real blobs; teardown removes the whole store
+   tree (blobs, staging, quarantine) together with the state directory. */
+static void delete_folder_files(const wchar_t *folder) {
+    wchar_t pattern[512]; WIN32_FIND_DATAW fd;
+    swprintf(pattern,512,L"%ls\\*",folder);
+    HANDLE found=FindFirstFileW(pattern,&fd);
+    if (found==INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0]==L'.' && (fd.cFileName[1]==0 ||
+            (fd.cFileName[1]==L'.' && fd.cFileName[2]==0))) continue;
+        wchar_t path[768];
+        swprintf(path,768,L"%ls\\%ls",folder,fd.cFileName);
+        DeleteFileW(path);
+    } while (FindNextFileW(found,&fd));
+    FindClose(found);
+}
+static void remove_attachment_dir(const wchar_t *dir) {
+    wchar_t att[512], sub[640];
+    swprintf(att,512,L"%ls\\attachments",dir);
+    swprintf(sub,640,L"%ls\\.tmp",att);
+    delete_folder_files(sub); RemoveDirectoryW(sub);
+    swprintf(sub,640,L"%ls\\corrupt",att);
+    delete_folder_files(sub); RemoveDirectoryW(sub);
+    delete_folder_files(att);
+    RemoveDirectoryW(att);
+}
 static int default_suite(void) {
     CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -621,6 +720,11 @@ static int default_suite(void) {
     h->background=CreateSolidBrush(RGB(20,20,20));
     wchar_t dir[256]; swprintf(dir,256,L"build\\host-test-%lu",GetCurrentProcessId());
     CHECK(storage_open(&h->storage,dir));
+    /* The commit-7 load tests need a real blob store beside the state dir,
+       with every blob read routed through the recording stub. */
+    CHECK(attachment_store_open(&h->attachments,dir,&chat->next_id));
+    attachment_real_read=h->attachments.io.read;
+    h->attachments.io.read=record_blob_read;
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(RegisterClassW(&cls));
     WNDCLASSW view_cls={0}; view_cls.lpfnWndProc=view_proc; view_cls.lpszClassName=L"DarkChat.Transcript";
@@ -757,19 +861,18 @@ static int default_suite(void) {
         /* A user turn carrying one managed image: the send must still start,
            and the client must see the projection text plus a two-part run
            (TEXT + IMAGE) whose image budget size comes from the attachment
-           record with no blob loaded. */
+           record -- and whose image slot the host has already filled with the
+           blob's bytes (commit 7: the worker deep-copies them from here). */
         Chat *chat=h->config.chat;
-        ChatAttachmentMeta rec={0};
-        rec.id=1;
-        for (int i=0;i<64;i++) rec.digest[i]='a';
-        rec.digest[64]=0;
-        strcpy(rec.mime,"image/png");
-        rec.bytes=1234;
-        rec.created_at=1;
-        wcscpy(rec.display_name,L"photo.png");
-        CHECK(chat_attachment_add(chat,&rec));
+        static unsigned char blob[1234];
+        for (size_t i=0;i<sizeof blob;i++) blob[i]=(unsigned char)(i&0xff);
+        ChatAttachmentMeta meta={0};
+        CHECK(attachment_store_put(&h->attachments,blob,sizeof blob,
+            "image/png",L"photo.png",&meta,NULL));
+        CHECK(meta.bytes==1234);
+        CHECK(chat_attachment_add(chat,&meta));
         ChatImagePart img={0};
-        img.attachment_id=1; img.pixel_width=2; img.pixel_height=3;
+        img.attachment_id=meta.id; img.pixel_width=2; img.pixel_height=3;
         strcpy(img.mime,"image/png");
         wcscpy(img.display_name,L"photo.png");
         ChatConversation *c=&chat->conversations[0];
@@ -777,6 +880,7 @@ static int default_suite(void) {
         CHECK(chat_message_add_image(&c->messages[shown],&img,0));
         int seen=chat_append(chat,CHAT_ROLE_ASSISTANT,L"seen it");
         c->messages[seen].generation.state=CHAT_GENERATION_COMPLETE;
+        read_watch_begin();
         int calls=completion_request_calls;
         rich_text_set_text(&h->composer,L"and now?");
         completion_request_fake_generation=5151;
@@ -789,12 +893,387 @@ static int default_suite(void) {
               !wcscmp(completion_request_last_texts[1],L"look at this"));
         CHECK(completion_request_last_part_counts[1]==2);   /* TEXT + IMAGE */
         CHECK(completion_request_last_image_bytes[1]==1234);
+        CHECK(completion_request_last_part_kinds[1][0]==CHAT_PART_TEXT &&
+              completion_request_last_part_kinds[1][1]==CHAT_PART_IMAGE);
+        CHECK(completion_request_last_part_lengths[1][1]==1234);
+        CHECK(completion_request_last_part_loaded[1][1]);   /* bytes loaded */
         CHECK(completion_request_last_part_counts[0]==0 &&
               completion_request_last_part_counts[2]==0 &&
               completion_request_last_part_counts[3]==0);
+        /* Exactly one blob read (the kept image's), and the host released its
+           buffer -- scrubbed -- once the client had copied it. */
+        CHECK(read_seen_count==1);
+        CHECK(read_seen_freed[0] && read_seen_zeroed[0]);
         handle_event(h,fixture(h,COMPLETION_DONE,NULL));
         CHECK(!h->generating);
         /* Restore the state the following checks expect. */
+        c=&chat->conversations[0];
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        chat_attachment_prune(chat,NULL,0);
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+    }
+    /* ---- A send whose TRIGGER carries the parts (the future attach path) - */
+    {
+        Chat *chat=h->config.chat;
+        static unsigned char blob[1237];
+        for (size_t i=0;i<sizeof blob;i++) blob[i]=(unsigned char)(i*7+1);
+        ChatAttachmentMeta meta={0};
+        CHECK(attachment_store_put(&h->attachments,blob,sizeof blob,
+            "image/png",L"shot.png",&meta,NULL));
+        CHECK(chat_attachment_add(chat,&meta));
+        ChatImagePart img={0};
+        img.attachment_id=meta.id; img.pixel_width=4; img.pixel_height=4;
+        strcpy(img.mime,"image/png");
+        wcscpy(img.display_name,L"shot.png");
+        ChatConversation *c=&chat->conversations[0];
+        int turn=chat_append(chat,CHAT_ROLE_USER,L"look at this");
+        CHECK(chat_message_add_image(&c->messages[turn],&img,0));
+        int failed=chat_append(chat,CHAT_ROLE_ASSISTANT,L"partial");
+        c->messages[failed].generation.state=CHAT_GENERATION_FAILED;
+        read_watch_begin();
+        int calls=completion_request_calls;
+        completion_request_fake_generation=5152;
+        start_response(h,CHAT_RETRY,NULL);
+        completion_request_fake_generation=0;
+        CHECK(completion_request_calls==calls+1);
+        CHECK(h->generating && h->request_generation==5152);
+        int last=completion_request_last_count-1;          /* the trigger */
+        CHECK(completion_request_last_part_counts[last]==2);
+        CHECK(completion_request_last_part_kinds[last][0]==CHAT_PART_TEXT &&
+              completion_request_last_part_kinds[last][1]==CHAT_PART_IMAGE);
+        CHECK(completion_request_last_part_lengths[last][1]==sizeof blob);
+        CHECK(completion_request_last_part_loaded[last][1]);
+        CHECK(read_seen_count==1 && read_seen_freed[0] && read_seen_zeroed[0]);
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+        CHECK(!h->generating);
+        c=&chat->conversations[0];
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        chat_attachment_prune(chat,NULL,0);
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+    }
+    /* ---- Dropped-history images are never read from disk ---------------- */
+    {
+        Chat *chat=h->config.chat;
+        static unsigned char blob[512];
+        memset(blob,0x33,sizeof blob);
+        ChatAttachmentMeta meta={0};
+        CHECK(attachment_store_put(&h->attachments,blob,sizeof blob,
+            "image/png",L"old.png",&meta,NULL));
+        CHECK(chat_attachment_add(chat,&meta));
+        ChatImagePart img={0};
+        img.attachment_id=meta.id;
+        strcpy(img.mime,"image/png");
+        wcscpy(img.display_name,L"old.png");
+        ChatConversation *c=&chat->conversations[0];
+        int old=chat_append(chat,CHAT_ROLE_USER,L"old question");
+        CHECK(chat_message_add_image(&c->messages[old],&img,0));
+        int answer=chat_append(chat,CHAT_ROLE_ASSISTANT,L"old answer");
+        c->messages[answer].generation.state=CHAT_GENERATION_COMPLETE;
+        /* One history turn past the text budget: the selection stops there,
+           and every older eligible turn -- the image turn included -- is
+           dropped and never measured, let alone read. */
+        wchar_t *huge=(wchar_t *)malloc(70001*sizeof *huge);
+        CHECK(huge);
+        for (int i=0;i<70000;i++) huge[i]=L'x';
+        huge[70000]=0;
+        chat_append(chat,CHAT_ROLE_USER,huge);
+        int big_answer=chat_append(chat,CHAT_ROLE_ASSISTANT,L"big answer");
+        c->messages[big_answer].generation.state=CHAT_GENERATION_COMPLETE;
+        free(huge);
+        read_watch_begin();
+        int calls=completion_request_calls;
+        completion_request_fake_generation=5153;
+        rich_text_set_text(&h->composer,L"and now?");
+        perform_send(h);
+        completion_request_fake_generation=0;
+        CHECK(completion_request_calls==calls+1);
+        CHECK(h->generating && h->request_generation==5153);
+        CHECK(h->context_dropped>=2);       /* the image turn is among them */
+        CHECK(read_seen_count==0);          /* its blob was never opened */
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+        CHECK(!h->generating);
+        c=&chat->conversations[0];
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        chat_attachment_prune(chat,NULL,0);
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+    }
+    /* ---- A missing blob fails the send before any request starts -------- */
+    {
+        Chat *chat=h->config.chat;
+        /* A record naming a digest with no file on disk. */
+        ChatAttachmentMeta rec={0};
+        rec.id=9901;
+        for (int i=0;i<64;i++) rec.digest[i]='b';
+        rec.digest[64]=0;
+        strcpy(rec.mime,"image/png");
+        rec.bytes=1237;
+        rec.created_at=1;
+        wcscpy(rec.display_name,L"gone.png");
+        CHECK(chat_attachment_add(chat,&rec));
+        ChatImagePart img={0};
+        img.attachment_id=rec.id;
+        strcpy(img.mime,"image/png");
+        wcscpy(img.display_name,L"gone.png");
+        ChatConversation *c=&chat->conversations[0];
+        int turn=chat_append(chat,CHAT_ROLE_USER,L"look at this");
+        CHECK(chat_message_add_image(&c->messages[turn],&img,0));
+        int failed=chat_append(chat,CHAT_ROLE_ASSISTANT,L"partial");
+        c->messages[failed].generation.state=CHAT_GENERATION_FAILED;
+        read_watch_begin();
+        int calls=completion_request_calls;
+        start_response(h,CHAT_RETRY,NULL);
+        CHECK(completion_request_calls==calls);          /* nothing was sent */
+        CHECK(!h->generating && h->request_generation==0);
+        CHECK(h->client.thread==NULL);                   /* no worker either */
+        ChatMessage *pending_message=pending(h);
+        CHECK(pending_message->generation.state==CHAT_GENERATION_FAILED);
+        CHECK(wcsstr(pending_message->generation.error,
+              L"could not be read")!=NULL);
+        CHECK(wcsstr(pending_message->generation.error,
+              L"request was not sent")!=NULL);
+        CHECK(read_seen_count==0);   /* the lookup fails before any read */
+        CHECK(wcsstr(chat->status,L"Request failed")!=NULL);
+        c=&chat->conversations[0];
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        chat_attachment_prune(chat,NULL,0);
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+    }
+    /* ---- A record-length mismatch aborts and frees every buffer --------- */
+    {
+        Chat *chat=h->config.chat;
+        static unsigned char good[777];
+        memset(good,0x44,sizeof good);
+        ChatAttachmentMeta meta={0};
+        CHECK(attachment_store_put(&h->attachments,good,sizeof good,
+            "image/png",L"good.png",&meta,NULL));
+        CHECK(chat_attachment_add(chat,&meta));
+        /* The same blob named by a record that lies about its length: the
+           read succeeds with 777 bytes but the budget charged 2000. */
+        ChatAttachmentMeta lying={0};
+        lying.id=9902;
+        memcpy(lying.digest,meta.digest,sizeof lying.digest);
+        strcpy(lying.mime,"image/png");
+        lying.bytes=2000;
+        lying.created_at=1;
+        wcscpy(lying.display_name,L"lying.png");
+        CHECK(chat_attachment_add(chat,&lying));
+        ChatImagePart first={0}, second={0};
+        first.attachment_id=meta.id;
+        strcpy(first.mime,"image/png");
+        wcscpy(first.display_name,L"good.png");
+        second.attachment_id=lying.id;
+        strcpy(second.mime,"image/png");
+        wcscpy(second.display_name,L"lying.png");
+        ChatConversation *c=&chat->conversations[0];
+        int turn=chat_append(chat,CHAT_ROLE_USER,L"look at these");
+        CHECK(chat_message_add_image(&c->messages[turn],&first,0));
+        CHECK(chat_message_add_image(&c->messages[turn],&second,0));
+        int failed=chat_append(chat,CHAT_ROLE_ASSISTANT,L"partial");
+        c->messages[failed].generation.state=CHAT_GENERATION_FAILED;
+        read_watch_begin();
+        int calls=completion_request_calls;
+        start_response(h,CHAT_RETRY,NULL);
+        CHECK(completion_request_calls==calls);          /* nothing was sent */
+        CHECK(!h->generating && h->request_generation==0);
+        CHECK(h->client.thread==NULL);
+        ChatMessage *pending_message=pending(h);
+        CHECK(pending_message->generation.state==CHAT_GENERATION_FAILED);
+        CHECK(wcsstr(pending_message->generation.error,
+              L"could not be read")!=NULL);
+        /* Both reads: the loaded one (released with its siblings) and the
+           just-read one (freed on the spot). Both scrubbed. */
+        CHECK(read_seen_count==2);
+        for (int i=0;i<2;i++)
+            CHECK(read_seen_freed[i] && read_seen_zeroed[i]);
+        c=&chat->conversations[0];
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        chat_attachment_prune(chat,NULL,0);
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+    }
+    /* ---- A digest mismatch quarantines the blob and fails the send ------ */
+    {
+        Chat *chat=h->config.chat;
+        /* A file named for a digest it does not have. */
+        char fake[65];
+        for (int i=0;i<64;i++) fake[i]='c';
+        fake[64]=0;
+        wchar_t name[65];
+        for (int i=0;i<64;i++) name[i]=L'c';
+        name[64]=0;
+        wchar_t path[1160];
+        swprintf(path,1160,L"%ls\\%ls",h->attachments.dir,name);
+        HANDLE file=CreateFileW(path,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,NULL);
+        CHECK(file!=INVALID_HANDLE_VALUE);
+        DWORD written=0;
+        CHECK(WriteFile(file,"not the right bytes",19,&written,NULL) &&
+              written==19);
+        CloseHandle(file);
+        ChatAttachmentMeta rec={0};
+        rec.id=9903;
+        memcpy(rec.digest,fake,65);
+        strcpy(rec.mime,"image/png");
+        rec.bytes=19;
+        rec.created_at=1;
+        wcscpy(rec.display_name,L"bad.png");
+        CHECK(chat_attachment_add(chat,&rec));
+        ChatImagePart img={0};
+        img.attachment_id=rec.id;
+        strcpy(img.mime,"image/png");
+        wcscpy(img.display_name,L"bad.png");
+        ChatConversation *c=&chat->conversations[0];
+        int turn=chat_append(chat,CHAT_ROLE_USER,L"look at this");
+        CHECK(chat_message_add_image(&c->messages[turn],&img,0));
+        int failed=chat_append(chat,CHAT_ROLE_ASSISTANT,L"partial");
+        c->messages[failed].generation.state=CHAT_GENERATION_FAILED;
+        read_watch_begin();
+        int calls=completion_request_calls;
+        start_response(h,CHAT_RETRY,NULL);
+        CHECK(completion_request_calls==calls);
+        CHECK(!h->generating && h->request_generation==0);
+        CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED);
+        CHECK(wcsstr(pending(h)->generation.error,L"could not be read")!=NULL);
+        CHECK(read_seen_count==1 && read_seen_freed[0]);
+        /* The store quarantined the mismatching file. */
+        wchar_t corrupt[1160];
+        swprintf(corrupt,1160,L"%ls\\corrupt\\%ls",h->attachments.dir,name);
+        CHECK(GetFileAttributesW(corrupt)!=INVALID_FILE_ATTRIBUTES);
+        c=&chat->conversations[0];
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        chat_attachment_prune(chat,NULL,0);
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+    }
+    /* ---- A zero-length image record is refused, never sent ------------- */
+    {
+        Chat *chat=h->config.chat;
+        /* The in-memory attachment API admits a zero-length record (snapshot
+           loading rejects one). The send must fail closed with the named
+           error before any read, instead of encoding an empty image. */
+        ChatAttachmentMeta rec={0};
+        rec.id=9904;
+        for (int i=0;i<64;i++) rec.digest[i]='d';
+        rec.digest[64]=0;
+        strcpy(rec.mime,"image/png");
+        rec.bytes=0;
+        rec.created_at=1;
+        wcscpy(rec.display_name,L"empty.png");
+        CHECK(chat_attachment_add(chat,&rec));
+        ChatImagePart img={0};
+        img.attachment_id=rec.id;
+        strcpy(img.mime,"image/png");
+        wcscpy(img.display_name,L"empty.png");
+        ChatConversation *c=&chat->conversations[0];
+        int turn=chat_append(chat,CHAT_ROLE_USER,L"look at this");
+        CHECK(chat_message_add_image(&c->messages[turn],&img,0));
+        int failed=chat_append(chat,CHAT_ROLE_ASSISTANT,L"partial");
+        c->messages[failed].generation.state=CHAT_GENERATION_FAILED;
+        read_watch_begin();
+        int calls=completion_request_calls;
+        start_response(h,CHAT_RETRY,NULL);
+        CHECK(completion_request_calls==calls);          /* nothing was sent */
+        CHECK(!h->generating && h->request_generation==0);
+        CHECK(h->client.thread==NULL);
+        ChatMessage *pending_message=pending(h);
+        CHECK(pending_message->generation.state==CHAT_GENERATION_FAILED);
+        CHECK(wcsstr(pending_message->generation.error,
+              L"could not be read")!=NULL);
+        CHECK(read_seen_count==0);   /* refused before any read */
+        c=&chat->conversations[0];
+        for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
+        c->message_count=2;
+        chat->system_prompt[0]=0; c->draft[0]=0;
+        chat_attachment_prune(chat,NULL,0);
+        rich_text_set_text(&h->composer,L"");
+        h->request_message=1; h->request_conversation=0;
+        h->generating=false; h->context_dropped=0; h->request_generation=0;
+        render_transcript(h);
+    }
+    /* ---- OOM on the worker's byte copy starts no request --------------- */
+    {
+        Chat *chat=h->config.chat;
+        /* Ollama needs no API key, so the real client runs its full copy
+           path; the arm lands exactly on the image byte copy (the store's
+           own read already happened, outside the armed window). */
+        chat->backend=CHAT_BACKEND_OLLAMA;
+        wcscpy(chat->ollama_model,L"test-model");
+        rich_text_set_text(&h->field,L"test-model");
+        completion_init(&h->client,window,CHAT_WM_COMPLETION_EVENT);
+        static unsigned char blob[61337];
+        for (size_t i=0;i<sizeof blob;i++) blob[i]=(unsigned char)(i&0xff);
+        ChatAttachmentMeta meta={0};
+        CHECK(attachment_store_put(&h->attachments,blob,sizeof blob,
+            "image/png",L"big.png",&meta,NULL));
+        CHECK(meta.bytes==sizeof blob);
+        CHECK(chat_attachment_add(chat,&meta));
+        ChatImagePart img={0};
+        img.attachment_id=meta.id;
+        strcpy(img.mime,"image/png");
+        wcscpy(img.display_name,L"big.png");
+        ChatConversation *c=&chat->conversations[0];
+        int shown=chat_append(chat,CHAT_ROLE_USER,L"look at this");
+        CHECK(chat_message_add_image(&c->messages[shown],&img,0));
+        int seen=chat_append(chat,CHAT_ROLE_ASSISTANT,L"seen it");
+        c->messages[seen].generation.state=CHAT_GENERATION_COMPLETE;
+        read_watch_begin();
+        int calls=completion_request_calls;
+        long hits=alloc_fail_hits;
+        rich_text_set_text(&h->composer,L"and now?");
+        completion_request_arm_copy_oom=sizeof blob;
+        perform_send(h);
+        completion_request_arm_copy_oom=0;
+        CHECK(alloc_fail_hits==hits+1);              /* the byte copy failed */
+        CHECK(completion_request_calls==calls+1);    /* the seam was reached */
+        CHECK(!h->generating && h->request_generation==0);
+        CHECK(h->client.thread==NULL);               /* no worker started */
+        CHECK(pending(h)->generation.state==CHAT_GENERATION_FAILED);
+        CHECK(wcsstr(pending(h)->generation.error,
+              L"Could not start Ollama request.")!=NULL);
+        /* The blob was loaded (and released, scrubbed) before the copy. */
+        CHECK(read_seen_count==1 && read_seen_freed[0] && read_seen_zeroed[0]);
+        /* The same send without the arm starts normally: clean state. */
+        int calls_after=completion_request_calls;
+        rich_text_set_text(&h->composer,L"again?");
+        completion_request_fake_generation=5154;
+        perform_send(h);
+        completion_request_fake_generation=0;
+        CHECK(completion_request_calls==calls_after+1);
+        CHECK(h->generating && h->request_generation==5154);
+        handle_event(h,fixture(h,COMPLETION_DONE,NULL));
+        CHECK(!h->generating);
+        completion_shutdown(&h->client);
+        chat->backend=CHAT_BACKEND_OPENROUTER;
+        chat->ollama_model[0]=0;
+        rich_text_set_text(&h->field,L"");
         c=&chat->conversations[0];
         for (size_t i=2;i<c->message_count;i++) chat_message_dispose(&c->messages[i]);
         c->message_count=2;
@@ -2890,9 +3369,14 @@ static int default_suite(void) {
     saver_shutdown(&h->saver);
     CloseHandle(save_paused_event); CloseHandle(save_resume_event);
     CloseHandle(save_teardown_event);
+    attachment_store_close(&h->attachments);
     storage_close(&h->storage);
     DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
-    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock);
+    /* The load tests' real blobs and the whole store tree go with the
+       state directory. */
+    remove_attachment_dir(dir);
+    RemoveDirectoryW(dir);
     ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer);
     DeleteObject(h->background);
     /* Slot-pool lifetime order: the container and EVERY child surface are

@@ -31,6 +31,27 @@ static const CompletionEndpoint ENDPOINTS[CHAT_BACKEND_COUNT] = {
 
 #define COMPLETION_MAX_RESPONSE (16u * 1024u * 1024u)
 
+/* Owned copy of one request content part, parallel to the borrowed
+   ChatRequestPart the pure encoder consumes. TEXT parts hold their own
+   text; IMAGE parts hold an owned copy of the managed bytes plus an owned
+   copy of the attachment record -- the record carrier is what lets
+   build_request re-wrap a trustworthy ChatRequestPart (the encoder reads
+   rec.mime and fails closed without one) with no reference into live Chat
+   state. `n` is the copied length and always equals rec.bytes for a term
+   the host loaded. */
+typedef struct {
+    uint8_t kind;      /* ChatPartKind */
+    uint8_t flags;     /* CHAT_PART_FLAG_* of the source part */
+    union {
+        wchar_t *text;
+        struct {
+            ChatAttachmentMeta rec;
+            unsigned char *bytes;
+            size_t n;
+        } image;
+    } u;
+} CompletionPart;
+
 typedef struct {
     int generation;
     HWND notify;
@@ -41,6 +62,13 @@ typedef struct {
     wchar_t *model;
     ChatRole *roles;
     wchar_t **texts;
+    /* Per-message owned part runs, parallel to roles/texts. A fast-path
+       message has a NULL entry and copies its text into texts[]; a message
+       with a run leaves texts[] NULL (the run is its content, and the
+       encoder never reads the projection of a content array). NULL arrays
+       when count == 0. */
+    CompletionPart **parts;
+    int *part_counts;
     int count;
     ChatProviderRouting routing;
     bool reasoning;
@@ -80,9 +108,18 @@ typedef struct {
 } Stream;
 typedef enum { REQUEST_DONE, REQUEST_ERROR, REQUEST_CANCELLED, REQUEST_INTERRUPTED } RequestOutcome;
 
+/* Checked multiplication: false instead of wrapping on overflow, so an
+   allocation size can never disagree with the count it came from. */
+static bool size_mul(size_t a, size_t b, size_t *out) {
+    if (b && a > (size_t)-1 / b) return false;
+    *out = a * b;
+    return true;
+}
+
 static wchar_t *copy_wide(const wchar_t *text) {
     if (!text) return NULL;
     size_t length = wcslen(text);
+    if (length > ((size_t)-1 / sizeof(wchar_t)) - 1) return NULL;
     wchar_t *copy = (wchar_t *)malloc((length + 1) * sizeof *copy);
     if (copy) memcpy(copy, text, (length + 1) * sizeof *copy);
     return copy;
@@ -260,27 +297,154 @@ void completion_events_free(CompletionEvent *batch) {
     }
 }
 
+/* Deep-copies one borrowed view into the work arrays (the owned carry the
+   worker needs once the per-send scope is gone). Two passes: every part is
+   validated before anything is copied -- kind, image record presence,
+   counts and allocation-size arithmetic -- because copying an IMAGE term
+   dereferences its record and an untrustworthy term must fail the request
+   before it starts, exactly as the encoder rejects it later. On failure the
+   partially filled work stays free_work-safe (every array is zeroed and
+   part_counts is published only together with its run). A fast-path message
+   (no run) copies its text like today; a message with a run copies the run
+   only. */
+static bool copy_work_messages(CompletionWork *work,
+    const CompletionMessage *messages, int count) {
+    if (!work || count < 0 || (count > 0 && !messages)) return false;
+    work->count = count;
+    if (count <= 0) return true;
+    size_t bytes = 0;
+    if (!size_mul((size_t)count, sizeof *work->roles, &bytes) ||
+        !size_mul((size_t)count, sizeof *work->texts, &bytes) ||
+        !size_mul((size_t)count, sizeof *work->parts, &bytes) ||
+        !size_mul((size_t)count, sizeof *work->part_counts, &bytes))
+        return false;
+    /* Validation pass. */
+    for (int i = 0; i < count; i++) {
+        int part_count = messages[i].part_count;
+        if (part_count < 0 || part_count > CHAT_MAX_PARTS) return false;
+        if (part_count > 0 && !messages[i].parts) return false;
+        if (!size_mul((size_t)part_count, sizeof(CompletionPart), &bytes))
+            return false;
+        for (int j = 0; j < part_count; j++) {
+            const ChatRequestPart *part = &messages[i].parts[j];
+            if (part->kind == CHAT_PART_TEXT) continue;
+            if (part->kind != CHAT_PART_IMAGE) return false;
+            /* The rec is copied below, so it must exist; and an image term
+               must carry real bytes to encode -- a zero-length term is
+               untrustworthy, not an empty image to send. */
+            if (!part->u.image.rec || !part->u.image.byte_length ||
+                !part->u.image.bytes)
+                return false;
+        }
+    }
+    /* Copy pass. */
+    work->roles = (ChatRole *)malloc((size_t)count * sizeof *work->roles);
+    work->texts = (wchar_t **)calloc((size_t)count, sizeof *work->texts);
+    work->parts = (CompletionPart **)calloc((size_t)count,
+        sizeof *work->parts);
+    work->part_counts = (int *)calloc((size_t)count,
+        sizeof *work->part_counts);
+    if (!work->roles || !work->texts || !work->parts || !work->part_counts)
+        return false;
+    for (int i = 0; i < count; i++) {
+        work->roles[i] = messages[i].role;
+        int part_count = messages[i].part_count;
+        if (part_count <= 0) {
+            work->texts[i] = copy_wide(messages[i].text);
+            if (!work->texts[i]) return false;
+            continue;
+        }
+        CompletionPart *run = (CompletionPart *)calloc((size_t)part_count,
+            sizeof *run);
+        if (!run) return false;
+        work->parts[i] = run;
+        work->part_counts[i] = part_count;
+        for (int j = 0; j < part_count; j++) {
+            const ChatRequestPart *part = &messages[i].parts[j];
+            CompletionPart *copy = &run[j];
+            copy->kind = (uint8_t)part->kind;
+            copy->flags = part->flags;
+            if (part->kind == CHAT_PART_TEXT) {
+                if (part->u.text) {
+                    copy->u.text = copy_wide(part->u.text);
+                    if (!copy->u.text) return false;
+                }
+            } else {
+                copy->u.image.rec = *part->u.image.rec;
+                copy->u.image.n = part->u.image.byte_length;
+                copy->u.image.bytes = (unsigned char *)malloc(
+                    part->u.image.byte_length);
+                if (!copy->u.image.bytes) return false;
+                memcpy(copy->u.image.bytes, part->u.image.bytes,
+                    part->u.image.byte_length);
+            }
+        }
+    }
+    return true;
+}
+
 /* Real encoder: adapts the work arrays into the shared borrowed view. Kept as
-   a thin adapter so the exact bytes live in one place. */
+   a thin adapter so the exact bytes live in one place. Owned parts are
+   re-wrapped as borrowed runs pointing back into the work arrays (the record
+   carrier supplies rec; the copied bytes supply the payload), so the body is
+   byte-identical to the pure encoder's over the original view. */
 static bool build_request(const CompletionWork *work, JsonBuf *body) {
     /* Initialize before any fallible step so a caller can always free it. */
     json_buf_init(body, 0);
     ChatRequestMessage *messages = NULL;
+    ChatRequestPart *run_storage = NULL;
     if (work->count > 0) {
         messages = (ChatRequestMessage *)malloc(
             (size_t)work->count * sizeof *messages);
         if (!messages) return false;
     }
+    size_t total = 0;
     for (int i = 0; i < work->count; i++) {
+        int part_count = work->part_counts ? work->part_counts[i] : 0;
+        if (part_count > 0) {
+            if (!work->parts || !work->parts[i]) { free(messages); return false; }
+            total += (size_t)part_count;
+        }
+    }
+    /* The re-wrap pool is allocated only when a run exists at all. */
+    if (total > 0) {
+        size_t bytes = 0;
+        if (!size_mul(total, sizeof *run_storage, &bytes)) {
+            free(messages);
+            return false;
+        }
+        run_storage = (ChatRequestPart *)malloc(bytes);
+        if (!run_storage) { free(messages); return false; }
+    }
+    size_t used = 0;
+    for (int i = 0; i < work->count; i++) {
+        int part_count = work->part_counts ? work->part_counts[i] : 0;
         messages[i].role = work->roles[i];
-        messages[i].text = work->texts[i];
-        /* The worker carries text only: until owned parts land here, every
-           re-wrapped entry is the fast path with no part run. */
+        messages[i].text = work->texts[i] ? work->texts[i] : L"";
         messages[i].parts = NULL;
         messages[i].part_count = 0;
+        if (part_count <= 0) continue;
+        messages[i].parts = &run_storage[used];
+        messages[i].part_count = part_count;
+        for (int j = 0; j < part_count; j++) {
+            const CompletionPart *src = &work->parts[i][j];
+            ChatRequestPart *dst = &run_storage[used + (size_t)j];
+            dst->kind = (ChatPartKind)src->kind;
+            dst->flags = src->flags;
+            if (src->kind == CHAT_PART_TEXT) {
+                dst->u.text = src->u.text;
+            } else {
+                dst->u.image.meta = NULL;
+                dst->u.image.rec = &src->u.image.rec;
+                dst->u.image.bytes = src->u.image.bytes;
+                dst->u.image.byte_length = src->u.image.n;
+            }
+        }
+        used += (size_t)part_count;
     }
     bool ok = chat_completion_request_build(body, work->backend, work->model,
         messages, work->count, &work->routing, work->reasoning);
+    free(run_storage);
     free(messages);
     return ok;
 }
@@ -720,6 +884,29 @@ static void free_work(CompletionWork *work) {
     }
     free(work->model);
     if (work->texts) for (int i = 0; i < work->count; i++) free(work->texts[i]);
+    if (work->parts) {
+        for (int i = 0; i < work->count; i++) {
+            CompletionPart *run = work->parts[i];
+            if (!run) continue;
+            int part_count = work->part_counts ? work->part_counts[i] : 0;
+            for (int j = 0; j < part_count; j++) {
+                if (run[j].kind == CHAT_PART_IMAGE) {
+                    /* Image bytes are user content, not secrets, but the
+                       scrub keeps stale heap residue out of freed blocks --
+                       consistent with the api-key and header scrubbing. */
+                    if (run[j].u.image.bytes) {
+                        SecureZeroMemory(run[j].u.image.bytes,
+                            run[j].u.image.n);
+                        free(run[j].u.image.bytes);
+                    }
+                } else {
+                    free(run[j].u.text);
+                }
+            }
+            free(run);
+        }
+    }
+    free(work->parts); free(work->part_counts);
     free(work->texts); free(work->roles); free(work);
 }
 
@@ -774,16 +961,7 @@ int completion_request(CompletionClient *client, ChatBackend backend,
         else ok = false;
     }
     work->model = copy_wide(model);
-    work->roles = (ChatRole *)malloc((count ? count : 1) * sizeof *work->roles);
-    work->texts = (wchar_t **)calloc(count ? count : 1, sizeof *work->texts);
-    ok = ok && work->model && work->roles && work->texts;
-    if (ok) {
-        for (int i = 0; i < count && ok; i++) {
-            work->roles[i] = messages[i].role;
-            work->texts[i] = copy_wide(messages[i].text);
-            if (!work->texts[i]) ok = false;
-        }
-    }
+    ok = ok && work->model && copy_work_messages(work, messages, count);
     if (ok) {
         uintptr_t thread = _beginthreadex(NULL, 0, worker, work, 0, NULL);
         if (thread) {

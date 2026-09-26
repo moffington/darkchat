@@ -168,8 +168,10 @@ static bool append_message(JsonBuf *buf, ChatBackend backend,
             const ChatAttachmentMeta *rec = part->u.image.rec;
             const unsigned char *bytes = part->u.image.bytes;
             size_t length = part->u.image.byte_length;
-            if (!rec) return false;
-            if (!bytes && length) return false;
+            /* Fail closed on any untrustworthy image term: no record to name
+               the MIME, or no real payload to write -- a zero-length term
+               would encode an empty image. */
+            if (!rec || !bytes || !length) return false;
             const char *open = backend == CHAT_BACKEND_OLLAMA
                 ? REQ_OL_IMG_PREFIX : REQ_OR_IMG_PREFIX;
             const char *close = backend == CHAT_BACKEND_OLLAMA

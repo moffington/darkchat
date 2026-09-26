@@ -77,7 +77,8 @@ ChatMessageCost chat_completion_message_costs(ChatBackend backend,
    message keeps the plain JSON string content. `reasoning` gates OpenRouter's
    reasoning object and is ignored for Ollama. Returns false on allocation
    failure and on an untrustworthy image term (a missing attachment record,
-   or byte_length with no bytes to encode). */
+   or anything short of real bytes to encode: no payload pointer, or a
+   zero-length payload -- an empty image is never sent). */
 bool chat_completion_request_build(JsonBuf *buf, ChatBackend backend,
     const wchar_t *model, const ChatRequestMessage *messages, int count,
     const ChatProviderRouting *routing, bool reasoning);

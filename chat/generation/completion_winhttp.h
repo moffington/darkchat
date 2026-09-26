@@ -19,7 +19,11 @@
 #define CHAT_WM_COMPLETION_EVENT (WM_APP + 0x4e)
 
 /* The client consumes the same borrowed role/text view the request context
-   builder produces (chat/generation/context.h), so a built context needs no conversion. */
+   builder produces (chat/generation/context.h), so a built context needs no
+   conversion. The view is deep-copied onto the worker before the thread
+   starts: texts copy like today, and a message carrying a part run copies
+   that run as owned parts (including the image bytes the host loaded into
+   the view), so a request can outlive the per-send scope that built it. */
 typedef ChatRequestMessage CompletionMessage;
 
 typedef enum {

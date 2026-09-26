@@ -8,6 +8,7 @@
 #include "chat/core/search.h"
 #include "chat/persistence/storage.h"
 #include "chat/persistence/saver.h"
+#include "chat/persistence/attachments.h"
 #include "chat/export/export.h"
 #include "chat/import/import.h"
 #include "chat/shell/actions_win32.h"
@@ -92,6 +93,11 @@ typedef struct {
     ULONGLONG reasoning_paint_tick;
     ULONGLONG reasoning_started_tick;
     ChatStorage storage;
+    /* Managed attachment blob store beside state.jsonl (same directory).
+       Opened next to storage; a failed open is non-fatal -- text chat must
+       survive a store that cannot be created, and a send that needs a blob
+       then fails with the named load error instead. */
+    ChatAttachmentStore attachments;
     /* Background snapshot writer. Mutations is the counter every save handoff
        captures; last_submitted_attempt is the newest accepted handoff and
        handled_attempt the newest attempt whose result has been interpreted,
@@ -1486,6 +1492,57 @@ static void capture_settings(ChatHost *host) {
     }
 }
 
+/* Frees (with a scrub) every loaded image buffer in the built scratch. The
+   scratch is the free registry: no parallel bookkeeping can forget one. */
+static void release_attachment_bytes(ChatRequestContext *context) {
+    if (!context) return;
+    for (int i = 0; i < context->part_slots_used; i++) {
+        ChatRequestPart *part = &context->part_scratch[i];
+        if (part->kind == CHAT_PART_IMAGE && part->u.image.bytes) {
+            SecureZeroMemory((void *)part->u.image.bytes,
+                part->u.image.byte_length);
+            free((void *)part->u.image.bytes);
+            part->u.image.bytes = NULL;
+        }
+    }
+}
+
+/* Fills every kept IMAGE part in the built context with its managed bytes.
+   Only parts the context kept are read -- a dropped-history image is never
+   opened. Each part receives its own buffer and none is ever shared, so the
+   release walk can free per-part. All-or-nothing and fail-closed: a missing
+   or quarantined blob, a zero-length record (the store never writes an empty
+   blob, so one is untrustworthy and an empty image must never be sent), an
+   empty read, or a length that disagrees with the attachment record (the
+   budget's authority) aborts the send and releases every buffer already
+   loaded, including the one just read. The length check is load-bearing:
+   adopting n would desynchronize the measured request body from the budget
+   that selected it, and encoding byte_length bytes from an n-byte buffer
+   would read past its end. */
+static bool load_attachment_bytes(ChatHost *host, ChatRequestContext *context) {
+    if (!context) return false;
+    for (int i = 0; i < context->part_slots_used; i++) {
+        ChatRequestPart *part = &context->part_scratch[i];
+        if (part->kind != CHAT_PART_IMAGE) continue;
+        const ChatAttachmentMeta *rec = part->u.image.rec;
+        unsigned char *data = NULL;
+        size_t n = 0;
+        bool ok = part->u.image.byte_length && rec && host->attachments.open &&
+            attachment_store_get(&host->attachments, rec->digest, &data, &n) &&
+            data && n == part->u.image.byte_length;
+        if (!ok) {
+            if (data) {
+                SecureZeroMemory(data, n);
+                free(data);
+            }
+            release_attachment_bytes(context);
+            return false;
+        }
+        part->u.image.bytes = data;
+    }
+    return true;
+}
+
 static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *prompt) {
     if (host->generating) return;
     Chat *chat=host->config.chat;
@@ -1541,18 +1598,26 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     size_t required_attach=context ? context->required_attachment_bytes : 0;
     host->context_dropped=(built==CHAT_CONTEXT_OK && context) ?
         context->dropped_messages : 0;
+    /* Only the parts the context kept are read from the store: an image in
+       dropped history is never opened. All-or-nothing -- a missing or
+       damaged blob fails the send before any request starts. */
+    bool loaded=saved && built==CHAT_CONTEXT_OK &&
+        load_attachment_bytes(host,context);
     /* OpenRouter keeps its credentials and provider routing; Ollama needs
         neither, so a missing OPENROUTER_API_KEY never blocks it. The model
         sent is the one chat_begin_response recorded in requested_model: the
         conversation's effective model (override or global slot) — the same
         authoritative resolution the audit metadata carries. */
-    host->request_generation=saved && built==CHAT_CONTEXT_OK ?
+    host->request_generation=saved && built==CHAT_CONTEXT_OK && loaded ?
         completion_request(&host->client,chat->backend,
             host->config.api_key_utf8,m->generation.requested_model,
             context->messages,context->count,
             chat->backend==CHAT_BACKEND_OPENROUTER ?
                 &chat->provider_routing : NULL,
             chat_effective_reasoning(chat, c)) : 0;
+    /* The host's loaded buffers live in the scratch and die with the send,
+       right after the client deep-copied them (or refused to start). */
+    release_attachment_bytes(context);
     free(context);
     if (!host->request_generation) {
         m->generation.state=CHAT_GENERATION_FAILED;
@@ -1598,6 +1663,8 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
                swprintf: terminate explicitly so every reader is safe. */
             m->generation.error[bound-1]=0;
         }
+        else if (!loaded) wcscpy(m->generation.error,
+            L"An attached image could not be read; request was not sent.");
         else if (chat->backend==CHAT_BACKEND_OPENROUTER &&
             (!host->config.api_key_utf8 || !host->config.api_key_utf8[0]))
             wcscpy(m->generation.error,
@@ -3679,6 +3746,10 @@ int chat_host_run(HINSTANCE instance, int show, const ChatHostConfig *config) {
         MessageBoxW(NULL,L"Cannot open DarkChat storage. Another instance may be running, or the directory is unavailable.",L"DarkChat",MB_OK|MB_ICONERROR);
         goto cleanup;
     }
+    /* Attachment blob store beside state.jsonl. A failed open is non-fatal:
+       text chat must survive a store that cannot be created, and a send that
+       needs a blob then fails with the named load error instead. */
+    attachment_store_open(&host->attachments,NULL,&config->chat->next_id);
     int loaded=storage_load(&host->storage,config->chat);
     if (loaded<0) {
         MessageBoxW(NULL,L"No valid supported DarkChat snapshot was found. Storage files have been preserved. Restore a valid state.jsonl before restarting.",L"DarkChat",MB_OK|MB_ICONERROR);
@@ -3807,6 +3878,7 @@ cleanup:
     for (int i = 0; i < CHAT_BACKEND_COUNT; i++)
         chat_model_catalog_dispose(&host->catalog[i]);
     rich_text_library_close();
+    attachment_store_close(&host->attachments);
     storage_close(&host->storage);
     free(host);
     CoUninitialize();

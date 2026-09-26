@@ -8,6 +8,26 @@
 static int deltas, reasons, terminal, wakes;
 static wchar_t reasoning_text[256];
 static wchar_t delta_text[4096];
+/* Terminal event text, captured for the live probes: the non-vision image
+   send records the provider's ACTUAL error rather than assuming one. */
+static wchar_t terminal_text[512];
+/* Free watch for the scrub proof: the test registers the owned image buffer
+   (readable from the work item) before free_work, and the wrap proves the
+   bytes were already zeroed when free saw them. */
+static unsigned char *free_watch_ptr;
+static size_t free_watch_n;
+static bool free_watch_seen, free_watch_zeroed;
+void __real_free(void *pointer);
+void __wrap_free(void *pointer) {
+    if (pointer && pointer == free_watch_ptr) {
+        free_watch_seen = true;
+        free_watch_zeroed = true;
+        for (size_t i = 0; i < free_watch_n; i++)
+            if (free_watch_ptr[i]) { free_watch_zeroed = false; break; }
+        free_watch_ptr = NULL;
+    }
+    __real_free(pointer);
+}
 static CompletionEventType order[16];
 static int order_count;
 static CompletionEventType outcome;
@@ -42,7 +62,15 @@ static LRESULT CALLBACK test_proc(HWND window,UINT msg,WPARAM w,LPARAM l) {
                                 -wcslen(reasoning_text));
                     }
                 }
-                else { ++terminal; outcome=e->type; }
+                else {
+                    ++terminal; outcome=e->type;
+                    if (e->text) {
+                        wcsncpy(terminal_text,e->text,
+                            (sizeof terminal_text/sizeof *terminal_text)-1);
+                        terminal_text[(sizeof terminal_text/
+                            sizeof *terminal_text)-1]=0;
+                    }
+                }
                 metadata=e->metadata;
             }
             completion_event_free(e);
@@ -641,6 +669,167 @@ int main(int argc,char **argv) {
         }
     }
     chat_dispose(context_chat); free(context_chat);
+    /* ---- Commit 7: the worker carries owned parts --------------------- */
+    {
+        /* The host's commit-7 job (point each kept run's image slot at
+           loaded bytes) is simulated with fixture bytes; this block proves
+           the worker's owned carry: copy_work_messages deep-copies the
+           view, build_request re-wraps it, and the body is byte-identical
+           to the pure encoder's over the borrowed view. */
+        ChatAttachmentMeta rec={0};
+        rec.id=1;
+        for (int i=0;i<64;i++) rec.digest[i]='a';
+        rec.digest[64]=0;
+        strcpy(rec.mime,"image/png");
+        rec.bytes=1237;
+        rec.created_at=1;
+        wcscpy(rec.display_name,L"photo.png");
+        static unsigned char blob[1237];
+        for (size_t i=0;i<sizeof blob;i++) blob[i]=(unsigned char)(i&0xff);
+        wchar_t text_a[32]; wcscpy(text_a,L"look at this");
+        wchar_t text_b[32]; wcscpy(text_b,L"and this?");
+        ChatRequestPart parts[3]; memset(parts,0,sizeof parts);
+        parts[0].kind=CHAT_PART_TEXT;
+        parts[0].u.text=text_a;
+        parts[1].kind=CHAT_PART_IMAGE;
+        parts[1].u.image.rec=&rec;
+        parts[1].u.image.bytes=blob;
+        parts[1].u.image.byte_length=sizeof blob;
+        parts[2].kind=CHAT_PART_IMAGE;
+        parts[2].u.image.rec=&rec;
+        parts[2].u.image.bytes=blob;
+        parts[2].u.image.byte_length=sizeof blob;
+        ChatRequestMessage view[3]; memset(view,0,sizeof view);
+        view[0].role=CHAT_ROLE_USER;
+        view[0].text=L"first question";
+        view[1].role=CHAT_ROLE_USER;
+        view[1].text=text_a;
+        view[1].parts=parts;
+        view[1].part_count=3;
+        view[2].role=CHAT_ROLE_USER;
+        view[2].text=text_b;
+
+        CompletionWork *work=(CompletionWork *)calloc(1,sizeof *work);
+        CHECK(work);
+        work->notify=window; work->message=CHAT_WM_COMPLETION_EVENT;
+        work->client=&client; work->generation=7;
+        work->backend=CHAT_BACKEND_OPENROUTER;
+        work->reasoning=true;
+        work->model=copy_wide(L"test/model");
+        CHECK(work->model);
+        CHECK(copy_work_messages(work,view,3));
+        CHECK(work->part_counts && work->part_counts[0]==0 &&
+              work->part_counts[1]==3 && work->part_counts[2]==0);
+        CHECK(work->texts[0] && !work->texts[1] && work->texts[2]);
+
+        JsonBuf from_view, from_work;
+        CHECK(chat_completion_request_build(&from_view,CHAT_BACKEND_OPENROUTER,
+            L"test/model",view,3,NULL,true));
+        CHECK(encode(work,&from_work));
+        CHECK(json_validate(from_work.data));
+        CHECK(from_work.length==from_view.length);
+        CHECK(memcmp(from_work.data,from_view.data,from_view.length)==0);
+        /* The same carry through Ollama's bare-string image shape. */
+        work->backend=CHAT_BACKEND_OLLAMA;
+        JsonBuf ollama_view, ollama_work;
+        CHECK(chat_completion_request_build(&ollama_view,CHAT_BACKEND_OLLAMA,
+            L"test/model",view,3,NULL,true));
+        CHECK(encode(work,&ollama_work));
+        CHECK(ollama_work.length==ollama_view.length);
+        CHECK(memcmp(ollama_work.data,ollama_view.data,ollama_view.length)==0);
+        CHECK(strstr(ollama_work.data,
+            "\"image_url\":\"data:image/png;base64,")!=NULL);
+        CHECK(strstr(ollama_work.data,"\"image_url\":{\"url\":")==NULL);
+        work->backend=CHAT_BACKEND_OPENROUTER;
+
+        /* Owned carry: scribble every borrowed source and re-encode. The
+           worker body cannot change because nothing it sends borrows them. */
+        wcscpy(text_a,L"tampered");
+        wcscpy(text_b,L"tampered");
+        memset(blob,0x5a,sizeof blob);
+        memset(&rec,0,sizeof rec);
+        JsonBuf again;
+        CHECK(encode(work,&again));
+        CHECK(again.length==from_view.length);
+        CHECK(memcmp(again.data,from_view.data,from_view.length)==0);
+
+        /* Scrub: free_work zeroes the image bytes before releasing them. */
+        free_watch_ptr=work->parts[1][1].u.image.bytes;
+        free_watch_n=work->parts[1][1].u.image.n;
+        free_watch_seen=false; free_watch_zeroed=false;
+        CHECK(free_watch_ptr && free_watch_n==sizeof blob);
+        free_work(work);
+        CHECK(free_watch_seen && free_watch_zeroed);
+
+        /* Fail closed on malformed views, before anything is copied:
+           an IMAGE with no record (the copy would dereference it, while the
+           encoder rejects it cleanly), an image with no bytes, a zero-length
+           image (never an empty image), an unknown kind, and out-of-range
+           counts. */
+        {
+            ChatRequestMessage bad={0};
+            ChatRequestPart bad_part={0};
+            bad.role=CHAT_ROLE_USER;
+            bad.text=L"";
+            bad.parts=&bad_part;
+            bad.part_count=1;
+            bad_part.kind=CHAT_PART_IMAGE;
+            bad_part.u.image.byte_length=8;
+            bad_part.u.image.bytes=blob;
+            for (int variant=0;variant<7;variant++) {
+                CompletionWork *w=(CompletionWork *)calloc(1,sizeof *w);
+                CHECK(w);
+                bad.part_count=1;
+                bad_part.kind=CHAT_PART_IMAGE;
+                bad_part.u.image.rec=NULL;
+                bad_part.u.image.byte_length=8;
+                bad_part.u.image.bytes=blob;
+                if (variant==0) {           /* IMAGE with no record */
+                    bad_part.u.image.rec=NULL;
+                } else if (variant==1) {    /* image with no bytes */
+                    bad_part.u.image.rec=&rec;
+                    bad_part.u.image.bytes=NULL;
+                } else if (variant==2) {    /* unknown part kind */
+                    bad_part.u.image.rec=&rec;
+                    bad_part.u.image.bytes=blob;
+                    bad_part.kind=99;
+                } else if (variant==3) {    /* run without its array */
+                    bad.parts=NULL;
+                } else if (variant==4) {    /* count above CHAT_MAX_PARTS */
+                    bad.parts=&bad_part;
+                    bad.part_count=CHAT_MAX_PARTS+1;
+                } else if (variant==5) {    /* zero-length image term */
+                    bad.parts=&bad_part;
+                    bad_part.u.image.rec=&rec;
+                    bad_part.u.image.byte_length=0;
+                    bad_part.u.image.bytes=blob;
+                } else {                    /* negative message count */
+                    bad.parts=&bad_part;
+                    bad.part_count=1;
+                    CHECK(!copy_work_messages(w,&bad,-1));
+                    free_work(w);
+                    break;
+                }
+                CHECK(!copy_work_messages(w,&bad,1));
+                free_work(w);
+            }
+            /* The pure encoder rejects the same term: a zero-length image
+               is never encoded as an empty image. */
+            bad.parts=&bad_part;
+            bad.part_count=1;
+            bad_part.kind=CHAT_PART_IMAGE;
+            bad_part.u.image.rec=&rec;
+            bad_part.u.image.byte_length=0;
+            bad_part.u.image.bytes=blob;
+            JsonBuf never;
+            CHECK(!chat_completion_request_build(&never,CHAT_BACKEND_OPENROUTER,
+                L"test/model",&bad,1,NULL,true));
+            json_buf_free(&never);
+        }
+        json_buf_free(&from_view); json_buf_free(&from_work);
+        json_buf_free(&ollama_view); json_buf_free(&ollama_work);
+        json_buf_free(&again);
+    }
     puts("The bounded request context measures exactly what the encoder writes");
     puts("Actual request encoder and SSE metadata/error decoding passed for both backends");
     if (argc>1 && !strcmp(argv[1],"--live")) {
@@ -649,6 +838,40 @@ int main(int argc,char **argv) {
         CompletionMessage message={0};
         message.role=CHAT_ROLE_USER;
         message.text=L"Reply with exactly the word OK.";
+        /* Commit 7 live probes: one tiny image over the real worker path.
+           The image message is the same borrowed view the host builds. */
+        static const unsigned char tiny_png[]={
+            0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,
+            0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+            0x08,0x06,0x00,0x00,0x00,0x1f,0x15,0xc4,0x89,0x00,0x00,0x00,
+            0x01,0x73,0x52,0x47,0x42,0x00,0xae,0xce,0x1c,0xe9,0x00,0x00,
+            0x00,0x04,0x67,0x41,0x4d,0x41,0x00,0x00,0xb1,0x8f,0x0b,0xfc,
+            0x61,0x05,0x00,0x00,0x00,0x09,0x70,0x48,0x59,0x73,0x00,0x00,
+            0x0e,0xc3,0x00,0x00,0x0e,0xc3,0x01,0xc7,0x6f,0xa8,0x64,0x00,
+            0x00,0x00,0x0d,0x49,0x44,0x41,0x54,0x18,0x57,0x63,0xf8,0xcf,
+            0xc0,0xf0,0x1f,0x00,0x05,0x00,0x01,0xff,0xa6,0x5c,0x9b,0x5d,
+            0x00,0x00,0x00,0x00,0x49,0x45,0x4e,0x44,0xae,0x42,0x60,0x82
+        };
+        ChatAttachmentMeta img_rec={0};
+        img_rec.id=1;
+        for (int i=0;i<64;i++) img_rec.digest[i]='a';
+        img_rec.digest[64]=0;
+        strcpy(img_rec.mime,"image/png");
+        img_rec.bytes=sizeof tiny_png;
+        img_rec.created_at=1;
+        wcscpy(img_rec.display_name,L"pixel.png");
+        ChatRequestPart img_parts[2]; memset(img_parts,0,sizeof img_parts);
+        img_parts[0].kind=CHAT_PART_TEXT;
+        img_parts[0].u.text=L"What color is this image? Answer in one word.";
+        img_parts[1].kind=CHAT_PART_IMAGE;
+        img_parts[1].u.image.rec=&img_rec;
+        img_parts[1].u.image.bytes=tiny_png;
+        img_parts[1].u.image.byte_length=sizeof tiny_png;
+        CompletionMessage image_message={0};
+        image_message.role=CHAT_ROLE_USER;
+        image_message.text=L"What color is this image? Answer in one word.";
+        image_message.parts=img_parts;
+        image_message.part_count=2;
         if (size && size<sizeof key) {
             terminal=0; deltas=0;
             generation=completion_request(&client,CHAT_BACKEND_OPENROUTER,key,
@@ -665,6 +888,43 @@ int main(int argc,char **argv) {
             CHECK(generation>0 && completion_cancel(&client,generation));
             CHECK(await_terminal(10000)); completion_complete(&client,generation);
             CHECK(outcome==COMPLETION_CANCELLED && terminal==1);
+            /* A vision model must accept the image and answer. */
+            terminal=0; deltas=0; terminal_text[0]=0;
+            generation=completion_request(&client,CHAT_BACKEND_OPENROUTER,key,
+                L"openai/gpt-4o-mini",&image_message,1,NULL,true);
+            CHECK(generation>0);
+            CHECK(await_terminal(90000)); completion_complete(&client,generation);
+            printf("OpenRouter vision image outcome=%d, text chunks=%d\n",
+                outcome,deltas);
+            if (terminal_text[0])
+                printf("OpenRouter vision image reply: %ls\n",terminal_text);
+            CHECK(outcome==COMPLETION_DONE && deltas>0);
+            /* Non-vision probe: first prove the chosen model is alive and
+               answers a text-only request, so the recorded image error
+               demonstrates a vision limitation rather than model
+               unavailability. */
+            terminal=0; deltas=0; terminal_text[0]=0;
+            generation=completion_request(&client,CHAT_BACKEND_OPENROUTER,key,
+                L"openai/gpt-3.5-turbo",&message,1,NULL,true);
+            CHECK(generation>0);
+            CHECK(await_terminal(90000)); completion_complete(&client,generation);
+            printf("OpenRouter non-vision text control outcome=%d, chunks=%d\n",
+                outcome,deltas);
+            CHECK(outcome==COMPLETION_DONE && deltas>0);
+            /* The image send to that same model must fail: that failure is
+               what closes the ledger's unverified row. Assert the error
+               outcome and that text was captured, and record the actual
+               wording -- the message itself is never assumed. */
+            terminal=0; deltas=0; terminal_text[0]=0;
+            generation=completion_request(&client,CHAT_BACKEND_OPENROUTER,key,
+                L"openai/gpt-3.5-turbo",&image_message,1,NULL,true);
+            CHECK(generation>0);
+            CHECK(await_terminal(90000)); completion_complete(&client,generation);
+            printf("OpenRouter non-vision image outcome=%d\n",outcome);
+            printf("OpenRouter non-vision image reply: %ls\n",
+                terminal_text[0] ? terminal_text : L"(no message)");
+            CHECK(outcome==COMPLETION_ERROR);
+            CHECK(terminal_text[0]!=0);
         } else {
             puts("Live OpenRouter test skipped: API key unavailable");
         }
@@ -686,6 +946,20 @@ int main(int argc,char **argv) {
             } else {
                 puts("Live Ollama test skipped or unavailable");
             }
+            /* The same tiny image to the same model. DARKCHAT_OLLAMA_MODEL
+               configures the VISION model for this probe: it must complete
+               with content, so the probe can never pass by printing an
+               error, timing out, or being "skipped" while configured. */
+            terminal=0; deltas=0; terminal_text[0]=0;
+            generation=completion_request(&client,CHAT_BACKEND_OLLAMA,NULL,
+                wide_model,&image_message,1,NULL,true);
+            CHECK(generation>0);
+            CHECK(await_terminal(60000));
+            completion_complete(&client,generation);
+            printf("Ollama image outcome=%d, text chunks=%d\n",outcome,deltas);
+            if (terminal_text[0])
+                printf("Ollama image reply: %ls\n",terminal_text);
+            CHECK(outcome==COMPLETION_DONE && deltas>0);
         } else {
             puts("Live Ollama test skipped: set DARKCHAT_OLLAMA_MODEL to run it");
         }
