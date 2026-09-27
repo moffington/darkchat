@@ -3464,10 +3464,15 @@ static int seam_toggle_suite(void) {
 
 /* ---- Model catalog / picker suite (separate clean fixture) ---------------- */
 
+/* The first fixture carries the one field the plan adds to a catalog entry:
+   `architecture.input_modalities`. Two of the three entries are classified, so
+   the parsed capability is observable on the host's own per-backend catalog. */
 static const char *catalog_first_json =
     "{\"data\":["
-    "{\"id\":\"openai/gpt-4\",\"name\":\"GPT-4\"},"
-    "{\"id\":\"anthropic/claude-3\",\"name\":\"Claude 3\"},"
+    "{\"id\":\"openai/gpt-4\",\"name\":\"GPT-4\",\"architecture\":"
+    "{\"modality\":\"text->text\",\"input_modalities\":[\"text\",\"image\"]}},"
+    "{\"id\":\"anthropic/claude-3\",\"name\":\"Claude 3\",\"architecture\":"
+    "{\"input_modalities\":[\"text\"]}},"
     "{\"id\":\"meta-llama/llama-3\",\"name\":\"Llama 3\"}]}";
 static const char *catalog_second_json =
     "{\"data\":["
@@ -3535,6 +3540,11 @@ static int catalog_suite(void) {
     catalog_event(h,catalog_fixture(h,MODEL_CATALOG_OK,catalog_first_json,NULL));
     CHECK(!h->catalog_loading && h->catalog_loaded[CHAT_BACKEND_OPENROUTER] && h->catalog[CHAT_BACKEND_OPENROUTER].count==3);
     CHECK(h->catalog_generation==0);
+    /* The capability the payload advertised reaches the host's catalog, and an
+       entry that advertises none stays UNKNOWN. Nothing consumes it yet. */
+    CHECK(h->catalog[CHAT_BACKEND_OPENROUTER].items[0].accepts_image==CHAT_CAP_YES);
+    CHECK(h->catalog[CHAT_BACKEND_OPENROUTER].items[1].accepts_image==CHAT_CAP_NO);
+    CHECK(h->catalog[CHAT_BACKEND_OPENROUTER].items[2].accepts_image==CHAT_CAP_UNKNOWN);
 
     /* A live picker gets the merged list; a refresh while open preserves the
        filter text and the selected id. The current model is one of the catalog

@@ -2,7 +2,8 @@
 #define DARKCHAT_MODEL_CATALOG_H
 
 /* OpenRouter model catalog: a bounded, transient list of selectable models
-   parsed from GET /api/v1/models. This module owns no Win32 handle and no
+   parsed from GET /api/v1/models, plus the per-model image-input capability
+   inferred from the same payloads. This module owns no Win32 handle and no
    network state; the worker and the picker build on it. The catalog is never
    persisted: a missing or stale catalog falls back to the model history. */
 #include <stdbool.h>
@@ -16,6 +17,19 @@
    truncated rather than growing without bound. */
 #define CHAT_MODEL_CATALOG_MAX 4096
 
+/* Image-input capability. UNKNOWN must stay distinct from NO for the same
+   reason the rest of this codebase fails closed on unreadable data: an API
+   that cannot prove the absence of a capability must never be read as a
+   refusal. Session-only; it is inferred from transient catalog payloads and
+   never persisted. */
+typedef enum {
+    CHAT_CAP_UNKNOWN = 0,   /* no evidence: absent field, unreadable payload,
+                               history-only id, failed probe */
+    CHAT_CAP_YES     = 1,   /* the source advertised image input */
+    CHAT_CAP_NO      = 2    /* the source advertised its inputs and image was
+                               absent from a fully readable list */
+} ChatCapability;
+
 typedef struct {
     /* Routable id (what a request sends); required and shorter than
        CHAT_MODEL_TEXT. `name` is a display label; empty means display `id`. */
@@ -23,7 +37,18 @@ typedef struct {
     wchar_t name[CHAT_MODEL_NAME_TEXT];
     /* -1 when the provider omitted context_length or gave a non-number. */
     int context_length;
+    /* Image-input capability, classified while parsing. A source that carries
+       no capability data leaves this UNKNOWN, exactly like an entry that only
+       exists in the model history. */
+    ChatCapability accepts_image;
 } ChatModelInfo;
+
+/* Classifies an Ollama `POST /api/show` document: a readable `capabilities`
+   array containing "vision" is CHAT_CAP_YES, a fully readable one without it
+   is CHAT_CAP_NO, and an absent, non-array or partly unreadable list is
+   CHAT_CAP_UNKNOWN. Pure and allocation-free, so the probe worker can
+   classify on its own thread and the UI thread never holds a show document. */
+ChatCapability chat_model_capability_from_show(const char *json);
 
 /* Why a raw entry was not retained. `parsed` counts retained entries. */
 typedef struct {

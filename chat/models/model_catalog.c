@@ -69,6 +69,52 @@ static bool decode_into(const char *json, const char *path, char *scratch,
     return true;
 }
 
+/* Image-input capability classification.
+
+   One rule, both sources: a match is proof of YES and is honored whatever the
+   rest of the list looks like, while NO requires a list that was read to its
+   closing bracket with every element a comparable string. Anything less --
+   an absent field, a non-array, a wrong-typed element, malformed structure --
+   is UNKNOWN, so no unreadable payload can ever become a refusal. The
+   comparison is exact: the documented vocabularies are the lowercase literals
+   `image` and `vision`, and JSON string equality does not fold case. Both
+   callers also require the whole document to validate before any of this runs
+   (the parse gates it on `trusted`, the show mapping on json_validate), since
+   a list that reads clean inside a document that does not is not evidence.
+
+   Allocation-free, so classification adds no failure path to a parse that is
+   already transactional. */
+static ChatCapability capability_from_string_array(const char *json,
+    const char *path, const char *needle) {
+    JsonArrayKind kind;
+    bool found = false;
+    json_query_array_contains_string(json, path, needle, &kind, &found);
+    if (found) return CHAT_CAP_YES;
+    return kind == JSON_ARRAY_STRINGS ? CHAT_CAP_NO : CHAT_CAP_UNKNOWN;
+}
+
+/* `architecture.input_modalities` of one catalog entry, where the documented
+   vocabulary is text|image|file|audio|video. */
+static ChatCapability capability_from_catalog_entry(const char *json,
+    size_t index) {
+    char path[64];
+    snprintf(path, sizeof path, "data[%lu].architecture.input_modalities",
+        (unsigned long)index);
+    return capability_from_string_array(json, path, "image");
+}
+
+ChatCapability chat_model_capability_from_show(const char *json) {
+    /* Unlike a catalog entry, a show document is classified on its own, with
+       no surrounding parse that has already read the whole payload: path
+       navigation stops at the closing bracket, so a body that carries a
+       complete-looking `capabilities` array and then trailing junk would
+       otherwise read as a proven refusal. Validate the entire document first.
+       This costs one linear pass over a body the caller has already buffered,
+       and it runs on the probe's worker thread, never the UI thread. */
+    if (!json || !json_validate(json)) return CHAT_CAP_UNKNOWN;
+    return capability_from_string_array(json, "capabilities", "vision");
+}
+
 bool chat_model_catalog_parse(ChatModelCatalog *catalog, const char *json,
     ChatModelParseStats *stats) {
     ChatModelParseStats local = {0};
@@ -76,6 +122,14 @@ bool chat_model_catalog_parse(ChatModelCatalog *catalog, const char *json,
     if (!catalog || !json) return false;
     size_t entries = 0;
     if (!json_query_array_length(json, "data", &entries)) return false;
+    /* Path navigation stops at the closing bracket, so a payload with junk
+       after the root value still yields every entry and every statistic
+       exactly as before -- this parse keeps accepting it. What such a payload
+       must not do is *infer* anything: one linear validation pass over the
+       document decides whether the fields inside it may be read as evidence.
+       A document that does not validate keeps its entries, its order and its
+       statistics; only the capabilities are withheld, all of them UNKNOWN. */
+    bool trusted = json_validate(json);
     size_t scratch_size = strlen(json) + 1;
     char *scratch = (char *)malloc(scratch_size);
     if (!scratch) return false;
@@ -103,6 +157,12 @@ bool chat_model_catalog_parse(ChatModelCatalog *catalog, const char *json,
         if (json_query_number(json, path, &value) && value >= 0 &&
             value < 2147483647.0)
             info.context_length = (int)value;
+        /* Additive and never fatal: an absent or unreadable modality list
+           leaves this entry UNKNOWN and changes nothing else about the parse
+           -- not the entry's fate, not its order, not any statistic. An
+           untrusted document withholds every capability for the same reason. */
+        info.accepts_image = trusted
+            ? capability_from_catalog_entry(json, i) : CHAT_CAP_UNKNOWN;
         if (chat_model_catalog_contains(&temp, info.id)) {
             ++local.duplicate;
             continue;
@@ -125,6 +185,11 @@ bool chat_model_catalog_parse(ChatModelCatalog *catalog, const char *json,
     return true;
 }
 
+/* Appends a bare id, with no catalog behind it. A current-model or history id
+   that the catalog also carries is claimed by this path first, so its merged
+   entry is UNKNOWN even though the catalog knows better: first occurrence
+   wins, and the capability a later consumer needs is resolved from the
+   catalog, not from this synthesized row. */
 static bool add_id(ChatModelCatalog *out, const wchar_t *id) {
     if (!id || !id[0] || wcslen(id) >= CHAT_MODEL_TEXT) return true;
     if (chat_model_catalog_contains(out, id)) return true;

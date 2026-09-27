@@ -66,6 +66,43 @@ bool json_query_number(const char *json, const char *path, double *out);
 /* Returns the number of elements in the array named by path. */
 bool json_query_array_length(const char *json, const char *path, size_t *out);
 
+/* --- Array-of-strings membership ----------------------------------------- */
+
+/* Longest decoded element this module compares exactly. Every vocabulary a
+   membership query is used for today is far shorter ("image", "vision"); an
+   element at or beyond this length is reported MIXED rather than compared, so
+   a caller can never read "not found" as proof of absence. */
+#define JSON_ARRAY_ELEMENT_MAX 64
+
+/* Classification of the array named by `path`. `kind` is always set:
+     JSON_ARRAY_ABSENT   the path names nothing, or names a value that is not
+                         an array (string, number, bool, null, object)
+     JSON_ARRAY_STRINGS  the path names an array whose every element is a
+                         JSON string short enough to be compared exactly
+     JSON_ARRAY_MIXED    the path names an array containing at least one
+                         element that is not such a string: a number, bool,
+                         null or nested container, a malformed element, trailing
+                         junk where `]` is required, or an element too long to
+                         compare
+   `*found` (optional) reports whether an element equal to `needle` byte for
+   byte was actually read. It is set independently of `kind`: a verified match
+   stays verified whatever the other elements look like, so a MIXED array that
+   contains the needle is distinguishable from one that does not. It is left
+   false when the path names nothing at all.
+
+   Comparison is exact and case-sensitive: folding is a provider-vocabulary
+   decision, not a JSON one. Allocation-free. The return value is true only
+   when the array was read to its closing bracket and every element was a
+   comparable string, i.e. when `kind` is JSON_ARRAY_STRINGS -- the only
+   outcome in which "not found" is a statement about the whole array. */
+typedef enum {
+    JSON_ARRAY_ABSENT,
+    JSON_ARRAY_STRINGS,
+    JSON_ARRAY_MIXED
+} JsonArrayKind;
+bool json_query_array_contains_string(const char *json, const char *path,
+    const char *needle, JsonArrayKind *kind, bool *found);
+
 /* Classifies the value a path names, so a caller can tell an absent field
    apart from one that is present but not a number. The field is located by
    exact key navigation (never substring matching), so "id" cannot match

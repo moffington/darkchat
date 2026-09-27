@@ -1,4 +1,4 @@
-#include "chat/json.h"
+﻿#include "chat/json.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -524,6 +524,126 @@ static void test_base64(void) {
     json_buf_free(&buf);
 }
 
+/* String-array membership. The contract that matters to a caller is the
+   difference between "the whole array was read and the needle is not in it"
+   and "the array could not be read": only the first licenses a conclusion.
+   `clean` is the query's return value, which must always agree with `kind`. */
+static JsonArrayKind membership(const char *doc, const char *path,
+    const char *needle, bool *found, bool *clean) {
+    JsonArrayKind kind;
+    *found = false;
+    *clean = json_query_array_contains_string(doc, path, needle, &kind, found);
+    return kind;
+}
+
+static void test_array_membership(void) {
+    bool found, clean;
+    const char *doc =
+        "{\"capabilities\":[\"completion\",\"thinking\",\"vision\"],"
+        "\"text\":[\"image\"],\"empty\":[],\"mixed\":[\"a\",1,\"b\"],"
+        "\"o\":{\"a\":1},\"s\":\"image\",\"num\":5,\"nul\":null,"
+        "\"deep\":{\"x\":{\"y\":[\"image\"]}},"
+        "\"esc\":[\"im\\u0061ge\"]}";
+    check(membership(doc, "capabilities", "vision", &found, &clean) ==
+            JSON_ARRAY_STRINGS && found && clean,
+        "a needle in a clean array is found and the array reads clean");
+    check(membership(doc, "capabilities", "embedding", &found, &clean) ==
+            JSON_ARRAY_STRINGS && !found && clean,
+        "a needle absent from a clean array is a fact about the whole array");
+    check(membership(doc, "text", "image", &found, &clean) ==
+            JSON_ARRAY_STRINGS && found,
+        "a single-element array matches");
+    check(membership(doc, "empty", "image", &found, &clean) ==
+            JSON_ARRAY_STRINGS && !found && clean,
+        "an empty array is clean and contains nothing");
+    check(membership(doc, "mixed", "z", &found, &clean) == JSON_ARRAY_MIXED &&
+            !found && !clean,
+        "a non-string element makes the array unreadable, not empty");
+    check(membership(doc, "mixed", "a", &found, &clean) == JSON_ARRAY_MIXED &&
+            found && !clean,
+        "a verified match survives an unreadable array");
+    check(membership(doc, "deep.x.y", "image", &found, &clean) ==
+            JSON_ARRAY_STRINGS && found,
+        "nested path navigation");
+    check(membership(doc, "esc", "image", &found, &clean) ==
+            JSON_ARRAY_STRINGS && found,
+        "an escaped element is compared decoded");
+    check(membership(doc, "esc", "im\\u0061ge", &found, &clean) ==
+            JSON_ARRAY_STRINGS && !found,
+        "comparison is byte-exact, never against a raw escape spelling");
+    /* Absent, and present-but-not-an-array, are the same answer. */
+    check(membership(doc, "missing", "image", &found, &clean) ==
+            JSON_ARRAY_ABSENT && !found && !clean,
+        "an absent path is absent, not empty");
+    check(membership(doc, "o", "image", &found, &clean) == JSON_ARRAY_ABSENT &&
+            membership(doc, "s", "image", &found, &clean) == JSON_ARRAY_ABSENT &&
+            membership(doc, "num", "image", &found, &clean) == JSON_ARRAY_ABSENT &&
+            membership(doc, "nul", "image", &found, &clean) == JSON_ARRAY_ABSENT,
+        "an object, a string, a number and null are all not an array");
+    check(membership(NULL, "text", "image", &found, &clean) ==
+            JSON_ARRAY_ABSENT && !json_query_array_contains_string(doc, "text.",
+            "image", NULL, NULL) && !json_query_array_contains_string(doc,
+            "text", NULL, NULL, NULL),
+        "a null document, a malformed path and a null needle are rejected");
+    check(membership(doc, "text", "", &found, &clean) == JSON_ARRAY_STRINGS &&
+            !found, "an empty needle matches only an empty element");
+    check(membership("{\"e\":[\"\"]}", "e", "", &found, &clean) ==
+            JSON_ARRAY_STRINGS && found,
+        "an empty element matches an empty needle");
+
+    /* An element too long to compare exactly is not compared, so a long
+       needle can never be reported as a match against a long element. */
+    char long_element[JSON_ARRAY_ELEMENT_MAX + 8];
+    memset(long_element, 'a', sizeof long_element - 1);
+    long_element[sizeof long_element - 1] = 0;
+    char long_doc[256];
+    snprintf(long_doc, sizeof long_doc, "{\"a\":[\"%s\"]}", long_element);
+    check(membership(long_doc, "a", long_element, &found, &clean) ==
+            JSON_ARRAY_MIXED && !found,
+        "an element too long to compare exactly reads as unreadable");
+    char at_limit[JSON_ARRAY_ELEMENT_MAX + 1];
+    memset(at_limit, 'b', JSON_ARRAY_ELEMENT_MAX);
+    at_limit[JSON_ARRAY_ELEMENT_MAX] = 0;
+    snprintf(long_doc, sizeof long_doc, "{\"a\":[\"%s\"]}", at_limit);
+    check(membership(long_doc, "a", at_limit, &found, &clean) ==
+            JSON_ARRAY_MIXED && !found,
+        "an element exactly at the comparison limit is not compared either");
+    snprintf(long_doc, sizeof long_doc, "{\"a\":[\"%.*s\"]}",
+        JSON_ARRAY_ELEMENT_MAX - 1, at_limit);
+    check(membership(long_doc, "a", at_limit, &found, &clean) ==
+            JSON_ARRAY_STRINGS && !found && clean,
+        "an element just under the limit is compared and simply does not match");
+
+    /* Malformed structure inside the array never reads as a clean absence. */
+    const char *broken[] = {
+        "{\"a\":[\"image\"",                 /* unterminated array */
+        "{\"a\":[\"imag\"e]}",               /* unterminated element string */
+        "{\"a\":[\"image\",]}",              /* missing element */
+        "{\"a\":[\"image\",5}"               /* element runs into the parent */
+    };
+    for (size_t i = 0; i < sizeof broken / sizeof broken[0]; i++) {
+        JsonArrayKind kind = membership(broken[i], "a", "image", &found, &clean);
+        check(kind == JSON_ARRAY_MIXED,
+            "malformed array structure is never a clean read");
+        check(!clean || found, "a malformed array never reports a clean read "
+            "without a verified match");
+    }
+    /* The needle in a malformed array is still reported when it was read. */
+    check(membership("{\"a\":[\"image\",5]}", "a", "image", &found, &clean) ==
+            JSON_ARRAY_MIXED && found,
+        "a verified match is reported even when the array is unreadable");
+    /* Junk *after* the closing bracket is outside this query, exactly as it is
+       outside json_query_array_length: the array itself read clean. */
+    check(membership("{\"a\":[\"image\"]x}", "a", "image", &found, &clean) ==
+            JSON_ARRAY_STRINGS && found && clean,
+        "trailing junk after the array does not make the array unreadable");
+    /* The documented return/kind agreement, over every case above. */
+    check((membership(doc, "capabilities", "vision", &found, &clean) ==
+                JSON_ARRAY_STRINGS) == clean &&
+            (membership(doc, "mixed", "a", &found, &clean) ==
+                JSON_ARRAY_STRINGS) == clean,
+        "the return value always agrees with the reported kind");
+}
 int main(void) {
     double value;
     check(json_validate("{\"n\":-1.25e+2,\"s\":\"\\uD83D\\uDE80\"}"), "strict document validates");
@@ -543,6 +663,7 @@ int main(void) {
     test_utf16_conversion();
     test_field_kind();
     test_spans_and_cursors();
+    test_array_membership();
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("\nall json checks passed\n");
     return 0;

@@ -143,6 +143,11 @@ static bool winhttp_transport(ChatBackend backend,
     DWORD *status, wchar_t **error) {
     *body = NULL; *length = 0; *status = 0; *error = NULL;
     HINTERNET session = NULL, connect = NULL, request = NULL;
+    /* Owned by this function until the success path hands it to *body, so that
+       every exit -- including a cancellation part-way through the body --
+       releases the buffer and the three WinHTTP handles through `done`. */
+    char *data = NULL;
+    size_t capacity = 0, used = 0;
     bool ok = false;
     session = WinHttpOpen(endpoint->user_agent, endpoint->access_type,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -180,32 +185,29 @@ static bool winhttp_transport(ChatBackend backend,
     }
     *status = code;
     if (code == 200) {
-        char *data = NULL;
-        size_t capacity = 0, used = 0;
         for (;;) {
-            if (cancelled(cancel)) { free(data); return false; }
+            /* A cancelled fetch abandons the body it has read so far; the
+               partial buffer and the three handles are released by `done`
+               like every other exit. */
+            if (cancelled(cancel)) goto done;
             DWORD available = 0;
             if (!WinHttpQueryDataAvailable(request, &available)) {
-                free(data);
                 *error = copy_wide(L"Could not read the catalog response.");
                 goto done;
             }
             if (!available) break;
             if (used + available + 1 > MODEL_CATALOG_MAX_RESPONSE) {
                 /* The caller validates length before reading the body. */
-                free(data);
                 *length = used + available;
                 ok = true;
                 goto done;
             }
             if (!reserve(&data, &capacity, used + available + 1)) {
-                free(data);
                 *error = copy_wide(L"Out of memory reading the catalog.");
                 goto done;
             }
             DWORD read = 0;
             if (!WinHttpReadData(request, data + used, available, &read)) {
-                free(data);
                 *error = copy_wide(L"Could not read the catalog response.");
                 goto done;
             }
@@ -214,12 +216,14 @@ static bool winhttp_transport(ChatBackend backend,
             if (!read) break;
         }
         *body = data;
+        data = NULL;  /* ownership transferred to the caller */
         *length = used;
         ok = true;
     } else {
         ok = true;
     }
 done:
+    free(data);
     if (request) WinHttpCloseHandle(request);
     if (connect) WinHttpCloseHandle(connect);
     if (session) WinHttpCloseHandle(session);

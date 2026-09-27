@@ -586,6 +586,51 @@ bool json_query_array_length(const char *json, const char *path, size_t *out) {
     }
 }
 
+/* Walks the array itself instead of using JsonCursor, because the cursor
+   reports a malformed element and a clean end the same way (both a false
+   return) and this query must tell them apart: a caller is entitled to treat
+   "the whole array was read and the needle is not in it" as a fact, and
+   nothing else. */
+bool json_query_array_contains_string(const char *json, const char *path,
+    const char *needle, JsonArrayKind *kind, bool *found) {
+    if (kind) *kind = JSON_ARRAY_ABSENT;
+    if (found) *found = false;
+    if (!json || !path || !needle) return false;
+    size_t needle_length = strlen(needle);
+    const char *p;
+    if (!find_path(json, path, &p)) return false;
+    p = skip_ws(p);
+    if (*p != '[') return false;
+    p = skip_ws(p + 1);
+    bool mixed = false;
+    if (*p != ']') {
+        char element[JSON_ARRAY_ELEMENT_MAX];
+        for (;;) {
+            /* skip_value validates the element and its extent; a malformed one
+               ends the read with the outcome still undecided. */
+            const char *end = skip_value(p, 0);
+            if (!end) { mixed = true; break; }
+            /* Measure first, decode only when the lengths can be equal. An
+               empty needle matches only an empty element. */
+            size_t length = 0;
+            if (!json_decode_string_strict(p, NULL, 0, &length) ||
+                length >= sizeof element) {
+                mixed = true;
+            } else if (length == needle_length &&
+                json_decode_string_strict(p, element, sizeof element, NULL) &&
+                !memcmp(element, needle, length)) {
+                if (found) *found = true;
+            }
+            p = skip_ws(end);
+            if (*p == ']') break;
+            if (*p != ',') { mixed = true; break; }
+            p = skip_ws(p + 1);
+        }
+    }
+    if (kind) *kind = mixed ? JSON_ARRAY_MIXED : JSON_ARRAY_STRINGS;
+    return !mixed;
+}
+
 /* Validates a path's syntax without touching the document: every segment
    must parse cleanly through the end of the path. Trailing dots, empty
    segments and malformed indexes make a path malformed, which is distinct
