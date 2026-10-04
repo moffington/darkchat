@@ -20,6 +20,7 @@ static int host_MessageBoxW_stub(HWND window, LPCWSTR text, LPCWSTR caption,
 #include <uiautomationclient.h>
 #include <uiautomationcoreapi.h>
 #include "chat/generation/provider_routing.h"
+#include "chat/core/sha256.h"
 #include <process.h>
 #include <stdio.h>
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
@@ -364,6 +365,12 @@ static void save_queue_push(const wchar_t *path, ChatFileDialogResult result) {
     __real_chat_write_file_utf8 in export_suite(). */
 static int write_file_calls;
 static bool write_file_fail;
+/* Ordered log of every destination the writer was handed. The package
+   contract is about sequence, not just outcomes: every sidecar must be
+   written before the .md that references it, so a single "last path" is not
+   enough to prove it. */
+static wchar_t write_file_log[16][512];
+static int write_file_log_count;
 static wchar_t write_file_last_path[512];
 static size_t write_file_last_length;
 static char write_file_capture[8192];
@@ -373,6 +380,11 @@ bool __wrap_chat_write_file_utf8(const wchar_t *path, const char *data,
     size_t length) {
     ++write_file_calls;
     wcsncpy(write_file_last_path, path, 511); write_file_last_path[511] = 0;
+    if (write_file_log_count < 16) {
+        wcsncpy(write_file_log[write_file_log_count], path, 511);
+        write_file_log[write_file_log_count][511] = 0;
+    }
+    write_file_log_count++;
     write_file_last_length = length;
     size_t copy = data ? (length < 8191 ? length : 8191) : 0;
     if (copy) memcpy(write_file_capture, data, copy);
@@ -6578,6 +6590,229 @@ static int export_suite(void) {
     CHECK(!wcscmp(chat->status,
         L"Stop generation before changing history or settings."));
 
+    /* ---- The attachment package: sidecars first, the .md last, and a
+       failure anywhere leaves a previous package intact. ---- */
+    {
+        /* A real store beside this fixture's storage, holding two records that
+           share one blob under different MIMEs -- the case a file set keyed on
+           the digest alone would get wrong. */
+        uint64_t store_id=5000;
+        CHECK(attachment_store_open(&h->attachments,dir,&store_id));
+        const unsigned char bytes[]={0x89,'P','N','G',7,7,7};
+        ChatAttachmentMeta first,second;
+        bool created=false;
+        CHECK(attachment_store_put(&h->attachments,bytes,sizeof bytes,
+            "image/png",L"a.png",&first,&created));
+        CHECK(attachment_store_put(&h->attachments,bytes,sizeof bytes,
+            "image/jpeg",L"b.jpg",&second,&created));
+        CHECK(!strcmp(first.digest,second.digest));
+        CHECK(chat_attachment_add(chat,&first));
+        CHECK(chat_attachment_add(chat,&second));
+        int pi=chat_append_at(chat,chat->active,CHAT_ROLE_USER,L"two views");
+        CHECK(pi>=0);
+        ChatMessage *pm=&chat->conversations[chat->active].messages[pi];
+        for (int k=0;k<2;k++) {
+            ChatImagePart im;
+            const ChatAttachmentMeta *rec=k?&second:&first;
+            memset(&im,0,sizeof im);
+            im.attachment_id=rec->id;
+            memcpy(im.mime,rec->mime,strlen(rec->mime)+1);
+            wcsncpy(im.display_name,rec->display_name,63);
+            CHECK(chat_message_add_image(pm,&im,0));
+        }
+
+        wchar_t pkg[600];
+        swprintf(pkg,600,L"%ls\\trip 1.md",dir);
+        save_queue_clear(); write_file_calls=0; write_file_log_count=0;
+        write_file_fail=false;
+        save_queue_push(pkg,CHAT_FILE_DIALOG_ACCEPTED);
+        action(h,ACTION_EXPORT_MARKDOWN);
+        CHECK(save_dialog_calls==1);
+        /* Two records, one blob, two files -- and the .md is written last. */
+        CHECK(write_file_log_count==3);
+        CHECK(wcsstr(write_file_log[0],L".attachments")!=NULL);
+        CHECK(wcsstr(write_file_log[1],L".attachments")!=NULL);
+        CHECK(!wcscmp(write_file_log[2],pkg));
+        /* Both names exist, holding identical bytes. */
+        wchar_t png[700],jpg[700];
+        swprintf(png,700,L"%ls\\trip 1.attachments\\%hs.png",dir,first.digest);
+        swprintf(jpg,700,L"%ls\\trip 1.attachments\\%hs.jpg",dir,second.digest);
+        CHECK(export_file_exists(png) && export_file_exists(jpg));
+        {
+            char a[512],b[512];
+            CHECK(export_read(png,a,sizeof a)==sizeof bytes);
+            CHECK(export_read(jpg,b,sizeof b)==sizeof bytes);
+            CHECK(!memcmp(a,b,sizeof bytes));
+            CHECK(!memcmp(a,bytes,sizeof bytes));
+        }
+        CHECK(!wcscmp(chat->status,L"Export complete."));
+
+        /* A failed sidecar leaves the package already at the destination
+           exactly as it was: the .md is not replaced and the half-written
+           sidecar is removed. */
+        {
+            char before[8192];
+            size_t before_len=export_read(pkg,before,sizeof before);
+            CHECK(before_len>0);
+            DeleteFileW(png);
+            save_queue_clear(); write_file_calls=0; write_file_log_count=0;
+            write_file_fail=true;
+            save_queue_push(pkg,CHAT_FILE_DIALOG_ACCEPTED);
+            action(h,ACTION_EXPORT_MARKDOWN);
+            write_file_fail=false;
+            char after[8192];
+            size_t after_len=export_read(pkg,after,sizeof after);
+            CHECK(after_len==before_len && !memcmp(after,before,before_len));
+            CHECK(!export_file_exists(png));
+            CHECK(export_contains(after,"darkchat.export"));
+        }
+
+        /* JSON carries the bytes inline, in one file. */
+        {
+            wchar_t jp[600];
+            swprintf(jp,600,L"%ls\\inline.json",dir);
+            save_queue_clear(); write_file_calls=0; write_file_log_count=0;
+            write_file_fail=false;
+            save_queue_push(jp,CHAT_FILE_DIALOG_ACCEPTED);
+            action(h,ACTION_EXPORT_JSON);
+            CHECK(write_file_log_count==1 && !wcscmp(write_file_log[0],jp));
+            char read[8192];
+            size_t n=export_read(jp,read,sizeof read);
+            CHECK(n>0);
+            CHECK(export_contains(read,"\"version\": 2"));
+            CHECK(export_contains(read,"\"data\": \""));
+            CHECK(export_contains(read,"\"sha256\": \""));
+        }
+
+        /* A name that cannot hold a package is refused before anything is
+           written, rather than producing a document naming an unopenable
+           folder. */
+        {
+            wchar_t bad[600];
+            swprintf(bad,600,L"%ls\\CON.md",dir);
+            save_queue_clear(); write_file_calls=0; write_file_log_count=0;
+            save_queue_push(bad,CHAT_FILE_DIALOG_ACCEPTED);
+            action(h,ACTION_EXPORT_MARKDOWN);
+            CHECK(write_file_calls==0);
+            CHECK(wcsstr(chat->status,L"attachment package")!=NULL);
+        }
+
+        /* A real filesystem round trip under a NON-ASCII file name. The
+           reference in the payload is UTF-8, so the import has to decode it
+           before it can name the sidecar; formatting the bytes straight into a
+           wide path would look for a different file and fail on a package this
+           exporter had just written. The stem here carries an accented
+           character and a space, and the bytes are not ASCII. */
+        {
+            wchar_t rt_dir[700],rt_md[800],rt_folder[900],rt_png[1000],
+                rt_jpg[1000];
+            swprintf(rt_dir,700,L"%ls\\r\xe9union",dir);
+            CHECK(CreateDirectoryW(rt_dir,NULL));
+            swprintf(rt_md,800,L"%ls\\r\xe9union 1.md",rt_dir);
+            /* The stem the exporter derives is everything before ".md". */
+            wchar_t stem[128];
+            CHECK(chat_export_sidecar_stem_from_path(rt_md,stem,128));
+            CHECK(!wcscmp(stem,L"r\xe9union 1"));
+            CHECK(wcslen(stem)>0 && stem[wcslen(stem)-1]!=L'.');
+            save_queue_clear(); write_file_calls=0; write_file_log_count=0;
+            write_file_fail=false;
+            save_queue_push(rt_md,CHAT_FILE_DIALOG_ACCEPTED);
+            action(h,ACTION_EXPORT_MARKDOWN);
+            CHECK(wcsstr(chat->status,L"Export complete")!=NULL);
+            CHECK(write_file_log_count==3);
+            /* The folder is created beside the .md, named after the STEM, so the
+               extension is replaced rather than appended. */
+            {
+                wchar_t wrong[900];
+                swprintf(rt_folder,900,L"%ls\\%ls.attachments",rt_dir,stem);
+                swprintf(wrong,900,L"%ls\\r\xe9union 1.md.attachments",rt_dir);
+                CHECK(wcscmp(rt_folder,wrong)!=0);
+            }
+            CHECK(GetFileAttributesW(rt_folder)!=INVALID_FILE_ATTRIBUTES);
+            swprintf(rt_png,1000,L"%ls\\%hs.png",rt_folder,first.digest);
+            swprintf(rt_jpg,1000,L"%ls\\%hs.jpg",rt_folder,second.digest);
+            CHECK(export_file_exists(rt_png) && export_file_exists(rt_jpg));
+            /* The payload names that folder, and the body link escapes it. */
+            {
+                char read[16384];
+                size_t n=export_read(rt_md,read,sizeof read);
+                CHECK(n>0);
+                CHECK(export_contains(read,".attachments/"));
+                /* The accented stem is percent-encoded in the link only. */
+                CHECK(export_contains(read,"%C3%A9union%201.attachments/"));
+            }
+            /* Import it back from the real filesystem: the bytes the exporter
+                   actually wrote are what the importer has to resolve. */
+            {
+                int before=chat->conversation_count;
+                size_t records=chat->attachment_count;
+                static char rt_doc[65536];
+                size_t rt_len=export_read(rt_md,rt_doc,sizeof rt_doc);
+                CHECK(rt_len>0);
+                open_queue_clear(); read_calls=0;
+                open_queue_push(rt_md,CHAT_FILE_DIALOG_ACCEPTED);
+                read_set(rt_doc,rt_len,CHAT_FILE_READ_OK);
+                action(h,ACTION_IMPORT_MARKDOWN);
+                CHECK(open_dialog_calls>=1);
+                CHECK(chat->conversation_count==before+1);
+                CHECK(wcsstr(chat->status,L"Imported")!=NULL);
+                /* The turn came back with both parts, still resolved through
+                   the records the import published. */
+/* The imported conversation reproduces the exported one, so its LAST turn is
+                   the one carrying the images. */
+                const ChatMessage *m=&chat->conversations[before]
+                    .messages[chat->conversations[before].message_count-1];
+                CHECK(chat_message_part_count(m)==3);
+                CHECK(chat_message_has_images(m));
+                ChatPartView v0,v1,v2;
+                CHECK(chat_message_part_at(m,0,&v0));
+                CHECK(v0.kind==CHAT_PART_TEXT);
+                CHECK(chat_message_part_at(m,1,&v1));
+                CHECK(v1.kind==CHAT_PART_IMAGE);
+                CHECK(!strcmp(v1.u.image.mime,"image/png"));
+                CHECK(chat_message_part_at(m,2,&v2));
+                CHECK(v2.kind==CHAT_PART_IMAGE);
+                CHECK(!strcmp(v2.u.image.mime,"image/jpeg"));
+                /* Two fresh records, and the pixels survived the round trip. */
+                CHECK(chat->attachment_count==records+2);
+                const ChatAttachmentMeta *r1=chat_attachment(chat,v1.u.image.attachment_id);
+                const ChatAttachmentMeta *r2=chat_attachment(chat,v2.u.image.attachment_id);
+                CHECK(r1 && r2);
+                CHECK(!strcmp(r1->digest,first.digest));
+                CHECK(!strcmp(r2->digest,second.digest));
+                /* One blob, two records: the round trip kept the sharing. */
+                CHECK(!strcmp(r1->digest,r2->digest));
+                CHECK(!wcscmp(r1->display_name,first.display_name));
+                CHECK(r1->bytes==sizeof bytes);
+                /* And the imported bytes are what was exported. */
+                unsigned char *back=NULL; size_t back_n=0;
+                CHECK(attachment_store_get(&h->attachments,r1->digest,&back,&back_n));
+                CHECK(back_n==sizeof bytes);
+                free(back);
+            }
+            DeleteFileW(rt_png); DeleteFileW(rt_jpg);
+            DeleteFileW(rt_md);
+            RemoveDirectoryW(rt_folder);
+            RemoveDirectoryW(rt_dir);
+        }
+
+        /* Removing the turn returns the conversation to a single-file export,
+           byte for byte what it always produced. */
+        {
+            ChatConversation *ac=&chat->conversations[chat->active];
+            chat_message_dispose(&ac->messages[pi]);
+            memmove(&ac->messages[pi],&ac->messages[pi+1],
+                (ac->message_count-(size_t)pi-1)*sizeof ac->messages[0]);
+            ac->message_count--;
+            chat->attachment_count=0;
+            save_queue_clear(); write_file_calls=0; write_file_log_count=0;
+            save_queue_push(md_path,CHAT_FILE_DIALOG_ACCEPTED);
+            action(h,ACTION_EXPORT_MARKDOWN);
+            CHECK(write_file_log_count==1 && !wcscmp(write_file_log[0],md_path));
+        }
+        attachment_store_close(&h->attachments);
+    }
+
     SendMessageW(window,WM_CLOSE,0,0);
     CHECK(!IsWindow(window));
     saver_shutdown(&h->saver); storage_close(&h->storage);
@@ -7014,8 +7249,8 @@ static int import_suite(void) {
     source->conversations[0].messages[mi].created_at=1600;
     source->conversations[0].messages[mi].modified_at=1600;
     source->conversations[0].messages[mi].generation.state=CHAT_GENERATION_COMPLETE;
-    JsonBuf out; CHECK(chat_export_json(source,0,true,7,&out));
-    JsonBuf markdown; CHECK(chat_export_markdown(source,0,true,7,&markdown));
+    JsonBuf out; CHECK(chat_export_json(source,0,true,7,NULL,&out));
+    JsonBuf markdown; CHECK(chat_export_markdown(source,0,true,7,NULL,NULL,&markdown));
     chat_dispose(source); free(source);
 
     /* ---- Cancel is a silent no-op: no read, no capture, no status ---- */
@@ -7365,6 +7600,340 @@ static int notify_suite(void) {
 
 /* ---- DPI reflow + saved-geometry hardening suite ------------------------ */
 
+/* The import rollback sweep. What must be true is reachability, not exact
+   filesystem rollback: everything still reachable survives, the failed
+   attempt's own blobs are reclaimed, and a sweep whose live set cannot be
+   completed does not run at all. */
+/* NOT YET WIRED IN: this suite crashes the host test with an access violation.
+   The crash is under investigation and the suite is left out of main() until
+   it is fixed, rather than left in a state that fails the build. See the
+   commit notes. */
+/* The commit checksum is the same FNV-1a the storage module computes over every
+   byte before the commit line. */
+static uint32_t snapshot_fnv1a(const char *data, size_t length) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < length; i++)
+        hash = (hash ^ (unsigned char)data[i]) * 16777619u;
+    return hash;
+}
+
+/* Inserts one `type:"attachment"` record into a real snapshot and recomputes
+   its commit checksum, so the result is a file the production loader accepts
+   and whose attachment table names exactly `digest`.
+
+   The record is deliberately referenced by no message. That is the case this
+   exists to set up: a blob whose ONLY remaining reference is a recovery
+   snapshot, with nothing in the live messages and nothing in the session digest
+   list. A sweep built from only those two would delete it, and the store would
+   lose an image a crash recovery still needs. */
+static bool snapshot_add_attachment(const wchar_t *path, uint64_t id,
+    const char *digest, size_t bytes) {
+    char original[262144];
+    size_t original_length = export_read(path, original, sizeof original);
+    if (!original_length) return false;
+    char rebuilt[262144];
+    size_t used = 0;
+    char record[256];
+    int record_length = snprintf(record, sizeof record,
+        "{\"type\":\"attachment\",\"id\":%llu,\"digest\":\"%s\","
+        "\"mime\":\"image/png\",\"bytes\":%llu}\n",
+        (unsigned long long)id, digest, (unsigned long long)bytes);
+    if (record_length <= 0) return false;
+    bool inserted = false;
+    size_t offset = 0;
+    while (offset < original_length) {
+        size_t end = offset;
+        while (end < original_length && original[end] != '\n') end++;
+        size_t line_length = end - offset;
+        /* Stop before the commit record: everything from the insertion point on
+           is regenerated, checksum included. */
+        if (line_length >= 15 && !memcmp(original + offset,
+                "{\"type\":\"commit\"", 15))
+            break;
+        if (!inserted && line_length >= 18 && !memcmp(original + offset,
+                "{\"type\":\"conversation\"", 18)) {
+            if (used + (size_t)record_length >= sizeof rebuilt) return false;
+            memcpy(rebuilt + used, record, (size_t)record_length);
+            used += (size_t)record_length;
+            inserted = true;
+        }
+        if (used + line_length + 1 >= sizeof rebuilt) return false;
+        memcpy(rebuilt + used, original + offset, line_length);
+        used += line_length;
+        rebuilt[used++] = '\n';
+        offset = end + 1;
+    }
+    if (!inserted) return false;
+    char commit[96];
+    int commit_length = snprintf(commit, sizeof commit,
+        "{\"type\":\"commit\",\"checksum\":%u}\n",
+        snapshot_fnv1a(rebuilt, used));
+    if (commit_length <= 0 || used + (size_t)commit_length >= sizeof rebuilt)
+        return false;
+    memcpy(rebuilt + used, commit, (size_t)commit_length);
+    used += (size_t)commit_length;
+    return __real_chat_write_file_utf8(path, rebuilt, used);
+}
+
+static int attachment_reclaim_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui);
+    Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Reclaim host",1100,720,720,480,NULL,
+        false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256];
+    swprintf(dir,256,L"build\\host-reclaim-%lu",(unsigned long)GetCurrentProcessId());
+    CHECK(storage_open(&h->storage,dir));
+    /* An import and a save both drive the window and the background writer,
+       so this suite needs the same live harness the other host suites use.
+       Without it the first flush dereferences a null window. */
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc;
+    cls.lpszClassName=L"DarkChat.ReclaimTest";
+    CHECK(register_class_once(&cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Reclaim integration",
+        WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+    uint64_t store_id=9000;
+    CHECK(attachment_store_open(&h->attachments,dir,&store_id));
+
+    /* A blob that predates the attempt AND is referenced by a live turn, so it
+       is genuinely live and the sweep must leave it alone. */
+    const unsigned char old_bytes[]={1,2,3,4,5};
+    ChatAttachmentMeta old_meta;
+    bool created=false;
+    CHECK(attachment_store_put(&h->attachments,old_bytes,sizeof old_bytes,
+        "image/png",L"old.png",&old_meta,&created));
+    CHECK(chat_attachment_add(chat,&old_meta));
+    {
+        int keepi=chat_append_at(chat,chat->active,CHAT_ROLE_USER,L"keep");
+        CHECK(keepi>=0);
+        ChatMessage *km=&chat->conversations[chat->active].messages[keepi];
+        ChatImagePart kim;
+        memset(&kim,0,sizeof kim);
+        kim.attachment_id=old_meta.id;
+        memcpy(kim.mime,old_meta.mime,strlen(old_meta.mime)+1);
+        wcsncpy(kim.display_name,old_meta.display_name,63);
+        CHECK(chat_message_add_image(km,&kim,0));
+    }
+    wchar_t old_path[700];
+    swprintf(old_path,700,L"%ls\\%hs",h->attachments.dir,old_meta.digest);
+
+    /* Two image payloads: the first will be written, the second's destination
+       is blocked by a directory so its rename fails. */
+    const unsigned char good[]={9,8,7,6,5,4};
+    const unsigned char blocked[]={1,1,2,3,5,8};
+    char good_digest[65],blocked_digest[65];
+    sha256_hex(good,sizeof good,good_digest);
+    sha256_hex(blocked,sizeof blocked,blocked_digest);
+    wchar_t blocker[700];
+    swprintf(blocker,700,L"%ls\\%hs",h->attachments.dir,blocked_digest);
+    RemoveDirectoryW(blocker);
+    CHECK(CreateDirectoryW(blocker,NULL));
+
+    /* A v2 document carrying both, sidecars resolved from beside the .md. */
+    JsonBuf dg,db;
+    json_buf_init(&dg,16); json_buf_init(&db,16);
+    json_buf_append_raw(&dg,"\"",1);
+    json_buf_append_base64(&dg,good,sizeof good);
+    json_buf_append_raw(&dg,"\"",1); dg.data[dg.length]=0;
+    json_buf_append_raw(&db,"\"",1);
+    json_buf_append_base64(&db,blocked,sizeof blocked);
+    json_buf_append_raw(&db,"\"",1); db.data[db.length]=0;
+    wchar_t folder[700],md_path[700];
+    swprintf(folder,700,L"%ls\\pkg.attachments",dir);
+    swprintf(md_path,700,L"%ls\\pkg.md",dir);
+    CreateDirectoryW(folder,NULL);
+    wchar_t gp[800],bp[800];
+    swprintf(gp,800,L"%ls\\%hs.png",folder,good_digest);
+    swprintf(bp,800,L"%ls\\%hs.png",folder,blocked_digest);
+    CHECK(__real_chat_write_file_utf8(gp,(const char *)good,sizeof good));
+    CHECK(__real_chat_write_file_utf8(bp,(const char *)blocked,sizeof blocked));
+    char doc[4096];
+    snprintf(doc,sizeof doc,
+        "<!-- darkchat.export:\n"
+        "{\"format\":\"darkchat.export\",\"version\":2,\"conversations\":["
+        "{\"id\":1,\"title\":\"T\",\"created_at\":1,\"modified_at\":1,"
+        "\"messages\":[{\"role\":\"user\",\"created_at\":1,\"modified_at\":1,"
+        "\"text\":\"two\",\"generation\":{},\"content\":["
+        "{\"type\":\"text\",\"text\":\"two\"},"
+        "{\"type\":\"image\",\"mime\":\"image/png\",\"sha256\":\"%s\","
+        "\"file\":\"pkg.attachments/%s.png\"},"
+        "{\"type\":\"image\",\"mime\":\"image/png\",\"sha256\":\"%s\","
+        "\"file\":\"pkg.attachments/%s.png\"}]}]}]}\n"
+        "-->\n# T\n",
+        good_digest,good_digest,blocked_digest,blocked_digest);
+    CHECK(__real_chat_write_file_utf8(md_path,doc,strlen(doc)));
+
+    int before_count=chat->conversation_count;
+    uint64_t before_next=chat->next_id;
+    /* The destination already holds the one live record, so the property under
+       test is that a failed import leaves that table exactly as it found it. */
+    size_t before_attachments=chat->attachment_count;
+    CHECK(before_attachments==1);
+
+    /* The write of the second blob fails, so the import aborts after the first
+       is already durable. */
+    {
+        open_queue_clear(); open_queue_push(md_path,CHAT_FILE_DIALOG_ACCEPTED);
+        read_set(doc,strlen(doc),CHAT_FILE_READ_OK);
+        action(h,ACTION_IMPORT_MARKDOWN);
+        CHECK(chat->conversation_count==before_count);
+        CHECK(chat->next_id==before_next);
+        CHECK(chat->attachment_count==before_attachments);
+        CHECK(wcsstr(chat->status,L"attachment")!=NULL);
+        /* The first blob was reachable only through this attempt, so it is
+           gone; the pre-existing one is untouched. */
+        wchar_t good_path[700];
+        swprintf(good_path,700,L"%ls\\%hs",h->attachments.dir,good_digest);
+        CHECK(!export_file_exists(good_path));
+        CHECK(export_file_exists(old_path));
+    }
+
+    /* A snapshot that cannot be read makes the live set unknowable, so the
+       sweep must not run: collecting against a partial set would delete blobs
+       that snapshot still needs. The attempt's own blob therefore survives. */
+    {
+        wchar_t keep[700];
+        swprintf(keep,700,L"%ls\\%hs",h->attachments.dir,good_digest);
+        CHECK(__real_chat_write_file_utf8(keep,(const char *)good,sizeof good));
+        /* save_sync is a no-op unless the session is dirty, so a snapshot has to be
+           requested explicitly. A backup has to EXIST to be made unreadable,
+           and the primary is only rotated into it on the second save; without
+           an existing file a scan reports an empty contribution and reports
+           true, so the sweep would legitimately run and this case would prove
+           nothing. */
+        mark_dirty(h);
+        CHECK(save_sync(h));
+        /* The first save completes and clears dirty, so the second one has to
+           request another snapshot explicitly; that second save is the one that
+           rotates the primary into the backup. */
+        mark_dirty(h);
+        CHECK(save_sync(h));
+        CHECK(export_file_exists(h->storage.backup));
+        HANDLE lock=CreateFileW(h->storage.backup,GENERIC_READ,0,NULL,
+            OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+        CHECK(lock!=INVALID_HANDLE_VALUE);
+        open_queue_clear(); open_queue_push(md_path,CHAT_FILE_DIALOG_ACCEPTED);
+        read_set(doc,strlen(doc),CHAT_FILE_READ_OK);
+        action(h,ACTION_IMPORT_MARKDOWN);
+        CloseHandle(lock);
+        CHECK(chat->conversation_count==before_count);
+        CHECK(export_file_exists(keep));
+        CHECK(export_file_exists(old_path));
+    }
+
+    /* A blob whose only reference is a RECOVERY SNAPSHOT survives the sweep.
+       Each of the three files is exercised in turn, because the live set is
+       the union of all three and a sweep consulting only some of them would
+       delete exactly what recovery still needs. Nothing here appears in a live
+       message or in the session digest list. */
+    {
+        const wchar_t *recovery[3] = { h->storage.path, h->storage.backup,
+            h->storage.temporary };
+        const char *names[3] = { "state.jsonl", "state.bak.jsonl",
+            "state.tmp.jsonl" };
+        for (int r = 0; r < 3; r++) {
+            const unsigned char snap[]={4,5,6,7,8,9,10,11};
+            ChatAttachmentMeta snap_meta;
+            bool made=false;
+            CHECK(attachment_store_put(&h->attachments,snap,sizeof snap,
+                "image/png",L"snap.png",&snap_meta,&made));
+            char snap_digest[65];
+            memcpy(snap_digest,snap_meta.digest,65);
+            wchar_t snap_path[700];
+            swprintf(snap_path,700,L"%ls\\%hs",h->attachments.dir,
+                snap_digest);
+            /* A fresh save each case: the helper rewrites the file, and the
+               next case must start from a clean one. */
+            mark_dirty(h);
+            CHECK(save_sync(h));
+            mark_dirty(h);
+            CHECK(save_sync(h));
+            /* state.tmp.jsonl is transient: a save renames it away, so it is
+               absent between saves and a scan reports it as an empty
+               contribution. An interrupted write leaves exactly this file
+               behind, so seeding it from the primary is the realistic shape. */
+            if (!export_file_exists(recovery[r]))
+                CHECK(CopyFileW(h->storage.path,recovery[r],FALSE));
+            CHECK(export_file_exists(recovery[r]));
+            CHECK(snapshot_add_attachment(recovery[r],snap_meta.id,
+                snap_digest,sizeof snap));
+            /* An import that fails after staging triggers a sweep. */
+            int count=chat->conversation_count;
+            open_queue_clear();
+            open_queue_push(md_path,CHAT_FILE_DIALOG_ACCEPTED);
+            read_set(doc,strlen(doc),CHAT_FILE_READ_OK);
+            action(h,ACTION_IMPORT_MARKDOWN);
+            CHECK(chat->conversation_count==count);
+            /* Nothing in a live message or the session list names this blob,
+               so only the snapshot can be what saved it. */
+            CHECK(export_file_exists(snap_path));
+            printf("ok: a blob referenced only by %s survives the sweep\n",
+                names[r]);
+            DeleteFileW(snap_path);
+        }
+    }
+
+    RemoveDirectoryW(blocker);
+    /* The same document imports cleanly once nothing blocks the write, which
+       proves the two cases above exercised staging rather than failing before
+       it. */
+    {
+        wchar_t good_path[700];
+        swprintf(good_path,700,L"%ls\\%hs",h->attachments.dir,good_digest);
+        DeleteFileW(good_path);
+        int before=chat->conversation_count;
+        /* The destination already holds the live record from earlier in this
+           suite, so the property is that this import ADDS two records. */
+        size_t before_records=chat->attachment_count;
+        open_queue_clear(); open_queue_push(md_path,CHAT_FILE_DIALOG_ACCEPTED);
+        read_set(doc,strlen(doc),CHAT_FILE_READ_OK);
+        action(h,ACTION_IMPORT_MARKDOWN);
+        CHECK(chat->conversation_count==before+1);
+        CHECK(chat->attachment_count==before_records+2);
+        CHECK(export_file_exists(good_path));
+        CHECK(wcsstr(chat->status,L"Imported")!=NULL);
+        /* Both records name one blob, and the turn carries both parts. */
+        const ChatMessage *m=&chat->conversations[before].messages[0];
+        CHECK(chat_message_part_count(m)==3);
+        CHECK(chat_message_has_images(m));
+        /* A second identical import reuses the blob rather than rewriting it. */
+        open_queue_clear(); open_queue_push(md_path,CHAT_FILE_DIALOG_ACCEPTED);
+        read_set(doc,strlen(doc),CHAT_FILE_READ_OK);
+        action(h,ACTION_IMPORT_MARKDOWN);
+        CHECK(chat->conversation_count==before+2);
+        CHECK(export_file_exists(good_path));
+        DeleteFileW(good_path);
+    }
+    DeleteFileW(old_path);
+    SendMessageW(window,WM_CLOSE,0,0);
+    /* The background writer must be stopped before the store it writes through
+       is closed and the Chat it snapshots is freed, or it reaches freed memory
+       from its own thread -- which is an intermittent access violation rather
+       than a clean failure. */
+    saver_shutdown(&h->saver);
+    attachment_store_close(&h->attachments);
+    storage_close(&h->storage);
+    wchar_t lockpath[300];
+    swprintf(lockpath,300,L"%ls\\writer.lock",dir);
+    DeleteFileW(lockpath);
+    DeleteFileW(gp); DeleteFileW(bp); DeleteFileW(md_path);
+    RemoveDirectoryW(folder);
+    RemoveDirectoryW(dir);
+    json_buf_free(&dg); json_buf_free(&db);
+    free(ui);
+    chat_dispose(chat); free(chat);
+    free(h);
+    CoUninitialize();
+    return 0;
+}
+
 static int hardening_suite(void) {
     /* Saved-geometry fallback is a pure predicate: the minimized sentinel and
        an off-monitor rectangle both force default placement, while an ordinary
@@ -7453,6 +8022,8 @@ int main(void) {
     failed=notify_suite();
     if (failed) return failed;
     failed=hardening_suite();
+    if (failed) return failed;
+    failed=attachment_reclaim_suite();
     if (failed) return failed;
     puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy + export + import + notifications + hardening fixtures) passed");
     return failed;

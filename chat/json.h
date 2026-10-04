@@ -45,6 +45,22 @@ size_t json_encoded_base64_size(size_t raw_bytes);
    n == 0. False on allocation failure (sticky oom). */
 bool json_buf_append_base64(JsonBuf *buf, const unsigned char *bytes, size_t n);
 
+/* Decodes `payload_len` characters of standard-alphabet padded base64 into a
+   freshly malloc'd buffer (free() it), reporting the decoded length in
+   *out_n. `text` need not be NUL-terminated. NULL on any rejection and
+   *out_n is then 0, so a caller can never confuse a failure with empty
+   output.
+
+   Strict where the encoder can afford to be simple, because a base64 string
+   that decodes to bytes other than the ones a document claims would import
+   as a valid-looking attachment with the wrong content. Rejected: a length
+   that is not a positive multiple of four; any character outside
+   A-Z a-z 0-9 + /; '=' anywhere but the last one or two characters of the
+   final group; and non-zero bits in the tail that padding discards, which
+   would otherwise admit two encodings of the same bytes. */
+unsigned char *json_base64_decode(const char *text, size_t payload_len,
+    size_t *out_n);
+
 /* Decodes a quoted JSON string starting at json into out (UTF-8,
    NUL-terminated). Handles \uXXXX escapes and UTF-16 surrogate pairs; a lone
    surrogate becomes U+FFFD. Returns one past the closing quote, or NULL on

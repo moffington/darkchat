@@ -786,6 +786,108 @@ concurrent app instances from overwriting each other. Hardware/filesystem failur
 cannot be made lossless; this is a local snapshot/backup scheme, not archival
 storage or a cross-machine synchronization format.
 
+## Export and import
+
+Export is deterministic and pure: a function of the live conversation plus an
+explicit timestamp, so the goldens in `tests/test_export.c` are byte-exact.
+Both formats share one authoritative JSON payload. **JSON** writes that payload
+as the file. **Markdown** writes it inside a leading
+`<!-- darkchat.export: … -->` comment, with `<`/`>` escaped as `\u003c`/`\u003e`
+so the closing `-->` cannot be forged, followed by a presentation-only body. The
+body is never authoritative: an importer reads the payload at offset zero only.
+
+The document version is **content-derived**, exactly as the snapshot's format
+version is. Version 2 is emitted only when a message carries an ordered
+`content` array; a conversation whose messages carry none produces
+byte-for-byte what version 1 produced, so an uncustomized text-only export is
+unchanged and every earlier build still imports it. Import accepts 1 and 2 and
+rejects 0 and anything above 2 rather than partially understanding it.
+
+A message with no content parts emits exactly the fields it always had. When it
+does carry parts, `content` is appended **last**, after the `generation` audit
+block, for the same reason the snapshot appends `parts` last: an absent
+optional field must cost a message without one exactly zero bytes. `text`
+remains the plain-text projection and is always present.
+
+Each part is `{"type":"text","text":…}` or, for an image,
+`{"type":"image","mime":…,"pixel_width":…,"pixel_height":…,"display_name":…,
+"sha256":…}` followed by exactly one of `data` or `file`. Zero-valued optionals
+are omitted rather than written as `0`; `flags` appears only when nonzero and is
+restricted to the known mask. The v1 shape is `[TEXT?, IMAGE…]`: one leading
+text part is the whole message text and the remaining parts are images in
+display order.
+
+On import, `content` present means authoritative. `text` must equal the
+projection of the document's own text parts, a text part may only lead, an image
+may not lead a message whose text it is not part of, an unknown part type or an
+undefined flag bit is corruption, and neither `data` nor `file`, or both, is
+corruption. An unknown part *field* is ignored, so a later version can add one
+without breaking this reader. A bound that is exceeded — an over-long display
+name, an image over the per-attachment cap — is reported as a bound, not as
+corruption.
+
+Attachment bytes are proved twice before anything is written: the declared
+`sha256` is checked against the bytes the document actually carries, and only
+then is the blob made durable. A document whose bytes do not match its declared
+digest therefore never reaches the store at all. Imported attachments receive
+fresh ids from the destination's own counter, and a record is published only
+after every blob it names is durable.
+
+**JSON stays a single file**, embedding the managed bytes as base64. A JSON
+document never resolves a sidecar: `file` inside one is a format error, because
+this exporter never writes it.
+
+**Markdown with attachments is a package.** The `.md` keeps the payload with
+`file` replacing `data`, and the body's image links are percent-encoded so the
+characters Windows permits in a filename but that carry URL meaning (`#`, `%`,
+`?`, space) cannot retarget or truncate them. The files sit beside the `.md`:
+
+```
+<name>.md
+<name>.attachments/<sha256>.<ext>
+```
+
+Sidecar files are written **first** and the `.md` **last**, because the `.md` is
+the only replaceable published artifact. A failure anywhere before it leaves any
+package already at that destination byte-for-byte intact; a sidecar this attempt
+created is removed on the way out, and a pre-existing one never is. The folder
+is removed only when this attempt created it and left it empty.
+
+The extension comes from the record's MIME (`image/jpeg` is named `.jpg`). One
+blob may back two records that differ only in MIME, since the store's filename
+carries no MIME hint — so the file set is keyed on `(digest, extension)`, and
+such a package gets two files holding identical bytes. Stale sidecars from an
+earlier export into a reused folder are not pruned.
+
+A `file` reference is validated as a shape before any filesystem call: exactly
+one `/`, no `\`, `:` or Windows-forbidden character in either half, a folder
+ending in `.attachments`, and a basename of exactly 64 lowercase hex characters,
+a dot and a known extension. That is sufficient because each component is then
+a bounded token free of separators, so a host joining them under the `.md`'s own
+directory cannot leave it. The folder is deliberately **not** required to match
+the `.md`'s stem, so a package survives being renamed as long as its folder stays
+beside it; correctness does not rest on that match, because the digest check
+above is what decides whether the bytes are the right ones. A document naming a
+folder that is not a package folder is rejected as malformed before any read.
+
+Import is transactional. The destination `Chat` is unchanged on every failure
+path: no conversation, message, attachment record, id or selection moves. On the
+blob store the guarantee is **reachability, not exact rollback** — everything
+still reachable survives (live parts, all three recoverable snapshots, and every
+digest an earlier successful import wrote this session), the failed attempt's own
+blobs are reclaimed by a sweep against that live set, and an unremovable orphan
+is harmless. If a snapshot cannot be read or validated the live set is not
+knowable, so **the sweep does not run**: collecting against a partial set would
+delete blobs that snapshot still needs, turning a recoverable store into one
+whose recovery silently renders missing images. A repair that rewrites a damaged
+blob is not undone.
+
+> **Backup semantics.** A complete DarkChat backup is the
+> `%LOCALAPPDATA%\DarkChat` **directory as a tree**. Once a conversation contains
+> attachments, copying `state.jsonl` alone is no longer sufficient: the blobs
+> live under `attachments\`. There is no archive format and no export of the
+> whole store; a full backup is the folder.
+
 ## Verification
 
 `chat.bat test` runs `test_sse`, `test_json`, `test_chat`, `test_markdown`,

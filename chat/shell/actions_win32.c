@@ -1,5 +1,6 @@
 #include "chat/shell/actions_win32.h"
 #include "chat/import/import.h"
+#include "chat/export/package.h"
 #include "platform/dark_mode_win32.h"
 #include "ui/ui.h"
 #include <commdlg.h>
@@ -334,6 +335,58 @@ ChatFileReadResult chat_read_file_utf8_limited(const wchar_t *path,
     return CHAT_FILE_READ_OK;
 }
 
+/* Whole-file BINARY read, for an attachment sidecar beside a Markdown export.
+   Deliberately not the text reader above: there is no BOM to strip and no
+   UTF-8 to validate, because the bytes are opaque image content whose
+   integrity is proved by the digest the export declares, not by any textual
+   property. The size preflight is the same, so a huge sidecar cannot cause a
+   huge allocation only to be discarded. */
+ChatFileReadResult chat_read_file_bytes_limited(const wchar_t *path,
+    size_t limit, unsigned char **data, size_t *length) {
+    if (data) *data = NULL;
+    if (length) *length = 0;
+    if (!path || !path[0] || !data || !length) return CHAT_FILE_READ_IO_ERROR;
+    HANDLE file = CreateFileW(path, GENERIC_READ,
+        FILE_SHARE_READ, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return CHAT_FILE_READ_IO_ERROR;
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0) {
+        CloseHandle(file);
+        return CHAT_FILE_READ_IO_ERROR;
+    }
+    if ((uint64_t)size.QuadPart > (uint64_t)limit) {
+        CloseHandle(file);
+        return CHAT_FILE_READ_TOO_LARGE;
+    }
+    size_t bytes = (size_t)size.QuadPart;
+    unsigned char *buffer = (unsigned char *)malloc(bytes + 1);
+    if (!buffer) {
+        CloseHandle(file);
+        return CHAT_FILE_READ_OOM;
+    }
+    size_t got = 0;
+    while (got < bytes) {
+        DWORD chunk = 0;
+        size_t remaining = bytes - got;
+        DWORD request = remaining > (size_t)MAXDWORD
+            ? MAXDWORD : (DWORD)remaining;
+        if (!ReadFile(file, buffer + got, request, &chunk, NULL) || chunk == 0) {
+            CloseHandle(file);
+            free(buffer);
+            return CHAT_FILE_READ_IO_ERROR;
+        }
+        got += chunk;
+    }
+    CloseHandle(file);
+    /* The terminator is not part of the content; it only keeps the buffer
+       safe to hand to code that expects a C string. */
+    buffer[bytes] = 0;
+    *data = buffer;
+    *length = bytes;
+    return CHAT_FILE_READ_OK;
+}
+
 ChatFileReadResult chat_read_file_utf8(const wchar_t *path, char **data,
     size_t *length) {
     return chat_read_file_utf8_limited(path, CHAT_IMPORT_LIMIT, data, length);
@@ -414,33 +467,14 @@ int64_t chat_export_timestamp(void) {
 
 /* True when `name` (already trimmed of trailing dots/spaces) begins with a
    reserved Win32 DOS device basename. Windows refuses such a name however it
-   is extended, so the caller must prefix it. The check is case-insensitive
-   and stops at the first dot: "CON", "CON.txt" and "con.anything" are all
-   reserved, while "CONSOLE" and "COM10" are not. */
+   is extended, so the caller must prefix it.
+
+   The rule itself lives in chat/export/package.c, because the attachment
+   package's stem has to apply exactly the same judgement: a package name the
+   save dialog could never suggest must also be one the stem helper refuses.
+   Keeping one definition is what stops the two from drifting. */
 static bool reserved_device_basename(const wchar_t *name, size_t length) {
-    static const wchar_t *const devices[] = {
-        L"CON", L"PRN", L"AUX", L"NUL",
-        L"COM1", L"COM2", L"COM3", L"COM4", L"COM5",
-        L"COM6", L"COM7", L"COM8", L"COM9",
-        L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5",
-        L"LPT6", L"LPT7", L"LPT8", L"LPT9"
-    };
-    size_t stem = length;
-    for (size_t i = 0; i < length; i++)
-        if (name[i] == L'.') { stem = i; break; }
-    for (size_t i = 0; i < sizeof devices / sizeof devices[0]; i++) {
-        const wchar_t *device = devices[i];
-        size_t j = 0;
-        for (; j < stem && device[j]; j++) {
-            wchar_t a = name[j];
-            wchar_t b = device[j];
-            if (a >= L'A' && a <= L'Z') a = (wchar_t)(a - L'A' + L'a');
-            if (b >= L'A' && b <= L'Z') b = (wchar_t)(b - L'A' + L'a');
-            if (a != b) break;
-        }
-        if (j == stem && device[j] == 0) return true;
-    }
-    return false;
+    return chat_filename_is_reserved_device(name, length);
 }
 
 void chat_export_default_name(const wchar_t *title, const wchar_t *ext,

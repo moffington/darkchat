@@ -95,6 +95,23 @@ bool attachment_store_open(ChatAttachmentStore *store,
 /* Idempotent; clears the store so a closed store fails every operation. */
 void attachment_store_close(ChatAttachmentStore *store);
 
+/* Durably writes `bytes` under their content digest with NO id allocation:
+the same validation, dedup verify, quarantine and atomic publish that
+attachment_store_put performs, minus the counter. `out_digest` receives the
+64 hex characters written or verified. `out_created` is optional and carries
+exactly the same informational meaning as in put -- never a delete permission.
+
+This exists for a caller that owns its own id space. The importer validates a
+whole document, then must make bytes durable before it publishes attachment
+records into the Chat's metadata table, and the ids for those records come
+from the Chat's counter rather than the store's. Routing through put would
+force the store to borrow a temporary counter.
+
+Blob-then-state ordering is unchanged: the function does not return true
+until the bytes are durable on disk. */
+bool attachment_store_write_blob(ChatAttachmentStore *store,
+    const void *bytes, size_t n, char out_digest[65], bool *out_created);
+
 /* Hashes bytes, publishes the blob (or verifies+reuses per the dedup rule
    above), then allocates a fresh id into *out_meta. `out_created` is
    optional; when supplied it receives informational write-vs-reuse status

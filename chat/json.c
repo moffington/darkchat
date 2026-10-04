@@ -250,6 +250,81 @@ bool json_buf_append_base64(JsonBuf *buf, const unsigned char *bytes, size_t n) 
     return out ? json_buf_append_raw(buf, chunk, out) : json_buf_ok(buf);
 }
 
+/* Reverse of the encoder above, for consuming an exported attachment. The
+   decoder is strict where the encoder can afford to be simple: a base64
+   string that decodes to bytes which are not the bytes the document claims
+   would import as a valid-looking attachment with the wrong content, so
+   anything ambiguous is rejected rather than guessed. */
+
+static int base64_value(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+unsigned char *json_base64_decode(const char *text, size_t payload_len,
+    size_t *out_n) {
+    size_t groups, capacity, produced = 0;
+    unsigned char *out;
+
+    if (out_n) *out_n = 0;
+    if (!text || !payload_len || payload_len % 4) return NULL;
+    groups = payload_len / 4;
+    if (!groups) return NULL;
+    capacity = groups * 3;
+    out = (unsigned char *)malloc(capacity);
+    if (!out) return NULL;
+
+    for (size_t g = 0; g < groups; g++) {
+        const char *q = text + g * 4;
+        unsigned acc, emit;
+        int v[4];
+        for (int k = 0; k < 4; k++) {
+            /* '=' may appear only in the final group, and only in the last two
+               positions -- and when it appears in the third it must be followed
+               by '=' in the fourth. Padding always comes in a pair at the very
+               end, so "AA=A" is not an encoding of anything. */
+            if (q[k] == '=') {
+                if (g + 1 != groups || k < 2 || (k == 2 && q[3] != '=')) {
+                    free(out);
+                    return NULL;
+                }
+                v[k] = 0;
+                continue;
+            }
+            v[k] = base64_value(q[k]);
+            if (v[k] < 0) { free(out); return NULL; }
+        }
+        acc = ((unsigned)v[0] << 18) | ((unsigned)v[1] << 12) |
+              ((unsigned)v[2] << 6) | (unsigned)v[3];
+        /* Padding only ever shortens the final group, and the bits it
+           discards must be zero. A group carries 24 bits; `emit` of them
+           become output bytes, so the low 8*(3-emit) bits are the discarded
+           tail. A non-zero tail would admit two encodings of the same bytes,
+           which is exactly the ambiguity this decoder refuses to resolve. */
+        if (g + 1 == groups) {
+            if (q[3] == '=') {
+                emit = (q[2] == '=') ? 1u : 2u;
+                if (acc & ((1u << (8 * (3 - emit))) - 1u)) {
+                    free(out);
+                    return NULL;
+                }
+            } else {
+                emit = 3u;
+            }
+        } else {
+            emit = 3u;
+        }
+        for (unsigned k = 0; k < emit; k++)
+            out[produced++] = (unsigned char)(acc >> (16 - 8 * k));
+    }
+    if (out_n) *out_n = produced;
+    return out;
+}
+
 /* --- Decoding ----------------------------------------------------------- */
 
 static const char *skip_ws(const char *p) {

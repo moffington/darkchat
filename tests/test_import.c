@@ -1,6 +1,8 @@
 #include "chat/import/import.h"
 #include "chat/core/chat.h"
+#include "chat/core/sha256.h"
 #include "chat/export/export.h"
+#include "chat/export/package.h"
 #include "chat/json.h"
 
 #include <stdio.h>
@@ -109,7 +111,138 @@ static char *minimal_doc(int conversations, int messages) {
 
 static ChatImportStatus import_text(Chat *chat, const char *text,
     ChatImportStats *stats) {
-    return chat_import_json(chat, text, strlen(text), stats);
+    return chat_import_json(chat, text, strlen(text), NULL, stats);
+}
+
+/* --- content parts (schema version 2) ------------------------------------- */
+
+static const unsigned char TINY[] = { 0x89, 'P', 'N', 'G', 1, 2, 3, 4, 5, 6 };
+
+/* A blob source that records what the importer asked to be made durable, and
+   can be told to fail partway. Nothing here is a filesystem: the point is to
+   prove the importer writes only after a document has fully validated. */
+typedef struct {
+    unsigned char staged[4][64];
+    size_t lengths[4];
+    char digests[4][65];
+    size_t count;
+    int fail_at;      /* -1 never fails, otherwise fail at this index */
+    bool read_missing;
+    char read_folder[80];
+    char read_basename[80];
+    size_t read_count;
+} BlobSink;
+
+static void sink_init(BlobSink *sink) {
+    memset(sink, 0, sizeof *sink);
+    sink->fail_at = -1;
+}
+
+static bool sink_stage(void *user, const unsigned char *bytes, size_t length,
+    char out_digest[65], bool *out_created) {
+    BlobSink *sink = (BlobSink *)user;
+    if (sink->fail_at >= 0 && (int)sink->count == sink->fail_at) return false;
+    if (sink->count >= 4) return false;
+    if (length > sizeof sink->staged[0]) return false;
+    memcpy(sink->staged[sink->count], bytes, length);
+    sink->lengths[sink->count] = length;
+    sha256_hex(bytes, length, sink->digests[sink->count]);
+    memcpy(out_digest, sink->digests[sink->count], 65);
+    if (out_created) *out_created = true;
+    sink->count++;
+    return true;
+}
+
+static bool sink_read_file(void *user, const char *folder,
+    const char *basename, unsigned char **out, size_t *out_n) {
+    BlobSink *sink = (BlobSink *)user;
+    snprintf(sink->read_folder, sizeof sink->read_folder, "%s", folder);
+    snprintf(sink->read_basename, sizeof sink->read_basename, "%s", basename);
+    sink->read_count++;
+    if (sink->read_missing) return false;
+    *out = (unsigned char *)malloc(sizeof TINY);
+    if (!*out) return false;
+    memcpy(*out, TINY, sizeof TINY);
+    *out_n = sizeof TINY;
+    return true;
+}
+
+static void sink_discard(void *user, unsigned char *bytes, size_t length) {
+    (void)user; (void)length;
+    free(bytes);
+}
+
+static void sink_blobs(BlobSink *sink, ChatImportBlobs *blobs) {
+    memset(blobs, 0, sizeof *blobs);
+    blobs->user = sink;
+    blobs->read_file = sink_read_file;
+    blobs->discard = sink_discard;
+    blobs->stage = sink_stage;
+}
+
+/* A one-conversation, one-message document carrying a single image part. The
+   payload is built as a string so a test can corrupt any field of it. */
+static char *image_doc(const char *version, const char *text,
+    const char *extra_part_fields, const char *extra_message_fields) {
+    char digest[65];
+    size_t capacity = 2048;
+    char *buffer = (char *)malloc(capacity);
+    if (!buffer) return NULL;
+    sha256_hex(TINY, sizeof TINY, digest);
+    JsonBuf data;
+    json_buf_init(&data, 16);
+    json_buf_append_raw(&data, "\"", 1);
+    json_buf_append_base64(&data, TINY, sizeof TINY);
+    json_buf_append_raw(&data, "\"", 1);
+    data.data[data.length] = 0;
+    snprintf(buffer, capacity,
+        "{\"format\":\"darkchat.export\",\"version\":%s,\"conversations\":["
+        "{\"id\":5,\"title\":\"T\",\"created_at\":1,\"modified_at\":2,"
+        "\"messages\":[{\"role\":\"user\",\"created_at\":9,\"modified_at\":9,"
+        "\"text\":\"%s\",\"generation\":{}%s,\"content\":["
+        "{\"type\":\"text\",\"text\":\"%s\"},"
+        "{\"type\":\"image\",\"mime\":\"image/png\",\"pixel_width\":7,"
+        "\"pixel_height\":9,\"display_name\":\"p.png\",\"sha256\":\"%s\","
+        "\"data\":%s%s}]}]}]}",
+        version, text, extra_message_fields ? extra_message_fields : "",
+        text, digest, data.data, extra_part_fields ? extra_part_fields : "");
+    json_buf_free(&data);
+    return buffer;
+}
+
+/* Compares the imported message against what the document described. The part
+   list must be [TEXT, IMAGE] with the metadata intact and the projection equal
+   to the text. */
+static int check_image_message(const Chat *chat, int conversation,
+    uint32_t want_width, uint32_t want_height, const wchar_t *want_name) {
+    const ChatMessage *m = &chat->conversations[conversation].messages[0];
+    CHECK(chat_message_part_count(m) == 2);
+    ChatPartView text, image;
+    CHECK(chat_message_part_at(m, 0, &text));
+    CHECK(text.kind == CHAT_PART_TEXT);
+    CHECK(text.u.text.length == 4 &&
+        !wmemcmp(text.u.text.data, L"look", 4));
+    CHECK(chat_message_part_at(m, 1, &image));
+    CHECK(image.kind == CHAT_PART_IMAGE);
+    CHECK(image.u.image.pixel_width == want_width &&
+        image.u.image.pixel_height == want_height);
+    CHECK(!strcmp(image.u.image.mime, "image/png"));
+    CHECK(!wcscmp(image.u.image.display_name, want_name));
+    CHECK(image.u.image.attachment_id != 0);
+    CHECK(chat_message_has_images(m));
+    /* The projection is what the document's `text` said. */
+    CHECK(!wcscmp(chat_message_text(m), L"look"));
+    /* The record the part names must exist and agree with it, because the
+       record is what the exporter and the request path read. */
+    const ChatAttachmentMeta *rec =
+        chat_attachment(chat, image.u.image.attachment_id);
+    CHECK(rec);
+    CHECK(rec->bytes == sizeof TINY);
+    CHECK(!strcmp(rec->mime, image.u.image.mime));
+    char digest[65];
+    sha256_hex(TINY, sizeof TINY, digest);
+    CHECK(!strcmp(rec->digest, digest));
+    return 0;
 }
 
 typedef struct {
@@ -169,9 +302,9 @@ static int test_round_trip(void) {
     CHECK(chat_conversation_apply_system_prompt(source, 1, L""));
 
     JsonBuf out;
-    CHECK(chat_export_json(source, 0, true, 42, &out));
+    CHECK(chat_export_json(source, 0, true, 42, NULL, &out));
     ChatImportStats stats;
-    CHECK(chat_import_json(dest, out.data, out.length, &stats) ==
+    CHECK(chat_import_json(dest, out.data, out.length, NULL, &stats) ==
         CHAT_IMPORT_OK);
     CHECK(stats.conversations_added == 2 && stats.messages_added == 3);
 
@@ -230,8 +363,8 @@ static int test_title_authority(void) {
     CHECK(source && dest);
     wcscpy(source->conversations[0].title, L"Custom title");
     JsonBuf out;
-    CHECK(chat_export_json(source, 0, false, 1, &out));
-    CHECK(chat_import_json(dest, out.data, out.length, NULL) == CHAT_IMPORT_OK);
+    CHECK(chat_export_json(source, 0, false, 1, NULL, &out));
+    CHECK(chat_import_json(dest, out.data, out.length, NULL, NULL) == CHAT_IMPORT_OK);
     int imported = dest->conversation_count - 1;
     CHECK(!wcscmp(dest->conversations[imported].title, L"Custom title"));
     CHECK(add(dest, imported, CHAT_ROLE_USER, L"first", 2) != NULL);
@@ -369,11 +502,11 @@ static int test_malformed(void) {
             "{\"title\":\"X%cY\",\"created_at\":1,\"modified_at\":1,"
             "\"messages\":[]}]}", (char)0xff);
         CHECK(length > 0 && (size_t)length < sizeof invalid);
-        CHECK(chat_import_json(dest, invalid, (size_t)length, NULL) ==
+        CHECK(chat_import_json(dest, invalid, (size_t)length, NULL, NULL) ==
             CHAT_IMPORT_MALFORMED);
     }
     static const char embedded_nul[] = { '{', 0, '}' };
-    CHECK(chat_import_json(dest, embedded_nul, sizeof embedded_nul, NULL) ==
+    CHECK(chat_import_json(dest, embedded_nul, sizeof embedded_nul, NULL, NULL) ==
         CHAT_IMPORT_MALFORMED);
     CHECK(unchanged(dest, &before));
 
@@ -425,7 +558,7 @@ static int test_allocation_failure(void) {
     CHECK(a != NULL);
     full_generation(a);
     JsonBuf out;
-    CHECK(chat_export_json(source, 0, false, 1, &out));
+    CHECK(chat_export_json(source, 0, false, 1, NULL, &out));
 
     Snapshot before;
     snapshot(dest, &before);
@@ -436,7 +569,7 @@ static int test_allocation_failure(void) {
         fail_allocs = 1;
         ChatImportStats stats;
         ChatImportStatus status = chat_import_json(dest, out.data, out.length,
-            &stats);
+            NULL, &stats);
         if (status == CHAT_IMPORT_OK) {
             CHECK(n > 0);
             CHECK(!unchanged(dest, &before));
@@ -465,10 +598,10 @@ static int test_reject_when_full(void) {
         CHECK(chat_new_conversation(dest) >= 0);
     CHECK(add(source, 0, CHAT_ROLE_USER, L"x", 1) != NULL);
     JsonBuf out;
-    CHECK(chat_export_json(source, 0, false, 1, &out));
+    CHECK(chat_export_json(source, 0, false, 1, NULL, &out));
     Snapshot before;
     snapshot(dest, &before);
-    CHECK(chat_import_json(dest, out.data, out.length, NULL) ==
+    CHECK(chat_import_json(dest, out.data, out.length, NULL, NULL) ==
         CHAT_IMPORT_CAPACITY);
     CHECK(unchanged(dest, &before));
     json_buf_free(&out);
@@ -481,7 +614,7 @@ static int test_reject_when_full(void) {
 
 static ChatImportStatus import_markdown(Chat *chat, const char *text,
     const wchar_t *fallback, ChatImportStats *stats) {
-    return chat_import_markdown(chat, text, strlen(text), fallback, stats);
+    return chat_import_markdown(chat, text, strlen(text), fallback, NULL, stats);
 }
 
 static int test_markdown_round_trip(void) {
@@ -513,9 +646,9 @@ static int test_markdown_round_trip(void) {
     CHECK(chat_conversation_apply_system_prompt(source, 1, L""));
 
     JsonBuf md;
-    CHECK(chat_export_markdown(source, 0, true, 42, &md));
+    CHECK(chat_export_markdown(source, 0, true, 42, NULL, NULL, &md));
     ChatImportStats stats;
-    CHECK(chat_import_markdown(dest, md.data, md.length, NULL, &stats) ==
+    CHECK(chat_import_markdown(dest, md.data, md.length, NULL, NULL, &stats) ==
         CHAT_IMPORT_OK);
     CHECK(stats.conversations_added == 2 && stats.messages_added == 3);
 
@@ -662,7 +795,7 @@ static int test_markdown_copy_title(void) {
     narrow[used++] = '\n';
     narrow[used++] = 'b';
     narrow[used] = 0;
-    CHECK(chat_import_markdown(dest, narrow, used, NULL, NULL) ==
+    CHECK(chat_import_markdown(dest, narrow, used, NULL, NULL, NULL) ==
         CHAT_IMPORT_OK);
     CHECK(wcslen(dest->conversations[1].title) == 62);
     CHECK(dest->conversations[1].title[61] == L'a');
@@ -677,7 +810,7 @@ static int test_markdown_bom(void) {
        with U+FEFF. */
     const char *body = "\xEF\xBB\xBF# BOM Title\nbody\n";
     ChatImportStats stats;
-    CHECK(chat_import_markdown(dest, body, strlen(body), NULL, &stats) ==
+    CHECK(chat_import_markdown(dest, body, strlen(body), NULL, NULL, &stats) ==
         CHAT_IMPORT_OK);
     ChatConversation *c = &dest->conversations[1];
     CHECK(!wcscmp(c->title, L"BOM Title"));
@@ -686,7 +819,7 @@ static int test_markdown_bom(void) {
     /* A BOM-only file is empty. */
     Snapshot before;
     snapshot(dest, &before);
-    CHECK(chat_import_markdown(dest, "\xEF\xBB\xBF", 3, NULL, NULL) ==
+    CHECK(chat_import_markdown(dest, "\xEF\xBB\xBF", 3, NULL, NULL, NULL) ==
         CHAT_IMPORT_MALFORMED);
     CHECK(unchanged(dest, &before));
 
@@ -695,7 +828,7 @@ static int test_markdown_bom(void) {
     CHECK(source);
     CHECK(add(source, 0, CHAT_ROLE_USER, L"bom round", 5) != NULL);
     JsonBuf md;
-    CHECK(chat_export_markdown(source, 0, false, 9, &md));
+    CHECK(chat_export_markdown(source, 0, false, 9, NULL, NULL, &md));
     char *prefixed = (char *)malloc(md.length + 3);
     CHECK(prefixed);
     prefixed[0] = (char)0xEF;
@@ -703,7 +836,7 @@ static int test_markdown_bom(void) {
     prefixed[2] = (char)0xBF;
     memcpy(prefixed + 3, md.data, md.length);
     int count = dest->conversation_count;
-    CHECK(chat_import_markdown(dest, prefixed, md.length + 3, NULL, &stats) ==
+    CHECK(chat_import_markdown(dest, prefixed, md.length + 3, NULL, NULL, &stats) ==
         CHAT_IMPORT_OK);
     CHECK(dest->conversation_count == count + 1);
     free(prefixed);
@@ -733,10 +866,10 @@ static int test_markdown_invalid(void) {
     }
     CHECK(import_markdown(dest, "", NULL, NULL) == CHAT_IMPORT_MALFORMED);
     static const char embedded_nul[] = { '#', 0, 'x' };
-    CHECK(chat_import_markdown(dest, embedded_nul, sizeof embedded_nul, NULL,
+    CHECK(chat_import_markdown(dest, embedded_nul, sizeof embedded_nul, NULL, NULL,
         NULL) == CHAT_IMPORT_MALFORMED);
     const char invalid[] = { '#', (char)0xff, 'x' };
-    CHECK(chat_import_markdown(dest, invalid, sizeof invalid, NULL, NULL) ==
+    CHECK(chat_import_markdown(dest, invalid, sizeof invalid, NULL, NULL, NULL) ==
         CHAT_IMPORT_MALFORMED);
     CHECK(unchanged(dest, &before));
     chat_dispose(dest); free(dest);
@@ -790,7 +923,7 @@ static int test_markdown_allocation_failure(void) {
         fail_allocs = 1;
         ChatImportStats stats;
         ChatImportStatus status = chat_import_markdown(dest, md, strlen(md),
-            NULL, &stats);
+            NULL, NULL, &stats);
         if (status == CHAT_IMPORT_OK) {
             CHECK(n > 0);
             CHECK(!unchanged(dest, &before));
@@ -805,6 +938,496 @@ static int test_markdown_allocation_failure(void) {
     seam_reset();
     chat_dispose(dest); free(dest);
     CHECK(live_allocs == baseline);
+    return 0;
+}
+
+/* --- schema version 2: ordered content parts ------------------------------ */
+
+static int test_version_2_round_trip(void) {
+    char *doc = image_doc("2", "look", NULL, NULL);
+    CHECK(doc);
+    BlobSink sink;
+    sink_init(&sink);
+    ChatImportBlobs blobs;
+    sink_blobs(&sink, &blobs);
+    Chat *dest = new_chat();
+    CHECK(dest);
+    Snapshot before;
+    snapshot(dest, &before);
+    ChatImportStats stats;
+    CHECK(chat_import_json(dest, doc, strlen(doc), &blobs, &stats) ==
+        CHAT_IMPORT_OK);
+    CHECK(stats.conversations_added == 1);
+    CHECK(stats.messages_added == 1);
+    CHECK(stats.attachments_added == 1);
+    CHECK(dest->conversation_count == 2);   /* the fixture plus the import */
+    if (check_image_message(dest, 1, 7, 9, L"p.png")) return 1;
+    /* Identity is rewritten: the fresh id is not the file's, and it came from
+       the destination's own counter. */
+    CHECK(dest->conversations[1].id != 5);
+    CHECK(dest->conversations[1].id <= dest->next_id);
+    CHECK(dest->next_id > before.next_id);
+    /* Exactly one blob was made durable, and it is the right one. */
+    CHECK(sink.count == 1);
+    CHECK(sink.lengths[0] == sizeof TINY);
+    CHECK(!memcmp(sink.staged[0], TINY, sizeof TINY));
+    /* The title is still authoritative and the turn keeps its timestamps. */
+    CHECK(!wcscmp(dest->conversations[1].title, L"T"));
+    CHECK(dest->conversations[1].messages[0].created_at == 9);
+    free(doc);
+    chat_dispose(dest);
+    free(dest);
+    return 0;
+}
+
+/* A version 1 document has no parts by construction, so carrying one is a
+   document that contradicts its own declared grammar. */
+static int test_version_gate(void) {
+    char *doc = image_doc("1", "look", NULL, NULL);
+    CHECK(doc);
+    BlobSink sink;
+    sink_init(&sink);
+    ChatImportBlobs blobs;
+    sink_blobs(&sink, &blobs);
+    Chat *dest = new_chat();
+    CHECK(dest);
+    CHECK(chat_import_json(dest, doc, strlen(doc), &blobs, NULL) ==
+        CHAT_IMPORT_MALFORMED);
+    CHECK(dest->conversation_count == 1);
+    CHECK(sink.count == 0);
+    free(doc);
+    chat_dispose(dest);
+    free(dest);
+
+    /* A later version is refused rather than partially understood. */
+    static const char *later[] = {
+        "{\"format\":\"darkchat.export\",\"version\":3,\"conversations\":["
+            "{\"id\":1,\"title\":\"T\",\"created_at\":1,\"modified_at\":1,"
+            "\"messages\":[]}]}",
+        "{\"format\":\"darkchat.export\",\"version\":0,\"conversations\":["
+            "{\"id\":1,\"title\":\"T\",\"created_at\":1,\"modified_at\":1,"
+            "\"messages\":[]}]}",
+    };
+    for (size_t i = 0; i < sizeof later / sizeof later[0]; i++) {
+        Chat *d = new_chat();
+        CHECK(d);
+        CHECK(chat_import_json(d, later[i], strlen(later[i]), NULL, NULL) ==
+            CHAT_IMPORT_MALFORMED);
+        CHECK(d->conversation_count == 1);
+        chat_dispose(d);
+        free(d);
+    }
+    /* Version 1 without content parts is untouched by all of this. */
+    {
+        Chat *d = new_chat();
+        CHECK(d);
+        char *plain = minimal_doc(1, 1);
+        CHECK(plain);
+        CHECK(chat_import_json(d, plain, strlen(plain), NULL, NULL) ==
+            CHAT_IMPORT_OK);
+        free(plain);
+        chat_dispose(d);
+        free(d);
+    }
+    return 0;
+}
+
+/* `content` present means authoritative. Every way a document can contradict
+   itself is rejected, and none of them reaches the store. */
+static int test_content_strictness(void) {
+    /* Every way a document can contradict itself. None of them may reach the
+       store, and none may disturb the destination. */
+    struct { const char *fields; ChatImportStatus expected; const char *why; }
+    bad[] = {
+        /* FIRST_FRAME is a real flag on an image; a bit outside the mask is
+           not, and is corruption rather than something to ignore. */
+        { ",\"flags\":2", CHAT_IMPORT_MALFORMED,
+          "an image part with an undefined flag bit" },
+        { ",\"mime\":\"\"", CHAT_IMPORT_MALFORMED, "an empty mime" },
+        { ",\"mime\":\"image/\\\"png\"", CHAT_IMPORT_MALFORMED,
+          "a mime containing a quote" },
+        { ",\"pixel_width\":-1", CHAT_IMPORT_MALFORMED,
+          "a negative pixel width" },
+        /* A bound that is exceeded is reported as a bound, not as corruption:
+           the document is well formed, its field is simply too long. */
+        { ",\"display_name\":\"" "0123456789012345678901234567890123456789"
+          "0123456789012345678901234567890123456789\"",
+          CHAT_IMPORT_TOO_LARGE, "an over-long display name" },
+    };
+    BlobSink sink;
+    ChatImportBlobs blobs;
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        char *doc = image_doc("2", "look", bad[i].fields, NULL);
+        CHECK(doc);
+        sink_init(&sink);
+        sink_blobs(&sink, &blobs);
+        Chat *dest = new_chat();
+        CHECK(dest);
+        Snapshot before;
+        snapshot(dest, &before);
+        ChatImportStatus got = chat_import_json(dest, doc, strlen(doc),
+            &blobs, NULL);
+        if (got != bad[i].expected) {
+            printf("case %zu got %d want %d (%s)\n", i, got, bad[i].expected,
+                bad[i].why);
+            return 1;
+        }
+        CHECK(unchanged(dest, &before));
+        CHECK(sink.count == 0);
+        free(doc);
+        chat_dispose(dest);
+        free(dest);
+    }
+    /* A `content` that is not an array, and a duplicated `content`. */
+    {
+        static const char *shapes[] = {
+            "{\"format\":\"darkchat.export\",\"version\":2,\"conversations\":["
+                "{\"id\":1,\"title\":\"T\",\"created_at\":1,\"modified_at\":1,"
+                "\"messages\":[{\"role\":\"user\",\"created_at\":1,"
+                "\"modified_at\":1,\"text\":\"x\",\"generation\":{},"
+                "\"content\":\"nope\"}]}]}",
+            "{\"format\":\"darkchat.export\",\"version\":2,\"conversations\":["
+                "{\"id\":1,\"title\":\"T\",\"created_at\":1,\"modified_at\":1,"
+                "\"messages\":[{\"role\":\"user\",\"created_at\":1,"
+                "\"modified_at\":1,\"text\":\"x\",\"generation\":{},"
+                "\"content\":[],\"content\":[]}]}]}",
+            /* An unknown part field is tolerated, so a later version can add
+               one without breaking this reader. */
+            "{\"format\":\"darkchat.export\",\"version\":2,\"conversations\":["
+                "{\"id\":1,\"title\":\"T\",\"created_at\":1,\"modified_at\":1,"
+                "\"messages\":[{\"role\":\"user\",\"created_at\":1,"
+                "\"modified_at\":1,\"text\":\"x\",\"generation\":{},"
+                "\"content\":[{\"type\":\"image\",\"future\":1}]}]}]}",
+        };
+        for (size_t i = 0; i < sizeof shapes / sizeof shapes[0]; i++) {
+            sink_init(&sink);
+            sink_blobs(&sink, &blobs);
+            Chat *dest = new_chat();
+            CHECK(dest);
+            CHECK(chat_import_json(dest, shapes[i], strlen(shapes[i]), &blobs,
+                NULL) == CHAT_IMPORT_MALFORMED);
+            CHECK(sink.count == 0);
+            chat_dispose(dest);
+            free(dest);
+        }
+    }
+    /* The digest is verified before anything is written, so a document whose
+       bytes do not match what it declares never reaches the store. */
+    {
+        char *doc = image_doc("2", "look", NULL, NULL);
+        CHECK(doc);
+        char *lie = strstr(doc, "\"sha256\":\"");
+        CHECK(lie);
+        memcpy(lie + 10,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            64);
+        Chat *dest = new_chat();
+        CHECK(dest);
+        sink_init(&sink);
+        sink_blobs(&sink, &blobs);
+        Snapshot before;
+        snapshot(dest, &before);
+        CHECK(chat_import_json(dest, doc, strlen(doc), &blobs, NULL) ==
+            CHAT_IMPORT_MALFORMED);
+        CHECK(sink.count == 0);
+        CHECK(unchanged(dest, &before));
+        free(doc);
+        chat_dispose(dest);
+        free(dest);
+    }
+    return 0;
+}
+
+/* `text` is the projection of the parts, so a document where the two disagree
+   describes two different messages. */
+static int test_content_projection_mismatch(void) {
+    char *doc = image_doc("2", "look", NULL, NULL);
+    CHECK(doc);
+    char *at = strstr(doc, "\"text\":\"look\",\"generation\"");
+    CHECK(at);
+    memcpy(at, "\"text\":\"other\",\"generation\"", 28);
+    BlobSink sink;
+    sink_init(&sink);
+    ChatImportBlobs blobs;
+    sink_blobs(&sink, &blobs);
+    Chat *dest = new_chat();
+    CHECK(dest);
+    Snapshot before;
+    snapshot(dest, &before);
+    CHECK(chat_import_json(dest, doc, strlen(doc), &blobs, NULL) ==
+        CHAT_IMPORT_MALFORMED);
+    CHECK(unchanged(dest, &before));
+    CHECK(sink.count == 0);
+    free(doc);
+    chat_dispose(dest);
+    free(dest);
+    return 0;
+}
+
+/* An image-only turn is legal: the projection is empty and the parts carry the
+   message. */
+static int test_content_image_only(void) {
+    char digest[65];
+    sha256_hex(TINY, sizeof TINY, digest);
+    JsonBuf data;
+    json_buf_init(&data, 16);
+    json_buf_append_raw(&data, "\"", 1);
+    json_buf_append_base64(&data, TINY, sizeof TINY);
+    json_buf_append_raw(&data, "\"", 1);
+    data.data[data.length] = 0;
+    char doc[2048];
+    snprintf(doc, sizeof doc,
+        "{\"format\":\"darkchat.export\",\"version\":2,\"conversations\":["
+        "{\"id\":1,\"title\":\"T\",\"created_at\":1,\"modified_at\":1,"
+        "\"messages\":[{\"role\":\"user\",\"created_at\":1,\"modified_at\":1,"
+        "\"text\":\"\",\"generation\":{},\"content\":["
+        "{\"type\":\"image\",\"mime\":\"image/png\",\"sha256\":\"%s\","
+        "\"data\":%s}]}]}]}", digest, data.data);
+    json_buf_free(&data);
+    BlobSink sink;
+    sink_init(&sink);
+    ChatImportBlobs blobs;
+    sink_blobs(&sink, &blobs);
+    Chat *dest = new_chat();
+    CHECK(dest);
+    CHECK(chat_import_json(dest, doc, strlen(doc), &blobs, NULL) ==
+        CHAT_IMPORT_OK);
+    const ChatMessage *m = &dest->conversations[1].messages[0];
+    /* No leading text part, because the projection is empty. */
+    CHECK(chat_message_part_count(m) == 1);
+    ChatPartView view;
+    CHECK(chat_message_part_at(m, 0, &view));
+    CHECK(view.kind == CHAT_PART_IMAGE);
+    CHECK(!chat_message_text(m)[0]);
+    CHECK(chat_message_has_images(m));
+    CHECK(sink.count == 1);
+    chat_dispose(dest);
+    free(dest);
+    return 0;
+}
+
+/* A Markdown package names its sidecars; the reference is validated before any
+   filesystem call, and the bytes are re-hashed against the digest the document
+   itself declares. */
+static int test_markdown_sidecar(void) {
+    char digest[65];
+    sha256_hex(TINY, sizeof TINY, digest);
+    char doc[2048];
+    snprintf(doc, sizeof doc,
+        "<!-- darkchat.export:\n"
+        "{\"format\":\"darkchat.export\",\"version\":2,\"conversations\":["
+        "{\"id\":1,\"title\":\"T\",\"created_at\":1,\"modified_at\":1,"
+        "\"messages\":[{\"role\":\"user\",\"created_at\":1,\"modified_at\":1,"
+        "\"text\":\"look\",\"generation\":{},\"content\":["
+        "{\"type\":\"text\",\"text\":\"look\"},"
+        "{\"type\":\"image\",\"mime\":\"image/png\",\"sha256\":\"%s\","
+        "\"file\":\"trip 1.attachments/%s.png\"}]}]}]}\n"
+        "-->\n# T\n\n## User\n\nlook\n\n![p.png](trip%%201.attachments/%s.png)\n",
+        digest, digest, digest);
+    BlobSink sink;
+    sink_init(&sink);
+    ChatImportBlobs blobs;
+    sink_blobs(&sink, &blobs);
+    Chat *dest = new_chat();
+    CHECK(dest);
+    CHECK(chat_import_markdown(dest, doc, strlen(doc), NULL, &blobs, NULL) ==
+        CHAT_IMPORT_OK);
+    /* The reference was split, not handed over whole: both components are
+       bounded tokens, which is what makes the host's join safe. */
+    CHECK(sink.read_count == 1);
+    CHECK(!strcmp(sink.read_folder, "trip 1.attachments"));
+    CHECK(sink.read_basename[0] != 0);
+    CHECK(!strncmp(sink.read_basename, digest, 64));
+    CHECK(!strcmp(sink.read_basename + 64, ".png"));
+    if (check_image_message(dest, 1, 0, 0, L"")) return 1;   /* the doc omits both */
+    CHECK(sink.count == 1);
+    chat_dispose(dest);
+    free(dest);
+    return 0;
+}
+
+/* A sidecar that is not there is a distinct outcome from a malformed
+   document: the file was valid, the bytes were not available. */
+static int test_sidecar_missing_is_attachment_io(void) {
+    char digest[65];
+    sha256_hex(TINY, sizeof TINY, digest);
+    char doc[2048];
+    snprintf(doc, sizeof doc,
+        "<!-- darkchat.export:\n"
+        "{\"format\":\"darkchat.export\",\"version\":2,\"conversations\":["
+        "{\"id\":1,\"title\":\"T\",\"created_at\":1,\"modified_at\":1,"
+        "\"messages\":[{\"role\":\"user\",\"created_at\":1,\"modified_at\":1,"
+        "\"text\":\"look\",\"generation\":{},\"content\":["
+        "{\"type\":\"text\",\"text\":\"look\"},"
+        "{\"type\":\"image\",\"mime\":\"image/png\",\"sha256\":\"%s\","
+        "\"file\":\"trip.attachments/%s.png\"}]}]}]}\n"
+        "-->\n# T\n", digest, digest);
+    BlobSink sink;
+    sink_init(&sink);
+    sink.read_missing = true;
+    ChatImportBlobs blobs;
+    sink_blobs(&sink, &blobs);
+    Chat *dest = new_chat();
+    CHECK(dest);
+    Snapshot before;
+    snapshot(dest, &before);
+    CHECK(chat_import_markdown(dest, doc, strlen(doc), NULL, &blobs, NULL) ==
+        CHAT_IMPORT_ATTACHMENT_IO);
+    CHECK(unchanged(dest, &before));
+    /* Nothing was staged: the bytes never arrived, so nothing was written. */
+    CHECK(sink.count == 0);
+    chat_dispose(dest);
+    free(dest);
+    return 0;
+}
+
+/* A reference whose folder is not shaped like a package folder is malformed
+   before any read is attempted, so a crafted document cannot steer a read. */
+static int test_sidecar_reference_rejected(void) {
+    char digest[65];
+    sha256_hex(TINY, sizeof TINY, digest);
+    const char *folders[] = {
+        "photos", "..", ".", "a.attachments/../b.attachments",
+        "a\\b.attachments", "C:evil.attachments",
+    };
+    for (size_t i = 0; i < sizeof folders / sizeof folders[0]; i++) {
+        char doc[2048];
+        snprintf(doc, sizeof doc,
+            "<!-- darkchat.export:\n"
+            "{\"format\":\"darkchat.export\",\"version\":2,\"conversations\":["
+            "{\"id\":1,\"title\":\"T\",\"created_at\":1,\"modified_at\":1,"
+            "\"messages\":[{\"role\":\"user\",\"created_at\":1,"
+            "\"modified_at\":1,\"text\":\"look\",\"generation\":{},"
+            "\"content\":[{\"type\":\"text\",\"text\":\"look\"},"
+            "{\"type\":\"image\",\"mime\":\"image/png\",\"sha256\":\"%s\","
+            "\"file\":\"%s/%s.png\"}]}]}]}\n"
+            "-->\n# T\n", digest, folders[i], digest);
+        BlobSink sink;
+        sink_init(&sink);
+        ChatImportBlobs blobs;
+        sink_blobs(&sink, &blobs);
+        Chat *dest = new_chat();
+        CHECK(dest);
+        Snapshot before;
+        snapshot(dest, &before);
+        CHECK(chat_import_markdown(dest, doc, strlen(doc), NULL, &blobs, NULL)
+            == CHAT_IMPORT_MALFORMED);
+        CHECK(unchanged(dest, &before));
+        CHECK(sink.read_count == 0);   /* never attempted */
+        CHECK(sink.count == 0);
+        chat_dispose(dest);
+        free(dest);
+    }
+    return 0;
+}
+
+/* JSON never resolves a sidecar: our JSON exports embed the bytes, so a `file`
+   reference in a JSON document is a format error, not a lookup. */
+static int test_file_rejected_in_json(void) {
+    char digest[65];
+    sha256_hex(TINY, sizeof TINY, digest);
+    char doc[2048];
+    snprintf(doc, sizeof doc,
+        "{\"format\":\"darkchat.export\",\"version\":2,\"conversations\":["
+        "{\"id\":1,\"title\":\"T\",\"created_at\":1,\"modified_at\":1,"
+        "\"messages\":[{\"role\":\"user\",\"created_at\":1,\"modified_at\":1,"
+        "\"text\":\"look\",\"generation\":{},\"content\":["
+        "{\"type\":\"text\",\"text\":\"look\"},"
+        "{\"type\":\"image\",\"mime\":\"image/png\",\"sha256\":\"%s\","
+        "\"file\":\"trip.attachments/%s.png\"}]}]}]}", digest, digest);
+    BlobSink sink;
+    sink_init(&sink);
+    ChatImportBlobs blobs;
+    sink_blobs(&sink, &blobs);
+    Chat *dest = new_chat();
+    CHECK(dest);
+    CHECK(chat_import_json(dest, doc, strlen(doc), &blobs, NULL) ==
+        CHAT_IMPORT_MALFORMED);
+    CHECK(sink.read_count == 0);
+    chat_dispose(dest);
+    free(dest);
+    return 0;
+}
+
+/* When the durable write fails partway, the destination is untouched and the
+   caller is left holding the digests it must reclaim. */
+static int test_stage_failure_is_transactional(void) {
+    char *doc = image_doc("2", "look", NULL, NULL);
+    CHECK(doc);
+    BlobSink sink;
+    sink_init(&sink);
+    sink.fail_at = 0;
+    ChatImportBlobs blobs;
+    sink_blobs(&sink, &blobs);
+    Chat *dest = new_chat();
+    CHECK(dest);
+    Snapshot before;
+    snapshot(dest, &before);
+    CHECK(chat_import_json(dest, doc, strlen(doc), &blobs, NULL) ==
+        CHAT_IMPORT_ATTACHMENT_IO);
+    CHECK(unchanged(dest, &before));
+    CHECK(dest->attachment_count == 0);
+    chat_dispose(dest);
+    free(dest);
+    free(doc);
+    return 0;
+}
+
+/* An existing record survives an import that adds another, and the imported
+   one gets a fresh id rather than colliding. */
+static int test_attachment_table_merge(void) {
+    ChatAttachmentMeta seed;
+    Chat *dest = new_chat();
+    CHECK(dest);
+    memset(&seed, 0, sizeof seed);
+    seed.id = ++dest->next_id;
+    sha256_hex("seed", 4, seed.digest);
+    strcpy(seed.mime, "image/png");
+    seed.bytes = 4;
+    wcscpy(seed.display_name, L"seed.png");
+    CHECK(chat_attachment_add(dest, &seed));
+
+    char *doc = image_doc("2", "look", NULL, NULL);
+    CHECK(doc);
+    BlobSink sink;
+    sink_init(&sink);
+    ChatImportBlobs blobs;
+    sink_blobs(&sink, &blobs);
+    CHECK(chat_import_json(dest, doc, strlen(doc), &blobs, NULL) ==
+        CHAT_IMPORT_OK);
+    CHECK(dest->attachment_count == 2);
+    /* The pre-existing record is intact and still resolvable. */
+    const ChatAttachmentMeta *found =
+        chat_attachment(dest, seed.id);
+    CHECK(found && !strcmp(found->digest, seed.digest));
+    if (check_image_message(dest, 1, 7, 9, L"p.png")) return 1;
+    free(doc);
+    chat_dispose(dest);
+    free(dest);
+    return 0;
+}
+
+/* The FIRST_FRAME flag round-trips, because it is what tells the transcript a
+   still image stands for an animation, and it is persisted in the snapshot. */
+static int test_content_flags_round_trip(void) {
+    char *doc = image_doc("2", "look", ",\"flags\":1", NULL);
+    CHECK(doc);
+    BlobSink sink;
+    sink_init(&sink);
+    ChatImportBlobs blobs;
+    sink_blobs(&sink, &blobs);
+    Chat *dest = new_chat();
+    CHECK(dest);
+    CHECK(chat_import_json(dest, doc, strlen(doc), &blobs, NULL) ==
+        CHAT_IMPORT_OK);
+    const ChatMessage *m = &dest->conversations[1].messages[0];
+    ChatPartView view;
+    CHECK(chat_message_part_at(m, 1, &view));
+    CHECK(view.kind == CHAT_PART_IMAGE);
+    CHECK(view.flags == CHAT_PART_FLAG_FIRST_FRAME);
+    free(doc);
+    chat_dispose(dest);
+    free(dest);
     return 0;
 }
 
@@ -828,6 +1451,18 @@ static const ImportTest import_tests[] = {
     { "markdown_capacity", test_markdown_capacity },
     { "markdown_id_exhaustion", test_markdown_id_exhaustion },
     { "markdown_allocation_failure", test_markdown_allocation_failure },
+    { "version_2_round_trip", test_version_2_round_trip },
+    { "version_gate", test_version_gate },
+    { "content_strictness", test_content_strictness },
+    { "content_flags_round_trip", test_content_flags_round_trip },
+    { "content_projection_mismatch", test_content_projection_mismatch },
+    { "content_image_only", test_content_image_only },
+    { "markdown_sidecar", test_markdown_sidecar },
+    { "sidecar_missing_is_attachment_io", test_sidecar_missing_is_attachment_io },
+    { "sidecar_reference_rejected", test_sidecar_reference_rejected },
+    { "file_rejected_in_json", test_file_rejected_in_json },
+    { "stage_failure_is_transactional", test_stage_failure_is_transactional },
+    { "attachment_table_merge", test_attachment_table_merge },
 };
 
 int main(void) {

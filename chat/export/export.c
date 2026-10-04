@@ -1,5 +1,7 @@
 #include "chat/export/export.h"
 
+#include "chat/export/package.h"
+
 #include <inttypes.h>
 #include <locale.h>
 #include <math.h>
@@ -14,6 +16,14 @@ typedef struct {
     JsonBuf *out;
     size_t limit;
     bool failed;
+    /* The live Chat, so an IMAGE part can be resolved to its attachment
+       record. Borrowed for the call, like every other serializer input. */
+    const Chat *chat;
+    /* Set for the Markdown path, which emits sidecar references and must not
+       read a byte: writing the package afterwards is the caller's job. */
+    const ChatExportBlobs *blobs;
+    const wchar_t *sidecar_stem;
+    bool markdown;
 } Export;
 
 static bool export_fail(Export *e) {
@@ -138,6 +148,114 @@ static bool export_sep(Export *e, bool last) {
     return export_raw(e, last ? "\n" : ",\n", last ? 1 : 2);
 }
 
+/* Emits a narrow ASCII value as a JSON string. An attachment record's MIME
+   and digest are both constrained to bytes that need no escape -- the MIME is
+   printable ASCII without a quote or a backslash, and the digest is 64
+   lowercase hex -- so this validates rather than escapes. Failing on an
+   unexpected byte keeps a malformed record from producing a document that no
+   parser could read. */
+static bool export_string_ascii(Export *e, int indent, const char *name,
+    const char *value) {
+    size_t length;
+    if (!value) return export_fail(e);
+    length = strlen(value);
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (c < 0x20 || c > 0x7e || c == '"' || c == '\\')
+            return export_fail(e);
+    }
+    if (!export_key(e, indent, name)) return false;
+    if (!export_raw(e, "\"", 1)) return false;
+    if (!export_raw(e, value, length)) return false;
+    return export_raw(e, "\"", 1);
+}
+
+/* Builds the shared "<stem>.attachments/<64-hex>.<ext>" reference. The payload
+   emits this literal; the body emits it percent-encoded. One builder, so the
+   two can never name different files. A NULL stem fails here rather than at a
+   use site: without it no reference could be resolved by a reader. */
+static bool export_build_sidecar_reference(const Export *e,
+    const char digest[65], const char ext[8], wchar_t *out, size_t capacity) {
+    size_t used = 0;
+    const char *tail[3];
+    if (!e->sidecar_stem) return false;
+    tail[0] = CHAT_EXPORT_SIDECAR_SUFFIX "/";
+    tail[1] = digest;
+    tail[2] = ".";
+    /* The stem first, then the folder suffix, then the digest, a dot and the
+       extension: the reference is a relative path whose leading component is
+       the package folder the stem names. */
+    for (const wchar_t *p = e->sidecar_stem; *p; p++) {
+        if (used + 1 >= capacity) return false;
+        out[used++] = *p;
+    }
+    for (size_t i = 0; i < 3; i++)
+        for (const char *p = tail[i]; *p; p++) {
+            if (used + 1 >= capacity) return false;
+            out[used++] = (wchar_t)(unsigned char)*p;
+        }
+    for (const char *p = ext; *p; p++) {
+        if (used + 1 >= capacity) return false;
+        out[used++] = (wchar_t)(unsigned char)*p;
+    }
+    out[used] = 0;
+    return true;
+}
+
+/* The Markdown payload's `file` value: the literal relative path, which is what
+   an importer validates and resolves. Deliberately NOT percent-encoded: the
+   payload is the authoritative document, and keeping it literal is what lets
+   the importer's shape check be a plain token test. Only the presentation link
+   is escaped. */
+static bool export_sidecar_reference(Export *e, int indent,
+    const char digest[65], const char ext[8]) {
+    wchar_t reference[512];
+    if (!export_build_sidecar_reference(e, digest, ext, reference,
+            sizeof reference / sizeof reference[0]))
+        return export_fail(e);
+    if (!export_key(e, indent, "file")) return false;
+    /* export_json_string writes its own quotes. */
+    return export_json_string(e, reference);
+}
+
+/* The JSON payload's `data` value: the managed bytes as base64. One blob is
+   resident at a time and is released before the next part, so a document with
+   many attachments never holds more than one. The encoded length is
+   preflighted against the same limit every other append uses, so an oversized
+   payload fails before the buffer grows rather than after. */
+static bool export_image_bytes(Export *e, int indent,
+    const ChatAttachmentMeta *rec) {
+    unsigned char *bytes = NULL;
+    size_t length = 0, encoded;
+    bool appended;
+    if (!e->blobs || !e->blobs->read || !e->blobs->discard)
+        return export_fail(e);
+    if (!e->blobs->read(e->blobs->user, rec->digest, &bytes, &length))
+        return export_fail(e);
+    if (!bytes || !length || length != rec->bytes) {
+        /* The record is the authority on how long the blob is, and the request
+           path enforces the same agreement before sending. An export trusting
+           a different length than it names would produce a document whose
+           digest does not describe its contents. */
+        if (bytes) e->blobs->discard(e->blobs->user, bytes, length);
+        return export_fail(e);
+    }
+    encoded = json_encoded_base64_size(length);
+    if (encoded == SIZE_MAX || !export_room(e, encoded)) {
+        e->blobs->discard(e->blobs->user, bytes, length);
+        return export_fail(e);
+    }
+    if (!export_key(e, indent, "data"))
+        return false;
+    /* json_buf_append_base64 writes the payload only, so the surrounding
+       quotes are this function's job. */
+    if (!export_raw(e, "\"", 1)) return false;
+    appended = json_buf_append_base64(e->out, bytes, length);
+    e->blobs->discard(e->blobs->user, bytes, length);
+    if (!appended) return export_fail(e);
+    return export_raw(e, "\"", 1);
+}
+
 /* Checked enum stringification: an unknown value fails rather than emitting a
    silently wrong token. The switches cover every enumerator, so a future role
    or backend is a compile-time prompt to extend them. */
@@ -167,6 +285,96 @@ static const char *backend_token(ChatBackend backend) {
     case CHAT_BACKEND_OLLAMA: return "ollama";
     }
     return NULL;
+}
+
+/* Resolves the attachment record an IMAGE part names. The record -- not the
+   part's own copy of the metadata -- is the single authority for digest,
+   MIME, byte length and display name, exactly as the snapshot decoder and the
+   request encoder both already treat it. A part whose id resolves to nothing
+   is a dangling reference and fails the export: emitting a reference that
+   cannot be filled would be the format-5 failure, where an older reader
+   silently drops what it does not understand. */
+static const ChatAttachmentMeta *export_image_record(const Export *e,
+    const ChatPart *part) {
+    if (part->kind != CHAT_PART_IMAGE) return NULL;
+    if (!part->u.image.attachment_id) return NULL;
+    return chat_attachment(e->chat, part->u.image.attachment_id);
+}
+
+/* The `content` array of a message that carries parts. `inner` is the
+   indentation of the message's own keys, so array elements sit two deeper and
+   their keys two deeper again. */
+static bool export_content(Export *e, const ChatMessage *m, int inner) {
+    if (!export_key(e, inner, "content")) return false;
+    if (!export_raw(e, "[\n", 2)) return false;
+    for (size_t i = 0; i < m->parts.count; i++) {
+        const ChatPart *part = &m->parts.items[i];
+        int pin = inner + 2;
+        bool more = i + 1 < m->parts.count;
+        if (!export_pad(e, pin)) return false;
+        if (!export_raw(e, "{\n", 2)) return false;
+        if (part->kind == CHAT_PART_TEXT) {
+            if (!export_token(e, pin + 2, "type", "text")) return false;
+            if (!export_sep(e, false)) return false;
+            if (!export_string(e, pin + 2, "text", part->u.text.data))
+                return false;
+        } else {
+            const ChatAttachmentMeta *rec = export_image_record(e, part);
+            char ext[8];
+            if (!rec || !chat_export_sidecar_extension(rec->mime, ext))
+                return export_fail(e);
+            /* The MIME has to be nameable before anything is emitted, so a
+               document is never published naming a file no extension map
+               covers. */
+            if (e->markdown) {
+                if (!e->blobs || !e->blobs->reference) return export_fail(e);
+                if (!e->blobs->reference(e->blobs->user, rec->digest, ext,
+                        rec->bytes))
+                    return export_fail(e);
+            }
+            if (!export_token(e, pin + 2, "type", "image")) return false;
+            if (!export_sep(e, false)) return false;
+            if (!export_string_ascii(e, pin + 2, "mime", rec->mime))
+                return false;
+            if (!export_sep(e, false)) return false;
+            if (rec->pixel_width) {
+                if (!export_u64(e, pin + 2, "pixel_width", rec->pixel_width))
+                    return false;
+                if (!export_sep(e, false)) return false;
+            }
+            if (rec->pixel_height) {
+                if (!export_u64(e, pin + 2, "pixel_height", rec->pixel_height))
+                    return false;
+                if (!export_sep(e, false)) return false;
+            }
+            if (!export_string(e, pin + 2, "display_name",
+                    rec->display_name)) return false;
+            if (!export_sep(e, false)) return false;
+            if (!export_string_ascii(e, pin + 2, "sha256", rec->digest))
+                return false;
+            if (!export_sep(e, false)) return false;
+            if (e->markdown) {
+                if (!e->sidecar_stem) return export_fail(e);
+                if (!export_sidecar_reference(e, pin + 2, rec->digest, ext))
+                    return false;
+            } else {
+                if (!export_image_bytes(e, pin + 2, rec)) return false;
+            }
+            if (part->flags) {
+                if (!export_sep(e, false)) return false;
+                if (!export_u64(e, pin + 2, "flags", part->flags))
+                    return false;
+            }
+        }
+        if (!export_raw(e, "\n", 1)) return false;
+        if (!export_pad(e, pin)) return false;
+        if (!export_raw(e, "}", 1)) return false;
+        /* Written where the brace is, so a following element gets its comma in
+           the right place. */
+        if (!export_raw(e, more ? ",\n" : "\n", more ? 2 : 1)) return false;
+    }
+    if (!export_pad(e, inner)) return false;
+    return export_raw(e, "]\n", 2);
 }
 
 static bool export_message(Export *e, const ChatMessage *m, int indent,
@@ -222,7 +430,18 @@ static bool export_message(Export *e, const ChatMessage *m, int indent,
     }
     if (!export_raw(e, "\n", 1)) return false;
     if (!export_pad(e, inner)) return false;
-    if (!export_raw(e, "}\n", 2)) return false;
+    if (!export_raw(e, "}", 1)) return false;
+    /* The ordered content parts are emitted LAST, after the audit block, for
+       the same reason the snapshot appends `parts` after `reasoning_ms` and
+       `backend`: an absent optional field must cost a message with none
+       exactly zero bytes, which is what keeps a text-only export identical to
+       what it always was. The member separator is therefore written here,
+       where the closing brace is, rather than after the newline that would
+       follow it. */
+    if (m->parts.items) {
+        if (!export_sep(e, false)) return false;
+        if (!export_content(e, m, inner)) return false;
+    } else if (!export_raw(e, "\n", 1)) return false;
     if (!export_pad(e, indent)) return false;
     return export_raw(e, last ? "}\n" : "},\n", last ? 2 : 3);
 }
@@ -279,6 +498,19 @@ static bool export_conversation(Export *e, const ChatConversation *c,
     return export_raw(e, last ? "}\n" : "},\n", last ? 2 : 3);
 }
 
+/* True when the selection carries at least one message with a content parts
+   array. This is the whole of the version decision: a message with no parts
+   emits exactly the fields it always has, so a document that gains no parts
+   gains no bytes and no version either. */
+static bool export_selection_has_parts(const Chat *chat, int first, int count) {
+    for (int i = 0; i < count; i++) {
+        const ChatConversation *c = &chat->conversations[first + i];
+        for (size_t j = 0; j < c->message_count; j++)
+            if (c->messages[j].parts.items) return true;
+    }
+    return false;
+}
+
 /* The one authoritative payload shared by both formats. */
 static bool export_build_payload(Export *e, const Chat *chat, int conversation,
     bool all, int64_t exported_at) {
@@ -296,7 +528,12 @@ static bool export_build_payload(Export *e, const Chat *chat, int conversation,
     if (!export_raw(e, "{\n", 2)) return false;
     if (!export_string(e, 2, "format", L"darkchat.export")) return false;
     if (!export_sep(e, false)) return false;
-    if (!export_i64(e, 2, "version", 1)) return false;
+    /* Content-derived, exactly as the snapshot's format_version_for is. The
+       version only rises when the grammar means something an earlier reader
+       would silently drop, so a text-only export stays byte-for-byte
+       importable by every earlier build. */
+    if (!export_i64(e, 2, "version",
+            export_selection_has_parts(chat, first, count) ? 2 : 1)) return false;
     if (!export_sep(e, false)) return false;
     if (!export_i64(e, 2, "exported_at", exported_at)) return false;
     if (!export_sep(e, false)) return false;
@@ -459,6 +696,37 @@ static bool export_reasoning_block(Export *e, const wchar_t *reasoning) {
     return export_raw(e, "\n", 1);
 }
 
+/* One presentation image link, "![alt](destination)". The alt text and the
+   destination are escaped separately because they carry different risks: the
+   name is user text that could otherwise open a second link, and the
+   destination is a URL whose '#' and '%' would silently retarget or truncate
+   it. Percent-encoding also removes the need for angle brackets, so there is
+   one mechanism rather than two. */
+static bool export_markdown_image(Export *e, const ChatPart *part) {
+    const ChatAttachmentMeta *rec = export_image_record(e, part);
+    wchar_t reference[512], destination[1024], alt[192];
+    char ext[8];
+    if (!rec || !chat_export_sidecar_extension(rec->mime, ext))
+        return export_fail(e);
+    if (!export_build_sidecar_reference(e, rec->digest, ext, reference,
+            sizeof reference / sizeof reference[0]))
+        return export_fail(e);
+    if (!chat_export_markdown_destination(reference, destination,
+            sizeof destination / sizeof destination[0]))
+        return export_fail(e);
+    if (!chat_export_markdown_alt(rec->display_name, alt,
+            sizeof alt / sizeof alt[0]))
+        return export_fail(e);
+    if (!export_utf8(e, L"![")) return false;
+    if (!export_utf8(e, alt)) return false;
+    if (!export_utf8(e, L"](")) return false;
+    if (!export_utf8(e, destination)) return false;
+    if (!export_utf8(e, L")\n")) return false;
+    /* Two newlines keep the next heading out of this paragraph, matching the
+       section break every other block in the body ends with. */
+    return export_raw(e, "\n", 1);
+}
+
 /* Presentation only: the exact title/text/reasoning stay in the payload. */
 static bool export_markdown_body(Export *e, const Chat *chat, int first,
     int count) {
@@ -490,6 +758,17 @@ static bool export_markdown_body(Export *e, const Chat *chat, int first,
                 if (!export_reasoning_block(e, reasoning)) return false;
                 if (!ensure_section_break(e, 1)) return false;
             }
+            /* Image parts render as ordinary Markdown image references after
+               the text, in part order, so a reader sitting beside the folder
+               shows what the payload describes. An image-only turn emits just
+               these: the text above is already skipped when the projection is
+               empty. */
+            if (m->parts.items)
+                for (size_t p = 0; p < m->parts.count; p++) {
+                    const ChatPart *part = &m->parts.items[p];
+                    if (part->kind != CHAT_PART_IMAGE) continue;
+                    if (!export_markdown_image(e, part)) return false;
+                }
         }
     }
     if (e->out->length && e->out->data[e->out->length - 1] != '\n')
@@ -498,10 +777,11 @@ static bool export_markdown_body(Export *e, const Chat *chat, int first,
 }
 
 bool chat_export_json_limited(const Chat *chat, int conversation, bool all,
-    int64_t exported_at, size_t limit, JsonBuf *out) {
+    int64_t exported_at, size_t limit, const ChatExportBlobs *blobs,
+    JsonBuf *out) {
     if (!out) return false;
     *out = (JsonBuf){0};
-    Export e = { out, limit, false };
+    Export e = { out, limit, false, chat, blobs, NULL, false };
     if (!export_build_payload(&e, chat, conversation, all, exported_at)) {
         json_buf_free(out);
         *out = (JsonBuf){0};
@@ -511,17 +791,18 @@ bool chat_export_json_limited(const Chat *chat, int conversation, bool all,
 }
 
 bool chat_export_json(const Chat *chat, int conversation, bool all,
-    int64_t exported_at, JsonBuf *out) {
+    int64_t exported_at, const ChatExportBlobs *blobs, JsonBuf *out) {
     return chat_export_json_limited(chat, conversation, all, exported_at,
-        CHAT_EXPORT_LIMIT, out);
+        CHAT_EXPORT_LIMIT, blobs, out);
 }
 
 bool chat_export_markdown_limited(const Chat *chat, int conversation, bool all,
-    int64_t exported_at, size_t limit, JsonBuf *out) {
+    int64_t exported_at, size_t limit, const ChatExportBlobs *blobs,
+    const wchar_t *sidecar_stem, JsonBuf *out) {
     if (!out) return false;
     *out = (JsonBuf){0};
     JsonBuf payload = {0};
-    Export pe = { &payload, limit, false };
+    Export pe = { &payload, limit, false, chat, blobs, sidecar_stem, true };
     if (!export_build_payload(&pe, chat, conversation, all, exported_at)) {
         json_buf_free(&payload);
         return false;
@@ -535,7 +816,11 @@ bool chat_export_markdown_limited(const Chat *chat, int conversation, bool all,
         first = conversation;
         count = 1;
     }
-    Export e = { out, limit, false };
+    /* The payload pass already reported every sidecar through
+       blobs->reference, and the body pass re-derives the same references from
+       the same records, so the caller's file set stays consistent whether it
+       dedupes on (digest, extension) or reports twice per part. */
+    Export e = { out, limit, false, chat, blobs, sidecar_stem, true };
     bool ok = export_cstr(&e, "<!-- darkchat.export:\n");
     /* Escape `<`/`>` in the payload. These characters can only occur inside
        JSON strings, where \uXXXX is legal, and escaping them guarantees the
@@ -565,7 +850,8 @@ bool chat_export_markdown_limited(const Chat *chat, int conversation, bool all,
 }
 
 bool chat_export_markdown(const Chat *chat, int conversation, bool all,
-    int64_t exported_at, JsonBuf *out) {
+    int64_t exported_at, const ChatExportBlobs *blobs,
+    const wchar_t *sidecar_stem, JsonBuf *out) {
     return chat_export_markdown_limited(chat, conversation, all, exported_at,
-        CHAT_EXPORT_LIMIT, out);
+        CHAT_EXPORT_LIMIT, blobs, sidecar_stem, out);
 }

@@ -1,4 +1,5 @@
 #include "chat/persistence/attachments.h"
+#include "chat/core/sha256.h"
 #include "chat/core/chat.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -173,6 +174,18 @@ int main(void) {
         memset(buf, 'a', 64);
         attachment_digest_hex(buf, 64, hex);
         CHECK(!strcmp(hex, "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"));
+    }
+    /* The canonical multi-block vector, fed through the pure entry point the
+       importer uses so both sides of a digest comparison share one definition.
+       A million bytes is well past every block boundary that could be
+       mis-counted. */
+    {
+        static char million[1000000];
+        memset(million, 'a', sizeof million);
+        sha256_hex(million, sizeof million, hex);
+        CHECK(!strcmp(hex, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"));
+        attachment_digest_hex(million, sizeof million, hex);
+        CHECK(!strcmp(hex, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"));
     }
 
     swprintf(dir, 256, L"build\\attach-test-%lu", (unsigned long)GetCurrentProcessId());
@@ -537,6 +550,71 @@ int main(void) {
             CHECK(attachment_store_collect(&store, NULL, 0));
             CHECK(!attachment_store_get(&store, dorphan, &data, &n));
             CHECK(file_has(foreign1) && file_has(foreign2) && file_has(foreign3));
+        }
+
+        /* --- write_blob: the id-free durable write the importer uses, and
+           one blob legitimately serving two MIME records. --- */
+        {
+            const char payload[] = "write-blob-bytes";
+            char digest[65], again[65], expect[65];
+            uint64_t baseline = next_id;
+            int before = count_top_managed(&store);
+            CHECK(attachment_store_write_blob(&store, payload,
+                sizeof payload - 1, digest, &created));
+            CHECK(created);
+            /* No id is allocated: the counter belongs to the caller. */
+            CHECK(next_id == baseline);
+            attachment_digest_hex(payload, sizeof payload - 1, expect);
+            CHECK(!strcmp(digest, expect));
+            CHECK(count_top_managed(&store) == before + 1);
+            CHECK(attachment_store_get(&store, digest, &data, &n));
+            CHECK(n == sizeof payload - 1 && !memcmp(data, payload, n));
+            free(data); data = NULL;
+
+            /* Identical bytes under two MIMEs share one blob. This is exactly
+               why an export package keys its file set on (digest, extension):
+               one blob can require two sidecar names. */
+            {
+                ChatAttachmentMeta png, jpeg;
+                bool made_png = false, made_jpeg = false;
+                CHECK(attachment_store_put(&store, payload, sizeof payload - 1,
+                    "image/png", L"photo.png", &png, &made_png));
+                CHECK(attachment_store_put(&store, payload, sizeof payload - 1,
+                    "image/jpeg", L"photo.jpg", &jpeg, &made_jpeg));
+                CHECK(!strcmp(png.digest, jpeg.digest) &&
+                    !strcmp(png.digest, digest));
+                CHECK(png.id != jpeg.id);            /* two identities */
+                CHECK(png.bytes == jpeg.bytes);
+                CHECK(!made_png && !made_jpeg);      /* but one file */
+                CHECK(count_top_managed(&store) == before + 1);
+            }
+
+            /* A repeat write verifies and reuses instead of rewriting, and
+               still consumes no id. */
+            CHECK(attachment_store_write_blob(&store, payload,
+                sizeof payload - 1, again, &created));
+            CHECK(!created);
+            CHECK(!strcmp(digest, again));
+
+            /* Validation precedes any I/O, as it does for put. */
+            CHECK(!attachment_store_write_blob(&store, NULL, 4, digest, &created));
+            CHECK(!attachment_store_write_blob(&store, "abcd", 0, digest, &created));
+            CHECK(!attachment_store_write_blob(&store, "abcd", 4, NULL, &created));
+            {
+                uint64_t before_failure = next_id;
+                AttachmentIo saved = store.io;
+                fail_write = true;
+                store.io.write_atomic = fault_write;
+                CHECK(!attachment_store_write_blob(&store, "rejected", 7,
+                    digest, &created));
+                CHECK(next_id == before_failure);
+                store.io = saved;
+                fail_write = false;
+            }
+            /* A rejected call clears the out digest, so a caller cannot read a
+               failure as a valid identity. */
+            CHECK(!attachment_store_write_blob(&store, NULL, 4, digest, NULL));
+            CHECK(!digest[0]);
         }
 
         /* remove failure during sweep: continues other work, reports false. */

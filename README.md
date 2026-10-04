@@ -177,6 +177,20 @@ per-conversation overrides, and the explicitly-empty prompt override) is
 version-gated in both directions, so an older binary can never silently
 erase it.
 
+Conversation export is deterministic and byte-exact, and its document version is
+content-derived: a conversation whose messages carry no attachments exports
+exactly what it always did, so older builds keep importing it, while only real
+multimodal content raises the version. JSON export stays a single file with the
+image bytes embedded. Markdown export of a conversation containing attachments
+becomes a package — the `.md` plus an `.attachments` folder beside it, with the
+sidecars written first so a failure never replaces a good export with a broken
+one.
+
+> **A complete backup is the `%LOCALAPPDATA%\DarkChat` directory as a tree.**
+> Once a conversation contains attachments, copying `state.jsonl` alone is no
+> longer enough: the managed image blobs live under `attachments\`. There is no
+> archive format and no whole-store export.
+
 State is autosaved roughly once per second while dirty and immediately after important lifecycle actions such as sending, stopping, completing, deleting, or closing.
 
 A running assistant message is persisted before the network request begins. If the application closes or crashes during generation, the partial response is retained and recovered as Interrupted rather than silently marked successful.

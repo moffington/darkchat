@@ -9,8 +9,10 @@
 #include "chat/export/export.h"
 
 bool chat_export_json_limited(const Chat *chat, int conversation, bool all,
-    int64_t exported_at, size_t limit, JsonBuf *out);
+    int64_t exported_at, size_t limit, const ChatExportBlobs *blobs,
+    JsonBuf *out);
 bool chat_export_markdown_limited(const Chat *chat, int conversation, bool all,
-    int64_t exported_at, size_t limit, JsonBuf *out);
+    int64_t exported_at, size_t limit, const ChatExportBlobs *blobs,
+    const wchar_t *sidecar_stem, JsonBuf *out);
 
 #endif

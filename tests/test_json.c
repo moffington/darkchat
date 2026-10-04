@@ -524,6 +524,69 @@ static void test_base64(void) {
     json_buf_free(&buf);
 }
 
+/* The decode side, which consumes an exported attachment. It has to be strict
+   where the encoder is simple: a base64 string that decodes to bytes other
+   than the ones a document claims would import as a valid-looking attachment
+   with the wrong content, and every ambiguity below is one the decoder refuses
+   rather than resolves by guessing. */
+static void test_base64_decode(void) {
+    /* Round-trip every boundary and a spread of larger inputs against the
+       encoder, which is the property that actually matters. */
+    size_t sizes[] = { 1, 2, 3, 4, 5, 6, 7, 100, 999, 1000, 4096, 65537 };
+    for (size_t i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+        size_t n = sizes[i];
+        unsigned char *raw = (unsigned char *)malloc(n);
+        check(raw != NULL, "round-trip: input allocates");
+        for (size_t k = 0; k < n; k++)
+            raw[k] = (unsigned char)((k * 37 + i * 11) & 0xff);
+        JsonBuf buf;
+        json_buf_init(&buf, 8);
+        check(json_buf_append_base64(&buf, raw, n), "round-trip: encodes");
+        size_t got = 12345;
+        unsigned char *back = json_base64_decode(buf.data, buf.length, &got);
+        check(back != NULL, "round-trip: decodes");
+        check(got == n, "round-trip: reports the original length");
+        check(n == 0 || (back && !memcmp(back, raw, n)),
+            "round-trip: recovers the exact bytes");
+        free(back);
+        json_buf_free(&buf);
+        free(raw);
+    }
+    /* Every rejection clears the out length, so a caller cannot read a failure
+       as empty content. */
+    struct { const char *text; size_t n; const char *why; } bad[] = {
+        { "", 0, "an empty payload is not a valid encoding" },
+        { "TQ", 2, "a length that is not a multiple of four is rejected" },
+        { "TQ=", 3, "a partial group is rejected" },
+        { "TW*u", 4, "a character outside the alphabet is rejected" },
+        { "TW u", 4, "an embedded space is rejected" },
+        { "TW-u", 4, "a character outside the standard alphabet is rejected" },
+        { "=WFU", 4, "padding in the leading position is rejected" },
+        { "T= FU", 5, "padding in a non-final group is rejected" },
+        { "TWF==", 5, "excessive padding is rejected" },
+        { "T=Q=", 4, "padding in the third position is rejected" },
+        /* Non-canonical tails. A group holds 24 bits and padding discards the
+           low ones, so a discarded bit that is set would mean two spellings of
+           the same bytes. "TQ==" is the canonical one byte 'M'; "TR==" would
+           be a second spelling of nothing at all. */
+        { "TR==", 4, "a non-zero discarded tail bit is rejected" },
+        { "TWB=", 4, "a non-zero tail byte with one pad is rejected" },
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        size_t got = 999;
+        unsigned char *out = json_base64_decode(bad[i].text, bad[i].n, &got);
+        check(out == NULL, bad[i].why);
+        check(got == 0, "a rejected payload reports zero length");
+        free(out);
+    }
+    /* A NULL text is a rejection, not a crash. */
+    check(json_base64_decode(NULL, 4, NULL) == NULL,
+        "a NULL payload is rejected");
+    check(json_base64_decode("TWFu", 4, NULL) != NULL,
+        "a NULL out pointer still decodes");
+    puts("ok: base64 decode round-trips the encoder and rejects every ambiguity");
+}
+
 /* String-array membership. The contract that matters to a caller is the
    difference between "the whole array was read and the needle is not in it"
    and "the array could not be read": only the first licenses a conclusion.
@@ -659,6 +722,7 @@ int main(void) {
     test_queries();
     test_encoded_size();
     test_base64();
+    test_base64_decode();
     test_buffers();
     test_utf16_conversion();
     test_field_kind();

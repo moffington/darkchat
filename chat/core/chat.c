@@ -627,6 +627,17 @@ static bool mime_shape_ok(const char *s) {
     return true;
 }
 
+bool chat_attachment_reserve(Chat *chat, size_t capacity) {
+    ChatAttachmentMeta *grown;
+    if (!chat || capacity <= chat->attachment_capacity) return chat != NULL;
+    grown = (ChatAttachmentMeta *)realloc(chat->attachments,
+        capacity * sizeof *grown);
+    if (!grown) return false;
+    chat->attachments = grown;
+    chat->attachment_capacity = capacity;
+    return true;
+}
+
 bool chat_attachment_add(Chat *chat, const ChatAttachmentMeta *meta) {
     if (!chat || !meta || !meta->id) return false;
     if (chat_attachment(chat,meta->id)) return false;

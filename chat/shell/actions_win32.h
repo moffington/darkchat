@@ -90,6 +90,14 @@ typedef enum {
     that check. */
 ChatFileReadResult chat_read_file_utf8_limited(const wchar_t *path,
     size_t limit, char **data, size_t *length);
+/* Whole-file BINARY read with the same size preflight and result mapping. No
+   BOM is stripped and no UTF-8 is validated: the caller is reading opaque
+   attachment bytes whose integrity is proved by the digest the export
+   declares. On success `*data` owns a buffer (release with free) and `*length`
+   is its exact byte count; on every failure `*data` is NULL and `*length` is
+   0. */
+ChatFileReadResult chat_read_file_bytes_limited(const wchar_t *path,
+    size_t limit, unsigned char **data, size_t *length);
 ChatFileReadResult chat_read_file_utf8(const wchar_t *path, char **data,
     size_t *length);
 

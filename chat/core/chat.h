@@ -424,6 +424,12 @@ void chat_dispose(Chat *chat);
    makes the encoder emit the `parts` field). */
 const ChatAttachmentMeta *chat_attachment(const Chat *chat, uint64_t id);
 bool chat_attachment_add(Chat *chat, const ChatAttachmentMeta *meta);
+/* Ensures room for at least `capacity` records without reallocating, so a
+   caller that must add several records atomically can pay for the growth once
+   and then treat every add as infallible. Does not shrink and never drops a
+   record. False only on allocation failure, in which case the table is
+   unchanged. */
+bool chat_attachment_reserve(Chat *chat, size_t capacity);
 bool chat_has_any_parts(const Chat *chat);
 bool chat_has_any_attachments(const Chat *chat);
 /* Drops every table entry referenced by neither any live message part (in

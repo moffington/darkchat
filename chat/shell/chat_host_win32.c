@@ -6,10 +6,12 @@
 #include "chat/generation/completion_request.h"
 #include "chat/generation/context.h"
 #include "chat/core/search.h"
+#include "chat/core/image_policy.h"
 #include "chat/persistence/storage.h"
 #include "chat/persistence/saver.h"
 #include "chat/persistence/attachments.h"
 #include "chat/export/export.h"
+#include "chat/export/package.h"
 #include "chat/import/import.h"
 #include "chat/shell/actions_win32.h"
 #include "chat/models/model_catalog.h"
@@ -98,6 +100,13 @@ typedef struct {
        survive a store that cannot be created, and a send that needs a blob
        then fails with the named load error instead. */
     ChatAttachmentStore attachments;
+    /* Digests written by SUCCESSFUL imports this session, in the live set of a
+       later import's rollback sweep. A failed import's digests are tracked in
+       a separate attempt-local list and deliberately never promoted here:
+       that is what lets the sweep actually reclaim them. The later attach UI
+       extends this with ingest and pending-list digests. */
+    char (*attachment_session_digests)[65];
+    size_t attachment_session_count, attachment_session_capacity;
     /* Background snapshot writer. Mutations is the counter every save handoff
        captures; last_submitted_attempt is the newest accepted handoff and
        handled_attempt the newest attempt whose result has been interpreted,
@@ -2176,21 +2185,160 @@ static RichTextControl *transcript_selected_surface(ChatHost *host) {
     return NULL;
 }
 
+/* --- attachment package I/O ----------------------------------------------- */
+
+/* One sidecar the payload named, recorded while the serializer reports it. */
+typedef struct {
+    char digest[65];
+    char ext[8];
+    bool existed;      /* already on disk before this attempt */
+} PackageFile;
+
+typedef struct {
+    PackageFile *items;
+    size_t count, capacity;
+} PackageSet;
+
+/* The single context handed to the export callbacks. Both halves need the host
+   and the file set, and passing the host itself would hand the reference
+   callback something it cannot interpret. */
+typedef struct {
+    ChatHost *host;
+    PackageSet set;
+} ExportContext;
+
+/* Recorded per IMAGE part, not per distinct digest: the store's filename
+   carries no MIME hint, so one blob can legitimately back two records that
+   differ only in MIME and the package then needs two files holding identical
+   bytes. Deduping on (digest, extension) is what keeps the package complete. */
+static bool package_record(void *user, const char digest[65],
+    const char *extension, size_t bytes) {
+    ExportContext *ctx = (ExportContext *)user;
+    PackageSet *set = &ctx->set;
+    (void)bytes;
+    for (size_t i = 0; i < set->count; i++)
+        if (!strcmp(set->items[i].digest, digest) &&
+            !strcmp(set->items[i].ext, extension))
+            return true;
+    if (set->count == set->capacity) {
+        size_t capacity = set->capacity ? set->capacity * 2 : 16;
+        PackageFile *grown = (PackageFile *)realloc(set->items,
+            capacity * sizeof *grown);
+        if (!grown) return false;
+        set->items = grown;
+        set->capacity = capacity;
+    }
+    PackageFile *slot = &set->items[set->count++];
+    memset(slot, 0, sizeof *slot);
+    memcpy(slot->digest, digest, 65);
+    memcpy(slot->ext, extension, strlen(extension) + 1);
+    slot->existed = false;
+    return true;
+}
+
+/* The JSON payload embeds bytes, so it needs the store to hand them over. The
+   store allocates; the serializer releases through discard as soon as the
+   bytes are in the buffer, so only one is resident at a time. */
+static bool package_read_bytes(void *user, const char digest[65],
+    unsigned char **out, size_t *out_n) {
+    ExportContext *ctx = (ExportContext *)user;
+    return attachment_store_get(&ctx->host->attachments, digest, out, out_n);
+}
+
+static void package_discard_bytes(void *user, unsigned char *bytes,
+    size_t length) {
+    (void)user; (void)length;
+    free(bytes);
+}
+
+/* Writes every sidecar, then the .md, in that order.
+ *
+ * The order is the whole point: the .md is the only replaceable published
+ * artifact, and it is written last, so a failure anywhere before it leaves any
+ * package already at the destination exactly as it was. A sidecar created by
+ * this attempt is removed on the way out; a pre-existing one is never touched,
+ * because a content-addressed name that already holds these exact bytes is not
+ * ours to delete. The folder goes only when this attempt created it and it is
+ * left empty. */
+/* The directory part of `path`, including its trailing separator, so a
+   sidecar is joined beside the file the user chose. The scan position and the
+   remembered cut are separate: reusing one counter for both restarts the scan
+   at each separator and never terminates on a path that has any. */
+static void path_directory(const wchar_t *path, wchar_t *out, size_t capacity) {
+    size_t cut = 0;
+    if (out && capacity) out[0] = 0;
+    if (!path || !out || capacity < 2) return;
+    for (size_t i = 0; path[i]; i++)
+        if (path[i] == L'\\' || path[i] == L'/') cut = i + 1;
+    if (cut >= capacity) cut = capacity - 1;
+    memcpy(out, path, cut * sizeof(wchar_t));
+    out[cut] = 0;
+}
+static bool export_write_package(ChatHost *host, const wchar_t *path,
+    const wchar_t *stem, PackageSet *set, const char *data, size_t length) {
+    wchar_t folder[1024], file[1160], parent[1024];
+    size_t written = 0;
+    bool folder_created = false;
+    /* The folder lives BESIDE the .md the user chose, not in the process's
+       working directory. The payload's `file` values are relative to the .md,
+       so a folder anywhere else would publish a document whose images no
+       reader could resolve while still reporting success. */
+    path_directory(path, parent, sizeof parent / sizeof parent[0]);
+    int written_chars = swprintf(folder, 1024, L"%ls%ls.attachments",
+        parent, stem);
+    if (written_chars < 0 || written_chars >= 1024) return false;
+    if (!CreateDirectoryW(folder, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return false;
+    folder_created = GetLastError() != ERROR_ALREADY_EXISTS;
+    for (size_t i = 0; i < set->count; i++) {
+        const PackageFile *item = &set->items[i];
+        unsigned char *bytes = NULL;
+        size_t bytes_n = 0;
+        bool have_bytes = attachment_store_get(&host->attachments, item->digest,
+            &bytes, &bytes_n);
+        set->items[i].existed = false;
+        if (swprintf(file, 1160, L"%ls\\%hs.%hs", folder, item->digest,
+                item->ext) < 0)
+            goto failed;
+        set->items[i].existed =
+            GetFileAttributesW(file) != INVALID_FILE_ATTRIBUTES;
+        if (!have_bytes || !bytes || !bytes_n) {
+            free(bytes);
+            goto failed;
+        }
+        if (!chat_write_file_utf8(file, (const char *)bytes, bytes_n)) {
+            free(bytes);
+            goto failed;
+        }
+        free(bytes);
+        written++;
+    }
+    if (!chat_write_file_utf8(path, data, length)) return false;
+    if (folder_created) RemoveDirectoryW(folder);
+    return true;
+failed:
+    for (size_t i = 0; i < written; i++) {
+        if (set->items[i].existed) continue;
+        if (swprintf(file, 1160, L"%ls\\%hs.%hs", folder, set->items[i].digest,
+                set->items[i].ext) >= 0)
+            DeleteFileW(file);
+    }
+    /* Only when this attempt created it and nothing else moved in. */
+    if (folder_created) RemoveDirectoryW(folder);
+    return false;
+}
+
 /* Exports the active conversation, or every conversation, through the native
    save dialog. Read-only with respect to the session: the caller dispatches
    this before capture_settings(), so a cancelled or failed export never
-   captures a draft, dirties or saves state. */
+   captures a draft, dirties or saves state.
+
+   The dialog runs BEFORE serialization. That reordering is required rather
+   than cosmetic: a Markdown package names its sidecars after the .md the user
+   actually chose, so the path has to be known first. It also means a cancelled
+   export no longer builds a payload that could reach the size limit. */
 static void export_conversation(ChatHost *host, bool json, bool all) {
     Chat *chat = host->config.chat;
-    JsonBuf out = {0};
-    bool serialized = json
-        ? chat_export_json(chat, chat->active, all, chat_export_timestamp(), &out)
-        : chat_export_markdown(chat, chat->active, all, chat_export_timestamp(), &out);
-    if (!serialized) {
-        json_buf_free(&out);
-        set_status(host, L"Export failed: the conversation could not be serialized.");
-        return;
-    }
     wchar_t default_name[CHAT_TITLE_TEXT + 8];
     if (all)
         wcscpy(default_name, json ? L"darkchat-export.json"
@@ -2207,16 +2355,71 @@ static void export_conversation(ChatHost *host, bool json, bool all) {
         all ? L"Export all conversations" : L"Export conversation", filter,
         json ? L"json" : L"md", default_name, path,
         sizeof path / sizeof *path);
-    if (result == CHAT_FILE_DIALOG_CANCELLED) { json_buf_free(&out); return; }
+    if (result == CHAT_FILE_DIALOG_CANCELLED) return;
     if (result == CHAT_FILE_DIALOG_ERROR) {
-        json_buf_free(&out);
         set_status(host, L"Could not open the save dialog.");
         return;
     }
-    bool written = chat_write_file_utf8(path, out.data, out.length);
+    /* A stem is only consulted once the format actually needs one; a JSON
+       export and a parts-free Markdown export both ignore it entirely. */
+    wchar_t stem[CHAT_EXPORT_STEM_MAX + 1];
+    bool have_stem = !json &&
+        chat_export_sidecar_stem_from_path(path, stem,
+            sizeof stem / sizeof *stem);
+    ExportContext ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.host = host;
+    ChatExportBlobs blobs;
+    memset(&blobs, 0, sizeof blobs);
+    blobs.user = &ctx;
+    /* JSON embeds bytes; Markdown only names sidecars, so the read half is
+       left NULL and never called. */
+    blobs.read = json ? package_read_bytes : NULL;
+    blobs.discard = json ? package_discard_bytes : NULL;
+    blobs.reference = json ? NULL : package_record;
+
+    /* Without a usable stem the payload would name files no reader could
+       resolve, so this is decided BEFORE serializing: otherwise the failure
+       surfaces as a generic serialization error and the user is told nothing
+       about the file name that caused it. */
+    if (!json && chat_has_any_parts(chat) && !have_stem) {
+        set_status(host,
+            L"Export failed: this file name cannot hold an attachment package. Choose a name with letters, digits, spaces, dots, dashes or underscores.");
+        return;
+    }
+
+    JsonBuf out = {0};
+    bool serialized = json
+        ? chat_export_json(chat, chat->active, all,
+            chat_export_timestamp(), &blobs, &out)
+        : chat_export_markdown(chat, chat->active, all,
+            chat_export_timestamp(), &blobs, have_stem ? stem : NULL, &out);
+    if (!serialized) {
+        json_buf_free(&out);
+        free(ctx.set.items);
+        set_status(host, L"Export failed: the conversation could not be serialized.");
+        return;
+    }
+    /* No attachments means no package: the plain single-file write, byte for
+       byte what a text-only conversation has always produced. */
+    if (json || ctx.set.count == 0) {
+        bool written = chat_write_file_utf8(path, out.data, out.length);
+        json_buf_free(&out);
+        free(ctx.set.items);
+        set_status(host, written ? L"Export complete."
+                                 : L"Could not write the export file.");
+        return;
+    }
+    bool written = export_write_package(host, path, stem, &ctx.set, out.data,
+        out.length);
     json_buf_free(&out);
-    set_status(host, written ? L"Export complete."
-                             : L"Could not write the export file.");
+    free(ctx.set.items);
+    if (!written) {
+        set_status(host,
+            L"Export failed: an attachment could not be written. The previous export at this location is unchanged.");
+        return;
+    }
+    set_status(host, L"Export complete.");
 }
 
 static const wchar_t *import_failure_text(ChatImportStatus status,
@@ -2232,8 +2435,232 @@ static const wchar_t *import_failure_text(ChatImportStatus status,
         return L"Import failed: not enough conversation or message capacity.";
     case CHAT_IMPORT_OOM:
         return L"Import failed: not enough memory.";
+    case CHAT_IMPORT_ATTACHMENT_IO:
+        return L"Import failed: an attachment referenced by this export could not be read.";
     default:
         return L"Import failed.";
+    }
+}
+
+/* --- attachment resolution for import ------------------------------------- */
+
+/* Everything the rollback sweep needs to know about one import attempt. */
+typedef struct {
+    ChatHost *host;
+    /* The .md's own directory; sidecars are resolved under it and nowhere
+       else. Empty for a JSON import, which never resolves a sidecar. */
+    wchar_t directory[1024];
+    /* Digests this attempt wrote. NEVER part of the sweep's live set: that is
+       the whole reason they are tracked apart from the session list, so the
+       sweep can actually reclaim them. */
+    char (*attempt)[65];
+    size_t attempt_count, attempt_capacity;
+} ImportAttempt;
+
+static bool attempt_note(ImportAttempt *a, const char digest[65]) {
+    for (size_t i = 0; i < a->attempt_count; i++)
+        if (!strcmp(a->attempt[i], digest)) return true;
+    if (a->attempt_count == a->attempt_capacity) {
+        size_t capacity = a->attempt_capacity ? a->attempt_capacity * 2 : 8;
+        char (*grown)[65] = (char (*)[65])realloc(a->attempt,
+            capacity * sizeof *grown);
+        if (!grown) return false;
+        a->attempt = grown;
+        a->attempt_capacity = capacity;
+    }
+    memcpy(a->attempt[a->attempt_count++], digest, 65);
+    return true;
+}
+
+static void attempt_release(ImportAttempt *a) {
+    free(a->attempt);
+    a->attempt = NULL;
+    a->attempt_count = 0;
+    a->attempt_capacity = 0;
+}
+
+/* A sidecar, resolved relative to the .md's directory only. Both components
+   have already been proved by chat/export/package.h to be bounded tokens free
+   of separators, so this join cannot leave the directory. The digest the
+   importer compares against is the document's own, not the filename's, so a
+   reference pointing at the wrong folder fails that comparison rather than
+   importing different content. */
+/* A sidecar, resolved relative to the .md's directory only.
+ *
+ * The reference arrives as UTF-8, and it is DECODED before the path is built.
+ * Formatting narrow bytes straight into a wide buffer (the %hs conversion) only
+ * works because the bytes happen to be ASCII; a folder name holding a
+ * non-ASCII character would become one wide unit per UTF-8 byte, so the path
+ * would name a file that does not exist and the import would fail on a package
+ * this exporter had just written. The payload was already validated as strict
+ * UTF-8, so a valid reference decodes exactly. */
+static bool import_read_sidecar(void *user, const char *folder,
+    const char *basename, unsigned char **out, size_t *out_n) {
+    ImportAttempt *a = (ImportAttempt *)user;
+    wchar_t *wide_folder = json_utf8_to_utf16(folder, strlen(folder));
+    wchar_t *wide_base = json_utf8_to_utf16(basename, strlen(basename));
+    bool ok = false;
+    if (wide_folder && wide_base) {
+        wchar_t full[1200];
+        int written = swprintf(full, 1200, L"%ls\\%ls\\%ls", a->directory,
+            wide_folder, wide_base);
+        if (written >= 0 && written < 1200)
+            ok = chat_read_file_bytes_limited(full, CHAT_ATTACHMENT_MAX_BYTES,
+                out, out_n) == CHAT_FILE_READ_OK;
+    }
+    free(wide_folder);
+    free(wide_base);
+    return ok;
+}
+
+static void import_discard_bytes(void *user, unsigned char *bytes,
+    size_t length) {
+    (void)user; (void)length;
+    free(bytes);
+}
+
+/* Makes one attachment durable. Blob-then-state: the durable rename completes
+   here, before the importer publishes any metadata record naming this digest. */
+static bool import_stage_blob(void *user, const unsigned char *bytes,
+    size_t length, char out_digest[65], bool *out_created) {
+    ImportAttempt *a = (ImportAttempt *)user;
+    char digest[65];
+    bool created = false;
+    if (!attachment_store_write_blob(&a->host->attachments, bytes, length,
+            digest, &created))
+        return false;
+    memcpy(out_digest, digest, 65);
+    if (out_created) *out_created = created;
+    /* A failed note would mean the digest is untracked and a later sweep could
+       not tell it from a live one, so treat it as a write failure. */
+    return attempt_note(a, digest);
+}
+
+/* The live set OWNS its digests, one fixed 65-unit row each. The scan callback
+   hands out a pointer into a decoded snapshot table that the scan frees before
+   it returns, so retaining that pointer would leave the sweep reading freed
+   memory -- and reading whatever now occupies it as though it were a digest.
+
+   The rows are kept as rows rather than as pointers precisely so nothing here
+   has to lie about the type: the pointer array collect() wants is built from
+   these rows afterwards, once collection is finished and the rows will not
+   move again. */
+typedef struct {
+    char (*items)[65];
+    size_t count, capacity;
+    bool oom;
+} LiveSet;
+
+static bool live_add(LiveSet *set, const char digest[65]) {
+    if (set->count == set->capacity) {
+        size_t capacity = set->capacity ? set->capacity * 2 : 16;
+        char (*grown)[65] = (char (*)[65])realloc(set->items,
+            capacity * sizeof *grown);
+        if (!grown) { set->oom = true; return false; }
+        set->items = grown;
+        set->capacity = capacity;
+    }
+    memcpy(set->items[set->count], digest, 65);
+    set->count++;
+    return true;
+}
+
+/* Builds the pointer view collect() documents, pointing into rows that are
+   already final. NULL on allocation failure, which the caller treats as "do not
+   sweep" rather than "sweep with what we had". */
+static const char **live_pointers(const LiveSet *set) {
+    const char **pointers;
+    if (!set->count) return NULL;
+    pointers = (const char **)malloc(set->count * sizeof *pointers);
+    if (!pointers) return NULL;
+    for (size_t i = 0; i < set->count; i++) pointers[i] = set->items[i];
+    return pointers;
+}
+
+/* Digest collector for the recovery-snapshot members of the live set. It
+   writes into the live set, never into the attempt's own digest list: those are
+   the blobs this attempt is trying to reclaim, and folding them in here would
+   protect exactly what the sweep exists to delete. */
+typedef struct { LiveSet *live; } ScanSink;
+
+static bool collect_digest(void *user, const char digest[65]) {
+    return live_add(((ScanSink *)user)->live, digest);
+}
+
+/* Adds every digest a live message part names, resolved through the Chat's own
+   metadata table. */
+static bool live_from_parts(const Chat *chat, LiveSet *set) {
+    for (int i = 0; i < chat->conversation_count; i++)
+        for (size_t j = 0; j < chat->conversations[i].message_count; j++) {
+            const ChatMessage *m = &chat->conversations[i].messages[j];
+            for (size_t p = 0; p < m->parts.count; p++)
+                if (m->parts.items[p].kind == CHAT_PART_IMAGE) {
+                    const ChatAttachmentMeta *rec =
+                        chat_attachment(chat, m->parts.items[p].u.image.attachment_id);
+                    if (rec && !live_add(set, rec->digest)) return false;
+                }
+        }
+    return true;
+}
+
+/* Reclaims what a failed import wrote.
+ *
+ * The live set is everything still reachable, and the sweep must not run
+ * unless we know all of it: live message parts, all three recoverable
+ * snapshots, and every digest an earlier SUCCESSFUL import wrote this session.
+ *
+ * A snapshot that cannot be read or validated aborts the whole sweep. Its
+ * digest list is not merely missing one entry, it is unknown, and collecting
+ * against a partial live set would delete blobs that snapshot still needs --
+ * turning a recoverable store into one whose recovery silently renders
+ * missing images. Leaving the attempt's blobs as orphans is the safe outcome:
+ * they are garbage, reclaimed by a later sweep, and never a dangling
+ * reference. */
+static void reclaim_attempt_blobs(ChatHost *host, ImportAttempt *attempt) {
+    if (!attempt->attempt_count) return;
+    LiveSet live = { NULL, 0, 0, false };
+    ScanSink sink = { &live };
+    bool complete = live_from_parts(host->config.chat, &live);
+    const wchar_t *files[3] = {
+        host->storage.path, host->storage.backup, host->storage.temporary };
+    for (size_t i = 0; complete && i < 3; i++) {
+        complete = storage_scan_attachment_digests(files[i], collect_digest,
+            &sink);
+    }
+    if (complete)
+        for (size_t i = 0; i < host->attachment_session_count; i++)
+            complete = live_add(&live, host->attachment_session_digests[i]);
+    /* Collection happens only once the set is complete and final. A failure to
+       build the pointer view skips the sweep entirely -- sweeping with a set we
+       could not fully describe is the exact hazard this function exists to
+       avoid, so an allocation failure here degrades to "reclaim nothing"
+       rather than to "reclaim what we happen to have". */
+    if (complete && !live.oom && live.count) {
+        const char **pointers = live_pointers(&live);
+        if (pointers) {
+            attachment_store_collect(&host->attachments, pointers, live.count);
+            free(pointers);
+        }
+    }
+    free(live.items);
+}
+
+/* Promotes an attempt's digests into the session list. Called only after the
+   import has committed, so a later import's sweep protects these blobs while a
+   failed attempt's never join the set that protects anything. */
+static void promote_attempt_digests(ChatHost *host, ImportAttempt *attempt) {
+    for (size_t i = 0; i < attempt->attempt_count; i++) {
+        if (host->attachment_session_count == host->attachment_session_capacity) {
+            size_t capacity = host->attachment_session_capacity
+                ? host->attachment_session_capacity * 2 : 16;
+            char (*grown)[65] = (char (*)[65])realloc(
+                host->attachment_session_digests, capacity * sizeof *grown);
+            if (!grown) return;   /* forgetfulness, never a wrong deletion */
+            host->attachment_session_digests = grown;
+            host->attachment_session_capacity = capacity;
+        }
+        memcpy(host->attachment_session_digests[
+            host->attachment_session_count++], attempt->attempt[i], 65);
     }
 }
 
@@ -2258,6 +2685,7 @@ static void import_fallback_title(const wchar_t *path, wchar_t *out,
    conversation is never changed, so its transcript is deliberately not
    invalidated or re-rendered. The sidebar remap, the reveal of the first
    imported row and the paint all ride the normal flush. */
+
 static void import_conversations(ChatHost *host, bool markdown) {
     Chat *chat = host->config.chat;
     wchar_t path[1024];
@@ -2294,19 +2722,39 @@ static void import_conversations(ChatHost *host, bool markdown) {
     int before = chat->conversation_count;
     ChatImportStats stats;
     ChatImportStatus status;
+    ImportAttempt attempt;
+    ChatImportBlobs blobs;
+    memset(&attempt, 0, sizeof attempt);
+    attempt.host = host;
+    /* Sidecars are resolved under the .md's own directory, never a stored
+       location, so a document cannot make the importer read anywhere the user
+       did not pick. */
+    path_directory(path, attempt.directory,
+        sizeof attempt.directory / sizeof attempt.directory[0]);
+    memset(&blobs, 0, sizeof blobs);
+    blobs.user = &attempt;
+    blobs.read_file = import_read_sidecar;
+    blobs.discard = import_discard_bytes;
+    blobs.stage = import_stage_blob;
     if (markdown) {
         wchar_t fallback_title[CHAT_TITLE_TEXT];
         import_fallback_title(path, fallback_title, CHAT_TITLE_TEXT);
         status = chat_import_markdown(chat, data, length, fallback_title,
-            &stats);
+            &blobs, &stats);
     } else {
-        status = chat_import_json(chat, data, length, &stats);
+        status = chat_import_json(chat, data, length, &blobs, &stats);
     }
     free(data);
     if (status != CHAT_IMPORT_OK) {
         set_status(host, import_failure_text(status, markdown));
+        /* Best effort: whatever this attempt managed to write is unreachable,
+           because the destination never learned about it. */
+        reclaim_attempt_blobs(host, &attempt);
+        attempt_release(&attempt);
         return;
     }
+    promote_attempt_digests(host, &attempt);
+    attempt_release(&attempt);
     capture_settings(host);
     mark_dirty(host);
     if (stats.conversations_added > 0 && before < chat->conversation_count)
@@ -3879,6 +4327,10 @@ cleanup:
         chat_model_catalog_dispose(&host->catalog[i]);
     rich_text_library_close();
     attachment_store_close(&host->attachments);
+    free(host->attachment_session_digests);
+    host->attachment_session_digests = NULL;
+    host->attachment_session_count = 0;
+    host->attachment_session_capacity = 0;
     storage_close(&host->storage);
     free(host);
     CoUninitialize();

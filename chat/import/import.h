@@ -49,22 +49,63 @@ typedef enum {
     /* Importing would exceed the conversation or message capacity. */
     CHAT_IMPORT_CAPACITY,
     /* Allocation failure; the destination is untouched. */
-    CHAT_IMPORT_OOM
+    CHAT_IMPORT_OOM,
+    /* A referenced attachment could not be obtained: the blob store is closed,
+       a sidecar is missing or unreadable, or a durable write failed. The
+       destination is untouched. Bytes this attempt did write are the
+       caller's to reclaim, and only through the full live-set sweep --
+       attachment_store_collect -- never by trusting a per-write flag. */
+    CHAT_IMPORT_ATTACHMENT_IO
 } ChatImportStatus;
 
 typedef struct {
     int conversations_added;
     int messages_added;
+    int attachments_added;
 } ChatImportStats;
+
+/* Attachment resolution for an import. The importer stays pure and
+   transactional: it decodes and validates a whole document before it writes a
+   single byte, so a malformed document reaches none of these callbacks.
+
+   Blob-then-state is preserved: `stage` does not return true until the bytes
+   are durable, and the importer only publishes attachment records after every
+   one of them has succeeded. A failure partway leaves the destination Chat
+   untouched and whatever was already written reclaimable by the caller's
+   sweep. */
+typedef struct {
+    void *user;
+    /* Markdown only. Resolves one sidecar. The importer has already proved the
+       reference's shape with chat/export/package.h, so each argument is a
+       bounded token containing no separator and no character Windows forbids
+       in a filename; joining them under the .md's own directory cannot leave
+       it. *out_bytes is malloc'd and released through `discard`. */
+    bool (*read_file)(void *user, const char *folder, const char *basename,
+        unsigned char **out_bytes, size_t *out_length);
+    void (*discard)(void *user, unsigned char *bytes, size_t length);
+    /* Durably stores staged bytes. The importer owns the id space and the
+       metadata table, so this only has to make the bytes durable under their
+       digest and report which digest that is. `out_created` is informational
+       only and is never a delete permission. */
+    bool (*stage)(void *user, const unsigned char *bytes, size_t length,
+        char out_digest[65], bool *out_created);
+} ChatImportBlobs;
 
 /* Imports `length` bytes of NUL-free UTF-8 JSON into `chat`. `json` may be any
    pointer with at least `length` readable bytes (it need not be terminated);
    the importer never retains it. `stats` may be NULL. On failure the
    destination Chat is semantically unchanged; on success the new conversations
    are appended, the previously active conversation stays active, and `stats`
-   reports what was added. */
+   reports what was added.
+
+   Schema versions 1 and 2 are accepted. Version 2 is what a document carrying
+   message content parts declares; a version 1 document has none by
+   construction. `blobs` is required only when a message carries an image part:
+   JSON exports embed the bytes inline as base64, so a `file` reference inside
+   a JSON document is malformed rather than unresolved. NULL is legal for a
+   document with no image parts. */
 ChatImportStatus chat_import_json(Chat *chat, const char *json, size_t length,
-    ChatImportStats *stats);
+    const ChatImportBlobs *blobs, ChatImportStats *stats);
 
 /* Imports `length` bytes of Markdown into `chat`, reusing the same
    transactional guarantees and fresh-id policy as chat_import_json.
@@ -89,9 +130,21 @@ ChatImportStatus chat_import_json(Chat *chat, const char *json, size_t length,
    preserves everything after the BOM (its first unit is never U+FEFF), and a
    BOM-only file is empty and therefore malformed. `markdown` may be any
    pointer with at least `length` readable bytes and need not be terminated;
-   the importer never retains it. `stats` may be NULL. */
+   the importer never retains it. `stats` may be NULL.
+
+   `blobs` is required only when the payload references image parts, which for
+   a Markdown export means sidecar files beside this one. A reference whose
+   folder is not shaped like a package folder is rejected as malformed before
+   any filesystem call, so a crafted document can never steer a read outside
+   the .md's directory. The folder is not required to match the .md's own
+   stem, so a package survives being renamed as long as its folder stays
+   beside it. Correctness does not rest on that: every attachment's bytes are
+   re-hashed and compared against the digest the document itself declares
+   before anything is written, so a document pointing at a different folder
+   can only fail that comparison, never import different content. */
 ChatImportStatus chat_import_markdown(Chat *chat, const char *markdown,
-    size_t length, const wchar_t *fallback_title, ChatImportStats *stats);
+    size_t length, const wchar_t *fallback_title,
+    const ChatImportBlobs *blobs, ChatImportStats *stats);
 
 /* Copies at most `capacity - 1` code units of `source[0..length)` into `out`,
    always terminating it. When truncation falls between a surrogate pair the
