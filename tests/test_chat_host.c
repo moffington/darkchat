@@ -16,6 +16,32 @@ static int host_MessageBoxW_stub(HWND window, LPCWSTR text, LPCWSTR caption,
     return message_box_result;
 }
 #define MessageBoxW host_MessageBoxW_stub
+/* Virtual-key state seam: dllimport cannot be --wrap'd, and the real
+   keyboard state of the developer's machine must never decide a test (the
+   same reasoning as the chat_ime_active wrap). The host translation unit
+   reads modifiers through this stub, which reports every key up; tests that
+   need chords call the shortcut functions with explicit arguments.
+   rich_text_win32.c keeps the real GetKeyState and is exercised through
+   explicit key messages. windows.h was already included above, so the macro
+   cannot rewrite its declarations. */
+static SHORT key_state_down[256];
+static SHORT host_GetKeyState_stub(int key) {
+    return (key >= 0 && key < 256 && key_state_down[key]) ? (SHORT)0x8000 : 0;
+}
+#define GetKeyState host_GetKeyState_stub
+/* Paint-scheduling seam: the host's flush invalidates its window exactly when
+   a repaint is owed. A hidden test window never paints, so the call is
+   recorded and swallowed -- tests assert that an input operation scheduled
+   its paint instead of leaving updates invisible. dllimport cannot be
+   --wrap'd, so this is another macro redirection into the host unit. */
+static int invalidate_calls;
+static BOOL host_InvalidateRect_stub(HWND window, const RECT *rect,
+    BOOL erase) {
+    (void)window; (void)rect; (void)erase;
+    ++invalidate_calls;
+    return TRUE;
+}
+#define InvalidateRect host_InvalidateRect_stub
 #include "chat/shell/chat_host_win32.c"
 #include <uiautomationclient.h>
 #include <uiautomationcoreapi.h>
@@ -422,6 +448,140 @@ static void open_queue_push(const wchar_t *path, ChatFileDialogResult result) {
     open_dialog_paths[open_dialog_count][511] = 0;
     open_dialog_results[open_dialog_count++] = result;
 }
+/* Clipboard-image seam (linked with -Wl,--wrap=chat_clipboard_has_image and
+   -Wl,--wrap=chat_clipboard_read_dib): the paste tests serve synthetic
+   clipboard content and inject read failures instead of depending on the
+   real clipboard (whose real use is covered by the text fall-through probe
+   below). */
+static bool clipboard_has_image;
+static int clipboard_has_image_calls;
+static unsigned char *clipboard_dib;      /* owned by the test */
+static size_t clipboard_dib_length;
+static bool clipboard_read_fail;
+static int clipboard_read_calls;
+bool __real_chat_clipboard_has_image(void);
+bool __wrap_chat_clipboard_has_image(void) {
+    ++clipboard_has_image_calls;
+    return clipboard_has_image;
+}
+bool __real_chat_clipboard_read_dib(unsigned char **out, size_t *out_n);
+bool __wrap_chat_clipboard_read_dib(unsigned char **out, size_t *out_n) {
+    ++clipboard_read_calls;
+    *out = NULL;
+    *out_n = 0;
+    if (clipboard_read_fail || !clipboard_dib || !clipboard_dib_length)
+        return false;
+    unsigned char *copy = (unsigned char *)malloc(clipboard_dib_length);
+    if (!copy) return false;
+    memcpy(copy, clipboard_dib, clipboard_dib_length);
+    *out = copy;
+    *out_n = clipboard_dib_length;
+    return true;
+}
+static void clipboard_serve(const unsigned char *dib, size_t n) {
+    free(clipboard_dib);
+    clipboard_dib = NULL;
+    clipboard_dib_length = 0;
+    clipboard_has_image = dib && n > 0;
+    clipboard_read_fail = false;
+    clipboard_has_image_calls = clipboard_read_calls = 0;
+    if (!dib || !n) return;
+    clipboard_dib = (unsigned char *)malloc(n);
+    if (!clipboard_dib) return;
+    memcpy(clipboard_dib, dib, n);
+    clipboard_dib_length = n;
+}
+/* Ingest seam (linked with -Wl,--wrap=image_ingest_file and
+   -Wl,--wrap=image_ingest_dib): deterministic normalized output and named
+   failures without WIC; the real decode policy is tested in test_image_wic.
+   On success the wrap allocates the ingest buffer exactly as the real one
+   does, so the host's dispose path frees real memory. */
+static ChatImageIngestResult ingest_result = IMAGE_INGEST_OK;
+static int ingest_file_calls, ingest_dib_calls;
+static uint32_t ingest_pixel_width = 4, ingest_pixel_height = 2;
+static uint8_t ingest_flags_value;
+static wchar_t ingest_display_name[64];
+static size_t ingest_bytes_length = 8;
+static wchar_t ingest_last_path[MAX_PATH];
+static int ingest_live_buffers;   /* net wrap allocations minus frees */
+static void ingest_fake(ChatImageIngest *out, const wchar_t *path) {
+    memset(out, 0, sizeof *out);
+    out->meta.pixel_width = ingest_pixel_width;
+    out->meta.pixel_height = ingest_pixel_height;
+    memcpy(out->meta.mime, "image/png", 10);
+    const wchar_t *name = ingest_display_name;
+    if (!name[0] && path) {
+        name = path;
+        for (const wchar_t *p = path; *p; p++)
+            if (*p == L'\\' || *p == L'/') name = p + 1;
+    }
+    wcsncpy(out->meta.display_name, name, 63);
+    out->meta.display_name[63] = 0;
+    out->flags = ingest_flags_value;
+    out->length = ingest_bytes_length;
+    out->bytes = (unsigned char *)malloc(out->length ? out->length : 1);
+    if (!out->bytes) { memset(out, 0, sizeof *out); return; }
+    memset(out->bytes, 0xAB, out->length);
+    ++ingest_live_buffers;
+}
+/* One-shot failure applied before the standing result, so a mixed drop can
+   fail exactly its first file. */
+static ChatImageIngestResult ingest_next_result;
+static ChatImageIngestResult ingest_take_result(void) {
+    if (ingest_next_result != IMAGE_INGEST_OK) {
+        ChatImageIngestResult once = ingest_next_result;
+        ingest_next_result = IMAGE_INGEST_OK;
+        return once;
+    }
+    return ingest_result;
+}
+static void ingest_reset(void) {
+    ingest_result = IMAGE_INGEST_OK;
+    ingest_next_result = IMAGE_INGEST_OK;
+    ingest_file_calls = ingest_dib_calls = 0;
+    ingest_pixel_width = 4;
+    ingest_pixel_height = 2;
+    ingest_flags_value = 0;
+    ingest_display_name[0] = 0;
+    ingest_bytes_length = 8;
+    ingest_last_path[0] = 0;
+}
+ChatImageIngestResult __real_image_ingest_file(const wchar_t *path,
+    ChatImageIngest *out);
+ChatImageIngestResult __wrap_image_ingest_file(const wchar_t *path,
+    ChatImageIngest *out) {
+    ++ingest_file_calls;
+    wcsncpy(ingest_last_path, path ? path : L"", MAX_PATH - 1);
+    ingest_last_path[MAX_PATH - 1] = 0;
+    ChatImageIngestResult result = ingest_take_result();
+    if (result != IMAGE_INGEST_OK) {
+        memset(out, 0, sizeof *out);
+        return result;
+    }
+    ingest_fake(out, path);
+    return out->bytes ? IMAGE_INGEST_OK : IMAGE_INGEST_OOM;
+}
+ChatImageIngestResult __real_image_ingest_dib(const void *dib, size_t dib_size,
+    ChatImageIngest *out);
+ChatImageIngestResult __wrap_image_ingest_dib(const void *dib, size_t dib_size,
+    ChatImageIngest *out) {
+    (void)dib; (void)dib_size;
+    ++ingest_dib_calls;
+    ChatImageIngestResult result = ingest_take_result();
+    if (result != IMAGE_INGEST_OK) {
+        memset(out, 0, sizeof *out);
+        return result;
+    }
+    ingest_fake(out, NULL);
+    return out->bytes ? IMAGE_INGEST_OK : IMAGE_INGEST_OOM;
+}
+/* The dispose path is real: it frees the wrap's buffer. Track the net so the
+   suites can assert every failure disposed its ingest. */
+void __real_image_ingest_dispose(ChatImageIngest *out);
+void __wrap_image_ingest_dispose(ChatImageIngest *out) {
+    if (out && out->bytes) --ingest_live_buffers;
+    __real_image_ingest_dispose(out);
+}
 /* File-reader seam (linked with -Wl,--wrap=chat_read_file_utf8): serves a
    fixed in-memory payload or a queued failure. The reader's own boundary
    behavior is tested directly against __real_chat_read_file_utf8_limited. */
@@ -520,7 +680,7 @@ static CompletionEvent *fixture(ChatHost *h,CompletionEventType type,const wchar
     return e;
 }
 static void begin_mode(ChatHost *h,ChatSendMode mode) {
-    h->request_message=chat_begin_response(h->config.chat,mode,NULL);
+    h->request_message=chat_begin_response(h->config.chat,mode,NULL, 0);
     h->request_conversation=h->config.chat->active;
     ++h->request_generation; h->generating=true; h->accepting=true; h->stopping=false;
     h->reasoning_streaming=false; h->content_started=false;
@@ -720,6 +880,18 @@ static void remove_attachment_dir(const wchar_t *dir) {
     delete_folder_files(att);
     RemoveDirectoryW(att);
 }
+/* Suite scratch directory, unique per run. Windows recycles process ids, so
+   a previous run's leftovers (a state.jsonl, a blob under attachments\, the
+   reclaim suite's blocker directory) collide with a later run's fixtures when
+   the name is only pid-derived -- from clean CHECK failures to teardown
+   faults. The tick suffix cannot repeat across runs. */
+static void suite_scratch_dir(wchar_t *out, size_t capacity,
+    const wchar_t *name) {
+    swprintf(out, capacity, L"build\\%ls-%lu-%llu", name,
+        (unsigned long)GetCurrentProcessId(),
+        (unsigned long long)(GetTickCount64() & 0xffffffffu));
+}
+
 static int default_suite(void) {
     CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -730,7 +902,7 @@ static int default_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-test-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-test");
     CHECK(storage_open(&h->storage,dir));
     /* The commit-7 load tests need a real blob store beside the state dir,
        with every blob read routed through the recording stub. */
@@ -3429,7 +3601,7 @@ static int seam_toggle_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-seam-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-seam");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -3514,7 +3686,7 @@ static int catalog_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-catalog-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-catalog");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -3708,7 +3880,7 @@ static int bounded_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-bounded-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-bounded");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -5073,7 +5245,7 @@ static int backend_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-backend-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-backend");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -5392,6 +5564,12 @@ static int backend_suite(void) {
         CHECK(wcsstr(meta,L"$0.00000")!=NULL);
     }
 
+    /* Every suite closes its top-level window before freeing the host: a
+       live window with a freed GWLP_USERDATA host would answer activation
+       broadcasts (WM_ACTIVATEAPP from another window's SetFocus) from
+       dangling state. */
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(!IsWindow(window));
     saver_shutdown(&h->saver);
     model_catalog_shutdown(&h->catalog_client);
     storage_close(&h->storage);
@@ -5447,7 +5625,7 @@ static int palette_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-palette-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-palette");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -5802,7 +5980,7 @@ static int navigation_suite(void) {
     h->chat_ui.command=command; h->chat_ui.command_user=h;
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-nav-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-nav");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -6028,7 +6206,7 @@ static int code_copy_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-copy-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-copy");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -6369,7 +6547,7 @@ static int export_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-export-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-export");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -6842,7 +7020,7 @@ static int model_palette_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-modelpal-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-modelpal");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -7155,6 +7333,8 @@ static int model_palette_suite(void) {
         CHECK(!h->dirty);
     }
 
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(!IsWindow(window));
     saver_shutdown(&h->saver); storage_close(&h->storage);
     DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup); DeleteFileW(h->storage.temporary);
     wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir); DeleteFileW(lock); RemoveDirectoryW(dir);
@@ -7175,7 +7355,7 @@ static int import_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-import-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-import");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -7434,6 +7614,8 @@ static int import_suite(void) {
     open_queue_clear(); read_set(NULL,0,CHAT_FILE_READ_OK);
     json_buf_free(&out);
     json_buf_free(&markdown);
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(!IsWindow(window));
     saver_shutdown(&h->saver); storage_close(&h->storage);
     DeleteFileW(bom_path); DeleteFileW(empty_path);
     DeleteFileW(exact_path); DeleteFileW(over_path);
@@ -7459,7 +7641,7 @@ static int notify_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-notify-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-notify");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -7675,6 +7857,703 @@ static bool snapshot_add_attachment(const wchar_t *path, uint64_t id,
     return __real_chat_write_file_utf8(path, rebuilt, used);
 }
 
+/* DROPFILES is behind shellapi/shlobj guard noise in this toolchain; the
+   layout is fixed and documented (shlobj_core.h). */
+typedef struct {
+    DWORD pFiles;
+    POINT pt;
+    BOOL fNC;
+    BOOL fWide;
+} ChatDropFiles;
+/* Builds a real HDROP for WM_DROPFILES: a DROPFILES header followed by a
+   double-NUL-terminated wide path list. */
+static HDROP make_hdrop(const wchar_t *const *paths, int count) {
+    size_t chars = 1;
+    for (int i = 0; i < count; i++) chars += wcslen(paths[i]) + 1;
+    size_t bytes = sizeof(ChatDropFiles) + chars * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GHND, bytes);
+    if (!memory) return NULL;
+    ChatDropFiles *header = (ChatDropFiles *)GlobalLock(memory);
+    if (!header) { GlobalFree(memory); return NULL; }
+    memset(header, 0, sizeof *header);
+    header->pFiles = sizeof(ChatDropFiles);
+    header->fWide = TRUE;
+    wchar_t *out = (wchar_t *)((char *)header + sizeof(ChatDropFiles));
+    for (int i = 0; i < count; i++) {
+        size_t length = wcslen(paths[i]);
+        memcpy(out, paths[i], (length + 1) * sizeof(wchar_t));
+        out += length + 1;
+    }
+    *out = 0;
+    GlobalUnlock(memory);
+    return (HDROP)memory;
+}
+static int drop_files(ChatHost *h, const wchar_t *const *paths, int count) {
+    HDROP drop = make_hdrop(paths, count);
+    if (!drop) return 1;
+    SendMessageW(h->window, WM_DROPFILES, (WPARAM)drop, 0);
+    return 0;
+}
+/* Composer paste through the subclass: the synthetic clipboard seam and the
+   wrapped ingest make this fully deterministic. */
+static void paste_image(ChatHost *h, const unsigned char *dib, size_t n) {
+    clipboard_serve(dib, n);
+    SendMessageW(h->composer.window, WM_PASTE, 0, 0);
+}
+static int attach_suite(void) {
+    CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ChatHost *h=calloc(1,sizeof *h); Ui *ui=calloc(1,sizeof *ui);
+    Chat *chat=calloc(1,sizeof *chat);
+    CHECK(h && ui && chat); ui_init(ui,NULL,NULL); chat_init(chat); chat_clear(chat);
+    h->config=(ChatHostConfig){ui,chat,L"Attach host",1100,720,720,480,NULL,
+        false};
+    h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
+    CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
+    h->background=CreateSolidBrush(RGB(20,20,20));
+    wchar_t dir[256];
+    suite_scratch_dir(dir,256,L"host-attach");
+    CHECK(storage_open(&h->storage,dir));
+    WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc;
+    cls.lpszClassName=L"DarkChat.AttachTest";
+    CHECK(register_class_once(&cls));
+    HWND window=CreateWindowW(cls.lpszClassName,L"Attach integration",
+        WS_OVERLAPPEDWINDOW,100,100,1100,720,NULL,NULL,NULL,h);
+    CHECK(window); KillTimer(window,2);
+    CHECK(saver_init(&h->saver,window,CHAT_WM_SAVER_RESULT,&h->storage));
+    CHECK(attachment_store_open(&h->attachments,dir,&chat->next_id));
+    flush(h);
+    static const unsigned char dib_bytes[64] = {0x28,0,0,0,4,0,0,0,2,0,0,0};
+    ingest_reset();
+
+    /* ---- clipboard DIB spans: the reader copies the header's own span,
+           never the untrusted envelope, and anything the ingest would reject
+           is refused before a byte is allocated ---- */
+    {
+        static unsigned char span_dib[16384];
+        BITMAPINFOHEADER *head;
+        size_t span = 12345;
+        /* 24bpp BI_RGB 4x2: 40-byte header + stride 12 * 2 rows = 64 bytes. */
+        memset(span_dib,0,sizeof span_dib);
+        head=(BITMAPINFOHEADER *)span_dib;
+        head->biSize=sizeof(BITMAPINFOHEADER);
+        head->biWidth=4; head->biHeight=2; head->biPlanes=1;
+        head->biBitCount=24; head->biCompression=BI_RGB;
+        CHECK(chat_clipboard_dib_span(span_dib,sizeof span_dib,&span) &&
+            span==64);
+        /* The span comes from the header, never the buffer envelope. */
+        CHECK(chat_clipboard_dib_span(span_dib,64,&span) && span==64);
+        CHECK(!chat_clipboard_dib_span(span_dib,63,&span) && span==0);
+        /* 32bpp BI_RGB 4x2: 40 + 4*4*2 = 72 bytes. */
+        head->biBitCount=32;
+        CHECK(chat_clipboard_dib_span(span_dib,sizeof span_dib,&span) &&
+            span==72);
+        /* 32bpp BI_BITFIELDS: three masks after a 40-byte header. */
+        head->biCompression=BI_BITFIELDS;
+        CHECK(chat_clipboard_dib_span(span_dib,84,&span) && span==84);
+        CHECK(!chat_clipboard_dib_span(span_dib,83,&span));
+        /* A V5 header carries its masks inside biSize. */
+        memset(span_dib,0,sizeof span_dib);
+        BITMAPV5HEADER *v5=(BITMAPV5HEADER *)span_dib;
+        v5->bV5Size=sizeof(BITMAPV5HEADER);
+        v5->bV5Width=4; v5->bV5Height=2; v5->bV5Planes=1;
+        v5->bV5BitCount=32; v5->bV5Compression=BI_BITFIELDS;
+        CHECK(chat_clipboard_dib_span(span_dib,124+32,&span) && span==156);
+        /* Dimensions past the product bound are refused up front, in both
+           orientations; exactly at the bound is accepted. */
+        memset(span_dib,0,sizeof span_dib);
+        head=(BITMAPINFOHEADER *)span_dib;
+        head->biSize=sizeof(BITMAPINFOHEADER);
+        head->biPlanes=1; head->biBitCount=24; head->biCompression=BI_RGB;
+        head->biWidth=CHAT_ATTACHMENT_MAX_PIXELS+1; head->biHeight=2;
+        CHECK(!chat_clipboard_dib_span(span_dib,sizeof span_dib,&span) &&
+            span==0);
+        head->biWidth=4;
+        head->biHeight=-(int)(CHAT_ATTACHMENT_MAX_PIXELS+1);
+        CHECK(!chat_clipboard_dib_span(span_dib,sizeof span_dib,&span));
+        head->biWidth=CHAT_ATTACHMENT_MAX_PIXELS; head->biHeight=1;
+        CHECK(chat_clipboard_dib_span(span_dib,sizeof span_dib,&span) &&
+            span==40+(((size_t)CHAT_ATTACHMENT_MAX_PIXELS*24+31)/32)*4);
+        /* The largest defined header (V5) is still accepted for BI_RGB. */
+        memset(span_dib,0,sizeof span_dib);
+        head=(BITMAPINFOHEADER *)span_dib;
+        head->biSize=sizeof(BITMAPV5HEADER);
+        head->biWidth=1; head->biHeight=1; head->biPlanes=1;
+        head->biBitCount=24; head->biCompression=BI_RGB;
+        CHECK(chat_clipboard_dib_span(span_dib,128,&span) && span==128);
+        /* A "header" past every defined DIB header size is just a gap before
+           the pixels and must not inflate the copy despite small dimensions
+           (regression: a 1x1 image declaring a 16380-byte header copied a
+           16384-byte span). */
+        head->biSize=16380;
+        CHECK(!chat_clipboard_dib_span(span_dib,16384,&span) && span==0);
+        head->biSize=sizeof(BITMAPV5HEADER)+1;
+        CHECK(!chat_clipboard_dib_span(span_dib,16384,&span));
+        /* Header rules the ingest enforces: planes, formats, sizes. */
+        head->biWidth=4; head->biHeight=2; head->biPlanes=2;
+        CHECK(!chat_clipboard_dib_span(span_dib,sizeof span_dib,&span));
+        head->biPlanes=1; head->biBitCount=16;
+        CHECK(!chat_clipboard_dib_span(span_dib,sizeof span_dib,&span));
+        head->biBitCount=24; head->biCompression=BI_RLE8;
+        CHECK(!chat_clipboard_dib_span(span_dib,sizeof span_dib,&span));
+        head->biCompression=BI_BITFIELDS; head->biBitCount=32;
+        head->biSize=sizeof(BITMAPINFOHEADER)+1;
+        CHECK(!chat_clipboard_dib_span(span_dib,sizeof span_dib,&span));
+        head->biSize=20;
+        CHECK(!chat_clipboard_dib_span(span_dib,sizeof span_dib,&span));
+        CHECK(!chat_clipboard_dib_span(NULL,64,&span));
+        CHECK(!chat_clipboard_dib_span(span_dib,sizeof span_dib,NULL));
+        CHECK(!chat_clipboard_dib_span(span_dib,4,&span));
+    }
+
+    /* ---- paste: an image on the clipboard attaches through the subclass ---- */
+    int inv = invalidate_calls;
+    paste_image(h,dib_bytes,sizeof dib_bytes);
+    CHECK(ingest_dib_calls==1);
+    CHECK(h->pending_count==1);
+    CHECK(chat->attachment_count==1);
+    CHECK(h->attachment_session_count==1);
+    CHECK(h->pending_attachments[0].conversation_id==
+        chat->conversations[chat->active].id);
+    /* The ingest's ChatImagePart is what the message model will take, with
+       the store's fresh identity assigned and the pixel size preserved. */
+    CHECK(h->pending_attachments[0].part.attachment_id==chat->attachments[0].id);
+    CHECK(h->pending_attachments[0].part.pixel_width==4 &&
+        h->pending_attachments[0].part.pixel_height==2);
+    CHECK(h->pending_attachments[0].part.display_name[0]==0);
+    CHECK(h->pending_attachments[0].flags==0);
+    CHECK(h->pending_attachments[0].digest[0]!=0);
+    CHECK(!strcmp(h->pending_attachments[0].digest,chat->attachments[0].digest));
+    /* The store record carries the ingest's pixel dimensions (metadata
+       authority), and the blob landed before any record could name it. */
+    CHECK(chat->attachments[0].pixel_width==4 &&
+        chat->attachments[0].pixel_height==2);
+    wchar_t blob[700];
+    swprintf(blob,700,L"%ls\\%hs",h->attachments.dir,
+        h->pending_attachments[0].digest);
+    CHECK(export_file_exists(blob));
+    /* The chip strip reflects the pending list. */
+    CHECK(h->chat_ui.chip_count==1);
+    CHECK(ui_node(ui,h->chat_ui.chips[0]) &&
+        !ui_node(ui,h->chat_ui.chips[0])->hidden);
+    CHECK(!wcscmp(ui_node(ui,h->chat_ui.chip_labels[0])->text,L"Image"));
+    /* The paste flushes its chip update: the chip is laid out and a paint is
+       scheduled immediately, not left for some later event. */
+    CHECK(invalidate_calls>inv);
+    CHECK(!ui_layout_pending(ui));
+    CHECK(chat_ui_rect(&h->chat_ui,h->chat_ui.chips[0]).w==120 &&
+        chat_ui_rect(&h->chat_ui,h->chat_ui.chips[0]).h==24);
+
+    /* ---- a text clipboard is not an image paste: the composer's paste
+           decision consults the seam, attaches nothing and declines the
+           gesture so the native Rich Edit paste runs untouched. The decision
+           is asserted directly -- delivering WM_PASTE to the control happens
+           only below, against clipboard content the probe installed and
+           verified: a best-effort empty can still leave foreign desktop
+           content for Rich Edit to paste ---- */
+    clipboard_serve(NULL,0);
+    int dib_calls=ingest_dib_calls;
+    int pending_before=(int)h->pending_count;
+    CHECK(!composer_paste(h));
+    CHECK(clipboard_has_image_calls==1);
+    CHECK(ingest_dib_calls==dib_calls);
+    CHECK((int)h->pending_count==pending_before);
+    /* Real-clipboard insertion probe: real text on the real clipboard is
+       inserted by the native control (the wrapped seam reports no image).
+       An active desktop locks and rewrites the clipboard (managers, the
+       user's own copying), so each attempt verifies its text was present
+       both immediately before and after the paste: a contested attempt
+       retries, and only a clean window is allowed to assert. */
+    {
+        static const wchar_t probe[]=L"pasted-text-probe";
+        wchar_t saved[256]; bool had_saved=false;
+        if (OpenClipboard(window)) {
+            HANDLE prior=GetClipboardData(CF_UNICODETEXT);
+            if (prior) {
+                const wchar_t *src=(const wchar_t *)GlobalLock(prior);
+                if (src) { wcsncpy(saved,src,255); saved[255]=0; had_saved=true;
+                    GlobalUnlock(prior); }
+            }
+            CloseClipboard();
+        }
+        bool asserted=false, saw_window=false;
+        for (int attempt=0; attempt<3 && !asserted; attempt++) {
+            bool armed=false;
+            if (OpenClipboard(window)) {
+                EmptyClipboard();
+                size_t bytes=(wcslen(probe)+1)*sizeof(wchar_t);
+                HGLOBAL memory=GlobalAlloc(GMEM_MOVEABLE,bytes);
+                if (memory) {
+                    void *target=GlobalLock(memory);
+                    if (target) {
+                        memcpy(target,probe,bytes);
+                        GlobalUnlock(memory);
+                        armed=SetClipboardData(CF_UNICODETEXT,memory)!=NULL;
+                    }
+                    if (!armed) GlobalFree(memory);
+                }
+                CloseClipboard();
+            }
+            if (!armed) continue;
+            rich_text_set_text(&h->composer,L"");
+            bool pre_ok=false;
+            if (OpenClipboard(window)) {
+                HANDLE held=GetClipboardData(CF_UNICODETEXT);
+                if (held) {
+                    const wchar_t *src=(const wchar_t *)GlobalLock(held);
+                    if (src) { pre_ok=!wcscmp(src,probe); GlobalUnlock(held); }
+                }
+                CloseClipboard();
+            }
+            if (!pre_ok) continue;
+            saw_window=true;
+            int seam_calls=clipboard_has_image_calls;
+            int seam_dib=ingest_dib_calls;
+            int seam_pending=(int)h->pending_count;
+            /* A consumed gesture (the product bug under test) never inserts
+               no matter how often it is retried, while a clipboard manager
+               swapping the content inside the paste itself clears on the
+               next try. Retrying the paste inside one verified window
+               separates the two. */
+            for (int paste_try=0; paste_try<3; paste_try++) {
+                wchar_t now[64];
+                rich_text_set_text(&h->composer,L"");
+                SendMessageW(h->composer.window,WM_PASTE,0,0);
+                rich_text_get_text(&h->composer,now,64);
+                bool still_ours=false;
+                if (OpenClipboard(window)) {
+                    HANDLE held=GetClipboardData(CF_UNICODETEXT);
+                    if (held) {
+                        const wchar_t *src=(const wchar_t *)GlobalLock(held);
+                        if (src) {
+                            still_ours=!wcscmp(src,probe);
+                            GlobalUnlock(held);
+                        }
+                    }
+                    CloseClipboard();
+                }
+                CHECK(ingest_dib_calls==seam_dib);
+                CHECK((int)h->pending_count==seam_pending);
+                if (!still_ours) break;
+                if (!wcscmp(now,probe)) {
+                    /* The gesture consulted the seam once per try, attached
+                       nothing and fell through to the native paste that
+                       inserted the probe text. */
+                    CHECK(clipboard_has_image_calls==
+                        seam_calls+paste_try+1);
+                    asserted=true;
+                    break;
+                }
+            }
+        }
+        if (!asserted)
+            puts(saw_window ?
+                "note: clipboard contested mid-paste; text-paste probe skipped" :
+                "note: clipboard unavailable; text-paste probe skipped");
+        /* Put back whatever text the desktop had. */
+        if (OpenClipboard(window)) {
+            EmptyClipboard();
+            if (had_saved) {
+                size_t bytes=(wcslen(saved)+1)*sizeof(wchar_t);
+                HGLOBAL memory=GlobalAlloc(GMEM_MOVEABLE,bytes);
+                if (memory) {
+                    void *target=GlobalLock(memory);
+                    if (target) { memcpy(target,saved,bytes);
+                        GlobalUnlock(memory); }
+                    if (!SetClipboardData(CF_UNICODETEXT,memory))
+                        GlobalFree(memory);
+                }
+            }
+            CloseClipboard();
+        }
+    }
+
+    /* ---- the real clipboard reader refuses an oversized DIB header before
+           it allocates or copies anything ---- */
+    {
+        unsigned char huge[64];
+        memset(huge,0,sizeof huge);
+        BITMAPINFOHEADER *head=(BITMAPINFOHEADER *)huge;
+        head->biSize=sizeof(BITMAPINFOHEADER);
+        head->biWidth=100000; head->biHeight=2;
+        head->biPlanes=1; head->biBitCount=24; head->biCompression=BI_RGB;
+        size_t span=12345;
+        CHECK(!chat_clipboard_dib_span(huge,sizeof huge,&span) && span==0);
+        bool probed=false;
+        if (OpenClipboard(window)) {
+            EmptyClipboard();
+            HGLOBAL memory=GlobalAlloc(GMEM_MOVEABLE,sizeof huge);
+            if (memory) {
+                void *target=GlobalLock(memory);
+                if (target) {
+                    memcpy(target,huge,sizeof huge);
+                    GlobalUnlock(memory);
+                }
+                probed=SetClipboardData(CF_DIB,memory)!=NULL;
+                if (!probed) GlobalFree(memory);
+            }
+            CloseClipboard();
+        }
+        if (probed) {
+            bool pre_ok=false;
+            SIZE_T pre_size=0;
+            if (OpenClipboard(window)) {
+                HANDLE held=GetClipboardData(CF_DIB);
+                if (held) {
+                    pre_size=GlobalSize(held);
+                    const unsigned char *src=
+                        (const unsigned char *)GlobalLock(held);
+                    if (src) {
+                        pre_ok=pre_size>=sizeof huge &&
+                            !memcmp(src,huge,sizeof huge);
+                        GlobalUnlock(held);
+                    }
+                }
+                CloseClipboard();
+            }
+            unsigned char *out=NULL; size_t n=0;
+            bool refused=!__real_chat_clipboard_read_dib(&out,&n);
+            bool allocated=out!=NULL || n!=0;
+            free(out);
+            /* The refusal proves something only while the probe was the
+               clipboard's content before and after: a clipboard manager
+               rewriting it mid-probe is an environment skip. */
+            bool still_ours=false;
+            SIZE_T post_size=0;
+            if (OpenClipboard(window)) {
+                HANDLE held=GetClipboardData(CF_DIB);
+                if (held) {
+                    post_size=GlobalSize(held);
+                    const unsigned char *src=
+                        (const unsigned char *)GlobalLock(held);
+                    if (src) {
+                        still_ours=post_size>=sizeof huge &&
+                            !memcmp(src,huge,sizeof huge);
+                        GlobalUnlock(held);
+                    }
+                }
+                EmptyClipboard();
+                CloseClipboard();
+            }
+            if (pre_ok && still_ours) CHECK(refused && !allocated);
+            else puts("note: clipboard contested mid-probe; oversized-DIB probe skipped");
+        } else {
+            puts("note: real clipboard unavailable; oversized-DIB probe skipped");
+        }
+    }
+
+    /* ---- drop: an image file attaches, named for its file ---- */
+    wchar_t photo[MAX_PATH];
+    swprintf(photo,MAX_PATH,L"%ls\\photo.png",dir);
+    CHECK(__real_chat_write_file_utf8(photo,"png",3));
+    const wchar_t *one[1] = { photo };
+    inv = invalidate_calls;
+    CHECK(drop_files(h,one,1)==0);
+    CHECK(ingest_file_calls==1);
+    CHECK(h->pending_count==2);
+    CHECK(!wcscmp(h->pending_attachments[1].part.display_name,L"photo.png"));
+    CHECK(h->chat_ui.chip_count==2);
+    CHECK(!wcscmp(ui_node(ui,h->chat_ui.chip_labels[1])->text,L"photo.png"));
+    /* An all-valid drop flushes exactly like a paste. */
+    CHECK(invalidate_calls>inv);
+    CHECK(!ui_layout_pending(ui));
+    CHECK(chat_ui_rect(&h->chat_ui,h->chat_ui.chips[1]).w==120 &&
+        chat_ui_rect(&h->chat_ui,h->chat_ui.chips[1]).h==24);
+
+    /* ---- a non-image file reports its ingest error and attaches nothing ---- */
+    {
+        int before=(int)h->pending_count;
+        ingest_next_result=IMAGE_INGEST_UNSUPPORTED;
+        wchar_t bad[MAX_PATH];
+        swprintf(bad,MAX_PATH,L"%ls\\notes.txt",dir);
+        CHECK(__real_chat_write_file_utf8(bad,"text",4));
+        const wchar_t *paths[1] = { bad };
+        inv = invalidate_calls;
+        CHECK(drop_files(h,paths,1)==0);
+        CHECK((int)h->pending_count==before);
+        CHECK(wcsstr(chat->status,
+            image_ingest_error_text(IMAGE_INGEST_UNSUPPORTED))!=NULL);
+        /* The status update is flushed too: the error is visible now. */
+        CHECK(invalidate_calls>inv);
+    }
+
+    /* ---- a mixed drop keeps its error visible after the later success ---- */
+    {
+        int before=(int)h->pending_count;
+        ingest_next_result=IMAGE_INGEST_UNSUPPORTED;
+        wcscpy(ingest_display_name,L"mix.png");
+        wchar_t bad[MAX_PATH], good[MAX_PATH];
+        swprintf(bad,MAX_PATH,L"%ls\\broken.png",dir);
+        swprintf(good,MAX_PATH,L"%ls\\mix.png",dir);
+        CHECK(__real_chat_write_file_utf8(bad,"x",1));
+        CHECK(__real_chat_write_file_utf8(good,"y",1));
+        const wchar_t *paths[2] = { bad, good };
+        CHECK(drop_files(h,paths,2)==0);
+        CHECK((int)h->pending_count==before+1);
+        /* The success did not swallow the failure: the status still names it. */
+        CHECK(wcsstr(chat->status,
+            image_ingest_error_text(IMAGE_INGEST_UNSUPPORTED))!=NULL);
+        CHECK(!wcscmp(h->pending_attachments[h->pending_count-1].part.display_name,
+            L"mix.png"));
+        ingest_display_name[0]=0;
+    }
+
+    /* ---- the Attach control opens the picker; a cancel attaches nothing ---- */
+    {
+        int before=(int)h->pending_count;
+        ingest_display_name[0]=0;
+        open_queue_clear(); open_queue_push(L"picked.png",CHAT_FILE_DIALOG_ACCEPTED);
+        command(h,CHAT_COMMAND_ATTACH,-1);
+        CHECK(open_dialog_calls==1);
+        CHECK((int)h->pending_count==before+1);
+        CHECK(!wcscmp(h->pending_attachments[h->pending_count-1].part.display_name,
+            L"picked.png"));
+        open_queue_clear(); open_queue_push(L"",CHAT_FILE_DIALOG_CANCELLED);
+        command(h,CHAT_COMMAND_ATTACH,-1);
+        CHECK((int)h->pending_count==before+1);
+    }
+
+    /* ---- the per-message bound: the ninth attach reports the limit ---- */
+    {
+        while (h->pending_count<CHAT_ATTACHMENT_MAX_PER_MESSAGE)
+            paste_image(h,dib_bytes,sizeof dib_bytes);
+        CHECK(h->pending_count==CHAT_ATTACHMENT_MAX_PER_MESSAGE);
+        CHECK(h->chat_ui.chip_count==CHAT_ATTACHMENT_MAX_PER_MESSAGE);
+        paste_image(h,dib_bytes,sizeof dib_bytes);
+        CHECK(h->pending_count==CHAT_ATTACHMENT_MAX_PER_MESSAGE);
+        CHECK(wcsstr(chat->status,L"up to 8 images")!=NULL);
+    }
+
+    /* ---- pending lists are per conversation and survive switches ---- */
+    int conv0=chat->active;
+    command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+    int conv1=chat->active;
+    CHECK(conv1!=conv0);
+    CHECK(h->chat_ui.chip_count==0);
+    wcscpy(ingest_display_name,L"x.png");
+    paste_image(h,dib_bytes,sizeof dib_bytes);
+    wcscpy(ingest_display_name,L"y.png");
+    paste_image(h,dib_bytes,sizeof dib_bytes);
+    ingest_display_name[0]=0;
+    CHECK(h->pending_count==CHAT_ATTACHMENT_MAX_PER_MESSAGE+2);
+    CHECK(h->chat_ui.chip_count==2);
+    command(h,CHAT_COMMAND_SELECT,conv0);
+    CHECK(h->chat_ui.chip_count==CHAT_ATTACHMENT_MAX_PER_MESSAGE);
+    CHECK(!wcscmp(ui_node(ui,h->chat_ui.chip_labels[0])->text,L"Image"));
+    command(h,CHAT_COMMAND_SELECT,conv1);
+    CHECK(h->chat_ui.chip_count==2);
+    CHECK(!wcscmp(ui_node(ui,h->chat_ui.chip_labels[0])->text,L"x.png"));
+
+    /* ---- send with an empty prompt and two images: exactly two IMAGE
+           parts, no TEXT part, and the chips drain with the composer ---- */
+    {
+        int calls=completion_request_calls;
+        rich_text_set_text(&h->composer,L"");
+        perform_send(h);
+        ChatConversation *c=&chat->conversations[conv1];
+        CHECK(c->message_count==2);
+        CHECK(c->messages[0].role==CHAT_ROLE_USER);
+        CHECK(chat_message_text(&c->messages[0])[0]==0);
+        CHECK(chat_message_part_count(&c->messages[0])==2);
+        ChatPartView v0,v1;
+        memset(&v0,0,sizeof v0); memset(&v1,0,sizeof v1);
+        CHECK(chat_message_part_at(&c->messages[0],0,&v0) &&
+            v0.kind==CHAT_PART_IMAGE);
+        CHECK(chat_message_part_at(&c->messages[0],1,&v1) &&
+            v1.kind==CHAT_PART_IMAGE);
+        CHECK(chat_message_has_images(&c->messages[0]));
+        /* The chips for this conversation drained; the other conversation's
+           list is untouched. */
+        CHECK(h->pending_count==CHAT_ATTACHMENT_MAX_PER_MESSAGE);
+        CHECK(h->chat_ui.chip_count==0);
+        /* The client was handed exactly that turn, with both images loaded
+           from the store before the hand-off. */
+        CHECK(completion_request_calls==calls+1);
+        int imsg=-1;
+        for (int i=0;i<completion_request_last_count;i++)
+            if (completion_request_last_part_counts[i]==2) imsg=i;
+        CHECK(imsg>=0);
+        CHECK(completion_request_last_part_kinds[imsg][0]==CHAT_PART_IMAGE &&
+            completion_request_last_part_kinds[imsg][1]==CHAT_PART_IMAGE);
+        CHECK(completion_request_last_part_loaded[imsg][0] &&
+            completion_request_last_part_loaded[imsg][1]);
+        CHECK(completion_request_last_image_bytes[imsg]==16);
+        CHECK(completion_request_last_texts[imsg][0]==0);
+        CHECK(h->generating==false);   /* no API key: the request fails cleanly */
+    }
+
+    /* ---- a chip's remove index maps to the right shared-array entry ---- */
+    {
+        command(h,CHAT_COMMAND_SELECT,conv0);
+        CHECK(h->chat_ui.chip_count==CHAT_ATTACHMENT_MAX_PER_MESSAGE);
+        size_t before=h->pending_count;
+        /* Chip 1 is "photo.png"; removing it shifts the survivors down. */
+        CHECK(!wcscmp(ui_node(ui,h->chat_ui.chip_labels[1])->text,L"photo.png"));
+        command(h,CHAT_COMMAND_REMOVE_ATTACHMENT,1);
+        CHECK(h->pending_count==before-1);
+        CHECK(h->chat_ui.chip_count==CHAT_ATTACHMENT_MAX_PER_MESSAGE-1);
+        CHECK(!wcscmp(ui_node(ui,h->chat_ui.chip_labels[1])->text,L"mix.png"));
+        CHECK(wcscmp(ui_node(ui,h->chat_ui.chip_labels[1])->text,L"photo.png"));
+    }
+
+    /* ---- snapshot pruning keeps pending records from every conversation;
+           removing a chip makes its record prunable, while sent records stay
+           because live message parts reference them ---- */
+    {
+        /* The just-removed chip's record is still in the table until the next
+           snapshot prune; the two sent parts' records are live either way. */
+        CHECK(chat->attachment_count==h->pending_count+3);
+        mark_dirty(h);
+        CHECK(save_sync(h));
+        CHECK(chat->attachment_count==h->pending_count+2);
+        while (h->pending_count) {
+            command(h,CHAT_COMMAND_REMOVE_ATTACHMENT,0);
+        }
+        CHECK(h->pending_count==0 && h->chat_ui.chip_count==0);
+        mark_dirty(h);
+        CHECK(save_sync(h));
+        CHECK(chat->attachment_count==2);
+    }
+
+    /* ---- conversation deletion clears that conversation's chips; Clear
+           clears the active one ---- */
+    {
+        wcscpy(ingest_display_name,L"gone.png");
+        paste_image(h,dib_bytes,sizeof dib_bytes);
+        ingest_display_name[0]=0;
+        command(h,CHAT_COMMAND_SELECT,conv1);
+        wcscpy(ingest_display_name,L"kept.png");
+        paste_image(h,dib_bytes,sizeof dib_bytes);
+        ingest_display_name[0]=0;
+        CHECK(h->pending_count==2);
+        message_box_result=IDYES;
+        command(h,CHAT_COMMAND_SELECT,conv0);
+        action(h,ACTION_DELETE);
+        CHECK(h->pending_count==1);
+        CHECK(h->chat_ui.chip_count==1);
+        CHECK(!wcscmp(ui_node(ui,h->chat_ui.chip_labels[0])->text,L"kept.png"));
+        action(h,ACTION_CLEAR);
+        CHECK(h->pending_count==0 && h->chat_ui.chip_count==0);
+    }
+
+    /* ---- attach and send transfer survive allocation failure without
+           publishing partial state ---- */
+    {
+        /* Attach: force the two growth allocations to exist (pending list,
+           session-digest list) by exhausting their capacity, then fail each
+           in turn (alloc_fail_realloc=N fails the N+1-th realloc). Every
+           rejection must leave the chips, the table and the digest list
+           untouched and must dispose the ingest buffers. */
+        for (long pos=0; pos<=1; pos++) {
+            h->pending_capacity = h->pending_count;
+            h->attachment_session_capacity = h->attachment_session_count;
+            size_t chips_before=h->pending_count;
+            size_t table_before=chat->attachment_count;
+            size_t digests_before=h->attachment_session_count;
+            long live_before=ingest_live_buffers;
+            alloc_fail_malloc=-1; alloc_fail_realloc=pos;
+            paste_image(h,dib_bytes,sizeof dib_bytes);
+            alloc_fail_realloc=-1;
+            CHECK(h->pending_count==chips_before);
+            CHECK(chat->attachment_count==table_before);
+            CHECK(h->attachment_session_count==digests_before);
+            CHECK(h->chat_ui.chip_count==(int)chips_before);
+            CHECK(ingest_live_buffers==live_before);
+        }
+        /* The same attach succeeds once allocation is allowed. */
+        h->pending_capacity = h->pending_count;
+        h->attachment_session_capacity = h->attachment_session_count;
+        size_t chips_before=h->pending_count;
+        paste_image(h,dib_bytes,sizeof dib_bytes);
+        CHECK(h->pending_count==chips_before+1);
+        command(h,CHAT_COMMAND_REMOVE_ATTACHMENT,0);
+        CHECK(h->pending_count==chips_before);
+
+        /* Send transfer: each staged-build allocation failure (the TEXT part
+           payload and the parts array) publishes no turns and keeps the
+           composer text and chips intact. */
+        wcscpy(ingest_display_name,L"oom.png");
+        paste_image(h,dib_bytes,sizeof dib_bytes);
+        ingest_display_name[0]=0;
+        CHECK(h->pending_count==chips_before+1);
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int victim=chat->active;
+        wcscpy(ingest_display_name,L"staged.png");
+        paste_image(h,dib_bytes,sizeof dib_bytes);
+        ingest_display_name[0]=0;
+        CHECK(h->chat_ui.chip_count==1);
+        size_t chips_kept=h->pending_count;
+        size_t messages_before=chat->conversations[victim].message_count;
+        rich_text_set_text(&h->composer,L"turn text");
+        for (long pos=0; pos<=1; pos++) {
+            alloc_fail_malloc=pos; alloc_fail_malloc_size=0;
+            alloc_fail_realloc=-1;
+            perform_send(h);
+            alloc_fail_malloc=-1; alloc_fail_malloc_size=0;
+            CHECK(chat->conversations[victim].message_count==messages_before);
+            CHECK(h->pending_count==chips_kept);
+            CHECK(h->chat_ui.chip_count==1);
+            wchar_t text[64]; rich_text_get_text(&h->composer,text,64);
+            CHECK(!wcscmp(text,L"turn text"));
+        }
+        /* The same send succeeds once allocation is allowed. */
+        perform_send(h);
+        CHECK(chat->conversations[victim].message_count==messages_before+2);
+        CHECK(h->pending_count==chips_kept-1);
+        CHECK(h->chat_ui.chip_count==0);
+    }
+
+    /* ---- attaching is allowed while generating; an edit-resend keeps its
+           chips (v1 preserves the turn's parts) ---- */
+    {
+        command(h,CHAT_COMMAND_NEW_CONVERSATION,-1);
+        int gen=chat->active;
+        CHECK(chat_begin_response(chat,CHAT_SEND,L"running",0)>=0);
+        h->request_conversation=gen; h->request_message=
+            (int)chat->conversations[gen].message_count-1;
+        h->generating=true; h->accepting=true;
+        wcscpy(ingest_display_name,L"while-gen.png");
+        paste_image(h,dib_bytes,sizeof dib_bytes);
+        ingest_display_name[0]=0;
+        CHECK(pending_count_for(h,chat->conversations[gen].id)==1);
+        CHECK(h->chat_ui.chip_count==1);
+        h->generating=false;
+        /* An edit-resend must not drain the chips. */
+        chat->conversations[gen].messages[h->request_message].generation.state=
+            CHAT_GENERATION_COMPLETE;
+        start_response(h,CHAT_EDIT_RESEND,L"edited");
+        CHECK(pending_count_for(h,chat->conversations[gen].id)==1);
+        CHECK(h->chat_ui.chip_count==1);
+        CHECK(chat->conversations[gen].message_count==2);
+        CHECK(!wcscmp(chat_message_text(
+            &chat->conversations[gen].messages[0]),L"edited"));
+    }
+
+    /* Every ingest buffer the suite allocated was disposed. */
+    CHECK(ingest_live_buffers==0);
+    free(clipboard_dib); clipboard_dib=NULL; clipboard_dib_length=0;
+
+    /* Close the top-level window before anything is freed: a live window
+       with a freed GWLP_USERDATA host answers activation broadcasts from
+       dangling state (the intermittent teardown crash this guards). */
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(!IsWindow(window));
+    ui_accessibility_destroy(h->accessibility); renderer_dispose(&h->renderer);
+    DeleteObject(h->background);
+    transcript_dispose(&h->transcript);
+    /* The background writer must be stopped before the store it writes through
+       is closed and the Chat it snapshots is freed, or it reaches freed memory
+       from its own thread -- which is an intermittent access violation rather
+       than a clean failure. */
+    saver_shutdown(&h->saver);
+    attachment_store_close(&h->attachments);
+    storage_close(&h->storage);
+    wchar_t lock[300]; swprintf(lock,300,L"%ls\\writer.lock",dir);
+    DeleteFileW(lock); RemoveDirectoryW(dir);
+    chat_dispose(chat); free(chat); free(ui); free(h); CoUninitialize();
+    return 0;
+}
+
 static int attachment_reclaim_suite(void) {
     CHECK(SUCCEEDED(CoInitializeEx(NULL,COINIT_APARTMENTTHREADED)));
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -7687,7 +8566,7 @@ static int attachment_reclaim_suite(void) {
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
     wchar_t dir[256];
-    swprintf(dir,256,L"build\\host-reclaim-%lu",(unsigned long)GetCurrentProcessId());
+    suite_scratch_dir(dir,256,L"host-reclaim");
     CHECK(storage_open(&h->storage,dir));
     /* An import and a save both drive the window and the background writer,
        so this suite needs the same live harness the other host suites use.
@@ -7951,7 +8830,7 @@ static int hardening_suite(void) {
     h->dpi=96; CHECK(chat_ui_init(&h->chat_ui,ui,chat));
     CHECK(SUCCEEDED(renderer_init(&h->renderer,&ui->theme)));
     h->background=CreateSolidBrush(RGB(20,20,20));
-    wchar_t dir[256]; swprintf(dir,256,L"build\\host-harden-%lu",GetCurrentProcessId());
+    wchar_t dir[256]; suite_scratch_dir(dir,256,L"host-harden");
     CHECK(storage_open(&h->storage,dir));
     WNDCLASSW cls={0}; cls.lpfnWndProc=window_proc; cls.lpszClassName=L"DarkChat.HostTest";
     CHECK(register_class_once(&cls));
@@ -7980,6 +8859,8 @@ static int hardening_suite(void) {
     CHECK(grown.left==0 && grown.top==0 &&
         grown.right==2000 && grown.bottom==1400);
 
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(!IsWindow(window));
     saver_shutdown(&h->saver); storage_close(&h->storage);
     DeleteFileW(h->storage.path); DeleteFileW(h->storage.backup);
     DeleteFileW(h->storage.temporary);
@@ -7993,6 +8874,9 @@ static int hardening_suite(void) {
 }
 
 int main(void) {
+    /* Unbuffered output: the suites print little, and a crash must leave its
+       position in the log instead of losing the buffered tail. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     /* The fixtures share one process and never unload Msftedit: repeated
         unload/reload cycles across fixtures can fail its DllMain with
         ERROR_DLL_INIT_FAILED (1114), so the first fixture's load is kept for
@@ -8023,8 +8907,10 @@ int main(void) {
     if (failed) return failed;
     failed=hardening_suite();
     if (failed) return failed;
+    failed=attach_suite();
+    if (failed) return failed;
     failed=attachment_reclaim_suite();
     if (failed) return failed;
-    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy + export + import + notifications + hardening fixtures) passed");
+    puts("Hidden host (default + bounded + catalog + backend + palette + model palette + navigation + code copy + export + import + notifications + hardening + attach fixtures) passed");
     return failed;
 }

@@ -513,6 +513,27 @@ static int wic_checks(IWICImagingFactory *factory, const wchar_t *dir) {
             CHECK(image_ingest_dib(&extreme, sizeof extreme, &ingest)
                 == IMAGE_INGEST_DIMENSIONS);
         }
+
+        /* A "header" past the defined DIB header sizes is rejected before it
+           can pad the gap in front of the pixels (regression: a 1x1 image
+           declaring a 16380-byte header was accepted with a 16384-byte
+           span). The largest defined header (V5) is still accepted. */
+        {
+            static unsigned char fat[16384];
+            BITMAPINFOHEADER *fat_header = (BITMAPINFOHEADER *)fat;
+            memset(fat, 0, sizeof fat);
+            fat_header->biSize = 16380;
+            fat_header->biWidth = 1;
+            fat_header->biHeight = 1;
+            fat_header->biPlanes = 1;
+            fat_header->biBitCount = 24;
+            fat_header->biCompression = BI_RGB;
+            CHECK(image_ingest_dib(fat, sizeof fat, &ingest)
+                == IMAGE_INGEST_UNSUPPORTED);
+            fat_header->biSize = sizeof(BITMAPV5HEADER);
+            CHECK(image_ingest_dib(fat, 128, &ingest) == IMAGE_INGEST_OK);
+            image_ingest_dispose(&ingest);
+        }
     }
 
     /* A bottom-up DIB is flipped so it matches the equivalent top-down DIB;

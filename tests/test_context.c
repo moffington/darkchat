@@ -672,7 +672,7 @@ static void check_mode(ChatSendMode mode, const wchar_t *prompt, const wchar_t *
     Chat *chat = fresh_chat();
     add_turn(chat, L"first", L"answer",
         mode == CHAT_RETRY ? CHAT_GENERATION_FAILED : CHAT_GENERATION_COMPLETE);
-    int response = chat_begin_response(chat, mode, prompt);
+    int response = chat_begin_response(chat, mode, prompt, 0);
     check(response > 0, "the send mode starts a response");
     static ChatRequestContext context;
     check(chat_context_build(chat, &chat->conversations[0], response - 1,

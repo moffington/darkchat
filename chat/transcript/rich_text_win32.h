@@ -65,6 +65,13 @@ struct RichTextControl {
     bool (*on_submit)(void *user);
     /* Down/up translation of any key. Return true to consume it. */
     bool (*on_key)(void *user, WPARAM key, bool shift, bool control, bool down);
+    /* Paste gesture (Ctrl+V or WM_PASTE) on this control. The subclass
+       intercepts the gesture itself -- a host-level WM_PASTE never fires for
+       a child Rich Edit -- and delegates the decision here; return true when
+       the paste was consumed as an image attach so the native text/RTF paste
+       does not also run. Returning false falls through to CallWindowProcW
+       unchanged, so native paste, undo and IME composition are untouched. */
+    bool (*on_paste)(void *user);
     /* A line of a read-only block was clicked. Return true to consume the
        click; the host uses this for a turn's reasoning row. */
     bool (*on_line_click)(void *user, RichTextControl *control, int line,

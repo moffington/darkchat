@@ -34,6 +34,11 @@
    for the retained search glyph. */
 #define CHAT_UI_SEARCH_ICON_INSET 26.0f
 
+/* Chip slots in the composer's attachment strip. Mirrors the product bound
+   CHAT_ATTACHMENT_MAX_PER_MESSAGE (chat/core/image_policy.h), which the pure
+   UI layer does not include. */
+#define CHAT_UI_ATTACH_SLOTS 8
+
 typedef enum {
     CHAT_COMMAND_NONE,
     CHAT_COMMAND_SEND,
@@ -49,7 +54,12 @@ typedef enum {
     CHAT_COMMAND_TOGGLE_REASONING,
     /* Flip the sidebar: the explicit preference at wide widths, the
        temporary drawer at narrow widths. */
-    CHAT_COMMAND_TOGGLE_SIDEBAR
+    CHAT_COMMAND_TOGGLE_SIDEBAR,
+    /* Open the image picker to add pending attachments to the composer. */
+    CHAT_COMMAND_ATTACH,
+    /* Drop one pending attachment. `index` is the chip's slot in the active
+       conversation's chip row (0-based, in display order). */
+    CHAT_COMMAND_REMOVE_ATTACHMENT
 } ChatCommand;
 
 typedef void (*ChatCommandFn)(void *user, ChatCommand command, int index);
@@ -82,6 +92,16 @@ typedef struct {
         search_status, new_conversation, list, transcript, composer, send,
         reasoning, status, empty, empty_title, empty_hint, header, sidebar,
         main, composer_area, composer_card, footer;
+    /* Composer attachment strip: the Attach button beside the Send/brain
+       stack, and up to CHAT_UI_ATTACH_SLOTS named chips wrapping across
+       bounded rows inside one scrollable strip above the composer. */
+    UiId attach, chip_strip;
+    UiId chip_rows[CHAT_UI_ATTACH_SLOTS];
+    UiId chips[CHAT_UI_ATTACH_SLOTS];
+    UiId chip_labels[CHAT_UI_ATTACH_SLOTS];
+    UiId chip_remove[CHAT_UI_ATTACH_SLOTS];
+    int chip_count;
+    float chip_strip_width; /* arranged width the wrap was computed against */
     /* Windowed conversation list: two spacers sandwich the live rows so the
        laid-out extent always equals the full list (count*pitch - gap). */
     UiId top_spacer, bottom_spacer;
@@ -132,9 +152,18 @@ bool chat_ui_apply_reveal(ChatUi *chat_ui);
    accessible name tracks the action. */
 void chat_ui_set_generation(ChatUi *chat_ui, bool generating, bool stopping);
 /* Reflects the active conversation's reasoning preference without rebuilding
-    the retained tree: the brain button reads as selected/accent when enabled
-    and greyed when disabled. Paint-only and a no-op when unchanged. */
+     the retained tree: the brain button reads as selected/accent when enabled
+     and greyed when disabled. Paint-only and a no-op when unchanged. */
 void chat_ui_set_reasoning(ChatUi *chat_ui, bool enabled);
+/* Rebinds the composer's attachment chip strip to `count` pending attachments
+   of the active conversation (display names in chip order; an empty name
+   reads as "Image"). Chips wrap across rows that fit the strip's width and
+   the strip scrolls when the rows exceed its fixed height; every chip keeps
+   its own accessible remove button. The composer area grows by the strip's
+   exact height while attachments exist. `count` is clamped to
+   CHAT_UI_ATTACH_SLOTS. */
+void chat_ui_set_attachments(ChatUi *chat_ui,
+    const wchar_t (*display_names)[64], int count);
 /* Toggles the sidebar through one command: at wide widths it flips and
    persists the explicit preference (written to Chat::sidebar_collapsed) and
    returns true so the host can mark storage dirty; at narrow widths it

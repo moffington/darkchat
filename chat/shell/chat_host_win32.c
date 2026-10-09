@@ -14,6 +14,7 @@
 #include "chat/export/package.h"
 #include "chat/import/import.h"
 #include "chat/shell/actions_win32.h"
+#include "chat/shell/image_wic.h"
 #include "chat/models/model_catalog.h"
 #include "chat/models/model_catalog_winhttp.h"
 #include "chat/shell/palette_win32.h"
@@ -45,10 +46,30 @@
 #define CHAT_NOTIFY_MIN_MS 5000
 /* Resource id of the application icon in app.rc. */
 #define CHAT_APP_ICON_ID 1
-/* Tool ids for the two composer button tooltips. */
+/* Tool ids for the composer buttons' tooltips. */
 #define CHAT_TOOLTIP_SEND 1
 #define CHAT_TOOLTIP_REASONING 2
-#define CHAT_TOOLTIP_COUNT 2
+#define CHAT_TOOLTIP_ATTACH 3
+#define CHAT_TOOLTIP_COUNT 3
+
+/* One pending attachment of one conversation: session memory only (never
+   persisted, Questions #3), keyed by the owning conversation's stable id so
+   switching away and back restores the same chips. `part` is the ingest's
+   ChatImagePart -- the exact input chat_message_add_image takes -- with its
+   attachment_id assigned by the store put; `digest` is the store's key for
+   the session live set (import rollback, future sweeps); `flags` carries
+   CHAT_PART_FLAG_*. Pixel dimensions live on `part`; the store record copies
+   them before it is published. */
+typedef struct {
+    uint64_t conversation_id;
+    ChatImagePart part;
+    uint8_t flags;
+    char digest[65];
+} PendingAttachment;
+
+/* Worst-case pending entries: every conversation holds the per-message cap
+   (the send-time bound) at once. Used for the snapshot prune keep-set. */
+#define CHAT_PENDING_MAX (CHAT_MAX_CONVERSATIONS * CHAT_ATTACHMENT_MAX_PER_MESSAGE)
 
 typedef struct {
     ChatHostConfig config;
@@ -107,6 +128,15 @@ typedef struct {
        extends this with ingest and pending-list digests. */
     char (*attachment_session_digests)[65];
     size_t attachment_session_count, attachment_session_capacity;
+    /* Composer attachments awaiting send, across every conversation (flat
+       array; the entry's conversation_id selects the owner). Session-only
+       state: send drains the active conversation's entries into the new user
+       turn, conversation deletion clears that conversation's entries, and
+       session end frees the array. Every entry's digest also lives in
+       attachment_session_digests, so the pending set is automatically part
+       of the live set of a later import rollback sweep. */
+    PendingAttachment *pending_attachments;
+    size_t pending_count, pending_capacity;
     /* Background snapshot writer. Mutations is the counter every save handoff
        captures; last_submitted_attempt is the newest accepted handoff and
        handled_attempt the newest attempt whose result has been interpreted,
@@ -635,11 +665,17 @@ static Chat *save_snapshot(ChatHost *host, uint64_t *captured) {
     *captured=host->mutations;
     /* Format-6 attachment pruning runs immediately before every snapshot
        hand-off: records referenced by neither a live message part nor a
-       pending/staged attachment are dropped so the encoded file omits them
-       and the emitted version can fall back off 6. The keep-set is empty
-       until the attach UI lands pending lists (later commit); pruning never
-       touches blobs. */
-    chat_attachment_prune(host->config.chat,NULL,0);
+       pending attachment are dropped so the encoded file omits them and the
+       emitted version can fall back off 6. The keep-set is every pending
+       entry's attachment id from EVERY conversation -- a chip in a background
+       conversation is still live session state its next send needs. Pruning
+       never touches blobs. */
+    uint64_t keep[CHAT_PENDING_MAX];
+    size_t keep_count=0;
+    for (size_t i=0;i<host->pending_count && keep_count<CHAT_PENDING_MAX;i++)
+        if (host->pending_attachments[i].part.attachment_id)
+            keep[keep_count++]=host->pending_attachments[i].part.attachment_id;
+    chat_attachment_prune(host->config.chat,keep,keep_count);
     Chat *snapshot=chat_snapshot(host->config.chat);
     if (!snapshot) {
         host->save_failed=true;
@@ -1246,14 +1282,16 @@ static void sidebar_accessibility(ChatHost *host, const ChatUiRemapReport *repor
                                    : host->config.ui->root);
 }
 
-/* The two composer buttons as (tool id, text slot) pairs. */
+/* The composer buttons as (tool id, text slot) pairs. */
 static const struct { UINT_PTR id; int slot; } host_tools[CHAT_TOOLTIP_COUNT] = {
     { CHAT_TOOLTIP_SEND, 0 },
-    { CHAT_TOOLTIP_REASONING, 1 }
+    { CHAT_TOOLTIP_REASONING, 1 },
+    { CHAT_TOOLTIP_ATTACH, 2 }
 };
 
 static UiId host_tool_node(const ChatHost *host, int slot) {
-    return slot == 0 ? host->chat_ui.send : host->chat_ui.reasoning;
+    return slot == 0 ? host->chat_ui.send :
+        slot == 1 ? host->chat_ui.reasoning : host->chat_ui.attach;
 }
 
 /* Fills a tracking TOOLINFO for one composer button. */
@@ -1348,6 +1386,7 @@ static int tooltip_slot_at(ChatHost *host, float x, float y) {
     UiId hit = ui_hit_test(host->config.ui, x, y);
     if (hit == host->chat_ui.send) return 0;
     if (hit == host->chat_ui.reasoning) return 1;
+    if (hit == host->chat_ui.attach) return 2;
     return -1;
 }
 
@@ -1552,15 +1591,293 @@ static bool load_attachment_bytes(ChatHost *host, ChatRequestContext *context) {
     return true;
 }
 
+/* ---- pending composer attachments ------------------------------------ */
+
+/* Entries of one conversation, counted or resolved in display order (the
+   shared array's insertion order, which is exactly the chip order). */
+static size_t pending_count_for(const ChatHost *host, uint64_t conversation_id) {
+    size_t count = 0;
+    for (size_t i = 0; i < host->pending_count; i++)
+        if (host->pending_attachments[i].conversation_id == conversation_id)
+            ++count;
+    return count;
+}
+
+static const PendingAttachment *pending_at(const ChatHost *host,
+    uint64_t conversation_id, size_t nth) {
+    size_t seen = 0;
+    for (size_t i = 0; i < host->pending_count; i++) {
+        if (host->pending_attachments[i].conversation_id != conversation_id)
+            continue;
+        if (seen++ == nth) return &host->pending_attachments[i];
+    }
+    return NULL;
+}
+
+/* Removes one chip: `nth` indexes the conversation's chips in display order,
+   which must be translated to the shared array entry that owns the chip. */
+static bool pending_remove_index(ChatHost *host, uint64_t conversation_id,
+    size_t nth) {
+    size_t seen = 0;
+    for (size_t i = 0; i < host->pending_count; i++) {
+        if (host->pending_attachments[i].conversation_id != conversation_id)
+            continue;
+        if (seen++ != nth) continue;
+        memmove(&host->pending_attachments[i], &host->pending_attachments[i + 1],
+            (host->pending_count - i - 1) * sizeof *host->pending_attachments);
+        --host->pending_count;
+        /* The table record becomes prunable at the next snapshot hand-off. */
+        mark_dirty(host);
+        return true;
+    }
+    return false;
+}
+
+static void pending_clear_conversation(ChatHost *host, uint64_t conversation_id) {
+    size_t out = 0;
+    bool changed = false;
+    for (size_t i = 0; i < host->pending_count; i++) {
+        if (host->pending_attachments[i].conversation_id == conversation_id) {
+            changed = true;
+            continue;
+        }
+        host->pending_attachments[out++] = host->pending_attachments[i];
+    }
+    if (changed) { host->pending_count = out; mark_dirty(host); }
+}
+
+static void pending_clear_all(ChatHost *host) {
+    if (!host->pending_count) return;
+    host->pending_count = 0;
+    mark_dirty(host);
+}
+
+/* Rebinds the chip strip to the active conversation's pending list. */
+static void sync_attachments_ui(ChatHost *host) {
+    Chat *chat = host->config.chat;
+    wchar_t names[CHAT_UI_ATTACH_SLOTS][64];
+    int count = 0;
+    if (chat->active >= 0 && chat->active < chat->conversation_count) {
+        uint64_t id = chat->conversations[chat->active].id;
+        for (size_t i = 0; i < host->pending_count &&
+                count < CHAT_UI_ATTACH_SLOTS; i++) {
+            if (host->pending_attachments[i].conversation_id != id) continue;
+            wcsncpy(names[count],
+                host->pending_attachments[i].part.display_name, 63);
+            names[count][63] = 0;
+            ++count;
+        }
+    }
+    chat_ui_set_attachments(&host->chat_ui,
+        (const wchar_t (*)[64])names, count);
+}
+
+/* Publishes one successfully ingested image as a pending attachment of the
+   active conversation. Returns NULL on success, else the error text (the
+   caller owns the status and the ingest buffers).
+
+   Failure cleanup contract: every fallible allocation (attachment table,
+   pending list, session-digest list) is reserved BEFORE the table record is
+   published, so a failure leaves the existing chips untouched and, at worst,
+   an unreferenced blob -- out_created alone never authorizes deleting it,
+   and mark/sweep reclaims orphans. */
+static const wchar_t *attach_ingest(ChatHost *host,
+    const ChatImageIngest *ingest) {
+    Chat *chat = host->config.chat;
+    if (chat->active < 0 || chat->active >= chat->conversation_count)
+        return L"Action unavailable: no active conversation.";
+    if (pending_count_for(host, chat->conversations[chat->active].id) >=
+            CHAT_ATTACHMENT_MAX_PER_MESSAGE)
+        return L"You can attach up to 8 images to one message.";
+    if (!host->attachments.open)
+        return L"Could not save the image: the attachment store is unavailable.";
+    if (!chat_attachment_reserve(chat, chat->attachment_count + 1))
+        return L"Out of memory adding the image.";
+    if (host->pending_count == host->pending_capacity) {
+        size_t capacity = host->pending_capacity ?
+            host->pending_capacity * 2 : 8;
+        PendingAttachment *grown = (PendingAttachment *)realloc(
+            host->pending_attachments, capacity * sizeof *grown);
+        if (!grown) return L"Out of memory adding the image.";
+        host->pending_attachments = grown;
+        host->pending_capacity = capacity;
+    }
+    if (host->attachment_session_count == host->attachment_session_capacity) {
+        size_t capacity = host->attachment_session_capacity ?
+            host->attachment_session_capacity * 2 : 8;
+        char (*grown)[65] = (char (*)[65])realloc(
+            host->attachment_session_digests, capacity * sizeof *grown);
+        if (!grown) return L"Out of memory adding the image.";
+        host->attachment_session_digests = grown;
+        host->attachment_session_capacity = capacity;
+    }
+    /* Blob-then-state: the managed bytes land before any record can
+       reference them. */
+    ChatAttachmentMeta store_meta;
+    memset(&store_meta, 0, sizeof store_meta);
+    bool created = false;
+    if (!attachment_store_put(&host->attachments, ingest->bytes,
+            ingest->length, ingest->meta.mime, ingest->meta.display_name,
+            &store_meta, &created))
+        return L"Could not save the image.";
+    /* The store record is metadata authority: copy the ingest's pixel
+       dimensions into it before publishing, and assign the fresh identity
+       back onto the ingest's ChatImagePart (the message-model input). */
+    store_meta.pixel_width = ingest->meta.pixel_width;
+    store_meta.pixel_height = ingest->meta.pixel_height;
+    ChatImagePart part = ingest->meta;
+    part.attachment_id = store_meta.id;
+    if (!chat_attachment_add(chat, &store_meta))
+        return L"Could not record the image.";
+    /* Commit: capacity is reserved, so neither append can fail from here. */
+    PendingAttachment *entry =
+        &host->pending_attachments[host->pending_count++];
+    entry->conversation_id = chat->conversations[chat->active].id;
+    entry->part = part;
+    entry->flags = ingest->flags;
+    memcpy(entry->digest, store_meta.digest, sizeof entry->digest);
+    memcpy(host->attachment_session_digests[host->attachment_session_count++],
+        store_meta.digest, 65);
+    /* The table record belongs in the next snapshot. */
+    mark_dirty(host);
+    return NULL;
+}
+
+/* Consumes the ingest (buffers disposed on every path) and refreshes the
+   chip row. */
+static const wchar_t *attach_staged(ChatHost *host, ChatImageIngest *ingest) {
+    const wchar_t *error = attach_ingest(host, ingest);
+    image_ingest_dispose(ingest);
+    sync_attachments_ui(host);
+    return error;
+}
+
+/* Paste decision for the composer: an image on the clipboard attaches and
+   consumes the gesture; anything else falls through to the native text/RTF
+   paste. Attaching is deliberately allowed while generating or editing --
+   chips are queued composer state and only a CHAT_SEND drains them (an
+   edit-resend preserves the turn's parts and keeps its chips). Every
+   consumed path flushes: the chip/status updates must lay out and schedule
+   their paint now, not wait for some later event to repaint the window. */
+static bool composer_paste(void *user) {
+    ChatHost *host = (ChatHost *)user;
+    if (!chat_clipboard_has_image()) return false;
+    Chat *chat = host->config.chat;
+    if (chat->active >= 0 && chat->active < chat->conversation_count &&
+        pending_count_for(host, chat->conversations[chat->active].id) >=
+            CHAT_ATTACHMENT_MAX_PER_MESSAGE) {
+        set_status(host, L"You can attach up to 8 images to one message.");
+    } else {
+        unsigned char *dib = NULL;
+        size_t n = 0;
+        if (!chat_clipboard_read_dib(&dib, &n) || !dib || !n) {
+            free(dib);
+            set_status(host, L"Could not read the image from the clipboard.");
+        } else {
+            ChatImageIngest ingest;
+            ChatImageIngestResult result = image_ingest_dib(dib, n, &ingest);
+            SecureZeroMemory(dib, n);
+            free(dib);
+            if (result != IMAGE_INGEST_OK) {
+                set_status(host, image_ingest_error_text(result));
+            } else {
+                const wchar_t *error = attach_staged(host, &ingest);
+                if (error) set_status(host, error);
+            }
+        }
+    }
+    flush(host);
+    return true;
+}
+
+/* Per-file ingest for a drop: a non-image or oversize file is skipped with an
+   error and never blocks the valid files of the same drop. The status is
+   written once after every file has been processed, so a later success can
+   never hide the first failure. The trailing flush lays the chip/status
+   updates out and schedules their paint immediately. */
+static void attach_dropped_files(ChatHost *host, HDROP drop) {
+    UINT files = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+    const wchar_t *first_error = NULL;
+    for (UINT i = 0; i < files; i++) {
+        wchar_t path[MAX_PATH];
+        if (!DragQueryFileW(drop, i, path, MAX_PATH)) continue;
+        ChatImageIngest ingest;
+        ChatImageIngestResult result = image_ingest_file(path, &ingest);
+        if (result != IMAGE_INGEST_OK) {
+            if (!first_error) first_error = image_ingest_error_text(result);
+            continue;
+        }
+        const wchar_t *error = attach_staged(host, &ingest);
+        if (error && !first_error) first_error = error;
+    }
+    if (first_error) set_status(host, first_error);
+    flush(host);
+}
+
+/* The explicit Attach control: one image per dialog run (multi-file entry is
+   the drop path). */
+static void attach_from_picker(ChatHost *host) {
+    wchar_t path[MAX_PATH];
+    ChatFileDialogResult result = chat_open_dialog(host->window, L"Attach image",
+        L"Images (*.png;*.jpg;*.jpeg;*.webp;*.gif)\0*.png;*.jpg;*.jpeg;*.webp;*.gif\0All files (*.*)\0*.*\0\0",
+        path, MAX_PATH);
+    if (result != CHAT_FILE_DIALOG_ACCEPTED) return;
+    ChatImageIngest ingest;
+    ChatImageIngestResult ingested = image_ingest_file(path, &ingest);
+    if (ingested != IMAGE_INGEST_OK) {
+        set_status(host, image_ingest_error_text(ingested));
+        return;
+    }
+    const wchar_t *error = attach_staged(host, &ingest);
+    if (error) set_status(host, error);
+}
+
 static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *prompt) {
     if (host->generating) return;
     Chat *chat=host->config.chat;
     sync_model(host);
-    int index=chat_begin_response(chat,mode,prompt);
-    if (index<0) { set_status(host,L"Action unavailable: check the latest turn and conversation capacity."); return; }
+    uint64_t conversation_id=chat->conversations[chat->active].id;
+    /* Stage the complete user content before publishing anything: the
+       prompt plus every pending image assembles in a scratch message, so a
+       mid-transfer failure can never leave a partially assembled turn and
+       the composer text and pending chips stay exactly as they were until
+       every image has transferred. */
+    size_t images = mode==CHAT_SEND ? pending_count_for(host,conversation_id) : 0;
+    ChatMessage staged;
+    memset(&staged,0,sizeof staged);
+    bool staged_ok = chat_message_set_text(&staged,prompt);
+    for (size_t i=0;staged_ok && i<images;i++) {
+        const PendingAttachment *item=pending_at(host,conversation_id,i);
+        staged_ok = item && chat_message_add_image(&staged,&item->part,
+            item->flags);
+    }
+    if (!staged_ok) {
+        chat_message_dispose(&staged);
+        set_status(host,L"Could not attach the images; nothing was sent.");
+        return;
+    }
+    int index=chat_begin_response(chat,mode,prompt,images);
+    if (index<0) {
+        chat_message_dispose(&staged);
+        set_status(host,L"Action unavailable: check the latest turn and conversation capacity.");
+        return;
+    }
+    ChatConversation *c=&chat->conversations[chat->active];
+    /* Publish the staged parts in one infallible move: the message was just
+       created from the same prompt, so its projection already matches. */
+    if (images && !chat_message_adopt_parts(&c->messages[index-1],&staged)) {
+        /* Unreachable by precondition; unwind both new turns rather than
+           send a partially assembled one. */
+        for (size_t i=(size_t)index-1;i<c->message_count;i++)
+            chat_message_dispose(&c->messages[i]);
+        c->message_count=(size_t)index-1;
+        chat_message_dispose(&staged);
+        set_status(host,L"Could not attach the images; nothing was sent.");
+        return;
+    }
+    chat_message_dispose(&staged);
     /* Resolved only once the response exists, so a rejected action cannot
        touch a conversation it never used. */
-    ChatConversation *c=&chat->conversations[chat->active];
     host->request_conversation=chat->active; host->request_message=index;
     /* A toolbar-triggered send/retry must not destroy a focused transcript
        surface: move focus to the composer through the transcript's
@@ -1579,7 +1896,15 @@ static void start_response(ChatHost *host, ChatSendMode mode, const wchar_t *pro
     host->transcript.body_render_tick=0;
     cancel_body_flush(host);
     ChatMessage *m=pending(host);
-    if (mode==CHAT_SEND) { rich_text_set_text(&host->composer,L""); chat->conversations[chat->active].draft[0]=0; }
+    if (mode==CHAT_SEND) {
+        /* Owed only after every image transferred successfully. The chips
+           join the text as consumed composer state; an edit-resend keeps its
+           chips (v1 preserves the turn's parts) and never drains this. */
+        rich_text_set_text(&host->composer,L"");
+        chat->conversations[chat->active].draft[0]=0;
+        pending_clear_conversation(host,conversation_id);
+        sync_attachments_ui(host);
+    }
     if (host->editing && mode!=CHAT_SEND) {
         host->editing=false;
         rich_text_set_text(&host->composer,chat->conversations[chat->active].draft);
@@ -1715,6 +2040,16 @@ static void perform_send(ChatHost *host) {
     }
     wchar_t prompt[CHAT_COMPOSER_TEXT];
     rich_text_get_text(&host->composer,prompt,CHAT_COMPOSER_TEXT);
+    /* An empty send is valid only with attached images; without either, say
+       so instead of reporting the generic availability failure. */
+    if (!host->editing && !prompt[0]) {
+        Chat *chat=host->config.chat;
+        if (chat->active<0 || chat->active>=chat->conversation_count ||
+            !pending_count_for(host,chat->conversations[chat->active].id)) {
+            set_status(host,L"Type a message or attach an image.");
+            return;
+        }
+    }
     start_response(host,host->editing ? CHAT_EDIT_RESEND : CHAT_SEND,prompt);
 }
 
@@ -2020,6 +2355,24 @@ static void command(void *user, ChatCommand code, int index) {
         flush(host);
         return;
     }
+    /* Attach and chip removal are composer-state commands: like the reasoning
+       toggle they never cancel an in-progress edit (attachment chips are
+       queued for the next send while editing or generating) and their own
+       helpers mark the store dirty when a table record changed. */
+    if (code == CHAT_COMMAND_ATTACH) {
+        attach_from_picker(host);
+        flush(host);
+        return;
+    }
+    if (code == CHAT_COMMAND_REMOVE_ATTACHMENT) {
+        if (index >= 0) {
+            pending_remove_index(host,
+                chat->conversations[chat->active].id, (size_t)index);
+            sync_attachments_ui(host);
+        }
+        flush(host);
+        return;
+    }
     if (code != CHAT_COMMAND_SEND) {
         capture_settings(host);
         host->editing=false;
@@ -2033,6 +2386,9 @@ static void command(void *user, ChatCommand code, int index) {
             sync_transcript_container(host);
             render_transcript(host);
             rich_text_set_text(&host->composer, L"");
+            /* The fresh conversation has no chips; the previous ones are
+               retained per conversation and restore on switch-back. */
+            sync_attachments_ui(host);
             /* The fresh conversation inherits the model: show its effective
                 model, not the previous conversation's. */
             sync_model_field(host);
@@ -2048,6 +2404,9 @@ static void command(void *user, ChatCommand code, int index) {
             sync_transcript_container(host);
             render_transcript(host);
             rich_text_set_text(&host->composer,chat->conversations[chat->active].draft);
+            /* Chips are retained per conversation for the session: the
+               switch restores exactly this conversation's list. */
+            sync_attachments_ui(host);
             /* The selected conversation may override the model: the field
                 shows its effective model so a later sync edits the right
                 target. */
@@ -2868,9 +3227,17 @@ static void action(ChatHost *host, int code) {
             L"Clear all messages in this conversation?";
         if (MessageBoxW(host->window,message,
             L"DarkChat",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES) return;
+        /* Pending chips are per-conversation composer state: deleting or
+           clearing a conversation drops its list (delete-all drops every
+           list), exactly like its draft. Blobs are not deleted inline; they
+           become unreferenced and mark/sweep reclaims them. */
+        uint64_t affected=chat->conversations[chat->active].id;
         if (code==ACTION_DELETE) chat_delete(chat);
         else if (code==ACTION_DELETE_ALL) chat_delete_all(chat);
         else chat_clear(chat);
+        if (code==ACTION_DELETE_ALL) pending_clear_all(host);
+        else pending_clear_conversation(host,affected);
+        sync_attachments_ui(host);
         transcript_invalidate(&host->transcript);
         sync_transcript_container(host);
         host->editing=false; rich_text_set_text(&host->composer,chat->conversations[chat->active].draft); render_transcript(host);
@@ -3749,6 +4116,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
         host->transcript.callbacks.user = host;
         host->composer.on_submit = composer_submit;
         host->composer.on_key = surface_key;
+        host->composer.on_paste = composer_paste;
         host->composer.user = host;
         host->field.on_submit = field_submit;
         host->field.on_key = surface_key;
@@ -3774,6 +4142,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             host->tray_visible = chat_tray_show(window, host->icon,
                 CHAT_WM_TRAY, L"DarkChat");
         create_tooltips(host);
+        /* The host window is the drop target; image files dropped anywhere on
+           it attach to the composer's pending list. */
+        DragAcceptFiles(window, TRUE);
         /* No menu bar: the header's overflow button (and the retained
            keyboard shortcuts) carries every command. */
         SetTimer(window,2,1000,NULL);
@@ -3824,6 +4195,11 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w,
             transcript_selected_surface(host) != NULL;
         chat_actions_sync((HMENU)w,&context);
         break;
+    }
+    case WM_DROPFILES: {
+        attach_dropped_files(host, (HDROP)w);
+        DragFinish((HDROP)w);
+        return 0;
     }
     case WM_COMMAND:
         if (!l) { action(host,LOWORD(w)); return 0; }
@@ -4331,6 +4707,12 @@ cleanup:
     host->attachment_session_digests = NULL;
     host->attachment_session_count = 0;
     host->attachment_session_capacity = 0;
+    /* Unsent chips die with the session; their blobs are orphans that a later
+       mark/sweep reclaims (session memory is not part of any live set). */
+    free(host->pending_attachments);
+    host->pending_attachments = NULL;
+    host->pending_count = 0;
+    host->pending_capacity = 0;
     storage_close(&host->storage);
     free(host);
     CoUninitialize();

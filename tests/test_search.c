@@ -182,7 +182,7 @@ static void test_resolution_and_invalidation(Chat *chat) {
     check(chat_search_build(chat, L"stable assistant", options, &results) &&
         results.count == 1, "replacement target refreshes");
     uint64_t replaced_id = conversation->messages[assistant].id;
-    int replacement = chat_begin_response(chat, CHAT_REGENERATE, NULL);
+    int replacement = chat_begin_response(chat, CHAT_REGENERATE, NULL, 0);
     check(replacement == assistant &&
         conversation->messages[replacement].id != replaced_id,
         "regenerate replaces the assistant with a fresh identity");

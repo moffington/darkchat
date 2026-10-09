@@ -374,9 +374,14 @@ bool chat_delete(Chat *chat);
 bool chat_delete_all(Chat *chat);
 void chat_clear(Chat *chat);
 /* Replacement actions remove only the latest user turn's response, never
-   duplicate its user message. Edit replaces that user text at send time. */
+   duplicate its user message. Edit replaces that user text at send time.
+   `attached_images` is the number of IMAGE parts the caller stages into the
+   new user message immediately after this call succeeds (0 today): it lets
+   CHAT_SEND accept an empty prompt when the turn carries attachments while
+   keeping the empty-send rejection for everything else. */
 typedef enum { CHAT_SEND, CHAT_RETRY, CHAT_REGENERATE, CHAT_EDIT_RESEND } ChatSendMode;
-int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt);
+int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt,
+    size_t attached_images);
 int chat_latest_user(const ChatConversation *conversation);
 bool chat_history_message(const ChatMessage *message);
 const wchar_t *chat_message_text(const ChatMessage *message);
@@ -407,6 +412,13 @@ bool chat_message_move_part(ChatMessage *message, size_t from, size_t to);
 /* Drops every part and returns to the fast path; the plain-text projection
    remains in `text`. Bumps revision/body_revision when parts existed. */
 void chat_message_clear_parts(ChatMessage *message);
+/* Infallible ownership transfer for staging a turn before publishing it:
+   moves `from`'s content parts into `message`, which must not already own
+   parts and whose plain-text projection must equal the concatenation of the
+   transferred TEXT parts (true when both messages were built from the same
+   prompt). `from` is left with no parts. Returns false without touching
+   either message when a precondition fails. */
+bool chat_message_adopt_parts(ChatMessage *message, ChatMessage *from);
 /* Marks a message as observably changed for view bookkeeping after a direct
    mutation the setters do not cover (generation metadata written in place).
    Bumping must be limited to real changes; never call it speculatively. */

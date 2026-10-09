@@ -301,7 +301,19 @@ static LRESULT CALLBACK rich_proc(HWND window, UINT message, WPARAM w,
             control->on_submit(control->user);
             return 0;
         }
+        /* Ctrl+V is an image-paste candidate: the host decides (clipboard
+           contents), and only a consumed paste swallows the key. AltGr (Ctrl
+           +Alt) and Ctrl+Shift+V chords fall through untouched. */
+        if (down && w == L'V' && control_key && !shift &&
+            !(GetKeyState(VK_MENU) & 0x8000) && control->on_paste &&
+            control->on_paste(control->user))
+            return 0;
     }
+    /* A paste request from anywhere else (context menu, EM_PASTE) reaches the
+       subclass first; the same consume/fall-through contract applies. */
+    if (message == WM_PASTE && control->on_paste &&
+        control->on_paste(control->user))
+        return 0;
     if (message == WM_CHAR) {
         /* Never insert a tab; plain Enter is swallowed when it submits. */
         if (w == L'\t') return 0;

@@ -19,6 +19,14 @@
 #define CHAT_SEND_BUTTON 34
 #define CHAT_STATUS_HEIGHT 18
 #define CHAT_COMPOSER_AREA_HEIGHT 132
+/* Composer attachment chips: fixed-width, end-ellipsized by the painter.
+   Rows wrap to the strip's width and the strip scrolls past
+   CHAT_CHIP_MAX_ROWS rows, so every chip keeps a reachable remove button. */
+#define CHAT_CHIP_WIDTH 120
+#define CHAT_CHIP_HEIGHT 24
+#define CHAT_CHIP_GAP 4
+#define CHAT_CHIP_REMOVE 16
+#define CHAT_CHIP_MAX_ROWS 2
 #define CHAT_EMPTY_HERO_MAX_WIDTH 520
 
 static UiId add(ChatUi *chat_ui, UiId parent, UiKind kind, const wchar_t *text) {
@@ -438,6 +446,24 @@ bool chat_ui_init(ChatUi *chat_ui, Ui *ui, Chat *chat) {
     node(chat_ui, chat_ui->composer)->style.border = false;
     ui_set_accessible_name(ui, chat_ui->composer, L"Message");
 
+    /* The attach control sits beside the Send/brain stack as its own fixed
+       column, so three controls share the composer card's height. */
+    UiId attach_wrap = add(chat_ui, card, UI_COLUMN, L"");
+    width(chat_ui, attach_wrap, CHAT_SEND_BUTTON);
+    fill_height(chat_ui, attach_wrap);
+    node(chat_ui, attach_wrap)->style.gap = 0;
+    node(chat_ui, attach_wrap)->style.padding = 0;
+    UiId attach_top = add(chat_ui, attach_wrap, UI_COLUMN, L"");
+    fill_width(chat_ui, attach_top);
+    fill_height(chat_ui, attach_top);
+    chat_ui->attach = icon_button(chat_ui, attach_wrap, UI_ICON_ATTACH,
+        L"Attach image", L"Add an image to this message.");
+    width(chat_ui, chat_ui->attach, CHAT_SEND_BUTTON);
+    height(chat_ui, chat_ui->attach, CHAT_SEND_BUTTON);
+    UiId attach_bottom = add(chat_ui, attach_wrap, UI_COLUMN, L"");
+    fill_width(chat_ui, attach_bottom);
+    fill_height(chat_ui, attach_bottom);
+
     UiId send_wrap = add(chat_ui, card, UI_COLUMN, L"");
     width(chat_ui, send_wrap, CHAT_SEND_BUTTON);
     fill_height(chat_ui, send_wrap);
@@ -466,6 +492,45 @@ bool chat_ui_init(ChatUi *chat_ui, Ui *ui, Chat *chat) {
     fill_height(chat_ui, send_bottom);
     UiId composer_right = add(chat_ui, composer_row, UI_COLUMN, L"");
     fill_width(chat_ui, composer_right);
+
+    /* The attachment chip strip: wrapped rows of named chips inside one
+       scrollable, fixed-height strip, hidden while nothing is pending. */
+    chat_ui->chip_strip = add(chat_ui, chat_ui->composer_area, UI_SCROLL, L"");
+    fill_width(chat_ui, chat_ui->chip_strip);
+    node(chat_ui, chat_ui->chip_strip)->style.padding = 0;
+    node(chat_ui, chat_ui->chip_strip)->style.gap = CHAT_CHIP_GAP;
+    node(chat_ui, chat_ui->chip_strip)->style.background = -1;
+    node(chat_ui, chat_ui->chip_strip)->style.border = false;
+    for (int i = 0; i < CHAT_UI_ATTACH_SLOTS; i++) {
+        chat_ui->chip_rows[i] = add(chat_ui, chat_ui->chip_strip, UI_ROW, L"");
+        fill_width(chat_ui, chat_ui->chip_rows[i]);
+        height(chat_ui, chat_ui->chip_rows[i], CHAT_CHIP_HEIGHT);
+        node(chat_ui, chat_ui->chip_rows[i])->style.gap = CHAT_CHIP_GAP;
+        node(chat_ui, chat_ui->chip_rows[i])->style.padding = 0;
+        chat_ui->chips[i] = add(chat_ui, chat_ui->chip_rows[i], UI_ROW, L"");
+        width(chat_ui, chat_ui->chips[i], CHAT_CHIP_WIDTH);
+        height(chat_ui, chat_ui->chips[i], CHAT_CHIP_HEIGHT);
+        UiNode *chip = node(chat_ui, chat_ui->chips[i]);
+        if (chip) {
+            chip->style.padding = 2;
+            chip->style.gap = CHAT_CHIP_GAP;
+            chip->style.border = true;
+            chip->style.background = UI_TRACK;
+        }
+        chat_ui->chip_labels[i] = label(chat_ui, chat_ui->chips[i], L"",
+            UI_SMALL, UI_BRIGHT);
+        fill_width(chat_ui, chat_ui->chip_labels[i]);
+        chat_ui->chip_remove[i] = icon_button(chat_ui, chat_ui->chips[i],
+            UI_ICON_CLOSE, L"Remove image",
+            L"Remove this image from the message.");
+        width(chat_ui, chat_ui->chip_remove[i], CHAT_CHIP_REMOVE);
+        height(chat_ui, chat_ui->chip_remove[i], CHAT_CHIP_REMOVE);
+        ui_set_hidden(ui, chat_ui->chip_rows[i], true);
+        ui_set_hidden(ui, chat_ui->chips[i], true);
+    }
+    chat_ui->chip_count = 0;
+    chat_ui->chip_strip_width = 0;
+    ui_set_hidden(ui, chat_ui->chip_strip, true);
 
     UiId status_row = add(chat_ui, chat_ui->composer_area, UI_ROW, L"");
     fill_width(chat_ui, status_row);
@@ -723,6 +788,67 @@ void chat_ui_set_search_status(ChatUi *chat_ui, const wchar_t *text) {
     ui_invalidate(chat_ui->ui, false);
 }
 
+/* Re-wraps the chip pool against the cached strip width and re-derives the
+   strip and composer heights. Chips wrap into per-row columns; rows past the
+   fixed strip height stay laid out so the strip scrolls to them, and unused
+   rows and chips are hidden. */
+static void chips_apply(ChatUi *chat_ui) {
+    int count = chat_ui->chip_count;
+    if (count > CHAT_UI_ATTACH_SLOTS) count = CHAT_UI_ATTACH_SLOTS;
+    int per = 1;
+    if (chat_ui->chip_strip_width > 0) {
+        /* UI_SCROLL reserves a stable scrollbar gutter, so chips wrap
+           against the strip's inner width even before it scrolls. */
+        float inner = chat_ui->chip_strip_width -
+            chat_ui->ui->theme.scrollbar_width;
+        per = (int)((inner + CHAT_CHIP_GAP) /
+            (CHAT_CHIP_WIDTH + CHAT_CHIP_GAP));
+        if (per < 1) per = 1;
+    }
+    int rows = count ? (count + per - 1) / per : 0;
+    int shown = rows > CHAT_CHIP_MAX_ROWS ? CHAT_CHIP_MAX_ROWS : rows;
+    for (int i = 0; i < CHAT_UI_ATTACH_SLOTS; i++) {
+        bool live = i < count;
+        ui_set_hidden(chat_ui->ui, chat_ui->chips[i], !live);
+        if (!live) continue;
+        /* Ascending reparent keeps each row's chips in display order. */
+        ui_reparent(chat_ui->ui, chat_ui->chips[i], chat_ui->chip_rows[i / per]);
+    }
+    for (int r = 0; r < CHAT_UI_ATTACH_SLOTS; r++)
+        ui_set_hidden(chat_ui->ui, chat_ui->chip_rows[r], r >= rows);
+    ui_set_hidden(chat_ui->ui, chat_ui->chip_strip, rows == 0);
+    float strip_h = shown ? shown * CHAT_CHIP_HEIGHT +
+        (shown - 1) * CHAT_CHIP_GAP : 0;
+    height(chat_ui, chat_ui->chip_strip, strip_h);
+    height(chat_ui, chat_ui->composer_area, CHAT_COMPOSER_AREA_HEIGHT +
+        (strip_h > 0 ? strip_h + 6 : 0));
+    ui_invalidate(chat_ui->ui, true);
+}
+
+void chat_ui_set_attachments(ChatUi *chat_ui,
+    const wchar_t (*display_names)[64], int count) {
+    if (!chat_ui || !chat_ui->ui) return;
+    if (count < 0) count = 0;
+    if (count > CHAT_UI_ATTACH_SLOTS) count = CHAT_UI_ATTACH_SLOTS;
+    chat_ui->chip_count = count;
+    for (int i = 0; i < count; i++) {
+        bool named = display_names && display_names[i][0];
+        const wchar_t *name = named ? display_names[i] : L"Image";
+        ui_set_text(chat_ui->ui, chat_ui->chip_labels[i], name);
+        if (named) {
+            wchar_t remove_name[UI_TEXT_CAPACITY];
+            swprintf(remove_name, UI_TEXT_CAPACITY, L"Remove image %ls", name);
+            ui_set_accessible_name(chat_ui->ui, chat_ui->chip_remove[i],
+                remove_name);
+        } else {
+            ui_set_accessible_name(chat_ui->ui, chat_ui->chip_remove[i],
+                L"Remove image");
+        }
+        ui_set_accessible_name(chat_ui->ui, chat_ui->chips[i], name);
+    }
+    chips_apply(chat_ui);
+}
+
 bool chat_ui_resize(ChatUi *chat_ui, float width, float height) {
     bool narrow = width < CHAT_UI_SIDEBAR_BREAKPOINT;
     bool state_changed = narrow != chat_ui->narrow;
@@ -740,6 +866,16 @@ bool chat_ui_resize(ChatUi *chat_ui, float width, float height) {
     chat_ui->last_layout_width = width;
     chat_ui->last_layout_height = height;
     ui_layout(chat_ui->ui, width, height);
+    /* Chip wrapping depends on the composer area's arranged width; one settle
+       pass re-wraps when it changed. The follow-up layout sees the same
+       width, so the reflow is idempotent. */
+    float area_w = chat_ui_rect(chat_ui, chat_ui->composer_area).w;
+    float strip_w = area_w > 12 ? area_w - 12 : 0;
+    if (strip_w != chat_ui->chip_strip_width) {
+        chat_ui->chip_strip_width = strip_w;
+        chips_apply(chat_ui);
+        ui_layout(chat_ui->ui, width, height);
+    }
     return true;
 }
 
@@ -759,7 +895,16 @@ void chat_ui_event(void *user, Ui *ui, UiEvent event) {
         command(chat_ui->command_user, CHAT_COMMAND_MODEL_PICKER, -1);
     } else if (event.id == chat_ui->reasoning) {
         command(chat_ui->command_user, CHAT_COMMAND_TOGGLE_REASONING, -1);
+    } else if (event.id == chat_ui->attach) {
+        command(chat_ui->command_user, CHAT_COMMAND_ATTACH, -1);
     } else {
+        for (int i = 0; i < CHAT_UI_ATTACH_SLOTS; i++) {
+            if (event.id == chat_ui->chip_remove[i]) {
+                command(chat_ui->command_user, CHAT_COMMAND_REMOVE_ATTACHMENT,
+                    i);
+                return;
+            }
+        }
         /* Selection is identity-based: the row's tag holds the stable
            conversation id, resolved to an index only at this instant. */
         for (int j = 0; j < chat_ui->pool_count; j++) {

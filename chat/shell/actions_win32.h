@@ -49,6 +49,28 @@ void chat_actions_sync_routing(HMENU menu, const Chat *chat);
 bool chat_edit_dialog(HWND owner, const wchar_t *title, wchar_t *text, size_t capacity, bool multiline);
 bool chat_copy_text(HWND owner, const wchar_t *text);
 
+/* Clipboard image seam for the composer's paste interception. Defined here
+   (not in the Rich Edit module) so the host's calls are cross-unit and
+   -Wl,--wrap can serve synthetic clipboard content in tests without touching
+   the real clipboard. has_image reports whether an image paste should be
+   intercepted (CF_DIBV5, CF_DIB or CF_BITMAP); read_dib copies the best
+   available representation into a freshly allocated packed DIB
+   (BITMAPINFOHEADER-based, the exact input image_ingest_dib accepts),
+   converting a GDI CF_BITMAP through GetDIBits. The caller frees *out with
+   free(); both functions zero the out parameters on failure. */
+bool chat_clipboard_has_image(void);
+bool chat_clipboard_read_dib(unsigned char **out, size_t *out_n);
+
+/* Exact byte span of a packed CF_DIB/CF_DIBV5 payload (header, optional
+   BITFIELDS masks, pixels), or false for anything image_ingest_dib would
+   reject (layout, planes, formats, a header size past the defined DIB
+   headers, dimensions past CHAT_ATTACHMENT_MAX_PIXELS, or pixel data that
+   runs past the buffer). The clipboard reader runs this BEFORE allocating:
+   the span it reports is the only copy the ingest needs, so an oversized or
+   lying clipboard entry costs a header read and nothing more. Exposed for
+   the reader's boundary tests. */
+bool chat_clipboard_dib_span(const void *dib, size_t bytes, size_t *out_span);
+
 /* Native file-dialog result: a dialog error is kept distinct from a user
    cancellation, so an export can stay silent on cancel but report a real
    failure. GetSaveFileNameW returns FALSE for both. */

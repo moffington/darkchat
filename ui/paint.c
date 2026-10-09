@@ -67,6 +67,16 @@ static void draw_icon(const UiPainter *p, UiRect r, UiIcon icon, UiColor c) {
             cx + s * .34f, cy + s * .2f, c, 1.2f);
         break;
     }
+    case UI_ICON_ATTACH: {
+        /* Paperclip: a tall wire loop (capsule outline) with the shorter
+           fold-back stroke inside, drawn from the standard primitives. */
+        float w = s * .84f, h = s * 1.72f;
+        p->stroke(p->user, (UiRect){cx - w / 2, cy - h / 2, w, h}, c,
+            w * .5f, 1.5f);
+        p->line(p->user, cx + w * .12f, cy - h * .22f,
+            cx + w * .12f, cy + h * .30f, c, 1.5f);
+        break;
+    }
     default:
         break;
     }

@@ -613,7 +613,7 @@ int main(void) {
     wcscpy(chat->conversations[0].draft,L"Unsent draft");
     chat->sidebar_width=280;
     chat->sidebar_collapsed=1;
-    int n=chat_begin_response(chat,CHAT_SEND,L"First question"); CHECK(n==1);
+    int n=chat_begin_response(chat,CHAT_SEND,L"First question", 0); CHECK(n==1);
     ChatMessage *m=&chat->conversations[0].messages[n];
     wcscpy(m->text,L"Partial \xd83d\xde80\n```c\nint x;\n```");
     wcscpy(m->generation.actual_model,L"actual/model");
@@ -1464,7 +1464,7 @@ int main(void) {
             Chat *big=calloc(1,sizeof *big);
             CHECK(big);
             chat_init(big); chat_clear(big);
-            CHECK(chat_begin_response(big,CHAT_SEND,L"large reasoning")==1);
+            CHECK(chat_begin_response(big,CHAT_SEND,L"large reasoning", 0)==1);
             wchar_t *wide=(wchar_t *)malloc(40001*sizeof *wide);
             CHECK(wide);
             for (int i=0;i<40000;i++) wide[i]=L'R';

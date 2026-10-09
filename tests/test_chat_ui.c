@@ -640,6 +640,123 @@ int main(void) {
     check(!reasoning->selected,
         "switching back restores the conversation's off state");
 
+    /* Composer attachments: the Attach button beside the Send/brain stack,
+       and a chip strip that wraps names across rows and scrolls past its
+       fixed height while every chip keeps a reachable remove button. */
+    {
+        UiNode *attach = ui_node(ui, chat_ui->attach);
+        check(attach && attach->icon == UI_ICON_ATTACH,
+            "the composer exposes an attach button");
+        check(attach->rect.w == send->rect.w &&
+            attach->rect.h == send->rect.h,
+            "the attach button matches the send button size");
+        check(attach->rect.x + attach->rect.w <= send->rect.x + 1 &&
+            attach->rect.x >= chat_ui_rect(chat_ui, chat_ui->composer).x +
+                chat_ui_rect(chat_ui, chat_ui->composer).w - 1,
+            "the attach button sits between the message area and the send stack");
+        check(!wcscmp(ui_accessible_name(ui, chat_ui->attach), L"Attach image"),
+            "the attach button announces itself");
+
+        /* No attachments: the strip disappears and the area keeps its height. */
+        wchar_t none[CHAT_UI_ATTACH_SLOTS][64];
+        memset(none, 0, sizeof none);
+        chat_ui_set_attachments(chat_ui, (const wchar_t (*)[64])none, 0);
+        check(chat_ui_resize(chat_ui, 1100, 720),
+            "clearing the chips relayouts");
+        UiNode *strip = ui_node(ui, chat_ui->chip_strip);
+        check(strip && strip->hidden, "an empty chip strip is hidden");
+        check(chat_ui_rect(chat_ui, chat_ui->composer_area).h == 132,
+            "the composer area keeps its base height without chips");
+
+        /* Three chips at a wide width: one row, bound names, grown area. */
+        wchar_t names[CHAT_UI_ATTACH_SLOTS][64];
+        memset(names, 0, sizeof names);
+        wcscpy(names[0], L"photo.jpg");
+        wcscpy(names[2], L"shot.png");
+        chat_ui_set_attachments(chat_ui, (const wchar_t (*)[64])names, 3);
+        check(chat_ui_resize(chat_ui, 1100, 720), "layout with chips");
+        strip = ui_node(ui, chat_ui->chip_strip);
+        check(strip && !strip->hidden, "a populated chip strip is visible");
+        check(!wcscmp(ui_node(ui, chat_ui->chip_labels[0])->text, L"photo.jpg"),
+            "chip zero binds its display name");
+        check(!wcscmp(ui_node(ui, chat_ui->chip_labels[1])->text, L"Image"),
+            "an unnamed chip reads as Image");
+        check(!wcscmp(ui_accessible_name(ui, chat_ui->chip_remove[0]),
+                L"Remove image photo.jpg"),
+            "the remove control names its image");
+        check(!wcscmp(ui_accessible_name(ui, chat_ui->chip_remove[1]),
+                L"Remove image"),
+            "an unnamed chip's remove control stays generic");
+        check(ui_node(ui, chat_ui->chips[0]) &&
+                !ui_node(ui, chat_ui->chips[0])->hidden &&
+            ui_node(ui, chat_ui->chips[2]) &&
+                !ui_node(ui, chat_ui->chips[2])->hidden,
+            "the live chips are shown");
+        check(ui_node(ui, chat_ui->chips[3])->hidden &&
+                ui_node(ui, chat_ui->chips[7])->hidden,
+            "unused chip slots are hidden");
+        UiRect chip0 = chat_ui_rect(chat_ui, chat_ui->chips[0]);
+        UiRect chip1 = chat_ui_rect(chat_ui, chat_ui->chips[1]);
+        UiRect chip2 = chat_ui_rect(chat_ui, chat_ui->chips[2]);
+        check(chip0.w == 120 && chip0.h == 24 &&
+            chip1.w == 120 && chip1.h == 24,
+            "chips are the fixed 120x24 track");
+        check(chip1.x >= chip0.x + 120 && chip1.y == chip0.y &&
+            chip2.x >= chip1.x + 120 && chip2.y == chip0.y,
+            "chips fill one row left to right with a gap");
+        float strip_h = chat_ui_rect(chat_ui, chat_ui->chip_strip).h;
+        check(strip_h == 24,
+            "one row of chips is one chip height tall");
+        check(chat_ui_rect(chat_ui, chat_ui->composer_area).h == 132 + 24 + 6,
+            "the composer area grows by exactly the strip plus its gap");
+
+        /* A remove click dispatches the chip's slot index. */
+        last_command = CHAT_COMMAND_NONE; last_index = -1;
+        chat_ui_event(chat_ui, ui,
+            (UiEvent){chat_ui->chip_remove[1], UI_ACTIVATE});
+        check(last_command == CHAT_COMMAND_REMOVE_ATTACHMENT && last_index == 1,
+            "a chip's remove button dispatches its slot index");
+        last_command = CHAT_COMMAND_NONE;
+        chat_ui_event(chat_ui, ui, (UiEvent){chat_ui->attach, UI_ACTIVATE});
+        check(last_command == CHAT_COMMAND_ATTACH,
+            "the attach button dispatches the attach command");
+
+        /* Eight chips at a very narrow width wrap into more rows than the
+           strip shows, so the strip stays capped at two rows and scrolls. */
+        chat_ui_set_attachments(chat_ui, (const wchar_t (*)[64])names, CHAT_UI_ATTACH_SLOTS);
+        check(chat_ui_resize(chat_ui, 400, 650), "narrow layout with 8 chips");
+        for (int i = 0; i < CHAT_UI_ATTACH_SLOTS; i++) {
+            UiRect r = chat_ui_rect(chat_ui, chat_ui->chips[i]);
+            check(r.w == 120 && r.h == 24,
+                "every chip keeps its fixed track at the narrow width");
+        }
+        /* Wrap invariant: same-row chips share y and advance in x; rows
+           stack downward in display order. */
+        bool wrapped_rows = true, rows_ordered = true;
+        int row_count = 1;
+        for (int i = 1; i < CHAT_UI_ATTACH_SLOTS; i++) {
+            UiRect a = chat_ui_rect(chat_ui, chat_ui->chips[i - 1]);
+            UiRect b = chat_ui_rect(chat_ui, chat_ui->chips[i]);
+            if (b.y == a.y) {
+                if (!(b.x >= a.x + 120)) wrapped_rows = false;
+            } else {
+                ++row_count;
+                if (!(b.y >= a.y + 24)) rows_ordered = false;
+            }
+        }
+        check(wrapped_rows, "chips inside a row advance left to right");
+        check(rows_ordered, "chip rows stack downward in display order");
+        strip_h = chat_ui_rect(chat_ui, chat_ui->chip_strip).h;
+        int shown = row_count > 2 ? 2 : row_count;
+        check(row_count > 2, "eight chips wrap past two rows when narrow");
+        check(strip_h == shown * 24 + (shown - 1) * 4,
+            "the strip caps at two rows and scrolls the rest");
+        check(chat_ui->chip_count == CHAT_UI_ATTACH_SLOTS,
+            "the chip pool covers the product attachment bound");
+        check(ui->count <= UI_CAPACITY - 15,
+            "the node census with live chips stays well below UI_CAPACITY");
+    }
+
     free(chat_ui); chat_dispose(chat); free(chat); free(ui);
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("\nall chat UI checks passed\n");

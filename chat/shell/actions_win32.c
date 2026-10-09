@@ -1,4 +1,5 @@
 #include "chat/shell/actions_win32.h"
+#include "chat/core/image_policy.h"
 #include "chat/import/import.h"
 #include "chat/export/package.h"
 #include "platform/dark_mode_win32.h"
@@ -235,6 +236,136 @@ bool chat_copy_text(HWND owner,const wchar_t *text) {
         CloseClipboard();
     }
     if (!ok) GlobalFree(memory);
+    return ok;
+}
+bool chat_clipboard_has_image(void) {
+    return IsClipboardFormatAvailable(CF_DIBV5) ||
+        IsClipboardFormatAvailable(CF_DIB) ||
+        IsClipboardFormatAvailable(CF_BITMAP);
+}
+bool chat_clipboard_dib_span(const void *dib, size_t bytes, size_t *out_span) {
+    if (!dib || !out_span) return false;
+    *out_span = 0;
+    if (bytes < sizeof(BITMAPINFOHEADER)) return false;
+    const BITMAPINFOHEADER *header = (const BITMAPINFOHEADER *)dib;
+    /* The header rules image_ingest_dib enforces, before anything is copied:
+       layout, planes, non-empty dimensions, and the product pixel bound. */
+    if (header->biSize < sizeof(BITMAPINFOHEADER) ||
+        (size_t)header->biSize > bytes || header->biPlanes != 1 ||
+        header->biWidth <= 0 || header->biHeight == 0)
+        return false;
+    /* biSize is the pixel offset, so an oversized "header" is nothing but a
+       gap in front of the pixels that inflates the copy despite bounded
+       dimensions. The defined DIB headers end at BITMAPV5HEADER; anything
+       larger is not a header. */
+    if (header->biSize > sizeof(BITMAPV5HEADER)) return false;
+    size_t width = (size_t)header->biWidth;
+    int64_t magnitude = header->biHeight;
+    if (magnitude < 0) magnitude = -magnitude;
+    if (width > CHAT_ATTACHMENT_MAX_PIXELS ||
+        magnitude > (int64_t)CHAT_ATTACHMENT_MAX_PIXELS)
+        return false;
+    size_t height = (size_t)magnitude;
+    size_t stride, offset, mask_bytes = 0;
+    if (header->biBitCount == 24 && header->biCompression == BI_RGB) {
+        stride = ((width * 24u + 31u) / 32u) * 4u;
+    } else if (header->biBitCount == 32 &&
+        (header->biCompression == BI_RGB ||
+         header->biCompression == BI_BITFIELDS)) {
+        stride = width * 4u;
+        if (header->biCompression == BI_BITFIELDS) {
+            /* A 40-byte header carries three masks right after it; a V4/V5
+               header carries them inside biSize. Anything between is the
+               layout image_ingest_dib rejects. */
+            if (header->biSize == sizeof(BITMAPINFOHEADER)) {
+                mask_bytes = 3 * sizeof(DWORD);
+                if (bytes < sizeof(BITMAPINFOHEADER) + mask_bytes)
+                    return false;
+            } else if (header->biSize < sizeof(BITMAPV4HEADER)) {
+                return false;
+            }
+        }
+    } else {
+        return false;
+    }
+    offset = (size_t)header->biSize + mask_bytes;
+    if (offset > bytes) return false;
+    size_t needed = offset + stride * height;
+    if (needed < offset || needed > bytes) return false;
+    *out_span = needed;
+    return true;
+}
+/* Converts a GDI bitmap into a packed 32bpp BI_RGB DIB (BITMAPINFOHEADER +
+   pixels), the clipboard representation image_ingest_dib understands. */
+static bool clipboard_bitmap_to_dib(HBITMAP bitmap, unsigned char **out,
+    size_t *out_n) {
+    BITMAP info;
+    if (!bitmap || !GetObjectW(bitmap, sizeof info, &info)) return false;
+    if (info.bmWidth <= 0 || info.bmHeight <= 0) return false;
+    /* The product pixel bound, checked before the pixel buffer is sized,
+       allocated or converted: an oversized source is rejected here exactly
+       as image_ingest_dib would reject it after the copy. */
+    if ((uint32_t)info.bmWidth > CHAT_ATTACHMENT_MAX_PIXELS ||
+        (uint32_t)info.bmHeight > CHAT_ATTACHMENT_MAX_PIXELS) return false;
+    size_t pixels = (size_t)info.bmWidth * (size_t)info.bmHeight;
+    if (pixels > (SIZE_MAX - sizeof(BITMAPINFOHEADER)) / 4) return false;
+    BITMAPINFOHEADER header;
+    memset(&header, 0, sizeof header);
+    header.biSize = sizeof header;
+    header.biWidth = info.bmWidth;
+    header.biHeight = info.bmHeight; /* positive: bottom-up, like CF_DIB */
+    header.biPlanes = 1;
+    header.biBitCount = 32;
+    header.biCompression = BI_RGB;
+    header.biSizeImage = (DWORD)(pixels * 4);
+    HDC dc = CreateCompatibleDC(NULL);
+    if (!dc) return false;
+    unsigned char *dib = (unsigned char *)malloc(
+        sizeof(BITMAPINFOHEADER) + pixels * 4);
+    if (!dib) { DeleteDC(dc); return false; }
+    memcpy(dib, &header, sizeof header);
+    int lines = GetDIBits(dc, bitmap, 0, (UINT)info.bmHeight, dib + sizeof header,
+        (BITMAPINFO *)dib, DIB_RGB_COLORS);
+    DeleteDC(dc);
+    if (lines != info.bmHeight) { free(dib); return false; }
+    *out = dib;
+    *out_n = sizeof(BITMAPINFOHEADER) + pixels * 4;
+    return true;
+}
+bool chat_clipboard_read_dib(unsigned char **out, size_t *out_n) {
+    if (!out || !out_n) return false;
+    *out = NULL;
+    *out_n = 0;
+    if (!OpenClipboard(NULL)) return false;
+    bool ok = false;
+    /* CF_DIBV5 first, then CF_DIB: both are already packed DIBs. */
+    HANDLE data = GetClipboardData(CF_DIBV5);
+    if (!data) data = GetClipboardData(CF_DIB);
+    if (data) {
+        SIZE_T bytes = GlobalSize(data);
+        const unsigned char *src =
+            (const unsigned char *)GlobalLock(data);
+        /* Bound the copy before making it: the span check reads the header in
+           place and rejects oversized or lying entries without allocating,
+           and the copy is exactly the bytes the ingest will consume (never
+           the untrusted GlobalSize envelope). */
+        size_t span = 0;
+        if (src && bytes &&
+            chat_clipboard_dib_span(src, (size_t)bytes, &span)) {
+            unsigned char *copy = (unsigned char *)malloc(span);
+            if (copy) {
+                memcpy(copy, src, span);
+                *out = copy;
+                *out_n = span;
+                ok = true;
+            }
+        }
+        if (src) GlobalUnlock(data);
+    } else {
+        HBITMAP bitmap = (HBITMAP)GetClipboardData(CF_BITMAP);
+        ok = clipboard_bitmap_to_dib(bitmap, out, out_n);
+    }
+    CloseClipboard();
     return ok;
 }
 ChatFileDialogResult chat_save_dialog(HWND owner, const wchar_t *title,

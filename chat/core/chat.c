@@ -444,6 +444,23 @@ void chat_message_clear_parts(ChatMessage *m) {
     ++m->body_revision;
 }
 
+bool chat_message_adopt_parts(ChatMessage *m, ChatMessage *from) {
+    if (!m || !from || m == from) return false;
+    /* Precondition: m holds no parts and its plain-text projection equals
+       the concatenation of from's TEXT parts (the staging caller builds both
+       from one prompt). The transfer itself moves one pointer and cannot
+       fail; a message with nothing staged succeeds as a no-op. */
+    if (m->parts.items) return false;
+    if (!from->parts.items) return true;
+    m->parts = from->parts;
+    from->parts.items = NULL;
+    from->parts.count = 0;
+    from->parts.capacity = 0;
+    ++m->revision;
+    ++m->body_revision;
+    return true;
+}
+
 bool chat_message_set_text(ChatMessage *m,const wchar_t *text) {
     if (!m) return false;
     if (!text) text=L"";
@@ -1362,7 +1379,8 @@ bool chat_history_message(const ChatMessage *m) {
     reservation succeeds, no
    remaining step can fail on array growth, so a -1 return from this function
    always leaves the conversation exactly as it was. */
-int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt) {
+int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt,
+    size_t attached_images) {
     if (!chat_active(chat)) return -1;
     if (mode != CHAT_SEND && mode != CHAT_RETRY &&
         mode != CHAT_REGENERATE && mode != CHAT_EDIT_RESEND) return -1;
@@ -1372,7 +1390,10 @@ int chat_begin_response(Chat *chat, ChatSendMode mode, const wchar_t *prompt) {
     int user = chat_latest_user(c);
     size_t final_count;
     if (mode == CHAT_SEND) {
-        if (!prompt || !prompt[0] || wcslen(prompt) >= CHAT_COMPOSER_TEXT ||
+        /* A send is valid when the prompt is non-empty or the caller stages
+           attached images into the turn (an image-only message). */
+        if (!prompt || (!prompt[0] && !attached_images) ||
+            wcslen(prompt) >= CHAT_COMPOSER_TEXT ||
             c->message_count + 2 > CHAT_MAX_MESSAGES) return -1;
         final_count = c->message_count + 2; /* user turn + fresh response */
     } else {

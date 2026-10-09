@@ -480,6 +480,11 @@ ChatImageIngestResult image_ingest_dib(const void *dib, size_t dib_size,
             (size_t)header->biSize > dib_size || header->biPlanes != 1 ||
             header->biWidth <= 0 || header->biHeight == 0)
         return IMAGE_INGEST_UNSUPPORTED;
+    /* biSize is the pixel offset: cap it at the largest defined DIB header so
+       a fat "header" cannot pad the gap in front of the pixels (the same
+       bound chat_clipboard_dib_span applies before copying one). */
+    if (header->biSize > sizeof(BITMAPV5HEADER))
+        return IMAGE_INGEST_UNSUPPORTED;
     width = (uint32_t)header->biWidth;
     {
         /* Sign-extend before negating: INT32_MIN would overflow a LONG. */

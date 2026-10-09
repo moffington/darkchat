@@ -666,7 +666,7 @@ int main(void) {
         fill_conversation(br, 4, 0);       /* 8 messages, capacity 8 */
         next_id = br->next_id; modified_at = c->modified_at;
         fail_next_reallocs = 1;
-        rc = chat_begin_response(br, CHAT_SEND, L"new question");
+        rc = chat_begin_response(br, CHAT_SEND, L"new question", 0);
         fail_next_reallocs = 0;
         check(rc < 0, "a send that must grow the array fails on allocation");
         check(c->message_count == 8 && br->next_id == next_id &&
@@ -675,7 +675,7 @@ int main(void) {
         check(!wcscmp(c->messages[0].text, L"question") &&
             !wcscmp(c->messages[7].text, L"answer"),
             "existing messages survive a failed send");
-        rc = chat_begin_response(br, CHAT_SEND, L"new question");
+        rc = chat_begin_response(br, CHAT_SEND, L"new question", 0);
         check(rc == 9, "the same send succeeds once growth is allowed");
         check(c->message_count == 10 && c->message_capacity == 16,
             "the send grew the array exactly once");
@@ -689,7 +689,7 @@ int main(void) {
         fill_conversation(br, 3, 2);       /* trailing users at 6 and 7 */
         next_id = br->next_id; modified_at = c->modified_at;
         fail_next_reallocs = 1;
-        rc = chat_begin_response(br, CHAT_RETRY, NULL);
+        rc = chat_begin_response(br, CHAT_RETRY, NULL, 0);
         fail_next_reallocs = 0;
         check(rc < 0, "a retry that must grow the array fails on allocation");
         check(c->message_count == 8 && br->next_id == next_id &&
@@ -698,7 +698,7 @@ int main(void) {
         check(!wcscmp(c->messages[7].text, L"trailing question"),
             "a failed retry trims nothing");
         fail_next_reallocs = 1;
-        rc = chat_begin_response(br, CHAT_EDIT_RESEND, L"edited while failing");
+        rc = chat_begin_response(br, CHAT_EDIT_RESEND, L"edited while failing", 0);
         fail_next_reallocs = 0;
         check(rc < 0, "an edit-resend that must grow fails on allocation");
         check(!wcscmp(c->messages[7].text, L"trailing question"),
@@ -707,7 +707,7 @@ int main(void) {
             c->modified_at == modified_at,
             "a failed edit-resend mutates nothing");
         fail_next_reallocs = 1;
-        rc = chat_begin_response(br, CHAT_REGENERATE, NULL);
+        rc = chat_begin_response(br, CHAT_REGENERATE, NULL, 0);
         fail_next_reallocs = 0;
         check(rc < 0, "a regenerate that must grow fails on allocation");
         check(c->message_count == 8 && br->next_id == next_id,
@@ -715,7 +715,7 @@ int main(void) {
 
         /* The same replacements succeed once growth is allowed, retaining
            capacity across the trim. */
-        rc = chat_begin_response(br, CHAT_RETRY, NULL);
+        rc = chat_begin_response(br, CHAT_RETRY, NULL, 0);
         check(rc == 8, "retry succeeds after the failed attempts");
         check(c->message_count == 9 && c->message_capacity == 16 &&
             c->messages != NULL,
@@ -724,13 +724,41 @@ int main(void) {
             c->messages[8].generation.state == CHAT_GENERATION_RUNNING,
             "retry kept the trailing user turn and started a response");
         c->messages[8].generation.state = CHAT_GENERATION_COMPLETE;
-        rc = chat_begin_response(br, CHAT_EDIT_RESEND, L"edited for real");
+        rc = chat_begin_response(br, CHAT_EDIT_RESEND, L"edited for real", 0);
         check(rc == 8, "edit-resend succeeds after the failed attempt");
         check(!wcscmp(c->messages[7].text, L"edited for real") &&
             c->message_count == 9,
             "edit-resend replaced the user text and response");
         check_invariants(br);
         chat_dispose(br); free(br);
+    }
+
+    /* Send gate: a send is valid with a non-empty prompt or with staged
+       attached images; an empty, image-free prompt is still rejected. */
+    {
+        Chat *gate = (Chat *)calloc(1, sizeof *gate);
+        if (!gate) return 2;
+        chat_init(gate); chat_clear(gate);
+        check(chat_begin_response(gate, CHAT_SEND, L"", 0) < 0,
+            "an empty prompt with no attachments cannot send");
+        check(chat_begin_response(gate, CHAT_SEND, NULL, 2) < 0,
+            "a NULL prompt is rejected even with attached images");
+        check(gate->conversations[gate->active].message_count == 0,
+            "rejected sends publish no turns");
+        int gi = chat_begin_response(gate, CHAT_SEND, L"", 2);
+        check(gi == 1,
+            "an empty prompt sends when attached images are staged");
+        const ChatConversation *gc = chat_active(gate);
+        check(gc->message_count == 2 && gc->messages[0].text[0] == 0 &&
+            gc->messages[1].generation.state == CHAT_GENERATION_RUNNING,
+            "the image-only send published empty-text user and running response");
+        /* Edit-resend stays strict: the edit dialog is text-only and v1
+           preserves parts, so it still demands non-empty text. */
+        gc->messages[1].generation.state = CHAT_GENERATION_COMPLETE;
+        check(chat_begin_response(gate, CHAT_EDIT_RESEND, L"", 2) < 0,
+            "edit-resend still requires non-empty text");
+        check_invariants(gate);
+        chat_dispose(gate); free(gate);
     }
 
     /* Product input limit: chat_begin_response itself enforces the composer's
@@ -749,7 +777,7 @@ int main(void) {
             const ChatConversation *c = chat_active(limit);
 
             prompt[300] = 0;
-            check(chat_begin_response(limit, CHAT_SEND, prompt) >= 0 &&
+            check(chat_begin_response(limit, CHAT_SEND, prompt, 0) >= 0 &&
                 c->message_count == 2 &&
                 c->messages[0].text_overflow != NULL &&
                 c->messages[0].text_length == 300,
@@ -758,7 +786,7 @@ int main(void) {
 
             prompt[300] = L'x';
             prompt[CHAT_COMPOSER_TEXT - 1] = 0;
-            check(chat_begin_response(limit, CHAT_SEND, prompt) >= 0 &&
+            check(chat_begin_response(limit, CHAT_SEND, prompt, 0) >= 0 &&
                 c->messages[0].text_overflow != NULL &&
                 c->messages[0].text_length == CHAT_COMPOSER_TEXT - 1,
                 "a CHAT_COMPOSER_TEXT - 1 unit prompt is accepted whole");
@@ -768,7 +796,7 @@ int main(void) {
             uint64_t before_id = limit->next_id;
             int64_t before_modified = c->modified_at;
             size_t before_count = c->message_count;
-            check(chat_begin_response(limit, CHAT_SEND, prompt) < 0 &&
+            check(chat_begin_response(limit, CHAT_SEND, prompt, 0) < 0 &&
                 c->message_count == before_count &&
                 limit->next_id == before_id &&
                 c->modified_at == before_modified,
@@ -792,7 +820,7 @@ int main(void) {
         /* Retry replaces the last response, so the old one must be in a
             failed terminal state first. */
         c->messages[511].generation.state = CHAT_GENERATION_FAILED;
-        check(chat_begin_response(cap, CHAT_RETRY, NULL) == 511,
+        check(chat_begin_response(cap, CHAT_RETRY, NULL, 0) == 511,
             "retry succeeds at the 512-message cap");
         check(c->message_count == 512 && c->message_capacity == 512,
             "retry at the cap needs no growth");
@@ -800,10 +828,10 @@ int main(void) {
             !c->messages[511].text[0],
             "retry at the cap replaced the last response");
         c->messages[511].generation.state = CHAT_GENERATION_COMPLETE;
-        check(chat_begin_response(cap, CHAT_REGENERATE, NULL) == 511,
+        check(chat_begin_response(cap, CHAT_REGENERATE, NULL, 0) == 511,
             "regenerate succeeds at the 512-message cap");
         c->messages[511].generation.state = CHAT_GENERATION_COMPLETE;
-        check(chat_begin_response(cap, CHAT_EDIT_RESEND, L"edited at the cap")
+        check(chat_begin_response(cap, CHAT_EDIT_RESEND, L"edited at the cap", 0)
             == 511, "edit-resend succeeds at the 512-message cap");
         check(!wcscmp(c->messages[510].text, L"edited at the cap") &&
             c->message_count == 512,
@@ -815,18 +843,18 @@ int main(void) {
         fill_conversation(cap, 255, 1);    /* 511 messages, last is user */
         uint64_t next_id = cap->next_id;
         int64_t modified_at = c->modified_at;
-        check(chat_begin_response(cap, CHAT_SEND, L"one too many") < 0,
+        check(chat_begin_response(cap, CHAT_SEND, L"one too many", 0) < 0,
             "a send whose final shape needs 513 live messages is rejected");
         check(c->message_count == 511 && cap->next_id == next_id &&
             c->modified_at == modified_at,
             "a rejected send mutates nothing");
         chat_append(cap, CHAT_ROLE_USER, L"512th");  /* user at 511 */
         next_id = cap->next_id; modified_at = c->modified_at;
-        check(chat_begin_response(cap, CHAT_REGENERATE, NULL) < 0,
+        check(chat_begin_response(cap, CHAT_REGENERATE, NULL, 0) < 0,
             "a regenerate whose final shape needs 513 live messages is rejected");
-        check(chat_begin_response(cap, CHAT_RETRY, NULL) < 0,
+        check(chat_begin_response(cap, CHAT_RETRY, NULL, 0) < 0,
             "a retry whose final shape needs 513 live messages is rejected");
-        check(chat_begin_response(cap, CHAT_EDIT_RESEND, L"no") < 0,
+        check(chat_begin_response(cap, CHAT_EDIT_RESEND, L"no", 0) < 0,
             "an edit-resend whose final shape needs 513 live messages is rejected");
         check(c->message_count == 512 && cap->next_id == next_id &&
             c->modified_at == modified_at,
@@ -856,7 +884,7 @@ int main(void) {
         /* A trim reduces the live range but retains capacity for reuse. */
         chat_active(stable)->messages[first + 1].generation.state =
             CHAT_GENERATION_FAILED;
-        check(chat_begin_response(stable, CHAT_RETRY, NULL) == 1,
+        check(chat_begin_response(stable, CHAT_RETRY, NULL, 0) == 1,
             "retry after growth succeeds");
         check(chat_active(stable)->message_count == 2 &&
             chat_active(stable)->message_capacity == 16 &&
@@ -978,9 +1006,9 @@ int main(void) {
             "invalid-mode probe seeded");
         uint64_t before_id = bad_mode->next_id;
         int64_t before_modified = chat_active(bad_mode)->modified_at;
-        check(chat_begin_response(bad_mode, (ChatSendMode)99, L"x") < 0,
+        check(chat_begin_response(bad_mode, (ChatSendMode)99, L"x", 0) < 0,
             "an out-of-range send mode is rejected");
-        check(chat_begin_response(bad_mode, (ChatSendMode)-1, L"x") < 0,
+        check(chat_begin_response(bad_mode, (ChatSendMode)-1, L"x", 0) < 0,
             "a negative send mode is rejected");
         check(chat_active(bad_mode)->message_count == 1 &&
             !wcscmp(chat_message_text(&chat_active(bad_mode)->messages[0]),
@@ -1417,7 +1445,7 @@ int main(void) {
             "the request fixture override is set");
         check(chat_append(eff, CHAT_ROLE_USER, L"question") == 1,
             "the request fixture has a user turn");
-        int resp = chat_begin_response(eff, CHAT_SEND, L"question");
+        int resp = chat_begin_response(eff, CHAT_SEND, L"question", 0);
         check(resp >= 0, "the effective-model response begins");
         if (resp >= 0) {
             const ChatGeneration *g =
@@ -1811,6 +1839,112 @@ int main(void) {
         check(chat_message_remove_part(dm, 1) && dm->parts.items == NULL &&
                 !wcscmp(chat_message_text(dm), L"demote me"),
             "removing the last image demotes and keeps text");
+
+        /* Staged-turn transfer: adopt_parts moves a fully staged part list
+           into a published message in one infallible step. */
+        {
+            ChatMessage staged;
+            memset(&staged, 0, sizeof staged);
+            check(chat_message_set_text(&staged, L"staged prompt"),
+                "staging set_text");
+            ChatImagePart i1, i2;
+            memset(&i1, 0, sizeof i1);
+            memset(&i2, 0, sizeof i2);
+            i1.attachment_id = 11;
+            memcpy(i1.mime, "image/png", 10);
+            i2.attachment_id = 12;
+            memcpy(i2.mime, "image/jpeg", 11);
+            check(chat_message_add_image(&staged, &i1, 0) &&
+                    chat_message_add_image(&staged, &i2,
+                        CHAT_PART_FLAG_FIRST_FRAME),
+                "staging two images");
+            check(staged.parts.count == 3 &&
+                    staged.parts.items[0].kind == CHAT_PART_TEXT &&
+                    staged.parts.items[1].kind == CHAT_PART_IMAGE &&
+                    staged.parts.items[2].kind == CHAT_PART_IMAGE,
+                "staged text plus two images is [TEXT, IMAGE, IMAGE]");
+
+            int pj = chat_append(pc, CHAT_ROLE_USER, L"staged prompt");
+            ChatMessage *pm = &pc->conversations[pc->active].messages[pj];
+            uint64_t prev = pm->revision, prev_body = pm->body_revision;
+            check(chat_message_adopt_parts(pm, &staged),
+                "adopt_parts transfers staged content");
+            check(staged.parts.items == NULL && staged.parts.count == 0 &&
+                    staged.parts.capacity == 0,
+                "adopt_parts leaves the staging message with no parts");
+            check(pm->parts.count == 3 &&
+                    pm->parts.items[0].kind == CHAT_PART_TEXT &&
+                    pm->parts.items[1].u.image.attachment_id == 11 &&
+                    pm->parts.items[2].u.image.attachment_id == 12 &&
+                    pm->parts.items[2].flags == CHAT_PART_FLAG_FIRST_FRAME,
+                "the published message owns the transferred parts");
+            check(pm->revision == prev + 1 &&
+                    pm->body_revision == prev_body + 1,
+                "adoption bumps revision and body_revision exactly once");
+            check(!wcscmp(chat_message_text(pm), L"staged prompt") &&
+                    parts_consistent(pm),
+                "projection matches the transferred TEXT part");
+            check(!chat_message_adopt_parts(pm, &staged),
+                "adopting into a message that already owns parts is rejected");
+            chat_message_dispose(&staged);
+        }
+        /* Image-only staging: empty text plus two images is exactly two
+           IMAGE parts, never an empty TEXT part. */
+        {
+            ChatMessage staged;
+            memset(&staged, 0, sizeof staged);
+            check(chat_message_set_text(&staged, L""), "empty staging text");
+            check(chat_message_add_image(&staged, &only, 0) &&
+                    chat_message_add_image(&staged, &only, 0),
+                "empty staging accepts two images");
+            check(staged.parts.count == 2 &&
+                    staged.parts.items[0].kind == CHAT_PART_IMAGE &&
+                    staged.parts.items[1].kind == CHAT_PART_IMAGE,
+                "empty text plus two images stages two IMAGE parts");
+            int qj = chat_append(pc, CHAT_ROLE_USER, L"");
+            ChatMessage *qm = &pc->conversations[pc->active].messages[qj];
+            check(chat_message_adopt_parts(qm, &staged) &&
+                    qm->parts.count == 2 &&
+                    qm->parts.items[0].kind == CHAT_PART_IMAGE &&
+                    qm->parts.items[1].kind == CHAT_PART_IMAGE &&
+                    chat_message_text(qm)[0] == 0 && parts_consistent(qm),
+                "the published image-only turn presents two IMAGE parts");
+            chat_message_dispose(&staged);
+        }
+        /* Adoption edges: no staged parts succeed as a no-op, and a message
+           can never adopt from itself. */
+        {
+            ChatMessage empty_stage, target;
+            memset(&empty_stage, 0, sizeof empty_stage);
+            memset(&target, 0, sizeof target);
+            uint64_t tr = target.revision;
+            check(chat_message_adopt_parts(&target, &empty_stage),
+                "adopting no staged parts is a successful no-op");
+            check(target.parts.items == NULL && target.revision == tr,
+                "a no-op adoption leaves the target untouched");
+            check(!chat_message_adopt_parts(&target, &target),
+                "self-adoption is rejected");
+        }
+        /* Staging OOM: each allocation failing mid-build leaves the scratch
+           safely disposable; nothing is ever published. */
+        {
+            bool saw_fail = false, saw_ok = false;
+            for (long pos = 1; pos <= 3; pos++) {
+                ChatMessage staged;
+                memset(&staged, 0, sizeof staged);
+                alloc_number = 0;
+                fail_allocation = pos;
+                bool ok = chat_message_set_text(&staged, L"stage text");
+                if (ok) ok = chat_message_add_image(&staged, &only, 0);
+                if (ok) ok = chat_message_add_image(&staged, &only, 0);
+                alloc_number = 0;
+                fail_allocation = 0;
+                if (ok) saw_ok = true; else saw_fail = true;
+                chat_message_dispose(&staged);
+            }
+            check(saw_fail && saw_ok,
+                "staged builds fail cleanly under allocation pressure");
+        }
 
         /* Revision matrix for part mutations (§3.5). */
         int rj = chat_append(pc, CHAT_ROLE_USER, L"revision parts");
